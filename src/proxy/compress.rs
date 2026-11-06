@@ -30,7 +30,7 @@ pub(super) async fn proxy_http_request_with_compression(
     initial_body: &[u8],
     max_chunked_body_size: u64,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
     wasm_modules: crate::wasm_plugin_config::WasmModules,
@@ -131,7 +131,7 @@ pub(super) async fn transfer_response_with_compression(
     backend_stream: &mut TcpStream,
     client_stream: &mut ServerTls,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     mut cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
     wasm_modules: crate::wasm_plugin_config::WasmModules,
@@ -280,14 +280,30 @@ pub(super) async fn transfer_response_with_compression(
 
                 // ヘッダーを修正（remove_response_headers・add_response_headers・Alt-Svc・Wasm・CORS）。1 本のバッファへ
                 // 直接書く（以前は Wasm のあるルートでヘッダの行ごとに `format!` と `Vec` を作って連結していた）
-                let modified_headers = finish_h1_upstream_head(
+                let modified_headers = match finish_h1_upstream_head(
                     &accumulated[..header_len],
                     status_code,
                     security,
                     #[cfg(feature = "wasm")]
                     &wasm_modules,
                 )
-                .await;
+                .await
+                {
+                    Ok(h) => h,
+                    // 応答ヘッダの段のローカルレスポンス（B-300）。上流の本文は読まないので上流の接続は戻さない
+                    Err(resp) => {
+                        return match super::sendfile::write_h1_wasm_local(
+                            client_stream,
+                            &resp,
+                            false,
+                        )
+                        .await
+                        {
+                            Some((st, n)) => (total + n, st, false, false),
+                            None => (total, status_code, false, true),
+                        };
+                    }
+                };
 
                 // 修正したヘッダー + 初期ボディを送信
                 // F-59: 平文接続では 1 回の SENDMSG（scatter-gather）で送出
@@ -429,15 +445,15 @@ async fn wasm_on_full_head(
     head: Vec<u8>,
     status: u16,
     wasm_modules: &crate::wasm_plugin_config::WasmModules,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, super::sendfile::HeadLocal> {
     if wasm_modules.is_empty() || !head.ends_with(b"\r\n\r\n") {
-        return head;
+        return Ok(head);
     }
     let mut lines = head;
     lines.truncate(lines.len() - 2);
-    let mut out = super::sendfile::h1_wasm_response_head(lines, status, wasm_modules).await;
+    let mut out = super::sendfile::h1_wasm_response_head(lines, status, wasm_modules).await?;
     out.extend_from_slice(b"\r\n");
-    out
+    Ok(out)
 }
 
 /// 上流の応答のヘッダ（ステータス行から空行まで）をクライアントへ返す形にし（`render_response_head`）、Wasm の
@@ -447,14 +463,14 @@ pub(super) async fn finish_h1_upstream_head(
     status: u16,
     security: &SecurityConfig,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, super::sendfile::HeadLocal> {
     let head = render_response_head(raw, status, security);
     #[cfg(feature = "wasm")]
-    let head = wasm_on_full_head(head, status, wasm_modules).await;
+    let head = wasm_on_full_head(head, status, wasm_modules).await?;
     let mut head = head;
     // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
     crate::route_cors::apply_h1(&mut head, security);
-    head
+    Ok(head)
 }
 
 /// 上流の応答のヘッダ（ステータス行から空行まで）を、クライアントへ返す形にする（WASM のフィルタが無いとき）。
@@ -666,7 +682,15 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
     );
     // Wasm の `on_http_response_headers` は圧縮した後のヘッダに（B-268。区切りの行は元のまま残る）
     #[cfg(feature = "wasm")]
-    let new_headers = wasm_on_full_head(new_headers, status_code, wasm_modules).await;
+    let new_headers = match wasm_on_full_head(new_headers, status_code, wasm_modules).await {
+        Ok(h) => h,
+        // 応答ヘッダの段のローカルレスポンス（B-300。上流の本文は読み切っている）
+        Err(resp) => {
+            return super::sendfile::write_h1_wasm_local(client_stream, &resp, false)
+                .await
+                .map(|(_, n)| (n, backend_wants_keep_alive));
+        }
+    };
     #[cfg(not(feature = "wasm"))]
     let _ = status_code;
 

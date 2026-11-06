@@ -6,7 +6,8 @@
 # zip の中身（既存の veil バイナリの成果物と混ざらないよう、名前は veil-lib-* で始める）:
 #   veil-lib-<ver>-<arch>-linux-gnu/
 #     README.md  LICENSE-APACHE  LICENSE-MIT  MANIFEST.txt
-#     c/include/veil.h  c/lib/libveil.so  c/lib/libveil.a  c/lib/pkgconfig/veil.pc  c/examples/...
+#     c/include/veil.h  c/include/veil_kit.h  c/lib/libveil.{so,a}  c/lib/libveil_kit.{so,a}
+#     c/lib/pkgconfig/veil.pc  c/lib/pkgconfig/veil-kit.pc  c/lib/cmake/veil/veil-config.cmake  c/examples/...
 #     python/veil_api-<ver>-cp38-abi3-<platform>.whl  python/examples/...
 #     rust/veil-src-<ver>.tar.gz  rust/examples/...
 #     docs/library.md  docs/ja/library.md
@@ -24,12 +25,16 @@ cp "$ROOT/docs/guide/library.md" "$STAGE/docs/library.md"
 cp "$ROOT/docs/guide/ja/library.md" "$STAGE/docs/ja/library.md"
 
 if has c; then
-  mkdir -p "$STAGE/c/include" "$STAGE/c/lib/pkgconfig" "$STAGE/c/examples"
-  cp "$ROOT/crates/veil-capi/include/veil.h" "$STAGE/c/include/"
-  cp "$TGT/$PROF/libveil.so" "$TGT/$PROF/libveil.a" "$STAGE/c/lib/"
+  mkdir -p "$STAGE/c/include" "$STAGE/c/lib/pkgconfig" "$STAGE/c/lib/cmake/veil" "$STAGE/c/examples"
+  cp "$ROOT/crates/veil-capi/include/veil.h" "$ROOT/crates/veil-capi-helpers/include/veil_kit.h" "$STAGE/c/include/"
+  # F-291: libveil_kit は libveil の上位集合（プログラムはどちらか一方だけをリンクする）
+  cp "$TGT/$PROF/libveil.so" "$TGT/$PROF/libveil.a" \
+     "$TGT/$PROF/libveil_kit.so" "$TGT/$PROF/libveil_kit.a" "$STAGE/c/lib/"
   cp "$ROOT/crates/veil-capi/README.md" "$STAGE/c/README.md"
-  cp -r "$ROOT/examples/api/c-hello" "$STAGE/c/examples/"
-  rm -f "$STAGE/c/examples/c-hello/hello" "$STAGE/c/examples/c-hello/hello-static"
+  cp "$ROOT/crates/veil-capi-helpers/README.md" "$STAGE/c/README-kit.md"
+  cp -r "$ROOT/examples/api/c-hello" "$ROOT/examples/api/c-kit" "$STAGE/c/examples/"
+  rm -f "$STAGE/c/examples/c-hello/hello" "$STAGE/c/examples/c-hello/hello-static" \
+        "$STAGE/c/examples/c-kit/kit" "$STAGE/c/examples/c-kit/kit-static"
   cat > "$STAGE/c/lib/pkgconfig/veil.pc" <<PC
 prefix=\${pcfiledir}/../..
 libdir=\${prefix}/lib
@@ -42,6 +47,60 @@ Libs: -L\${libdir} -lveil
 Libs.private: -lpthread -ldl -lm
 Cflags: -I\${includedir}
 PC
+  # veil-kit は veil を Requires にしない（libveil_kit が libveil の全関数を含む。両方リンクすると壊れる）
+  cat > "$STAGE/c/lib/pkgconfig/veil-kit.pc" <<PC
+prefix=\${pcfiledir}/../..
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: veil-kit
+Description: veil API server library with the helpers kit (C API; includes everything of veil, do not link both)
+Version: $VER
+Libs: -L\${libdir} -lveil_kit
+Libs.private: -lpthread -ldl -lm
+Cflags: -I\${includedir}
+PC
+  # CMake: find_package(veil CONFIG) で veil::veil（libveil）と veil::kit（libveil_kit）。static は veil::veil_static・veil::kit_static
+  cat > "$STAGE/c/lib/cmake/veil/veil-config.cmake" <<'CMAKE'
+# veil C API: imported targets veil::veil, veil::kit (shared) and veil::veil_static, veil::kit_static.
+# Link exactly one of libveil and libveil_kit (libveil_kit contains everything of libveil).
+get_filename_component(_veil_prefix "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+set(_veil_inc "${_veil_prefix}/include")
+set(_veil_lib "${_veil_prefix}/lib")
+find_package(Threads REQUIRED)
+foreach(_t IN ITEMS veil kit)
+  if(_t STREQUAL "veil")
+    set(_n veil)
+  else()
+    set(_n veil_kit)
+  endif()
+  if(NOT TARGET veil::${_t})
+    add_library(veil::${_t} SHARED IMPORTED)
+    set_target_properties(veil::${_t} PROPERTIES
+      IMPORTED_LOCATION "${_veil_lib}/lib${_n}.so"
+      INTERFACE_INCLUDE_DIRECTORIES "${_veil_inc}")
+  endif()
+  if(NOT TARGET veil::${_t}_static)
+    add_library(veil::${_t}_static STATIC IMPORTED)
+    set_target_properties(veil::${_t}_static PROPERTIES
+      IMPORTED_LOCATION "${_veil_lib}/lib${_n}.a"
+      INTERFACE_INCLUDE_DIRECTORIES "${_veil_inc}"
+      INTERFACE_LINK_LIBRARIES "Threads::Threads;${CMAKE_DL_LIBS};m")
+  endif()
+endforeach()
+set(veil_FOUND TRUE)
+CMAKE
+  cat > "$STAGE/c/lib/cmake/veil/veil-config-version.cmake" <<CMAKE
+set(PACKAGE_VERSION "$VER")
+if(PACKAGE_FIND_VERSION VERSION_GREATER PACKAGE_VERSION)
+  set(PACKAGE_VERSION_COMPATIBLE FALSE)
+else()
+  set(PACKAGE_VERSION_COMPATIBLE TRUE)
+  if(PACKAGE_FIND_VERSION VERSION_EQUAL PACKAGE_VERSION)
+    set(PACKAGE_VERSION_EXACT TRUE)
+  endif()
+endif()
+CMAKE
 fi
 
 if has python; then
@@ -85,7 +144,7 @@ cat > "$STAGE/README.md" <<MD
 
 | Directory | Contents |
 |-----------|----------|
-$(has c && echo "| \`c/\` | C API: \`include/veil.h\`, \`lib/libveil.so\`, \`lib/libveil.a\`, \`lib/pkgconfig/veil.pc\`, example |")
+$(has c && echo "| \`c/\` | C API: \`include/veil.h\` + \`lib/libveil.{so,a}\` (pkg-config \`veil\`), or the helpers kit \`include/veil_kit.h\` + \`lib/libveil_kit.{so,a}\` (pkg-config \`veil-kit\`; link one of the two), CMake \`find_package(veil)\` (\`veil::veil\`, \`veil::kit\`), examples |")
 $(has python && echo "| \`python/\` | Python wheel (\`pip install python/*.whl\`, import \`veil\`), examples |")
 $(has rust && echo "| \`rust/\` | Rust source package and example (depend on it by path) |")
 | \`docs/\` | Library guide (English / Japanese) |

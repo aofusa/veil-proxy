@@ -11,7 +11,7 @@ VeilはProxy-Wasm ABI v0.2.1に完全準拠したWASM拡張システムを提供
 - **Proxy-Wasm v0.2.1準拠**: Nginx/Envoyと100%互換
 - **AOTコンパイル・自動キャッシュ**: モジュールを AOT コンパイルし、初回ロード時に `.wasm` の隣へ `.cwasm` サイドカーを自動生成。次回起動時はそれを `deserialize` して高速起動する（`.wasm` が新しい場合や wasmtime 版が変わった場合は自動無効化し、エラー時は再コンパイルへフォールバック）。明示的な `.cwasm` パス指定も可。
 - **Pooling Allocator**: 高速なインスタンス化
-- **非同期実行（Head-of-Line ブロッキングなし）**: wasmtime async support + Fuel ベースの協調的 yield（約10k命令ごと）で実行。CPU バウンドなフィルタが io_uring ワーカーの他 I/O をストールさせない
+- **非同期実行（Head-of-Line ブロッキングなし）**: wasmtime async support + Fuel ベースの協調的 yield（ゲストの CPU 時間で約 1ms ごと。`yield_interval_us`）で実行。CPU バウンドなフィルタが io_uring ワーカーの他 I/O をストールさせない
 - **Capability制限**: モジュールごとの細かい権限制御（デフォルト全て無効）
 - **Pulley インタープリタ選択**（`[wasm] interpreter = true`、F-135）: Cranelift ネイティブ JIT の代わりに wasmtime の Pulley ポータブルバイトコードインタープリタで実行し、ネイティブコードを一切生成しない。W^X 制約のあるホストや実行可能 `mmap` を許可できない環境向け。ネイティブ JIT より低速。既定は `false`（Cranelift JIT）。AOT サイドカーキャッシュはファイル名を分離（`.pulley.cwasm`）し、JIT 版と Pulley 版が同じキャッシュを奪い合って毎回再コンパイルする事態を避ける。**OpenBSD（全アーキ）・NetBSD（全アーキ）・FreeBSD aarch64 ではこの設定は常に無視され、常に Pulley が使われる**（B-52/B-55。`interpreter = false` を明示指定すると起動時に警告ログが出るが無視される）
 - **HTTP/3 が HTTP/1.1・HTTP/2 と同等のライフサイクルに対応**（F-132）: HTTP/3 経路でも `on_log` がすべての離脱点（`LocalResponse` による早期 return を含む）から確実に呼ばれるようになり、`Backend::File`（静的配信）ルートにも `on_response_headers` フィルタが適用される。`Backend::Proxy` ルートではリクエスト/レスポンスボディフィルタ（`on_request_body`/`on_response_body`）も動作する（HTTP/3 は WASM 適用時に本文全体を既にバッファしているため `end_of_stream=true` の1回呼びで実装）。レスポンス本文を書き換えた場合は `content-length` を新しい長さへ更新し、nghttp3 の `H3_MESSAGE_ERROR`（本文長不一致・重複)を回避する。
@@ -142,6 +142,10 @@ path = "./www"
 | `on_http_response_body` | ○ | ○ | ○ |
 | `on_log` | ○ | ○ | ○ |
 
+要求のフェーズと `on_http_response_headers` のローカル応答（`send_local_response`）は、上流の応答の代わりに返す（上流の応答の残りは
+読まず、その上流の接続は使い回さない）。`on_http_response_trailers` のローカル応答は、応答のヘッダを送った後なので送れない（元の
+トレーラーのまま）。ローカル応答の後も `on_log` は呼ぶ。
+
 要求本文のフェーズは、要求に本文があり、ルートのモジュールのどれかが `allow_request_body_read = true` のときに走る。
 veil は本文を全部読んでから（Content-Length・chunked。上限は `max_request_body_size`・`max_chunked_body_size`、超えたら
 `413`）`on_http_request_body` を `end_of_stream = true` で 1 回呼ぶ。コールバックからは要求のパス・メソッド・ヘッダも読める。
@@ -214,17 +218,53 @@ data_files = { dataset = "/etc/veil/data/dataset.json" }
 
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
-| `max_execution_time_ms` | WASM呼び出しごとの最大実行時間（ミリ秒） | 100 |
+| `max_execution_time_ms` | 1 回のコールバックの CPU の量（ミリ秒。fuel で数え、1ms は約 100 万）。新しいインスタンスの起動時のコールバック（`_start`・`proxy_on_vm_start`・`proxy_on_configure`）は別の枠 | 100 |
 | `yield_interval_us` | 実行中のコールバックが同じワーカーの他の要求へ制御を返す間隔（マイクロ秒の目安。fuel で数える）。小さくすると CPU を長く使うフィルタの後ろで待つ他の要求の待ちが短くなるが、どのコールバックも頻繁に止まり、`instance_reuse` のインスタンスが同時に多く開き、要求ごとの費用が増える | 1000 |
 | `interpreter` | Cranelift ネイティブ JIT の代わりに Pulley インタープリタで実行する（F-135）。OpenBSD では常に `true` 相当（B-52） | false |
 | `grpc_connect_timeout_ms` | `proxy_grpc_call`・`proxy_grpc_stream` で gRPC の上流へ接続する（TCP と TLS）時間の上限。ゲストの `timeout_ms` が長くても接続はこの時間で諦める（到達できない上流で全プラグインの gRPC が止まらないように）。gRPC のスレッドが取り込む前の呼び出し・ストリームのメッセージはそれぞれ 4096 件までで、超えるとホスト関数は `InternalFailure` を返す | 5000 |
 | `http_call_max_timeout_ms` | `proxy_http_call` にプラグインが渡す `timeout_ms` の上限（負の値は 0 とみなす） | 60000 |
 | `shared_data_max_keys` | 1 モジュールの shared data のキーの数の上限。超える新しいキーの `proxy_set_shared_data` は `InternalFailure` を返す（既存のキーは更新できる） | 100000 |
+| `failure_policy` | フィルタが失敗したときの扱い。`fail_closed`・`fail_open`・`fail_reload`（[失敗の扱い](#失敗の扱い)）。`[[wasm.modules]]` の `failure_policy` で上書きできる | `fail_closed` |
 
-コールバックがトラップしたり上限（`max_execution_time_ms` から決まる CPU の量、または他の要求へ譲っていた時間を含む約 1 秒の
-実時間）を超えたりすると、エラーをログに出し、そのフィルタが無かったものとして要求を続ける（fail open）。WAF のようなセキュリティの
-フィルタは、ワーカーが混んでいるときでも上限より十分短く終わるようにする。メッシュの `WasmPlugin` の `failure_policy: FAIL_CLOSED` は
-代わりに 503 を返す。
+### 失敗の扱い
+
+次のときフィルタは失敗する: コールバックがトラップした（SDK の panic・`proc_exit`・`unreachable`）、CPU の量（`max_execution_time_ms`）を
+使い切った、他の要求へ譲っていた時間を含めて約 1 秒の実時間を超えた、インスタンスを作れない（`total_memories` の枠が約 130ms 埋まったまま）、
+新しいインスタンスの起動時のコールバックが失敗した、Pause した要求を再開する `proxy_on_http_call_response` がトラップした、待てるものの無い
+`Pause` を返した（下記）。要求の扱いは `failure_policy` で決まる:
+
+| `failure_policy` | 要求 | インスタンス |
+|---|---|---|
+| `fail_closed`（既定） | `503`（gRPC のクライアントには `UNAVAILABLE`） | 捨てて、次の要求は新しいインスタンスで |
+| `fail_open` | 失敗したモジュールを飛ばし、次のモジュールへ続ける。失敗する前にモジュールが変えたヘッダは残る | 捨てる |
+| `fail_reload` | `503` | 捨てて、そのモジュールの使い回しているインスタンス（`instance_reuse`）も次に使う前に作り直す |
+
+Envoy の `FAIL_CLOSED` と違い、1 つの要求の失敗で後の要求は失敗しない（次の要求は必ず正常なインスタンスで始める）。失敗する前に
+フィルタが設定したローカル応答は、ポリシーに関係なく返す。失敗は `veil_wasm_failures_total{filter, phase, reason, action}`
+（`reason` は `trap`・`fuel`・`timeout`・`instantiate`・`lifecycle`・`http_call_resume`・`unsupported_pause`、`action` は `rejected`・
+`continued`）で数え、警告をログに出す（頻度は抑える）。
+
+`Pause` は、フィルタが待つものを veil が待てるときに守る: どのフェーズの `dispatch_http_call` でもその場で解決する
+（[外部サービス連携](#外部サービス連携http呼び出し)）。`on_http_request_headers` が本文の前（`end_of_stream = false`）に `Pause` を返し、
+モジュールが本文を読む（`allow_request_body_read`）なら本文のフェーズで続きを決める（応答も同じ）。`proxy_grpc_call`・`proxy_grpc_stream` を
+待つ `Pause` や、待つものの無い `Pause` は `unsupported_pause` の失敗になる。`dispatch_http_call` の後は、
+`proxy_on_http_call_response` が要求を再開する（`resume_http_request`、つまり `proxy_continue_stream`）かローカル応答を返したときだけ
+要求を続ける。どちらもしないフィルタや、`max_http_calls` 回を過ぎてもコールが残るフィルタは Pause のままで、上と同じに扱う
+（0.11.0 より前は続けていた）。WebSocket のアップグレード（HTTP/1.1 と HTTP/2・HTTP/3 の拡張 CONNECT）は本文の段を走らせないので、
+`on_http_request_headers` には `end_of_stream = true` を渡す。
+
+L4 のネットワークフィルタ（`[[l4]] wasm_modules`）も同じ `failure_policy` に従う: `fail_closed`（既定）では
+`proxy_on_new_connection`・`proxy_on_downstream_data`・`proxy_on_upstream_data` が失敗すると接続を閉じる（`phase` は
+`new_connection`・`downstream_data`・`upstream_data`）。`fail_open` ではそのモジュールを飛ばす。
+`proxy_on_downstream_data`・`proxy_on_upstream_data` が `Pause` を返すと、veil はそのバイトを転送せずに持ち、次に読んだ
+バイトを後ろに付けて次の呼び出しでもう一度渡す。持つ量が 1 MiB を超えると接続を閉じる。0.11.0 より前の L4 のフィルタは
+失敗しても常に続け、`Pause` でもバイトを転送していた。
+
+起動時とリロード時に、各モジュールの `_start`・`proxy_on_vm_start`・`proxy_on_configure` を 1 回走らせる。トラップしたり `false` を
+返したり（プラグインが設定を拒否した等）したら設定を拒否する（起動は失敗し、リロードは前の設定のまま）。
+
+0.11.0 より前は失敗しても常に続けていた（今の `fail_open` と同じ。メトリクスは無かった）。`[wasm.defaults]` に
+`failure_policy = "fail_open"` を書くと以前と同じになる。
 
 #### Poolingアロケータ設定
 
@@ -257,7 +297,12 @@ data_files = { dataset = "/etc/veil/data/dataset.json" }
 | `allow_upstream_data_write` | L4 upstream 接続データ書き換え（F-133） | false |
 | `allow_send_local_response` | ローカルレスポンス送信 | false |
 | `allow_http_calls` | HTTP外部呼び出し | false |
-| `allowed_upstreams` | 許可upstream | [] |
+| `allowed_upstreams` | `proxy_http_call`・`proxy_grpc_call` が呼べる上流。空なら全上流グループを許す | [] |
+
+capability の無いホスト関数は `NotAllowed` を返す。その状態を unwrap する SDK（Rust の `proxy-wasm` は多くの呼び出しでそうする）は
+panic し、コールバックがトラップして要求は `failure_policy` で扱われる（既定は `503`）。veil は、`proxy_send_local_response`・
+`proxy_http_call`・`proxy_grpc_call`/`proxy_grpc_stream`・`proxy_define_metric`・shared data の関数・`proxy_set_property` を import するのに
+対応する capability が無いモジュールを、ロード時に警告する。
 
 ### Rustによる拡張機能開発
 
@@ -368,7 +413,7 @@ cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
 ### 外部サービス連携（HTTP呼び出し）
 
 Proxy-Wasmの`dispatch_http_call`を使用して外部HTTPサービス（Redis用Webdis等）を呼び出せます。
-フィルタが呼び出し後に`Action::Pause`を返すと、Veilはリクエスト経路上で上流コールを
+フィルタが呼び出し後に（HTTP のどのフェーズでも）`Action::Pause`を返すと、Veilはリクエスト経路上で上流コールを
 インライン解決し（ブロッキングHTTPクライアントは専用オフロードスレッドで実行するため
 イベントループはブロックしません）、`proxy_on_http_call_response`で同一WASMインスタンスを
 再開します。動作例は`examples/wasm-filters/http-call-filter/`にあります。

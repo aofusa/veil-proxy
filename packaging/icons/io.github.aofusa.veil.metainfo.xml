@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata installed by the deb / rpm packages and the BSD ports (share/metainfo). -->
+<component type="console-application">
+  <id>io.github.aofusa.veil</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0 OR MIT</project_license>
+  <name>veil</name>
+  <summary>High-performance reverse proxy and web server</summary>
+  <description>
+    <p>
+      Veil is a reverse proxy and web server for HTTP/1.1, HTTP/2 and HTTP/3. It serves static files, proxies to
+      HTTP, HTTPS, gRPC and WebSocket backends with load balancing and health checks, and can be extended with
+      Proxy-Wasm plugins.
+    </p>
+    <p>
+      On Linux it uses io_uring and kernel TLS, and it confines itself with seccomp and Landlock.
+    </p>
+  </description>
+  <icon type="stock">veil</icon>
+  <developer id="io.github.aofusa">
+    <name>aofusa</name>
+  </developer>
+  <url type="homepage">https://github.com/aofusa/veil-proxy</url>
+  <url type="bugtracker">https://github.com/aofusa/veil-proxy/issues</url>
+  <url type="help">https://github.com/aofusa/veil-proxy/blob/main/docs/guide/README.md</url>
+  <categories>
+    <category>Network</category>
+  </categories>
+  <keywords>
+    <keyword>proxy</keyword>
+    <keyword>reverse proxy</keyword>
+    <keyword>web server</keyword>
+    <keyword>HTTP/3</keyword>
+  </keywords>
+  <provides>
+    <binary>veil</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+</component>

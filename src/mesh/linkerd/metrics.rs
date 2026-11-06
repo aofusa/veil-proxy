@@ -74,6 +74,19 @@ thread_local! {
     static LOCAL: RefCell<Option<Arc<Mutex<Table>>>> = const { RefCell::new(None) };
 }
 
+/// Prometheus のラベルの値を書く（`\`・`"`・改行をエスケープする。B-318: 以前は `"` を消すだけで、
+/// Host の末尾の `\` が閉じの `"` をエスケープして表示形式を壊していた。F38）
+fn push_label_value(s: &mut String, v: &str) {
+    for ch in v.chars() {
+        match ch {
+            '\\' => s.push_str("\\\\"),
+            '"' => s.push_str("\\\""),
+            '\n' => s.push_str("\\n"),
+            c => s.push(c),
+        }
+    }
+}
+
 fn labels(r: &Req<'_>) -> String {
     let mut s = String::with_capacity(160);
     s.push_str(if r.inbound {
@@ -82,7 +95,7 @@ fn labels(r: &Req<'_>) -> String {
         "direction=\"outbound\""
     });
     s.push_str(",authority=\"");
-    s.push_str(&r.authority.replace('"', ""));
+    push_label_value(&mut s, r.authority);
     s.push_str("\",target_addr=\"");
     s.push_str(&r.target_addr.to_string());
     s.push('"');
@@ -90,12 +103,12 @@ fn labels(r: &Req<'_>) -> String {
         s.push_str(",tls=\"true\"");
         if let Some(c) = r.client_id {
             s.push_str(",client_id=\"");
-            s.push_str(c);
+            push_label_value(&mut s, c);
             s.push('"');
         }
         if let Some(sv) = r.server_id {
             s.push_str(",server_id=\"");
-            s.push_str(sv);
+            push_label_value(&mut s, sv);
             s.push('"');
         }
     } else {
@@ -375,4 +388,15 @@ pub fn text() -> String {
         super::identity::EXPIRY.load(std::sync::atomic::Ordering::Relaxed)
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    /// B-318: ラベルの値の `\`・`"`・改行はエスケープする
+    #[test]
+    fn label_value_is_escaped() {
+        let mut s = String::new();
+        super::push_label_value(&mut s, "a\\\"b\nc");
+        assert_eq!(s, "a\\\\\\\"b\\nc");
+    }
 }

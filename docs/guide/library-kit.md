@@ -13,8 +13,8 @@ For Python, the package `veil-api-kit` (`import veil_kit`) has the same parts wi
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
-veil-kit = { package = "veil-proxy-kit", version = "0.10", features = ["full"] }
+veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
+veil-kit = { package = "veil-proxy-kit", version = "0.11", features = ["full"] }
 ```
 
 | Module | Feature | Contents |
@@ -93,9 +93,10 @@ path on this site (not `//host` or `/\host`) or an `http(s)` URL whose host is l
 
 `serve::dir("/assets", "/srv/www")` is `App::serve_dir` with the defaults: a `type = "File"` route with
 `open_file_cache` and `static_file_cache`. Requests do not go through a handler; sendfile, kTLS, Range and ETag
-work as for the proxy. Precompressed `.br` / `.gz` files are not used; `compression` compresses files on the fly for
-HTTP/2 and HTTP/3 (HTTP/1.1 sends them as they are). `serve::dir_with(prefix, dir, ServeOptions { .. })` takes
-`index`, `mode`, the two caches, `compression` and extra route keys. The File backend has no SPA fallback; serve an `index.html` route
+work as for the proxy. `precompressed` (for example `vec!["br".into(), "gzip".into()]`) serves precompressed
+`.br` / `.gz` / `.zst` siblings, and `compression` compresses files on the fly on HTTP/1.1, HTTP/2 and HTTP/3.
+`serve::dir_with(prefix, dir, ServeOptions { .. })` takes `index`, `mode`, the two caches, `compression`, `precompressed`
+and extra route keys. The File backend has no SPA fallback; serve an `index.html` route
 with a handler if you need one.
 
 `serve::file(path, max_size).await` reads one file on the file offload pool and answers with a media type from the
@@ -201,7 +202,8 @@ let created: Item = res.error_for_status()?.json()?;
 - HTTP/1.1 connections are pooled per worker (`pool_idle_timeout`, default 60 s); an idempotent request whose pooled
   connection turned out to be closed is sent once more on a new connection.
 - Bodies are read whole (`max_response_size`, default 64 MiB). Errors have a `kind()` (`Connect`, `Timeout`,
-  `Protocol`, `Status`, ...) and convert into a 502/504 `Response`.
+  `Protocol`, `Status`, ...) and convert into a 502/504 `Response` whose body says only `Bad Gateway` / `Gateway Timeout`
+  (log the error itself for the details; its message never contains the URL's query or userinfo).
 - Build clients at startup: a custom CA or client certificate is read from disk when the client is built.
 
 `veil_kit::client::{get_json, post_json, retry}` add JSON round trips and retries with exponential backoff for
@@ -300,3 +302,74 @@ App::new().with(
 headers, and `ServeDir` mounted with `App::tokio_service` on `veil::tokio` (the `tokio` crate patched to the shim) next
 to the recommended `App::serve_dir`. tower-cookies' `Cookies` lives in the `http` request extensions and does not
 reach veil handlers.
+
+## C (`libveil_kit`)
+
+The crate `veil-capi-helpers` builds `libveil_kit` (`.so` / `.dylib` / `.dll` and a static library) with the header
+[`veil_kit.h`](../../crates/veil-capi-helpers/include/veil_kit.h). It contains the whole C API of
+[`libveil`](library.md#c-api) plus the `veil_kit_*` helpers, so a program links **one** of the two libraries, never both.
+Cookies, signed and private cookies and sessions use the Rust kit's format byte for byte (the same `Key` derived from
+the same secret reads the other side's cookies), and HS256/RS256/ES256 tokens issued by one side verify on the other.
+
+```sh
+cargo build -p veil-capi-helpers --release      # target/release/libveil_kit.{so,a}
+cc app.c -Icrates/veil-capi/include -Icrates/veil-capi-helpers/include -Ltarget/release -lveil_kit -lpthread -ldl -lm
+```
+
+| Area | Functions |
+|---|---|
+| Cookies | `veil_kit_cookie_get`, `veil_kit_set_cookie` (`veil_kit_cookie_t`: path, domain, `Max-Age`, `Secure`, `HttpOnly`, `SameSite`, `Partitioned`), `veil_kit_remove_cookie` |
+| Keys, signed and private cookies | `veil_kit_key_derive / from / generate / add_fallback / free`, `veil_kit_signed_get / set` (HMAC-SHA256), `veil_kit_private_get / set` (AES-256-GCM) |
+| Sessions | `veil_kit_sessions_install` (`veil_kit_sessions_t`: prefix, cookie name, TTL, memory store), `veil_kit_session_get / get_str / set / set_str / remove / clear / destroy / cycle_id` |
+| Credentials | `veil_kit_basic_auth`, `veil_kit_basic_matches`, `veil_kit_bearer`, `veil_kit_api_key`, `veil_kit_api_key_matches` (constant-time), `veil_kit_unauthorized` |
+| Principal | `veil_kit_principal_new / add_scope / add_role / set_attributes / free`, `veil_kit_set_principal`, `veil_kit_principal`, `veil_kit_principal_subject / has_scope / has_role / attributes`, `veil_kit_require_scope` |
+| JWT | `veil_kit_jwt_verifier_new / add_hmac / add_pem / add_jwks / set_jwks / issuer / audience / require_exp / leeway / free`, `veil_kit_jwt_verify`, `veil_kit_jwt_encode_hmac`, `veil_kit_jwt_authenticate` |
+| Redirects and files | `veil_kit_redirect`, `veil_kit_redirect_safe` (against open redirects), `veil_kit_send_file` |
+| Small helpers | `veil_kit_form_get`, `veil_kit_error` (`{"detail": ...}`), `veil_kit_json_string`, `veil_kit_oauth2_security_scheme`, `veil_kit_free`, `veil_kit_version` |
+| Tasks | `veil_kit_every`, `veil_kit_cron` (app tasks on the handler pool; after-response work is `veil_response_after_send` in `libveil`) |
+| Route tables | `veil_kit_route_t`, `VEIL_KIT_GET / POST / PUT / PATCH / DELETE`, `veil_kit_register_all` (header only) |
+| Dependency injection | `veil_kit_di_new / free / register / value / override / override_value / get` (string keys; `VEIL_KIT_DI_SINGLETON`, `_SCOPED` (per request), `_TRANSIENT`; factories may resolve other keys, cycles are errors) |
+| HTTP client | `veil_kit_client_get_json`, `veil_kit_client_post_json` (2xx and a JSON body, else `VEIL_KIT_ERR_STATUS` / `VEIL_KIT_ERR_JSON` with the response kept), `veil_kit_client_send_retry` / `_async` (`veil_kit_retry_t`: attempts, exponential backoff, 502/503/504) |
+| gRPC | `veil_kit_grpc_balanced_new / pick / unary / unary_async / free` (round robin; a unary call that fails with `UNAVAILABLE` moves to the next server) |
+| GraphQL | `veil_kit_graphql` (transport only; the executor is a C callback), `veil_kit_graphql_query / operation_name / variables / extensions / request / set_result` |
+| Tests | `veil_kit_test_new / free / request / get / post_json / header / set_cookie / cookie / clear_cookies` (`veil_test_*` plus a cookie jar and default headers) |
+| JSON writer | `veil_kit_jw_t`, `veil_kit_jw_object / array / end / key / string / string_n / int / double / bool / null / json` (header only) |
+
+CORS, static directories, middleware, request-scoped values, lifecycle hooks, WebSocket subprotocols and gRPC
+reflection are in `libveil` itself (`veil_config_cors`, `veil_config_serve_dir`, `veil_register_middleware`,
+`veil_request_set_local`, `veil_config_on_startup / on_shutdown / on_worker_start`, `veil_ws_accept_ex`,
+`veil_grpc_reflection`; see [library.md](library.md#c-api)).
+
+- C middleware and the kit's guards run on the handler pool in the same call as the handler. The middleware
+  registered last runs first, so register `veil_kit_require_scope` before `veil_kit_jwt_authenticate` on the same
+  prefix. `veil_kit_jwt_authenticate` answers 401 with `WWW-Authenticate: Bearer` for a missing or invalid token
+  (with `VEIL_KIT_JWT_OPTIONAL`, a missing token passes), and sets the principal from `sub`, `scope` / `scp` and
+  `roles`.
+- Strings returned without `veil_kit_free` (`veil_kit_cookie_get`, `veil_kit_session_get`, `veil_kit_form_get`, ...)
+  are not NUL-terminated (use the length) and stay valid until the callback returns. Strings documented as "free it
+  with `veil_kit_free`" are NUL-terminated and owned by the caller.
+- `veil_kit_send_file` reads the file in the callback and is refused on `VEIL_ROUTE_INLINE` routes; serve
+  directories with `veil_config_serve_dir`.
+- The example [`examples/api/c-kit`](../../examples/api/c-kit/) uses every area and is run by
+  `tests/api/library_e2e.sh c-kit`, which also checks cookies and tokens against independent implementations.
+- The HTTP and gRPC clients, deferred responses, JSON body validation (422) and in-process tests are in `libveil`
+  (`veil_client_*`, `veil_grpc_channel_*`, `veil_response_defer`, `veil_register_route_ex2`, `veil_test_*`; see
+  [library.md](library.md#c-api)). The kit's client helpers and `Balanced` are built on them and follow the same
+  rule: the waiting forms return `VEIL_ERR_STATE` on a worker, the `_async` forms call back on the handler pool.
+- Dependency injection has no types in C, so keys are strings and instances are `void *` with an optional free
+  function. Singletons and values live as long as the container; scoped and transient instances are freed when the
+  request ends. `veil_kit_di_override` replaces a registration in tests, like `Container::replace`.
+- `veil_kit_grpc_balanced_*` follows `veil_kit::grpc::Balanced` (round robin, failover on `UNAVAILABLE` once per
+  server). Messages are bytes, so there is no codec parameter; `pick` returns a channel for streaming calls.
+- GraphQL: there is no GraphQL engine in C, so `veil_kit_graphql` is the HTTP transport of the Rust kit's `mount`
+  and the executor is your callback (it receives the query, the operation name and the variables as JSON text and
+  sets the result JSON). The HTTP rules are the same: `POST` takes JSON only (415 otherwise) and batches, `GET`
+  takes the query string and a mutation gets 405, `Accept` picks `application/graphql-response+json`,
+  `text/event-stream` gets the result as GraphQL over SSE, and GraphiQL is served when enabled. Subscriptions need a
+  stream of results from the executor, so the closest equivalent is the `upgrade` option: WebSocket upgrades on the
+  path go to your handler, which accepts `graphql-transport-ws` with `veil_ws_accept_ex` and sends the results.
+- The JSON writer is header-only (no allocation in the library): it escapes strings, inserts commas and reports
+  allocation failure, too deep nesting or an unbalanced `end` in `failed`.
+- Distribution: the library archive (`packaging/scripts/build-lib.sh`) ships `libveil_kit` and `veil_kit.h` next to
+  `libveil`, with the pkg-config file `veil-kit.pc` (it does not require `veil`, since `libveil_kit` contains it) and
+  the CMake targets `veil::kit` / `veil::kit_static`.

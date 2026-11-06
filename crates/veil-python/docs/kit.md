@@ -107,7 +107,7 @@ app.mount("/static", StaticFiles(directory="public", html=True))
 ```
 
 The directory is served by the server's file backend: `sendfile`, kTLS, Range, `ETag` and the file caches work as
-for the proxy, and requests do not reach Python. Precompressed `.br` / `.gz` files are not used. `html=True` serves `index.html` for directories.
+for the proxy, and requests do not reach Python. `precompressed=["br", "gzip"]` serves precompressed `.br` / `.gz` / `.zst` siblings. `html=True` serves `index.html` for directories.
 `app.serve_dir(path, directory, index=None)` is the same without the kit.
 
 ## GraphQL (`veil_kit.graphql`)

@@ -48,6 +48,9 @@ pub mod resolve;
 // そのまま `super::StaticContentCacheConfig` として使い回せる）。
 pub mod compressed;
 
+// 事前圧縮した兄弟ファイル（`app.js.br` 等）を探す（F-294）
+pub mod precompressed;
+
 // DashMap依存モジュール（cache feature 有効時のみ）
 #[cfg(feature = "cache")]
 mod content_cache;
@@ -534,6 +537,8 @@ pub enum StaticFileOutcome {
     Directory(CachedFileInfo),
     /// per-route の封じ込め検査に失敗（403 相当）。**本体は読んでいない。**
     Forbidden,
+    /// 読み込みの上限に達した（503 相当。B-321）
+    Busy,
 }
 
 /// B-65: `cache` feature 無効時のスタブ（キャッシュは持たないが、メタデータ+本体を

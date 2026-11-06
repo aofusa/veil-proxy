@@ -19,8 +19,9 @@ use crate::config::{AcceptedEncoding, CompressionConfig};
 pub struct Validators {
     /// 強い ETag（引用符付き。nginx と同じ `"<mtime の 16 進>-<大きさの 16 進>"`）
     pub etag: Bytes,
-    /// 圧縮した表現の弱い ETag（`W/"…"`。表現が違うので強い ETag は使えない）
-    pub weak_etag: Bytes,
+    /// 圧縮した表現の弱い ETag（`W/"…-zstd"`・`-br`・`-gzip`・`-deflate` の順）。表現が違うので強い ETag は使えず、
+    /// 方式ごとに変える（共有キャッシュが方式を取り違えない。B-304）
+    pub weak_etags: [Bytes; 4],
     /// `Last-Modified`（IMF-fixdate）。更新時刻が分からなければ空
     pub last_modified: Bytes,
     /// 更新時刻（UNIX 秒）。`If-Modified-Since` の比較に使う
@@ -29,6 +30,8 @@ pub struct Validators {
     pub content_type: Bytes,
     /// 全体の長さの 10 進（200 の `content-length`。同上）
     pub full_length: Bytes,
+    /// 事前圧縮した兄弟ファイルの表現なら、その方式（`content-encoding` を付ける。F-294）
+    pub content_encoding: Option<AcceptedEncoding>,
 }
 
 impl Validators {
@@ -80,11 +83,7 @@ impl Validators {
         let mtime_secs = modified
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for &b in body {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0100_0000_01b3);
-        }
+        let h = fnv1a(body);
         Self::build(
             |out| {
                 let _ = write!(out, "m{:x}-{:x}", h, body.len());
@@ -101,16 +100,29 @@ impl Validators {
     where
         F: Fn(&mut Vec<u8>),
     {
-        // content-type + 長さ（最大 20）+ 強い・弱い ETag（各 最大 2 + 34 + 2）+ IMF-fixdate（29）
-        let mut buf: Vec<u8> = Vec::with_capacity(mime.len() + 20 + 40 + 42 + 29);
+        // content-type + 長さ（最大 20）+ 強い ETag（最大 36）+ 弱い ETag 4 つ（各 最大 2 + 36 + 8）+ IMF-fixdate（29）
+        let mut buf: Vec<u8> = Vec::with_capacity(mime.len() + 20 + 36 + 4 * 46 + 29);
         buf.extend_from_slice(mime.as_bytes());
         let ct_end = buf.len();
         buf.extend_from_slice(itoa::Buffer::new().format(size).as_bytes());
         let len_end = buf.len();
-        buf.extend_from_slice(b"W/\"");
+        buf.push(b'"');
         write_tag(&mut buf);
         buf.push(b'"');
         let etag_end = buf.len();
+        let mut weak = [(0usize, 0usize); 4];
+        for (i, suffix) in [&b"-zstd"[..], b"-br", b"-gzip", b"-deflate"]
+            .iter()
+            .enumerate()
+        {
+            let start = buf.len();
+            buf.extend_from_slice(b"W/\"");
+            write_tag(&mut buf);
+            buf.extend_from_slice(suffix);
+            buf.push(b'"');
+            weak[i] = (start, buf.len());
+        }
+        let weak_end = buf.len();
         if let Some(s) = mtime_secs {
             write_http_date(&mut buf, s);
         }
@@ -118,12 +130,124 @@ impl Validators {
         Self {
             content_type: buf.slice(..ct_end),
             full_length: buf.slice(ct_end..len_end),
-            etag: buf.slice(len_end + 2..etag_end),
-            weak_etag: buf.slice(len_end..etag_end),
-            last_modified: buf.slice(etag_end..),
+            etag: buf.slice(len_end..etag_end),
+            weak_etags: weak.map(|(a, b)| buf.slice(a..b)),
+            last_modified: buf.slice(weak_end..),
             mtime_secs,
+            content_encoding: None,
         }
     }
+
+    /// 事前圧縮した兄弟ファイル（F-294）。ETag は兄弟の更新時刻・大きさと方式の強い ETag
+    /// （`"<mtime>-<size>-br"`）、`Last-Modified`・`If-Modified-Since` は元のファイルの更新時刻、型は元のファイルの型。
+    pub fn for_sibling(
+        size: u64,
+        modified: Option<SystemTime>,
+        original_mtime_secs: Option<u64>,
+        mime: &str,
+        encoding: AcceptedEncoding,
+    ) -> Self {
+        let sib_secs = modified
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let suffix = encoding.as_header_value();
+        let mut v = Self::build(
+            |out| {
+                let _ = write!(out, "{:x}-{:x}-", sib_secs, size);
+                out.extend_from_slice(suffix);
+            },
+            original_mtime_secs,
+            mime,
+            size,
+        );
+        v.content_encoding = Some(encoding);
+        v
+    }
+
+    /// memory の兄弟（F-294）。内容のハッシュと方式の強い ETag
+    pub fn for_memory_sibling(
+        body: &[u8],
+        original_mtime_secs: Option<u64>,
+        mime: &str,
+        encoding: AcceptedEncoding,
+    ) -> Self {
+        let h = fnv1a(body);
+        let suffix = encoding.as_header_value();
+        let mut v = Self::build(
+            |out| {
+                let _ = write!(out, "m{:x}-{:x}-", h, body.len());
+                out.extend_from_slice(suffix);
+            },
+            original_mtime_secs,
+            mime,
+            body.len() as u64,
+        );
+        v.content_encoding = Some(encoding);
+        v
+    }
+
+    /// 表現（圧縮の方式。`None` は圧縮しない）の ETag
+    pub fn etag_for(&self, encoding: Option<AcceptedEncoding>) -> &Bytes {
+        match encoding {
+            Some(AcceptedEncoding::Zstd) => &self.weak_etags[0],
+            Some(AcceptedEncoding::Brotli) => &self.weak_etags[1],
+            Some(AcceptedEncoding::Gzip) => &self.weak_etags[2],
+            Some(AcceptedEncoding::Deflate) => &self.weak_etags[3],
+            Some(AcceptedEncoding::Identity) | None => &self.etag,
+        }
+    }
+}
+
+/// 通常のファイルを読む（設定のロード時。F-294）。開いた fd で種類を確かめる（FIFO で止まらないよう
+/// unix では `O_NONBLOCK` で開く）。FreeBSD の capability mode 中（リロード）は登録済みルートの dirfd 相対で開く
+fn read_regular_file(path: &std::path::Path) -> Option<(Vec<u8>, std::fs::Metadata)> {
+    use std::io::Read;
+    #[cfg(target_os = "freebsd")]
+    let opened = match crate::security::capsicum::open_static_ro(path) {
+        Some(f) => f.ok(),
+        None => open_nonblocking(path),
+    };
+    #[cfg(not(target_os = "freebsd"))]
+    let opened = open_nonblocking(path);
+    let mut f = opened?;
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut v = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    f.read_to_end(&mut v).ok()?;
+    Some((v, meta))
+}
+
+fn open_nonblocking(path: &std::path::Path) -> Option<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NONBLOCK);
+    }
+    // 理由付き allow: 設定のロード時（データプレーンの外）に 1 回だけ開く
+    #[allow(clippy::disallowed_methods)]
+    let f = o.open(path).ok();
+    f
+}
+
+/// 圧縮しない設定（事前圧縮した兄弟を返すときに `plan` へ渡す。F-294）
+pub fn no_compression() -> &'static CompressionConfig {
+    static NONE: std::sync::OnceLock<CompressionConfig> = std::sync::OnceLock::new();
+    NONE.get_or_init(CompressionConfig::default)
+}
+
+/// 内容のハッシュ（FNV-1a。memory の ETag 用。ロード時だけ）
+fn fnv1a(body: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in body {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 /// [`Validators::shared_for_file`] のスレッドごとの表の大きさ（直接写像。衝突したら置き換えるだけ）
@@ -160,8 +284,19 @@ pub fn intern_mime(mime: &str) -> std::sync::Arc<str> {
 pub struct MemoryContent {
     pub body: Bytes,
     pub validators: Validators,
-    /// 圧縮した本体（方式ごとに初回に作る。ルートの圧縮設定はこの内容と一緒にロードし直すので変わらない）
-    compressed: [std::sync::OnceLock<Bytes>; 4],
+    /// 圧縮した本体と、そのときのレベル（方式ごとに初回に作る）。HTTP/3 は別のレベルを設定でき、同じ内容を
+    /// HTTP/1.1・HTTP/2 と共有するので、レベルが違えばその要求だけ圧縮する（B-303）
+    compressed: [std::sync::OnceLock<(i32, Bytes)>; 4],
+    /// 事前圧縮した兄弟（br・gzip・zstd の順。ロード時に読む。F-294）
+    siblings: [Option<MemorySibling>; 3],
+    /// 事前圧縮の兄弟を使うルート（`Vary` を常に付ける）
+    precompressed: crate::config::Precompressed,
+}
+
+/// `mode = "memory"` の事前圧縮した兄弟（F-294）
+pub struct MemorySibling {
+    pub body: Bytes,
+    pub validators: Validators,
 }
 
 impl MemoryContent {
@@ -171,7 +306,81 @@ impl MemoryContent {
             body: Bytes::from(data),
             validators,
             compressed: Default::default(),
+            siblings: Default::default(),
+            precompressed: crate::config::Precompressed::default(),
         }
+    }
+
+    /// 事前圧縮した兄弟（`path` + `.br` 等）を読む（設定のロード時。F-294）。元のファイルより古い兄弟・通常の
+    /// ファイルでない兄弟は使わない（古い内容を返さない）
+    pub fn load_precompressed(
+        &mut self,
+        pre: crate::config::Precompressed,
+        path: &std::path::Path,
+        modified: Option<SystemTime>,
+    ) {
+        self.precompressed = pre;
+        let mime = std::str::from_utf8(&self.validators.content_type)
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        for enc in pre.iter() {
+            let (Some(ext), Some(slot)) = (
+                crate::config::Precompressed::extension(enc),
+                crate::config::Precompressed::slot(enc),
+            ) else {
+                continue;
+            };
+            let mut sib = path.as_os_str().to_owned();
+            sib.push(ext);
+            let sib = std::path::PathBuf::from(sib);
+            let Some((data, meta)) = read_regular_file(&sib) else {
+                continue;
+            };
+            let sib_mtime = meta.modified().ok();
+            if let (Some(o), Some(s)) = (modified, sib_mtime) {
+                if s < o {
+                    ftlog::warn!(
+                        "Ignoring precompressed file older than the original: {}",
+                        sib.display()
+                    );
+                    continue;
+                }
+            }
+            let validators =
+                Validators::for_memory_sibling(&data, self.validators.mtime_secs, &mime, enc);
+            self.siblings[slot] = Some(MemorySibling {
+                body: Bytes::from(data),
+                validators,
+            });
+        }
+    }
+
+    /// 事前圧縮の兄弟を使うルートか
+    #[inline]
+    pub fn uses_precompressed(&self) -> bool {
+        !self.precompressed.is_empty()
+    }
+
+    /// この要求に返す事前圧縮の兄弟（無ければ None。F-294）
+    pub fn select_sibling(
+        &self,
+        accept_encoding: Option<&[u8]>,
+        compression: &CompressionConfig,
+    ) -> Option<&MemorySibling> {
+        if self.precompressed.is_empty() {
+            return None;
+        }
+        let mime = std::str::from_utf8(&self.validators.content_type).unwrap_or("");
+        precompressed_candidates(
+            accept_encoding,
+            self.precompressed,
+            compression,
+            mime,
+            self.len(),
+        )
+        .into_iter()
+        .map_while(|e| e)
+        .find_map(|e| crate::config::Precompressed::slot(e).and_then(|i| self.siblings[i].as_ref()))
     }
 
     #[inline]
@@ -193,9 +402,18 @@ impl MemoryContent {
             AcceptedEncoding::Deflate => 3,
             AcceptedEncoding::Identity => return self.body.clone(),
         };
-        self.compressed[slot]
-            .get_or_init(|| Bytes::from(compress_body(&self.body, encoding, compression)))
-            .clone()
+        let level = crate::cache::compressed::compression_level(encoding, compression);
+        let (cached_level, body) = self.compressed[slot].get_or_init(|| {
+            (
+                level,
+                Bytes::from(compress_body(&self.body, encoding, compression)),
+            )
+        });
+        if *cached_level == level {
+            body.clone()
+        } else {
+            Bytes::from(compress_body(&self.body, encoding, compression))
+        }
     }
 
     /// `plan` の本文（206 は切り出し、圧縮は圧縮した全体。304・416 は空）
@@ -206,8 +424,17 @@ impl MemoryContent {
             } => self.compressed(enc, compression),
             Plan::Full { encoding: None } => self.body.clone(),
             Plan::Partial { start, end } => self.body.slice(start as usize..=end as usize),
-            Plan::NotModified | Plan::Unsatisfiable => Bytes::new(),
+            Plan::NotModified { .. } | Plan::Unsatisfiable => Bytes::new(),
         }
+    }
+}
+
+/// 圧縮しない表現の `plan` の本文（206 は切り出し。304・416 は空。参照カウントだけ）
+pub fn slice_for_plan(body: &Bytes, plan: &Plan) -> Bytes {
+    match *plan {
+        Plan::Full { .. } => body.clone(),
+        Plan::Partial { start, end } => body.slice(start as usize..=end as usize),
+        Plan::NotModified { .. } | Plan::Unsatisfiable => Bytes::new(),
     }
 }
 
@@ -256,8 +483,8 @@ impl<'a> StaticRequest<'a> {
 /// 返す応答の種類
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plan {
-    /// 304（本文なし）
-    NotModified,
+    /// 304（本文なし）。`encoding` は 200 なら返したはずの表現（その ETag を返す。B-304）
+    NotModified { encoding: Option<AcceptedEncoding> },
     /// 416（`Content-Range: bytes */<size>`）
     Unsatisfiable,
     /// 206（`start..=end`）
@@ -271,7 +498,7 @@ impl Plan {
     #[inline]
     pub fn status(&self) -> u16 {
         match self {
-            Plan::NotModified => 304,
+            Plan::NotModified { .. } => 304,
             Plan::Unsatisfiable => 416,
             Plan::Partial { .. } => 206,
             Plan::Full { .. } => 200,
@@ -285,6 +512,8 @@ pub const MAX_STATIC_COMPRESS_SIZE: u64 = 8 * 1024 * 1024;
 
 /// 返す応答を決める（RFC 9110 §13.2.2 の順: `If-None-Match` → `If-Modified-Since` → `Range`/`If-Range`）。
 ///
+/// 先に返す表現（圧縮の方式）を決め、その表現の検証子で条件付き要求を評価する（304 は 200 で送ったはずの ETag を
+/// 返す。以前は圧縮した 200 が弱い ETag、304 が強い ETag で食い違っていた。B-304）。
 /// 圧縮する応答には Range を当てない（nginx の gzip と同じ。表現ごとの範囲を持たない）。
 pub fn plan(
     req: &StaticRequest<'_>,
@@ -293,28 +522,28 @@ pub fn plan(
     validators: Option<&Validators>,
     compression: &CompressionConfig,
 ) -> Plan {
-    if let Some(v) = validators {
-        if let Some(inm) = req.if_none_match {
-            if etag_list_matches_weak(inm, &v.etag) {
-                return Plan::NotModified;
-            }
-        } else if let (Some(ims), Some(mtime)) = (req.if_modified_since, v.mtime_secs) {
-            if parse_http_date(ims).is_some_and(|t| mtime <= t) {
-                return Plan::NotModified;
-            }
-        }
-    }
-
     let encoding = match req.accept_encoding {
         Some(ae) if compression.enabled && size <= MAX_STATIC_COMPRESS_SIZE => compression
             .should_compress(
-                AcceptedEncoding::parse(ae),
+                crate::config::ClientAccept::parse(ae),
                 Some(mime.as_bytes()),
                 usize::try_from(size).ok(),
                 None,
             ),
         _ => None,
     };
+    if let Some(v) = validators {
+        if let Some(inm) = req.if_none_match {
+            if etag_list_matches_weak(inm, v.etag_for(encoding)) {
+                return Plan::NotModified { encoding };
+            }
+        } else if let (Some(ims), Some(mtime)) = (req.if_modified_since, v.mtime_secs) {
+            if parse_http_date(ims).is_some_and(|t| mtime <= t) {
+                return Plan::NotModified { encoding };
+            }
+        }
+    }
+
     if encoding.is_some() {
         return Plan::Full { encoding };
     }
@@ -392,6 +621,53 @@ fn trim_ows(v: &[u8]) -> &[u8] {
     &v[start..end]
 }
 
+/// 事前圧縮した兄弟を試す順（F-294）。クライアントの q が高い順（同点は設定の順）で、その場の圧縮の方が q が
+/// 厳密に高い方式は除く（その場の圧縮に任せる）。`Accept-Encoding` が無ければ空
+pub fn precompressed_candidates(
+    accept_encoding: Option<&[u8]>,
+    pre: crate::config::Precompressed,
+    compression: &CompressionConfig,
+    mime: &str,
+    size: u64,
+) -> [Option<AcceptedEncoding>; 3] {
+    let mut out = [None; 3];
+    let Some(ae) = accept_encoding else {
+        return out;
+    };
+    if pre.is_empty() {
+        return out;
+    }
+    let client = crate::config::ClientAccept::parse(ae);
+    let fly_q = if compression.enabled && size <= MAX_STATIC_COMPRESS_SIZE {
+        compression
+            .should_compress(
+                client,
+                Some(mime.as_bytes()),
+                usize::try_from(size).ok(),
+                None,
+            )
+            .map_or(0, |e| client.q(e))
+    } else {
+        0
+    };
+    let mut n = 0usize;
+    for enc in pre.iter() {
+        let q = client.q(enc);
+        if q == 0 || q < fly_q {
+            continue;
+        }
+        // q の降順に挿入（同点は先に来た方＝設定の順を前に）
+        let mut i = n;
+        while i > 0 && out[i - 1].is_some_and(|p| client.q(p) < q) {
+            out[i] = out[i - 1];
+            i -= 1;
+        }
+        out[i] = Some(enc);
+        n += 1;
+    }
+    out
+}
+
 /// `compression` がこの型・大きさの応答を圧縮し得るか（`Vary: Accept-Encoding` を付けるか）
 #[inline]
 pub fn compression_applies(compression: &CompressionConfig, mime: &str, size: u64) -> bool {
@@ -399,7 +675,7 @@ pub fn compression_applies(compression: &CompressionConfig, mime: &str, size: u6
         && size <= MAX_STATIC_COMPRESS_SIZE
         && compression
             .should_compress(
-                AcceptedEncoding::Zstd,
+                crate::config::ClientAccept::ALL,
                 Some(mime.as_bytes()),
                 usize::try_from(size).ok(),
                 None,
@@ -450,11 +726,12 @@ pub fn emit_headers<F>(
 ) where
     F: FnMut(&'static [u8], HVal<'_>),
 {
-    let encoding = match plan {
-        Plan::Full { encoding } => *encoding,
-        _ => None,
+    let (encoding, rep_encoding) = match plan {
+        Plan::Full { encoding } => (*encoding, *encoding),
+        Plan::NotModified { encoding } => (None, *encoding),
+        _ => (None, None),
     };
-    if !matches!(plan, Plan::NotModified) {
+    if !matches!(plan, Plan::NotModified { .. }) {
         match validators {
             Some(v) => push(b"content-type", HVal::Shared(&v.content_type)),
             None => push(b"content-type", HVal::Borrowed(mime.as_bytes())),
@@ -477,11 +754,7 @@ pub fn emit_headers<F>(
     }
     if let Some(v) = validators {
         if !matches!(plan, Plan::Unsatisfiable) {
-            if encoding.is_some() {
-                push(b"etag", HVal::Shared(&v.weak_etag));
-            } else {
-                push(b"etag", HVal::Shared(&v.etag));
-            }
+            push(b"etag", HVal::Shared(v.etag_for(rep_encoding)));
             if !v.last_modified.is_empty() {
                 push(b"last-modified", HVal::Shared(&v.last_modified));
             }
@@ -489,8 +762,14 @@ pub fn emit_headers<F>(
     }
     if let Some(enc) = encoding {
         push(b"content-encoding", HVal::Static(enc.as_header_value()));
+    } else if let (Some(enc), Plan::Full { .. } | Plan::Partial { .. }) =
+        (validators.and_then(|v| v.content_encoding), plan)
+    {
+        // 事前圧縮した兄弟（F-294。範囲も圧縮した表現のバイト範囲）
+        push(b"content-encoding", HVal::Static(enc.as_header_value()));
     }
-    if vary && !matches!(plan, Plan::Unsatisfiable) {
+    // 416 も表現の選び方は同じ（B-304）
+    if vary {
         push(b"vary", HVal::Static(b"Accept-Encoding"));
     }
 }
@@ -515,7 +794,7 @@ pub fn push_bytes_headers(
             out.push((Bytes::from_static(n), v.to_bytes()));
         }
     });
-    if !matches!(plan, Plan::NotModified) {
+    if !matches!(plan, Plan::NotModified { .. }) {
         let value = match validators {
             Some(v) if content_length == size => v.full_length.clone(),
             _ => Bytes::copy_from_slice(itoa::Buffer::new().format(content_length).as_bytes()),
@@ -544,10 +823,28 @@ pub fn build_bytes_response(
     compression: &CompressionConfig,
     static_ctx: Option<(&std::path::Path, &crate::cache::StaticContentCacheConfig)>,
     memory: Option<&MemoryContent>,
+    // 事前圧縮の兄弟を使うルート（`Accept-Encoding` で表現が変わるので常に `Vary` を付ける。F-294）
+    force_vary: bool,
 ) -> (u16, Vec<(Bytes, Bytes)>, Bytes) {
+    // memory の事前圧縮した兄弟（F-294）
+    let (data, validators, compression, memory, force_vary) = match memory {
+        Some(m) if m.uses_precompressed() => {
+            match m.select_sibling(sreq.accept_encoding, compression) {
+                Some(sib) => (
+                    sib.body.clone(),
+                    &sib.validators,
+                    no_compression(),
+                    None,
+                    true,
+                ),
+                None => (data, validators, compression, memory, true),
+            }
+        }
+        _ => (data, validators, compression, memory, force_vary),
+    };
     let size = data.len() as u64;
     let plan = plan(sreq, size, mime, Some(validators), compression);
-    let vary = compression_applies(compression, mime, size);
+    let vary = force_vary || compression_applies(compression, mime, size);
     let body = match plan {
         Plan::Full {
             encoding: Some(enc),
@@ -555,15 +852,21 @@ pub fn build_bytes_response(
             (Some(m), _) => m.compressed(enc, compression),
             (None, Some((path, static_cfg))) => {
                 let level = crate::cache::compressed::compression_level(enc, compression);
-                crate::cache::compressed::get_or_compress(path, enc, level, static_cfg, || {
-                    compress_body(&data, enc, compression)
-                })
+                let ident = crate::cache::compressed::file_ident(size, validators.mtime_secs);
+                crate::cache::compressed::get_or_compress(
+                    path,
+                    enc,
+                    level,
+                    ident,
+                    static_cfg,
+                    || compress_body(&data, enc, compression),
+                )
             }
             (None, None) => Bytes::from(compress_body(&data, enc, compression)),
         },
         Plan::Full { encoding: None } => data,
         Plan::Partial { start, end } => data.slice(start as usize..=end as usize),
-        Plan::NotModified | Plan::Unsatisfiable => Bytes::new(),
+        Plan::NotModified { .. } | Plan::Unsatisfiable => Bytes::new(),
     };
     let mut out: Vec<(Bytes, Bytes)> = Vec::with_capacity(12);
     push_bytes_headers(
@@ -831,7 +1134,9 @@ mod tests {
         );
         assert_eq!(&v.etag[..], b"\"3e8-a\"");
         // 1 つのバッファから切り分けた値がそれぞれ正しいこと
-        assert_eq!(&v.weak_etag[..], b"W/\"3e8-a\"");
+        assert_eq!(&v.weak_etags[0][..], b"W/\"3e8-a-zstd\"");
+        assert_eq!(&v.weak_etags[2][..], b"W/\"3e8-a-gzip\"");
+        assert_eq!(&v.weak_etags[3][..], b"W/\"3e8-a-deflate\"");
         assert_eq!(&v.content_type[..], b"text/plain");
         assert_eq!(&v.full_length[..], b"10");
         assert_eq!(&v.last_modified[..], b"Thu, 01 Jan 1970 00:16:40 GMT");
@@ -841,17 +1146,29 @@ mod tests {
         assert_eq!(&no_mtime.full_length[..], b"0");
         let c = comp(false);
         let etag = v.etag.clone();
-        let weak = v.weak_etag.clone();
+        let weak = b"W/\"3e8-a\"".to_vec();
         let lm = v.last_modified.clone();
         let cases: [(&[(&[u8], &[u8])], Plan); 7] = [
-            (&[(b"If-None-Match", &etag)], Plan::NotModified),
-            (&[(b"if-none-match", &weak)], Plan::NotModified),
-            (&[(b"if-none-match", b"\"x\", *")], Plan::NotModified),
+            (
+                &[(b"If-None-Match", &etag)],
+                Plan::NotModified { encoding: None },
+            ),
+            (
+                &[(b"if-none-match", &weak)],
+                Plan::NotModified { encoding: None },
+            ),
+            (
+                &[(b"if-none-match", b"\"x\", *")],
+                Plan::NotModified { encoding: None },
+            ),
             (
                 &[(b"if-none-match", b"\"other\"")],
                 Plan::Full { encoding: None },
             ),
-            (&[(b"if-modified-since", &lm)], Plan::NotModified),
+            (
+                &[(b"if-modified-since", &lm)],
+                Plan::NotModified { encoding: None },
+            ),
             (
                 &[(b"if-modified-since", b"Thu, 01 Jan 1970 00:00:00 GMT")],
                 Plan::Full { encoding: None },
@@ -868,6 +1185,40 @@ mod tests {
         for (hs, want) in cases {
             assert_eq!(plan(&req(hs, b"GET"), 10, "text/plain", Some(&v), &c), want);
         }
+    }
+
+    /// B-304: 表現を先に決め、その表現の ETag で条件付き要求を評価する
+    #[test]
+    fn conditional_requests_use_the_representation_etag() {
+        let v = Validators::for_file(4096, None, "text/plain");
+        let c = comp(true);
+        let gz = v.weak_etags[2].clone();
+        let p = |hs: &[(&[u8], &[u8])]| plan(&req(hs, b"GET"), 4096, "text/plain", Some(&v), &c);
+        assert_eq!(
+            p(&[(b"accept-encoding", b"gzip"), (b"if-none-match", &gz)]),
+            Plan::NotModified {
+                encoding: Some(AcceptedEncoding::Gzip)
+            }
+        );
+        // 別の方式の ETag では 304 にしない
+        assert_eq!(
+            p(&[(b"accept-encoding", b"br"), (b"if-none-match", &gz)]),
+            Plan::Full {
+                encoding: Some(AcceptedEncoding::Brotli)
+            }
+        );
+        // 圧縮しない表現の ETag は圧縮した表現と一致しない
+        let strong = v.etag.clone();
+        assert_eq!(
+            p(&[(b"accept-encoding", b"gzip"), (b"if-none-match", &strong)]),
+            Plan::Full {
+                encoding: Some(AcceptedEncoding::Gzip)
+            }
+        );
+        assert_eq!(
+            p(&[(b"if-none-match", &strong)]),
+            Plan::NotModified { encoding: None }
+        );
     }
 
     #[test]
@@ -946,20 +1297,32 @@ mod tests {
         assert!(partial.contains(&(b"content-range".to_vec(), b"bytes 0-9/100".to_vec())));
         let unsat = collect(Plan::Unsatisfiable, true);
         assert!(unsat.contains(&(b"content-range".to_vec(), b"bytes */100".to_vec())));
-        assert!(!unsat.iter().any(|(n, _)| n == b"etag" || n == b"vary"));
+        assert!(!unsat.iter().any(|(n, _)| n == b"etag"));
+        // 416 にも Vary（B-304）
+        assert!(unsat.contains(&(b"vary".to_vec(), b"Accept-Encoding".to_vec())));
         let gz = collect(
             Plan::Full {
                 encoding: Some(AcceptedEncoding::Gzip),
             },
             true,
         );
-        assert!(gz.contains(&(b"etag".to_vec(), v.weak_etag.to_vec())));
+        assert!(gz.contains(&(b"etag".to_vec(), v.weak_etags[2].to_vec())));
         assert!(gz.contains(&(b"content-encoding".to_vec(), b"gzip".to_vec())));
         assert!(gz.contains(&(b"vary".to_vec(), b"Accept-Encoding".to_vec())));
         assert!(!gz.iter().any(|(n, _)| n == b"accept-ranges"));
-        let nm = collect(Plan::NotModified, false);
+        let nm = collect(Plan::NotModified { encoding: None }, false);
         assert!(!nm.iter().any(|(n, _)| n == b"content-type"));
         assert!(nm.contains(&(b"etag".to_vec(), v.etag.to_vec())));
+        // 圧縮した表現の 304 は 200 と同じ弱い ETag（B-304）
+        let nm_gz = collect(
+            Plan::NotModified {
+                encoding: Some(AcceptedEncoding::Gzip),
+            },
+            true,
+        );
+        assert!(nm_gz.contains(&(b"etag".to_vec(), v.weak_etags[2].to_vec())));
+        assert!(!nm_gz.iter().any(|(n, _)| n == b"content-encoding"));
+        assert!(nm_gz.contains(&(b"vary".to_vec(), b"Accept-Encoding".to_vec())));
     }
 
     #[test]
@@ -976,5 +1339,177 @@ mod tests {
         assert_eq!(a.etag, b.etag);
         assert_ne!(a.etag, c.etag);
         assert!(a.last_modified.is_empty());
+    }
+
+    fn pre(names: &[&str]) -> crate::config::Precompressed {
+        crate::config::Precompressed::parse(names).unwrap()
+    }
+
+    #[test]
+    fn precompressed_candidates_follow_client_q() {
+        let off = comp(false);
+        // q の高い順、同点は設定の順
+        let c = precompressed_candidates(
+            Some(b"gzip;q=0.5, br"),
+            pre(&["gzip", "br"]),
+            &off,
+            "text/css",
+            100,
+        );
+        assert_eq!(
+            c,
+            [
+                Some(AcceptedEncoding::Brotli),
+                Some(AcceptedEncoding::Gzip),
+                None
+            ]
+        );
+        let c = precompressed_candidates(
+            Some(b"gzip, br"),
+            pre(&["gzip", "br"]),
+            &off,
+            "text/css",
+            100,
+        );
+        assert_eq!(c[0], Some(AcceptedEncoding::Gzip));
+        // 受け付けない方式・Accept-Encoding 無し・設定無しは空
+        let c = precompressed_candidates(Some(b"br;q=0"), pre(&["br"]), &off, "text/css", 1);
+        assert_eq!(c, [None; 3]);
+        let c = precompressed_candidates(None, pre(&["br"]), &off, "text/css", 1);
+        assert_eq!(c, [None; 3]);
+        let c = precompressed_candidates(
+            Some(b"br"),
+            crate::config::Precompressed::default(),
+            &off,
+            "text/css",
+            1,
+        );
+        assert_eq!(c, [None; 3]);
+    }
+
+    #[test]
+    fn precompressed_yields_to_higher_q_on_the_fly() {
+        // その場の圧縮（zstd q=1）の方が q が高ければ兄弟（gzip q=0.5）は使わない
+        let mut on = comp(true);
+        on.preferred_encodings = vec!["zstd".into(), "gzip".into()];
+        on.min_size = 0;
+        let c = precompressed_candidates(
+            Some(b"zstd, gzip;q=0.5"),
+            pre(&["gzip"]),
+            &on,
+            "text/css",
+            100,
+        );
+        if cfg!(feature = "compression") {
+            assert_eq!(c, [None; 3]);
+        }
+        // 同点なら兄弟を使う
+        let c = precompressed_candidates(Some(b"zstd, gzip"), pre(&["gzip"]), &on, "text/css", 100);
+        assert_eq!(c[0], Some(AcceptedEncoding::Gzip));
+    }
+
+    #[test]
+    fn sibling_validators_carry_content_encoding() {
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let v = Validators::for_sibling(
+            42,
+            Some(t),
+            Some(1_600_000_000),
+            "text/css",
+            AcceptedEncoding::Brotli,
+        );
+        // 強い ETag（方式を含む）。Last-Modified は元のファイルの時刻
+        assert!(v.etag.starts_with(b"\"") && v.etag.ends_with(b"-br\""));
+        assert_eq!(v.mtime_secs, Some(1_600_000_000));
+        assert_eq!(&v.content_type[..], b"text/css");
+        let collect = |p: Plan| {
+            let mut out = Vec::new();
+            emit_headers(&p, 42, "text/css", Some(&v), true, |n, val| {
+                out.push((n.to_vec(), val.as_slice().to_vec()));
+            });
+            out
+        };
+        let full = collect(Plan::Full { encoding: None });
+        assert!(full.contains(&(b"content-encoding".to_vec(), b"br".to_vec())));
+        assert!(full.contains(&(b"etag".to_vec(), v.etag.to_vec())));
+        assert!(full.contains(&(b"accept-ranges".to_vec(), b"bytes".to_vec())));
+        let part = collect(Plan::Partial { start: 0, end: 9 });
+        assert!(part.contains(&(b"content-encoding".to_vec(), b"br".to_vec())));
+        // 304・416 には付けない
+        let nm = collect(Plan::NotModified { encoding: None });
+        assert!(!nm.iter().any(|(n, _)| n == b"content-encoding"));
+        let un = collect(Plan::Unsatisfiable);
+        assert!(!un.iter().any(|(n, _)| n == b"content-encoding"));
+    }
+
+    #[test]
+    fn memory_sibling_selected_and_varies() {
+        let dir = std::env::temp_dir().join(format!("veil-pre-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let orig = dir.join("app.css");
+        #[allow(clippy::disallowed_methods)] // テスト
+        {
+            std::fs::write(&orig, b"body{color:red}").unwrap();
+            std::fs::write(dir.join("app.css.br"), b"BROTLI").unwrap();
+        }
+        #[allow(clippy::disallowed_methods)] // テスト
+        let modified = std::fs::metadata(&orig).unwrap().modified().ok();
+        let mut m = MemoryContent::new(b"body{color:red}".to_vec(), modified, "text/css");
+        m.load_precompressed(pre(&["br", "gzip"]), &orig, modified);
+        let off = comp(false);
+        let sib = m
+            .select_sibling(Some(b"gzip, br"), &off)
+            .expect("br sibling");
+        assert_eq!(&sib.body[..], b"BROTLI");
+        assert!(m.select_sibling(Some(b"gzip"), &off).is_none());
+        assert!(m.select_sibling(None, &off).is_none());
+
+        let sreq = StaticRequest {
+            head: false,
+            range: None,
+            if_range: None,
+            if_none_match: None,
+            if_modified_since: None,
+            accept_encoding: Some(b"br"),
+        };
+        let sec = crate::config::SecurityConfig::default();
+        let (st, hs, body) = build_bytes_response(
+            &sreq,
+            m.body.clone(),
+            "text/css",
+            &m.validators,
+            &sec,
+            &off,
+            None,
+            Some(&m),
+            false,
+        );
+        assert_eq!(st, 200);
+        assert_eq!(&body[..], b"BROTLI");
+        assert!(hs
+            .iter()
+            .any(|(n, v)| &n[..] == b"content-encoding" && &v[..] == b"br"));
+        // 兄弟を返さない要求にも Vary を付ける
+        let sreq_id = StaticRequest {
+            accept_encoding: None,
+            ..sreq
+        };
+        let (_, hs, body) = build_bytes_response(
+            &sreq_id,
+            m.body.clone(),
+            "text/css",
+            &m.validators,
+            &sec,
+            &off,
+            None,
+            Some(&m),
+            false,
+        );
+        assert_eq!(&body[..], b"body{color:red}");
+        assert!(hs
+            .iter()
+            .any(|(n, v)| &n[..] == b"vary" && &v[..] == b"Accept-Encoding"));
+        assert!(!hs.iter().any(|(n, _)| &n[..] == b"content-encoding"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

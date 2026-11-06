@@ -90,7 +90,7 @@ HTTP/3・kTLS・gRPC・WASM などプロキシ機能を一通り含み、コン�
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
 # リポジトリやローカルのチェックアウトを使う場合:
 # veil = { package = "veil-proxy", git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
 # veil = { package = "veil-proxy", path = "../veil-proxy", default-features = false, features = ["full", "api"] }
@@ -374,7 +374,7 @@ async fn upper(req: &Request) -> Response {
 ### プロトコルアップグレード（HTTP/1.1）
 
 ハンドラは `101 Switching Protocols` で接続を引き取れます。`Request::upgrade_protocol()` は要求がアップグレードを求めているとき
-（`Connection: upgrade` と `Upgrade` がある。HTTP/2・HTTP/3 では常に `None`）に `Upgrade` の値を返し、
+（`Connection: upgrade` と `Upgrade` がある。HTTP/2・HTTP/3 では拡張 CONNECT の `:protocol`。下記）に `Upgrade` の値を返し、
 `Response::switching_protocols(protocol, f)` は 101 を書いてから `veil::api::upgrade::Upgraded` の接続で `f` を呼びます。
 
 ```rust
@@ -421,7 +421,7 @@ async fn echo(req: Request) -> Response {
 
 `veil::api::ws` でハンドラが WebSocket（RFC 6455）を終端します。`WebSocketUpgrade` はハンドシェイク（HTTP/1.1・`GET`・
 `Upgrade: websocket`・`Connection: upgrade`・`Sec-WebSocket-Version: 13`・16 バイトの `Sec-WebSocket-Key`）を検査する抽出子で、
-正しくなければ 400、版違いは 426 と `Sec-WebSocket-Version: 13` を返します。`on_upgrade` は `Sec-WebSocket-Accept` 付きの
+`GET` 以外は 405、それ以外の不正は 400、版違いは 426 と `Sec-WebSocket-Version: 13` を返します。`on_upgrade` は `Sec-WebSocket-Accept` 付きの
 101 を返し、接続を渡して関数を呼びます。
 
 ```rust
@@ -463,7 +463,10 @@ async fn ws(upgrade: WebSocketUpgrade) -> Response {
   WebSocket のハンドシェイクにも Cookie を付けるので、Cookie で認証するなら絞ってください（クロスサイト WebSocket ハイジャック）。
 - permessage-deflate（RFC 7692）は `[api] websocket_compression = true` のときだけ交渉します（既定は off。展開後の大きさは
   `websocket_max_message_size` で制限）。
-- WebSocket は HTTP/1.1 だけです。HTTP/2・HTTP/3 のハンドシェイクは 400 になります（RFC 8441 / RFC 9220 は非対応）。
+- HTTP/2・HTTP/3 の上の WebSocket（拡張 CONNECT。RFC 8441 / RFC 9220）は `[http2]`・`[http3]` の `enable_connect_protocol = true`
+  で使えます。`WebSocketUpgrade` は `:protocol = websocket` の `CONNECT` を受け（`Sec-WebSocket-Key` は無い）、`on_upgrade` は `200` で
+  応えて、`WebSocket` はストリームの上で動きます。HTTP/2・HTTP/3 のそれ以外のハンドシェイクは 400 です。`Response::switching_protocols`
+  も `:protocol` の一致する拡張 CONNECT で同じに動きます（不一致は 500）。`Upgraded::into_tokio_io()` は HTTP/1.1 だけです。
 - メトリクス（`metrics` feature）: `veil_proxy_websocket_connections`（開いている接続数）と
   `veil_proxy_websocket_messages_total{direction="received"|"sent"}`。
 - アップグレードした接続と同じく `[security] max_concurrent_connections` に数えます。
@@ -709,7 +712,7 @@ tokio 前提のクレート（hyper・reqwest・sqlx・tower-http など）が v
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
 tokio = { version = "1", features = ["full"] }        # シムに解決される
 reqwest = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
@@ -717,8 +720,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 [patch.crates-io]
 # シムはパッケージ名が tokio なので crates.io には無く、リポジトリから取る。veil も同じタグから取り、シムと自分のコードが
 # 同じ 1 つの veil を使うようにする（2 つになるとランタイムも 2 つになる）。
-tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.10.1", package = "tokio" }   # crates/veil-tokio/tokio-shim
-veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.10.1" }
+tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.11.0-rc.1", package = "tokio" }   # crates/veil-tokio/tokio-shim
+veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.11.0-rc.1" }
 ```
 
 `veil::tokio` を直接使うコード（`use veil::tokio as tokio;`）はパッチ無しで動きます。`#[tokio::main]` / `#[tokio::test]` は
@@ -790,7 +793,7 @@ let items: Vec<Item> = res.error_for_status()?.json()?;
 または `ClientBuilder::ca`。mTLS は `client_cert`）、多重化した HTTP/2 の接続と、ワーカーごとの HTTP/1.1 のプール。
 `Http2::Auto`（既定）は TLS では ALPN で h2 か HTTP/1.1 を選び、平文では HTTP/1.1。`Http2::On` は h2 と prior knowledge の h2c、
 `Http2::Off` は HTTP/1.1。`ClientBuilder::unix_sockets(true)` を付けると `http://unix:/path.sock:/x` で Unix ソケットへ接続します（既定は無効）。応答の本文は全部読みます（`max_response_size`、
-既定 64 MiB）。エラーには `kind()` があり、502・504 の `Response` に変換できます。詳しくは [library-kit.md](library-kit.md#http-クライアント)。
+既定 64 MiB）。エラーには `kind()` があり、502・504 の `Response`（本文は汎用の文言。詳細はエラーをログへ）に変換できます。詳しくは [library-kit.md](library-kit.md#http-クライアント)。
 
 ## GraphQL
 
@@ -1134,6 +1137,63 @@ Operation Object を JSON で渡すと説明が反映されます）。設定は
 全部を使うサンプル: [examples/api/c-features/](../../../examples/api/c-features/)（Rust の gRPC のサンプルと同じ tonic の
 相互運用試験を通ります）。
 
+**ミドルウェア・フック・アプリの補助。** 次も `libveil` にあります:
+
+- ヘッダ: `veil_response_add_header`（同じ名前のヘッダをもう 1 つ足す。2 個目の `Set-Cookie` など）、
+  `veil_request_header_count` / `veil_request_header_at` / `veil_request_header_next`（繰り返されたヘッダの全部の値）、
+  `veil_request_version`（`VEIL_HTTP_1_1`・`VEIL_HTTP_2`・`VEIL_HTTP_3`）、`veil_request_is_tls`。
+- 要求ごとの値: `veil_request_set_local(req, key, ptr, free_fn)` / `veil_request_get_local(req, key)`（要求の終わりで解放）。
+- ミドルウェア: `veil_register_middleware(cfg, prefix, before, after, ud)`。`before` は `VEIL_MW_CONTINUE` か `VEIL_MW_STOP`
+  （設定した応答を返す）を返し、`after` は最終的な応答を見ます（ストリーミングの応答では呼ばれません）。ミドルウェアは
+  ハンドラと同じ呼び出しの中でハンドラ用プールで動き、最後に登録したものが最初（最も外側）です（Rust の `wrap_on` と同じ）。
+- 応答の後: `veil_response_after_send(resp, fn, ud)` は応答を送り終えてから（ストリーミングでは本文の終わりの後）
+  ハンドラ用プールで `fn(ud)` を呼びます。
+- ライフサイクル: `veil_config_on_startup`（リスナーを開く前。0 以外を返すと起動を止め、`veil_run` は `VEIL_ERR_RUNTIME` を返す）、`veil_config_on_worker_start`
+  （`veil_worker_info_t`）、`veil_config_on_shutdown`（サーバが止まった後）。
+- `veil_config_cors(cfg, &veil_cors_t)`（プリフライトにも答える CORS）、`veil_config_serve_dir(cfg, prefix, dir,
+  &veil_serve_options_t)`（veil のファイルサーバ）、`veil_grpc_reflection(cfg, data, len)`（`FileDescriptorSet` からの
+  gRPC サーバリフレクション）。
+- WebSocket: `veil_ws_accept_ex(req, resp, &cb, ud, &veil_ws_options_t)` はサブプロトコルを選び、`Origin` を確かめ（403）、
+  メッセージの大きさの上限と自動の pong を設定します。選んだものは `veil_ws_protocol(ws, &len)`。
+
+**外向きの呼び出し・遅延応答・検証・試験。** これらも `libveil` にあります:
+
+- HTTP クライアント: `veil_client_new(&veil_client_options_t)`（タイムアウト・HTTP/2・CA とクライアント証明書・User-Agent・
+  応答の大きさの上限・Unix ソケット）と `veil_client_send(c, &veil_client_request_t, &resp)`（待つ）、または
+  `veil_client_send_async(c, &req, done, ud)`（`done(rc, resp, ud)` はハンドラ用プールで呼ばれる）。応答は
+  `veil_client_response_status / header / header_count / header_at / body / free`。誤りは `VEIL_ERR_TIMEOUT` と
+  `VEIL_ERR_CLIENT` で、状態コードが何でも（4xx・5xx でも）呼び出しは成功です。
+- gRPC クライアント: `veil_grpc_channel_new(url, &veil_grpc_channel_options_t)`（h2c か ALPN h2 の TLS、gzip、メッセージの
+  大きさ、既定の期限）。`veil_grpc_channel_unary(ch, path, msg, len, &veil_grpc_call_options_t, &call)` と
+  `veil_grpc_channel_unary_async`、全種類のメソッドは `veil_grpc_channel_call` と
+  `veil_grpc_client_send / close_send / recv / finish / status_message / metadata / cancel / call_free`。メッセージは
+  サーバ側と同じく符号化済みのバイト列です。
+- 呼び出しは Python の束縛と共有する veil の専用スレッドで動き、ワーカーでは動きません。待つ形（`veil_client_send`・
+  `veil_grpc_channel_unary`・`veil_grpc_client_recv`・`veil_grpc_client_finish`）はハンドラ用プールのハンドラ・起動時の
+  関数・自前のスレッド向けで、ワーカー（`VEIL_ROUTE_INLINE` のルート・ワーカー開始の関数）では `VEIL_ERR_STATE` を返します。
+  そこでは `_async` の形を使います。
+- 遅延応答: `veil_deferred_t *d = veil_response_defer(resp)` でハンドラはすぐ戻れ、プールのスレッドを空けます。応答は
+  `veil_deferred_response(d)` にいつもの関数で任意のスレッドから組み立て（例: 非同期の呼び出しの `done` の中）、
+  `veil_deferred_complete(d)` で送ります（相手が切断していれば `VEIL_ERR_CLOSED`）。`veil_deferred_free(d)` は代わりに 500 を
+  返します。`VEIL_ROUTE_INLINE` のルートでは使えません。遅延応答にはミドルウェアの後処理は走りません。
+- JSON 本文の検証: `veil_register_route_ex2(cfg, path, methods, fn, ud, &veil_route_options_t)` の `body_schema_json`
+  （JSON Schema）。JSON でない・合わない本文には、ハンドラを呼ぶ前に 422 と `{"detail": [{"type", "loc", "msg"}]}`
+  （Rust の `Validate`・FastAPI と同じ形。`loc` は `"body"` から）を返し、スキーマは OpenAPI のルートの `requestBody` に
+  なります。使えるキーワード: `type`（`null`・型の配列も）、`properties`、`required`、`additionalProperties`、`items`、
+  `minItems`、`maxItems`、`minLength`、`maxLength`、`pattern`、`enum`、`const`、`minimum`、`maximum`、`exclusiveMinimum`、
+  `exclusiveMaximum`、`multipleOf`、`format`（`email`・`uri`）、`nullable`、`allOf`、`anyOf`、`oneOf`、`not`。注釈は無視します。
+  `$ref` と他のキーワードは登録時に拒否します（参照先は展開して書く）。スキーマは登録時に 1 回だけコンパイルします。
+- ソケットを開かない試験: `veil_test_t *t = veil_test_new(cfg)` はアプリを組み（起動時の関数は走り、ソケットは開かない）、
+  `veil_test_request(t, &veil_test_request_t, &resp)` はサーバと同じルートの選び方（404・405）・ミドルウェア・プラグイン
+  （CORS・セッション）・検証・ハンドラ用プールで呼び、ストリーミングの本文は集めて返します。
+  `veil_test_response_status / header / header_count / header_at / body / trailer / free`。`veil_test_free` は停止後の
+  関数を呼びます。Rust では `App::into_test_client()` で同じことができます。
+
+C 向けの Cookie・セッション・認証（Basic・API キー・JWT）・リダイレクト・ファイル・アプリのタスク・依存性注入・
+クライアントの補助・gRPC の Balanced・GraphQL・Cookie を覚える試験のクライアントは別のライブラリ
+`libveil_kit`（`libveil` を含む上位集合。どちらか 1 つとリンクする）にあります:
+[ヘルパークレートの C](library-kit.md#clibveil_kit)。サンプル: [examples/api/c-kit/](../../../examples/api/c-kit/)。
+
 ## Python
 
 `crates/veil-python` は PyO3 の拡張（abi3、Python 3.9 以上）で、`veil` として import します。
@@ -1239,7 +1299,10 @@ packaging/scripts/build-lib.sh [--kind all|rust|c|python] [--docker]
 
 指定した種類（既定は `all`）をビルドし（`--docker` は `docker/Dockerfile.lib` を使ってコンテナ内でビルド）、
 `packaging/output/lib/` に 1 つのアーカイブ `veil-lib-<version>-<arch>-linux-gnu.zip` を出力します。中身は
-`libveil.so`/`libveil.a` と `veil.h`（C）、Python の wheel、Rust 向けのソースと使い方のメモです。
+`libveil.so`/`libveil.a` と `veil.h`、helpers kit の `libveil_kit.so`/`libveil_kit.a` と `veil_kit.h`（C。pkg-config の
+`veil.pc`・`veil-kit.pc` と CMake のパッケージ: `find_package(veil CONFIG)` で `veil::veil`・`veil::kit`、静的は
+`veil::veil_static`・`veil::kit_static`）、Python の wheel、Rust 向けのソースと使い方のメモです。`veil` と `veil-kit` は
+どちらか 1 つをリンクします。
 プロキシ本体のパッケージは[ビルドとパッケージ](building.md)を参照してください。
 
 ## 性能
@@ -1341,14 +1404,14 @@ F-212 の後に測り直した値です（前のバインディングと 5 ラ�
 ## テスト
 
 ```bash
-tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|python|nonregression|all]     # 既定: all
+tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|c-kit|python|nonregression|all]     # 既定: all
 ```
 
 Rust のショーケース、C のサンプル（動的・静的）、Python のサンプルをビルド・起動し、curl で叩きます（ルーティング・検証・
 OpenAPI・tower・L4 エコー・ストリーミング・HTTP/1.1 と h2c、`examples/api/rust-graphql` で GraphQL と SSE のサブスクリプション）。`grpc` は `examples/api/rust-grpc` に対して gRPC の相互運用試験を行います（Linux では io_uring と epoll の両方のビルド）。`websocket` は WebSocket の試験（ハンドシェイク・エコー・断片化・まとめ送り・プロトコル違反・2,000 接続〈`WS_E2E_CONNS=16384` で増やせる〉・繋ぎ直しの繰り返し・graceful shutdown の 1001、平文・TLS・kTLS。docker と `crossbario/autobahn-testsuite` があれば Autobahn TestSuite の fuzzingclient も）です。`python` は `examples/api/python-websocket` に同じ試験と Autobahn の 1.*〜7.* を行い、`await asyncio.sleep(1)` の要求 2,000 本の同時実行（`PY_E2E_SLEEPERS` で増やせる）・lifespan・アップグレードも確かめます。`nonregression` はプロキシ本体のバイナリにライブラリのコードが入っていないことを確認します。
 Linux・macOS・FreeBSD・OpenBSD・NetBSD・Windows（Git Bash）で動き、OS の `full*` feature を選びます。
 cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTTP/2 対応の curl・openssl・protoc（gRPC 用）・python3 が必要です
-（python3 の名前が違うときは `PY3` で指定。Windows では `PY3=python`）。単体テストは `cargo test --lib --features full,api`、`cargo test -p veil-capi`、Python は `tests/test_binding.py` と `tests/test_aio.py` です。
+（python3 の名前が違うときは `PY3` で指定。Windows では `PY3=python`）。単体テストは `cargo test --lib --features full,api`、`cargo test -p veil-capi-core -p veil-capi-helpers`、Python は `tests/test_binding.py` と `tests/test_aio.py` です。
 [テスト](testing.md)も参照してください。
 
 ## 制限事項
@@ -1359,5 +1422,6 @@ cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTT
 - `serve` / `run` は **プロセスにつき 1 回** だけ呼べます（設定フックと共有状態がプロセス全体のため）。2 回目はエラーになります。
 - Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。`async def` のハンドラの中でブロックすると、
   そのイベントループが止まります（上記）。
-- プロトコルアップグレードと WebSocket は HTTP/1.1 だけです（HTTP/2・HTTP/3 の拡張 CONNECT〈RFC 8441 / RFC 9220〉は非対応）。
+- HTTP/2・HTTP/3 のプロトコルアップグレードと WebSocket には `enable_connect_protocol = true`（拡張 CONNECT。既定は無効）が要ります。
+  `Upgraded::into_tokio_io()` は HTTP/1.1 だけです。
 - ライブラリモードは `/etc/veil` の設定ファイルを使いません。カレントディレクトリの `config.toml`（または渡したパス）だけです。

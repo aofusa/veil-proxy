@@ -5,7 +5,7 @@
 # 注意: libFuzzer の harness 自体は単一スレッドのため、TSAN が競合を捕捉するのは
 # ターゲットが内部で複数スレッドを起こす経路（runtime のワーカー/offload 等）に限られる。
 # 本スクリプトは TSAN パイプラインの基盤確立が目的（F-71）。既定は SKIP。
-# MSAN（未初期化読み）は instrumented std（`-Zbuild-std`）が必須で別途対応する。
+# std も計装する（`--build-std`）。MSAN（未初期化読み）は別途対応する。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,7 +40,11 @@ fi
 : >"${REPORT}"
 echo "libfuzzer_tsan start runs=${FUZZ_RUNS} max_time=${FUZZ_MAX_TIME}s targets=${FUZZ_TARGETS}" | tee -a "${REPORT}"
 
+# TSAN は起動時に personality(ADDR_NO_RANDOMIZE) で ASLR を外して再実行する（メモリ配置が合わないとき）。
+# Docker の既定の seccomp はこの personality を拒否し "unable to disable ASLR" で終了 66 になるので、
+# e2e_sanitizer_chaos.sh と同じく seccomp を外す（計測用の使い捨てコンテナ）。
 docker run --rm \
+    --security-opt seccomp=unconfined \
     -v "${REPO_ROOT}:/app:rw" \
     -v "${RESULTS_DIR}:/results:rw" \
     -v "${CORPUS_DIR}:/corpus:rw" \
@@ -71,7 +75,9 @@ docker run --rm \
         for target in ${FUZZ_TARGETS}; do
             mkdir -p /corpus/\${target}
             echo \"libfuzzer_tsan target=\${target}\" | tee -a /results/libfuzzer_tsan_report.txt
-            cargo fuzz run --sanitizer thread \"\${target}\" /corpus/\${target} -- \
+            # 最近の nightly は sanitizer の有無が違うクレートの混在（計装していない std）を ABI 不一致の
+            # エラーにする（\`mixing -Zsanitizer will cause an ABI mismatch\`）。TSAN は std ごと計装する。
+            cargo fuzz run --build-std --sanitizer thread \"\${target}\" /corpus/\${target} -- \
                 -runs=${FUZZ_RUNS} -max_total_time=${FUZZ_MAX_TIME} \
                 2>&1 | tee -a /results/libfuzzer_tsan_report.txt
         done

@@ -14,7 +14,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+//! veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
 //! ```
 //!
 //! | Feature | Adds |
@@ -63,6 +63,11 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // F-241: docs.rs にソースの表示を出さない（コメントは日本語のため。ソースは crates.io と GitHub で読める）。
 #![doc(html_no_source)]
+// F-290: docs.rs の左上とタブのロゴ（packaging/icons。tools/release/render-icons.sh の生成物）
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/aofusa/veil-proxy/main/packaging/icons/hicolor/128x128/apps/veil.png",
+    html_favicon_url = "https://raw.githubusercontent.com/aofusa/veil-proxy/main/packaging/icons/hicolor/32x32/apps/veil.png"
+)]
 
 // ====================
 // メモリアロケータ選択

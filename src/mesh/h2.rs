@@ -52,7 +52,8 @@ impl H2Service for MeshH2Service {
             *self.ctx.borrow_mut() = r;
         }
         let c = self.ctx.borrow().clone();
-        crate::runtime::spawn(async move {
+        // B-314: ストリームの処理の panic はそのストリームだけで止める
+        crate::system::spawn_with_panic_catch(async move {
             task(c, ctx, req_rx, &resp_tx, &notify).await;
             drop(resp_tx);
             notify.notify();
@@ -684,7 +685,14 @@ async fn forward(
                     }
                     let ums = started.elapsed().as_millis() as u64;
                     out.upstream_ms = Some(ums);
-                    f.response_filters(status, &mut headers).await;
+                    if let Err(lr) = f.response_filters(status, &mut headers).await {
+                        // Wasm のローカル応答（B-300）。上流のストリームはここで捨てる
+                        out.status = lr.status;
+                        local(tx, notify, &lr, is_grpc, &c.hcm).await;
+                        head_sent = true;
+                        done = true;
+                        continue;
+                    }
                     let peer_resp = l7::downstream_response_headers(
                         c,
                         Some(f),
@@ -803,14 +811,20 @@ async fn to_h1(
             }
         },
     };
-    let declared_len: Option<Option<u64>> = req_headers
+    // B-315: content-length が複数あるときは、すべてが同じ正しい値でなければ不正とする。以前は最初の 1 つだけを
+    // 確かめて全部を HTTP/1.1 の上流へ書き、上流が 2 つ目を使うと本文の切れ目が食い違っていた（F26）
+    let mut declared_len: Option<Option<u64>> = None;
+    for (_, v) in req_headers
         .iter()
-        .find(|(k, _)| k.as_ref() == b"content-length")
-        .map(|(_, v)| {
-            std::str::from_utf8(v)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-        });
+        .filter(|(k, _)| k.as_ref() == b"content-length")
+    {
+        let n = crate::http_utils::parse_content_length(v);
+        declared_len = match declared_len {
+            None => Some(n),
+            Some(prev) if prev == n => Some(prev),
+            Some(_) => Some(None),
+        };
+    }
     let has_len = declared_len.is_some();
     // F-236（F1）: 宣言された content-length と本文が合わない要求は malformed（RFC 9113 §8.1.1）。そのまま
     // HTTP/1.1 の上流へ送ると、足りない分を次の要求（プールの接続）で埋められて密輸になる
@@ -988,7 +1002,13 @@ async fn to_h1(
     }
     let ums = started.elapsed().as_millis() as u64;
     out.upstream_ms = Some(ums);
-    f.response_filters(status, &mut headers).await;
+    if let Err(lr) = f.response_filters(status, &mut headers).await {
+        // Wasm のローカル応答（B-300）。上流の本文は読まないので上流の接続は戻さない
+        picked.end(false, false);
+        out.status = lr.status;
+        local(tx, notify, &lr, is_grpc, &c.hcm).await;
+        return out;
+    }
     let peer_resp = l7::downstream_response_headers(c, Some(f), &mut headers, Some(ums), origin);
     // Linkerd の inbound で HTTP/1.1 に戻した要求の応答には元の版を付ける（相手のプロキシが外す）
     if c.hcm.linkerd && c.direction == super::model::Direction::Inbound {
@@ -1037,6 +1057,9 @@ async fn to_h1(
                 sc_buf.extend_from_slice(&rbuf.split());
                 // chunked をほどいて中身だけ送る
                 while let Some(i) = memchr::memmem::find(&sc_buf, b"\r\n") {
+                    // B-315: 不正な長さを 0（本文の終わり）として扱わず、長さの足し算も溢れないようにする。
+                    // 以前は `ffffffffffffffff` で `i + 2 + size + 2` が折り返して長さの検査を通り、範囲外を
+                    // 切り出して panic していた（F12）。不正な chunked はストリームのリセットにする
                     let size = usize::from_str_radix(
                         std::str::from_utf8(&sc_buf[..i])
                             .unwrap_or("")
@@ -1046,14 +1069,21 @@ async fn to_h1(
                             .trim(),
                         16,
                     )
-                    .unwrap_or(0);
+                    .ok();
+                    let need = size.and_then(|n| n.checked_add(i + 4));
+                    let (Some(size), Some(need)) = (size, need) else {
+                        keep = false;
+                        remaining = Some(0);
+                        let _ = send(tx, notify, H2RespMsg::Reset(2)).await;
+                        break;
+                    };
                     if size == 0 {
                         remaining = Some(0);
                         rbuf.clear();
                         sc_buf.clear();
                         break;
                     }
-                    if sc_buf.len() < i + 2 + size + 2 {
+                    if sc_buf.len() < need {
                         break;
                     }
                     let _ = sc_buf.split_to(i + 2);

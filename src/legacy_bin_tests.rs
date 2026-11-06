@@ -255,86 +255,89 @@ mod ip_filter_tests {
 
 mod encoding_tests {
     use super::*;
+    use crate::config::ClientAccept;
+
+    const PREFERRED: [&str; 4] = ["zstd", "br", "gzip", "deflate"];
 
     #[test]
     fn test_parse_gzip() {
-        let encoding = AcceptedEncoding::parse(b"gzip");
-        assert_eq!(encoding, AcceptedEncoding::Gzip);
+        let encoding = ClientAccept::parse(b"gzip").negotiate(&PREFERRED);
+        assert_eq!(encoding, Some(AcceptedEncoding::Gzip));
     }
 
     #[test]
     fn test_parse_brotli() {
-        let encoding = AcceptedEncoding::parse(b"br");
-        assert_eq!(encoding, AcceptedEncoding::Brotli);
+        let encoding = ClientAccept::parse(b"br").negotiate(&PREFERRED);
+        assert_eq!(encoding, Some(AcceptedEncoding::Brotli));
     }
 
     #[test]
     fn test_parse_zstd() {
-        let encoding = AcceptedEncoding::parse(b"zstd");
-        assert_eq!(encoding, AcceptedEncoding::Zstd);
+        let encoding = ClientAccept::parse(b"zstd").negotiate(&PREFERRED);
+        assert_eq!(encoding, Some(AcceptedEncoding::Zstd));
     }
 
     #[test]
     fn test_parse_deflate() {
-        let encoding = AcceptedEncoding::parse(b"deflate");
-        assert_eq!(encoding, AcceptedEncoding::Deflate);
+        let encoding = ClientAccept::parse(b"deflate").negotiate(&PREFERRED);
+        assert_eq!(encoding, Some(AcceptedEncoding::Deflate));
     }
 
     #[test]
     fn test_parse_multiple_prefer_zstd() {
         // 複数指定時はzstdを優先
-        let encoding = AcceptedEncoding::parse(b"gzip, br, zstd");
-        assert_eq!(encoding, AcceptedEncoding::Zstd);
+        let encoding = ClientAccept::parse(b"gzip, br, zstd").negotiate(&PREFERRED);
+        assert_eq!(encoding, Some(AcceptedEncoding::Zstd));
     }
 
     #[test]
     fn test_parse_with_quality() {
         // q値指定
-        let encoding = AcceptedEncoding::parse(b"gzip;q=0.5, br;q=1.0");
+        let encoding = ClientAccept::parse(b"gzip;q=0.5, br;q=1.0").negotiate(&PREFERRED);
         // br (q=1.0) > gzip (q=0.5)
-        assert_eq!(encoding, AcceptedEncoding::Brotli);
+        assert_eq!(encoding, Some(AcceptedEncoding::Brotli));
     }
 
     #[test]
     fn test_parse_zstd_higher_quality() {
         // zstdが高いq値を持つ場合
-        let encoding = AcceptedEncoding::parse(b"gzip;q=0.8, zstd;q=1.0");
-        assert_eq!(encoding, AcceptedEncoding::Zstd);
+        let encoding = ClientAccept::parse(b"gzip;q=0.8, zstd;q=1.0").negotiate(&PREFERRED);
+        assert_eq!(encoding, Some(AcceptedEncoding::Zstd));
     }
 
     #[test]
     fn test_parse_empty() {
         // 空の場合はIdentity
-        let encoding = AcceptedEncoding::parse(b"");
-        assert_eq!(encoding, AcceptedEncoding::Identity);
+        let encoding = ClientAccept::parse(b"").negotiate(&PREFERRED);
+        assert_eq!(encoding, None);
     }
 
     #[test]
     fn test_parse_identity() {
         // identityのみ（圧縮なし）
-        let encoding = AcceptedEncoding::parse(b"identity");
-        assert_eq!(encoding, AcceptedEncoding::Identity);
+        let encoding = ClientAccept::parse(b"identity").negotiate(&PREFERRED);
+        assert_eq!(encoding, None);
     }
 
     #[test]
     fn test_parse_wildcard() {
-        // * はgzipとして扱う
-        let encoding = AcceptedEncoding::parse(b"*");
-        assert_eq!(encoding, AcceptedEncoding::Gzip);
+        // * はすべての方式を受け付ける（設定の優先順で先頭を選ぶ）
+        let encoding = ClientAccept::parse(b"*").negotiate(&PREFERRED);
+        assert_eq!(encoding, Some(AcceptedEncoding::Zstd));
     }
 
     #[test]
     fn test_parse_unknown() {
         // 不明なエンコーディングはIdentity
-        let encoding = AcceptedEncoding::parse(b"unknown");
-        assert_eq!(encoding, AcceptedEncoding::Identity);
+        let encoding = ClientAccept::parse(b"unknown").negotiate(&PREFERRED);
+        assert_eq!(encoding, None);
     }
 
     #[test]
     fn test_parse_invalid_utf8() {
         // 無効なUTF-8はIdentity
-        let encoding = AcceptedEncoding::parse(&[0xff, 0xfe]);
-        assert_eq!(encoding, AcceptedEncoding::Identity);
+        let encoding = ClientAccept::parse(&[0xff, 0xfe]).negotiate(&PREFERRED);
+        assert_eq!(encoding, None);
     }
 
     #[test]
@@ -438,8 +441,12 @@ mod compression_config_tests {
             enabled: false,
             ..Default::default()
         };
-        let result =
-            config.should_compress(AcceptedEncoding::Gzip, Some(b"text/html"), Some(2048), None);
+        let result = config.should_compress(
+            crate::config::ClientAccept::parse(b"gzip"),
+            Some(b"text/html"),
+            Some(2048),
+            None,
+        );
         assert!(result.is_none());
     }
 
@@ -451,7 +458,7 @@ mod compression_config_tests {
             ..Default::default()
         };
         let result = config.should_compress(
-            AcceptedEncoding::Identity,
+            crate::config::ClientAccept::NONE,
             Some(b"text/html"),
             Some(2048),
             None,
@@ -467,7 +474,7 @@ mod compression_config_tests {
             ..Default::default()
         };
         let result = config.should_compress(
-            AcceptedEncoding::Gzip,
+            crate::config::ClientAccept::parse(b"gzip"),
             Some(b"text/html"),
             Some(2048),
             Some(b"gzip"),
@@ -483,7 +490,7 @@ mod compression_config_tests {
             ..Default::default()
         };
         let result = config.should_compress(
-            AcceptedEncoding::Gzip,
+            crate::config::ClientAccept::parse(b"gzip"),
             Some(b"text/html; charset=utf-8"),
             Some(2048),
             None,
@@ -499,7 +506,7 @@ mod compression_config_tests {
             ..Default::default()
         };
         let result = config.should_compress(
-            AcceptedEncoding::Brotli,
+            crate::config::ClientAccept::parse(b"br"),
             Some(b"application/json"),
             Some(2048),
             None,
@@ -515,7 +522,7 @@ mod compression_config_tests {
             ..Default::default()
         };
         let result = config.should_compress(
-            AcceptedEncoding::Gzip,
+            crate::config::ClientAccept::parse(b"gzip"),
             Some(b"image/png"),
             Some(100000),
             None,
@@ -532,7 +539,7 @@ mod compression_config_tests {
             ..Default::default()
         };
         let result = config.should_compress(
-            AcceptedEncoding::Gzip,
+            crate::config::ClientAccept::parse(b"gzip"),
             Some(b"text/html"),
             Some(500), // 1024未満
             None,
@@ -547,7 +554,12 @@ mod compression_config_tests {
             enabled: true,
             ..Default::default()
         };
-        let result = config.should_compress(AcceptedEncoding::Gzip, None, Some(2048), None);
+        let result = config.should_compress(
+            crate::config::ClientAccept::parse(b"gzip"),
+            None,
+            Some(2048),
+            None,
+        );
         assert!(result.is_none());
     }
 
@@ -563,16 +575,26 @@ mod compression_config_tests {
             b"Text/Event-Stream; charset=utf-8",
         ] {
             assert!(config
-                .should_compress(AcceptedEncoding::Gzip, Some(ct), None, None)
+                .should_compress(
+                    crate::config::ClientAccept::parse(b"gzip"),
+                    Some(ct),
+                    None,
+                    None
+                )
                 .is_none());
         }
         let cap = crate::pool::MAX_COLLECTED_RESPONSE_BODY;
         assert!(config
-            .should_compress(AcceptedEncoding::Gzip, Some(b"text/plain"), Some(cap), None)
+            .should_compress(
+                crate::config::ClientAccept::parse(b"gzip"),
+                Some(b"text/plain"),
+                Some(cap),
+                None
+            )
             .is_some());
         assert!(config
             .should_compress(
-                AcceptedEncoding::Gzip,
+                crate::config::ClientAccept::parse(b"gzip"),
                 Some(b"text/plain"),
                 Some(cap + 1),
                 None
@@ -854,6 +876,7 @@ mod backend_tests {
             path: "/var/www".to_string(),
             mode: "sendfile".to_string(),
             index: None,
+            precompressed: Default::default(),
         };
         assert!(matches!(file, crate::config::BackendConfig::File { .. }));
     }

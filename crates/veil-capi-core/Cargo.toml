@@ -1,0 +1,36 @@
+# F-291: C API の本体（rlib）。成果物のクレート veil-capi（libveil）と veil-capi-helpers（libveil_kit）が
+# 再公開する。lib 名を veil にしないのは、veil-proxy（lib 名 veil）と同じ名前の rlib を並べないため。
+[package]
+name = "veil-capi-core"
+version.workspace = true
+edition.workspace = true
+description = "C API for the veil API server library (the code shared by libveil and libveil_kit)"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "veil_capi"
+
+# 機能セットはコンテナ向けと同じ（Linux は epoll の readiness reactor）+ API 基盤。
+# ライブラリはホストプロセスのアロケータを置き換えない（veil-alloc / mimalloc を含めない）。
+[dependencies]
+veil = { package = "veil-proxy", path = "../..", default-features = false, features = [
+    "ktls", "http2", "http3", "compression", "cache", "metrics", "websocket",
+    "rate-limit", "buffering", "admin", "access-log", "l4-proxy",
+    "handler", "openapi", "openapi-ui-embedded", "macro", "grpc-handler", "l4-handler",
+] }
+# veil_config_cors（veil-python の app.cors と同じく veil_kit::cors に委ねる）
+veil_kit = { package = "veil-proxy-kit", path = "../veil-kit", default-features = false, features = ["cors"] }
+bytes = "1"
+serde_json = "1"
+# C のルートの本文検証（JSON Schema の pattern）。F-291
+regex = "1"
+ftlog = "0.2"
+toml = "0.9.8"
+
+# epoll feature は Linux でだけ指定できる（他の OS は kqueue / WSAPoll の reactor が自動で選ばれ、
+# 指定すると veil の build.rs がエラーにする）。
+[target.'cfg(target_os = "linux")'.dependencies]
+veil = { package = "veil-proxy", path = "../..", default-features = false, features = ["epoll"] }

@@ -9,10 +9,12 @@ use super::standalone::parity::*;
 use super::standalone::*;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "compression")]
 fn text_body(len: usize) -> Vec<u8> {
     (0..len).map(|i| b'a' + (i % 26) as u8).collect()
 }
 
+#[cfg(feature = "compression")]
 fn gunzip(data: &[u8]) -> Vec<u8> {
     use std::io::Read;
     let mut out = Vec::new();
@@ -25,6 +27,7 @@ fn gunzip(data: &[u8]) -> Vec<u8> {
 /// B-266・B-269・F-286・F-287: 静的配信（`type = "File"` の sendfile・memory）の HEAD・Range・416・
 /// 条件付き要求（304・If-Range）・検証子・圧縮が 4 つのプロトコルで同じになる
 #[test]
+#[cfg(feature = "compression")]
 fn b266_f286_f287_static_responses_match_across_protocols() {
     let dir = tempfile::tempdir().unwrap();
     let (cert, key) = write_self_signed(dir.path());
@@ -314,6 +317,7 @@ body = "respond"
 /// （上流は同じ veil の memory の静的配信を h2c で引く）。B-279: `buffering = "full"` の上流の応答を
 /// 圧縮したら Content-Encoding を付ける（HTTP/3 は付けずに圧縮した本文を返していた）
 #[test]
+#[cfg(feature = "compression")]
 fn b270_h2c_upstream_responses_are_compressed() {
     let dir = tempfile::tempdir().unwrap();
     let (cert, key) = write_self_signed(dir.path());
@@ -667,7 +671,7 @@ use_h2c = true
 }
 
 /// 応答本文を `REWRITTEN-BODY` に置き換える Proxy-Wasm モジュール（WAT）
-#[cfg(feature = "wasm")]
+#[cfg(all(feature = "wasm", feature = "compression"))]
 const RESPONSE_BODY_REWRITER: &str = r#"
 (module
   (import "env" "proxy_set_buffer_bytes"
@@ -689,7 +693,7 @@ const RESPONSE_BODY_REWRITER: &str = r#"
 "#;
 
 /// 応答ヘッダに `x-wasm-resp: 1` を足す Proxy-Wasm モジュール（WAT）
-#[cfg(feature = "wasm")]
+#[cfg(all(feature = "wasm", feature = "compression"))]
 const RESPONSE_HEADER_ADDER: &str = r#"
 (module
   (import "env" "proxy_add_header_map_value"
@@ -712,7 +716,7 @@ const RESPONSE_HEADER_ADDER: &str = r#"
 /// B-268: Proxy-Wasm の `on_http_response_headers` が上流（HTTP/1.1・h2c）・圧縮・`buffering = "full"` の
 /// どの経路でも全プロトコルで呼ばれる（以前は HTTP/2 → HTTP/1.1 の上流・HTTP/1.1 → h2c の上流・HTTP/1.1 の
 /// 圧縮とバッファの経路で呼ばれなかった）
-#[cfg(feature = "wasm")]
+#[cfg(all(feature = "wasm", feature = "compression"))]
 #[test]
 fn b268_wasm_response_headers_on_every_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -807,7 +811,7 @@ mode = "memory"
 
 /// F-285: Proxy-Wasm の `on_http_response_body` が HTTP/1.1・HTTP/2 でも呼ばれ、書き換えた本文と
 /// Content-Length・圧縮が全プロトコルでそろう（上流は HTTP/1.1・h2c）
-#[cfg(feature = "wasm")]
+#[cfg(all(feature = "wasm", feature = "compression"))]
 #[test]
 fn f285_wasm_response_body_rewrite_on_every_protocol() {
     let dir = tempfile::tempdir().unwrap();
@@ -1305,4 +1309,72 @@ url = "http://127.0.0.1:{up}/p"
     let (st, _, body) = h1_keepalive(&mut s, &mut pending, &get("/static/small.txt", ""), false);
     assert_eq!((st, body.as_slice()), (200, &b"abc"[..]), "{}", veil.log());
     assert!(pending.is_empty(), "{} extra bytes", pending.len());
+}
+
+/// B-293: プロキシの splice の経路で要求の本文が途中で終わっても、同じ上流の接続へ要求の head を書き直さない
+/// （以前は `None` を返し、通常の経路が head と最初の本文をもう一度書いた＝上流から見て本文の途中に 2 つ目の要求）。
+#[test]
+fn b293_truncated_request_body_is_not_resent_upstream() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    // 上流は受け取った生のバイト列を全部記録する（不完全な要求の本文も見る）
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let up = l.local_addr().unwrap().port();
+    let raw = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let raw2 = raw.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            let raw = raw2.clone();
+            std::thread::spawn(move || {
+                let _ = c.set_read_timeout(Some(Duration::from_secs(20)));
+                let mut tmp = [0u8; 16384];
+                while let Ok(n) = c.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
+                    raw.lock().unwrap().extend_from_slice(&tmp[..n]);
+                }
+            });
+        }
+    });
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[[route]]
+[route.conditions]
+path = "/p"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}/p"
+"#,
+        listeners = listeners_toml(ports, &cert, &key),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", ports.clear)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    // head だけ先に送り（読み取り済みの本文を小さくして splice の経路に乗せる）、本文の一部を送って送信側を閉じる
+    s.write_all(b"POST /p HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048576\r\n\r\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    s.write_all(&binary_body(100 * 1024)).unwrap();
+    s.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut resp = Vec::new();
+    let _ = s.read_to_end(&mut resp);
+    std::thread::sleep(Duration::from_millis(500));
+    let raw = raw.lock().unwrap();
+    let heads = raw.windows(8).filter(|w| w == b"POST /p/").count();
+    assert_eq!(
+        heads,
+        1,
+        "upstream must see the request head once ({} bytes received)\n{}",
+        raw.len(),
+        veil.log()
+    );
+    assert!(
+        resp.starts_with(b"HTTP/1.1 502"),
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
 }

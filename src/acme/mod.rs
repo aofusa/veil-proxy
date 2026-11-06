@@ -156,7 +156,83 @@ fn create_dir(p: &Path) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
     }
+    // B-325: Windows は親の DACL を継承して Users が読めることがあるので、SYSTEM・Administrators・所有者だけにする
+    #[cfg(windows)]
+    restrict_to_owner(p)?;
     Ok(())
+}
+
+/// 継承を切った DACL（SYSTEM・Administrators・所有者のフルアクセスだけ）を付ける（B-325）。
+/// unix の 0600 / 0700 に当たる。
+#[cfg(windows)]
+fn restrict_to_owner(p: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    let err = |what: &str| {
+        format!(
+            "restrict permissions of {} ({}): {}",
+            p.display(),
+            what,
+            std::io::Error::last_os_error()
+        )
+    };
+    let sddl: Vec<u16> = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let path: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: sddl は NUL 終端の UTF-16。成功時の sd は LocalFree で解放する
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(err("security descriptor"));
+    }
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: sd は上で得た有効な記述子。dacl は sd の中を指し、sd を解放するまでだけ使う
+    let r = unsafe {
+        if GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) == 0 {
+            Err(err("dacl"))
+        } else {
+            let e = SetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            );
+            if e == ERROR_SUCCESS {
+                Ok(())
+            } else {
+                Err(format!(
+                    "restrict permissions of {}: {}",
+                    p.display(),
+                    std::io::Error::from_raw_os_error(e as i32)
+                ))
+            }
+        }
+    };
+    // SAFETY: Convert… が LocalAlloc した記述子
+    unsafe { LocalFree(sd as _) };
+    r
 }
 
 /// 同じディレクトリの一時ファイルに書いて rename する（読み手が半端な内容を見ないように）。
@@ -180,11 +256,16 @@ fn write_atomic(path: &Path, data: &[u8], secret: bool) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(if secret { 0o600 } else { 0o644 });
     }
-    #[cfg(not(unix))]
-    let _ = secret;
     let mut f = opts
         .open(&tmp)
         .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    // B-325: 秘密は書く前に所有者だけの DACL にする（unix は上の 0600）
+    #[cfg(windows)]
+    if secret {
+        restrict_to_owner(&tmp)?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = secret;
     f.write_all(data)
         .and_then(|_| f.sync_all())
         .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
@@ -288,5 +369,34 @@ fn run_loop() {
             }
         }
         sleep_interruptible(Duration::from_secs(st.cfg.check_interval_secs.max(60)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B-325: 秘密は所有者だけ（unix は 0600、Windows は継承を切った DACL）で書く
+    // 理由付き allow: 試験でファイルのモードを読む（データプレーン外）
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn secret_files_are_owner_only() {
+        let dir = std::env::temp_dir().join(format!("veil-acme-b325-{}", std::process::id()));
+        create_dir(&dir).unwrap();
+        let key = dir.join("key.pem");
+        write_atomic(&key, b"secret", true).unwrap();
+        assert_eq!(read(&key).as_deref(), Some(&b"secret"[..]));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            let dmode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(dmode & 0o777, 0o700);
+        }
+        // 書き直せる（所有者が DACL で締め出されない）
+        write_atomic(&key, b"secret2", true).unwrap();
+        assert_eq!(read(&key).as_deref(), Some(&b"secret2"[..]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

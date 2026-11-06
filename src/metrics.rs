@@ -907,6 +907,53 @@ pub(crate) fn record_http3_invalid_packet() {
     }
 }
 
+// B-308: プロキシの WebSocket のトンネル（ハンドラが終端する接続は `websocket_connections`）。ラベルはクライアント側の
+// プロトコル（"http/1.1"・"h2"・"h3"）だけ（系列の上限。B-159）
+#[cfg(feature = "metrics")]
+static WEBSOCKET_TUNNELS: Lazy<prometheus::IntGaugeVec> = Lazy::new(|| {
+    let g = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "websocket_tunnels",
+            "Number of open WebSocket tunnels relayed to upstreams",
+        )
+        .namespace("veil_proxy"),
+        &["protocol"],
+    )
+    .unwrap();
+    METRICS_REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+/// 開いている WebSocket のトンネルを数える（drop で減らす。トンネルの task が途中で捨てられても数を戻す）
+pub(crate) struct WebSocketTunnelGuard {
+    #[cfg(feature = "metrics")]
+    gauge: Option<prometheus::IntGauge>,
+}
+
+/// トンネルを開いた（`protocol` は "http/1.1"・"h2"・"h3"）
+pub(crate) fn websocket_tunnel_opened(_protocol: &'static str) -> WebSocketTunnelGuard {
+    #[cfg(feature = "metrics")]
+    {
+        let gauge = metrics_runtime_enabled().then(|| {
+            let g = WEBSOCKET_TUNNELS.with_label_values(&[_protocol]);
+            g.inc();
+            g
+        });
+        WebSocketTunnelGuard { gauge }
+    }
+    #[cfg(not(feature = "metrics"))]
+    WebSocketTunnelGuard {}
+}
+
+impl Drop for WebSocketTunnelGuard {
+    fn drop(&mut self) {
+        #[cfg(feature = "metrics")]
+        if let Some(g) = &self.gauge {
+            g.dec();
+        }
+    }
+}
+
 // B-251: 上流への接続の失敗（要求ごとの error! の代わりに数える）。上流のアドレスはラベルにしない（系列の上限。B-159）
 #[cfg(feature = "metrics")]
 static UPSTREAM_CONNECT_ERRORS_TOTAL: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
@@ -1314,6 +1361,32 @@ pub fn observe_wasm_filter_duration(_filter: &str, _phase: &str, _duration_secs:
 }
 
 #[cfg(all(feature = "metrics", feature = "wasm"))]
+/// WASM フィルタの失敗の数（F-293。filter, phase, reason, action）
+pub(crate) static WASM_FAILURES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "wasm_failures_total",
+        "Total Proxy-Wasm filter failures (trap, fuel, timeout, instantiate, lifecycle, http_call_resume, unsupported_pause) by the action taken",
+    )
+    .namespace("veil");
+    let counter = CounterVec::new(opts, &["filter", "phase", "reason", "action"]).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+});
+
+/// メトリクス: WASM フィルタの失敗を数える（F-293。`action` は `rejected` か `continued`）
+#[inline]
+pub fn inc_wasm_failure(_filter: &str, _phase: &str, _reason: &str, _action: &str) {
+    #[cfg(all(feature = "metrics", feature = "wasm"))]
+    if metrics_runtime_enabled() {
+        WASM_FAILURES_TOTAL
+            .with_label_values(&[_filter, _phase, _reason, _action])
+            .inc();
+    }
+}
+
+#[cfg(all(feature = "metrics", feature = "wasm"))]
 /// WASM fuel 消費量カウンタ（filter, phase。F-48: ベンチ・運用での CPU 消費観測用）
 pub(crate) static WASM_FUEL_CONSUMED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     let opts = Opts::new(
@@ -1366,6 +1439,9 @@ pub struct CacheSaveContext {
     pub capture_aborted: bool,
     /// レスポンスのVaryヘッダーで指定されたヘッダー名のリスト
     pub vary_headers: Option<Vec<String>>,
+    /// 要求に Cookie が付いていた（キーに Cookie を含めないとき）。B-321: このときは応答が `public`・`s-maxage`
+    /// で共有を明示したときだけ保存する（利用者ごとのページを別の利用者へ返さない。F22）
+    pub request_has_cookie: bool,
 }
 
 impl CacheSaveContext {
@@ -1381,6 +1457,7 @@ impl CacheSaveContext {
             max_capture_size,
             capture_aborted: false,
             vary_headers: None,
+            request_has_cookie: false,
         }
     }
 
@@ -1395,6 +1472,7 @@ impl CacheSaveContext {
             max_capture_size: 0,
             capture_aborted: true,
             vary_headers: None,
+            request_has_cookie: false,
         }
     }
 
@@ -1433,6 +1511,11 @@ impl CacheSaveContext {
         #[cfg(feature = "cache")]
         {
             if self.capture_aborted || self.captured_body.is_empty() {
+                return false;
+            }
+            if self.request_has_cookie
+                && !crate::cache::CachePolicy::explicitly_shared(&self.captured_headers)
+            {
                 return false;
             }
 
@@ -1575,12 +1658,16 @@ pub(crate) fn record_request_metrics(
             .with_label_values(&[method, status_str, host])
             .inc();
 
-        HTTP_REQUEST_DURATION_SECONDS
-            .with_label_values(&[method, host])
-            .observe(_duration_secs);
+        // B-308: 101（アップグレードしたトンネル）の時間はトンネルの寿命なので、所要時間・大きさの分布に入れない
+        // （トンネルは `websocket_tunnels` で数える）
+        if _status != 101 {
+            HTTP_REQUEST_DURATION_SECONDS
+                .with_label_values(&[method, host])
+                .observe(_duration_secs);
 
-        HTTP_REQUEST_SIZE_BYTES.observe(_req_body_size as f64);
-        HTTP_RESPONSE_SIZE_BYTES.observe(_resp_body_size as f64);
+            HTTP_REQUEST_SIZE_BYTES.observe(_req_body_size as f64);
+            HTTP_RESPONSE_SIZE_BYTES.observe(_resp_body_size as f64);
+        }
     }
 }
 

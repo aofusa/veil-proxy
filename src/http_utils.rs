@@ -488,6 +488,34 @@ pub(crate) const HOP_BY_HOP_HEADERS: &[&[u8]] = &[
     b"upgrade",
 ];
 
+/// どれかの `name` ヘッダのカンマ区切りの値に `token` があるか（大文字小文字を区別しない。確保しない。B-307）
+pub(crate) fn header_has_token<N: AsRef<[u8]>, V: AsRef<[u8]>>(
+    headers: &[(N, V)],
+    name: &[u8],
+    token: &[u8],
+) -> bool {
+    headers
+        .iter()
+        .filter(|(n, _)| n.as_ref().eq_ignore_ascii_case(name))
+        .any(|(_, v)| has_token(v.as_ref(), token))
+}
+
+/// カンマ区切りの値に `token` があるか（大文字小文字を区別しない）
+#[inline]
+pub(crate) fn has_token(value: &[u8], token: &[u8]) -> bool {
+    value
+        .split(|&b| b == b',')
+        .any(|t| t.trim_ascii().eq_ignore_ascii_case(token))
+}
+
+/// `Connection` ヘッダに `name` が挙がっているか（そのヘッダはホップバイホップ。B-307）
+pub(crate) fn connection_lists<N: AsRef<[u8]>, V: AsRef<[u8]>>(
+    headers: &[(N, V)],
+    name: &[u8],
+) -> bool {
+    header_has_token(headers, b"connection", name)
+}
+
 /// 指定されたヘッダーがHop-by-hopヘッダーかチェック (RFC 7230 Section 6.1)
 ///
 /// # Arguments
@@ -825,8 +853,10 @@ pub(crate) fn decode_chunked_body(chunked_data: &[u8]) -> Vec<u8> {
         // チャンク拡張（;以降）を除去
         let size_str = size_str.split(';').next().unwrap_or(size_str);
 
+        // B-315: 長さは飽和させる（`ffffffffffffffff` で `pos + chunk_size` が折り返し、`end < pos` の切り出しで
+        // panic していた。F55）
         let chunk_size = match u64::from_str_radix(size_str, 16) {
-            Ok(s) => s as usize,
+            Ok(s) => usize::try_from(s).unwrap_or(usize::MAX),
             Err(_) => break,
         };
 
@@ -842,7 +872,7 @@ pub(crate) fn decode_chunked_body(chunked_data: &[u8]) -> Vec<u8> {
         }
 
         // チャンクデータをコピー
-        let end = std::cmp::min(pos + chunk_size, chunked_data.len());
+        let end = std::cmp::min(pos.saturating_add(chunk_size), chunked_data.len());
         result.extend_from_slice(&chunked_data[pos..end]);
         pos = end;
 
@@ -917,6 +947,16 @@ pub(crate) fn is_valid_header_value(value: &[u8]) -> bool {
     memchr3(b'\r', b'\n', 0, value).is_none()
 }
 
+/// HTTP/1.1 の応答の head にそのまま書いてよいフィールドか（名前が token、値に CR・LF・NUL が無い）。
+///
+/// B-318: ハンドラ・Proxy-Wasm・上流の HTTP/2 の応答のヘッダは任意のバイトを持ち得るので、HTTP/1.1 へ書く
+/// 直前に確かめて、満たさないものは書かない（応答の分割を防ぐ。F15・F30・F40）
+#[cfg(any(feature = "handler", feature = "wasm"))]
+#[inline]
+pub(crate) fn is_writable_h1_field(name: &[u8], value: &[u8]) -> bool {
+    is_valid_header_name(name) && is_valid_header_value(value)
+}
+
 /// HTTP/2・HTTP/3 のフィールドの値が RFC 9113 §8.2.1・RFC 9114 §4.2 の条件を満たすか:
 /// NUL・LF・CR を含まず、空白（SP・HTAB）で始まらず終わらない。HPACK・QPACK は任意のバイトを運べるので、
 /// HTTP/1.1 の上流へ渡すと要求の密輸になる（F-236 の F1・F2）。
@@ -942,16 +982,73 @@ pub(crate) fn is_valid_method(method: &[u8]) -> bool {
     is_valid_header_name(method)
 }
 
+/// Content-Length の値を厳密に読む（RFC 9110 §8.6: `1*DIGIT`。前後の SP・HTAB だけ許す）。
+///
+/// B-315: `str::parse` は `+5` を受け付け（`trim` は Unicode の空白も外す）、上流（`+5` を拒否する実装）と本文の
+/// 長さの解釈が食い違って要求の密輸の足がかりになっていた（F17）。数字以外・空・桁あふれは `None`。
+pub(crate) fn parse_content_length(value: &[u8]) -> Option<u64> {
+    let v = trim_ascii_whitespace(value);
+    if v.is_empty() || v.len() > 20 {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &b in v {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+    }
+    Some(n)
+}
+
+/// `Redirect` のルートの `Location` を作る（HTTP/1.1・HTTP/2・HTTP/3 で共通）。
+///
+/// - `$request_uri` は要求のパス全体、`$path` はルートの接頭辞を除いた残り。
+/// - B-322: `$path` は空でなければ必ず `/` で始める。接頭辞が `/` で終わる（`path = "/"` のルート等）と残りが
+///   `/` で始まらず、`/@evil.com` が `https://new.example.com@evil.com`（別のホスト）になっていた（F56）。
+/// - `preserve_path` なら残りを後ろに足す（`/` を 1 つにまとめる）。
+pub(crate) fn build_redirect_url(
+    redirect_url: &str,
+    path_str: &str,
+    prefix_str: &str,
+    preserve_path: bool,
+) -> String {
+    let stripped = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+        &path_str[prefix_str.len()..]
+    } else {
+        path_str
+    };
+    let slashed;
+    let sub_path = if stripped.is_empty() || stripped.starts_with('/') {
+        stripped
+    } else {
+        slashed = format!("/{stripped}");
+        &slashed
+    };
+    let mut final_url = redirect_url
+        .replace("$request_uri", path_str)
+        .replace("$path", sub_path);
+    if preserve_path && !sub_path.is_empty() {
+        if final_url.ends_with('/') {
+            final_url.push_str(&sub_path[1..]);
+        } else {
+            final_url.push_str(sub_path);
+        }
+    }
+    final_url
+}
+
 /// HTTP/1.1 の要求先を origin 形式の範囲にする（RFC 9112 §3.2）。
 ///
 /// - origin 形式（`/` で始まる）: そのまま
 /// - 絶対形式（`http://host/path`・`https://...`）: authority の後ろのパスの部分（パスの無い絶対形式は `None`）
-/// - CONNECT（authority 形式）と OPTIONS の `*`: そのまま
-/// - それ以外: `None`（呼び出し側は 400）
+/// - OPTIONS の `*`: そのまま
+/// - それ以外（CONNECT の authority 形式を含む）: `None`（呼び出し側は 400）
+///
+/// B-317: HTTP/1.1 の CONNECT のトンネルは持たないので、authority 形式（`host:443`・`x/admin`）を
+/// 通常の要求として通さない（ルートの照合は catch-all にしか合わず、上流は `/admin` と読んでいた。F18）
 pub(crate) fn origin_form_target(method: &[u8], target: &[u8]) -> Option<std::ops::Range<usize>> {
-    if target.first() == Some(&b'/')
-        || method.eq_ignore_ascii_case(b"CONNECT")
-        || (target == b"*" && method.eq_ignore_ascii_case(b"OPTIONS"))
+    if target.first() == Some(&b'/') || (target == b"*" && method.eq_ignore_ascii_case(b"OPTIONS"))
     {
         return Some(0..target.len());
     }
@@ -2064,6 +2161,74 @@ mod idempotent_method_tests {
             assert!(!super::is_idempotent_method(m));
         }
     }
+
+    /// B-318: HTTP/1.1 の応答の head に書けるフィールド
+    #[cfg(any(feature = "handler", feature = "wasm"))]
+    #[test]
+    fn writable_h1_field() {
+        assert!(super::is_writable_h1_field(b"x-a", b"v 1"));
+        assert!(!super::is_writable_h1_field(
+            b"x-a",
+            b"v\r\nSet-Cookie: a=b"
+        ));
+        assert!(!super::is_writable_h1_field(b"x-a", b"v\0"));
+        assert!(!super::is_writable_h1_field(b"x a", b"v"));
+        assert!(!super::is_writable_h1_field(b"x-a\r\n", b"v"));
+    }
+
+    /// B-322: `$path` は `/` で始まる（別のホストを指す Location を作らない）
+    #[test]
+    fn redirect_path_keeps_leading_slash() {
+        use super::build_redirect_url as b;
+        let t = "https://new.example.com$path";
+        assert_eq!(
+            b(t, "/@evil.com", "/", false),
+            "https://new.example.com/@evil.com"
+        );
+        assert_eq!(
+            b(t, "/.evil.com", "/", false),
+            "https://new.example.com/.evil.com"
+        );
+        assert_eq!(b(t, "/old/a", "/old", false), "https://new.example.com/a");
+        assert_eq!(b(t, "/old/a", "/old/", false), "https://new.example.com/a");
+        assert_eq!(b(t, "/", "/", false), "https://new.example.com");
+        assert_eq!(
+            b("https://n.example$request_uri", "/x?y", "/", false),
+            "https://n.example/x?y"
+        );
+        assert_eq!(
+            b("https://n.example/", "/old/a", "/old", true),
+            "https://n.example/a"
+        );
+        assert_eq!(
+            b("https://n.example", "/old/a", "/old", true),
+            "https://n.example/a"
+        );
+        assert_eq!(
+            b("https://n.example/", "/a", "/", true),
+            "https://n.example/a"
+        );
+    }
+
+    /// B-317: CONNECT の authority 形式は通さない（origin 形式・絶対形式・`OPTIONS *` だけ）
+    #[test]
+    fn origin_form_target_rejects_connect_authority_form() {
+        assert_eq!(
+            super::origin_form_target(b"CONNECT", b"x/admin/users"),
+            None
+        );
+        assert_eq!(
+            super::origin_form_target(b"CONNECT", b"example.com:443"),
+            None
+        );
+        assert_eq!(super::origin_form_target(b"GET", b"/a"), Some(0..2));
+        assert_eq!(super::origin_form_target(b"OPTIONS", b"*"), Some(0..1));
+        assert_eq!(super::origin_form_target(b"GET", b"*"), None);
+        assert_eq!(
+            super::origin_form_target(b"GET", b"http://h/admin"),
+            Some(8..14)
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "http2", feature = "http3")))]
@@ -2236,6 +2401,39 @@ mod chunked_span_tests {
         let (_body, complete, limit) = drive(&mut d, &[b"5\r\nhello\r\n0\r\n\r\n"]);
         assert!(!complete);
         assert!(limit);
+    }
+
+    /// B-315: 巨大なチャンク長で panic しない（`pos + chunk_size` の折り返し）
+    #[cfg(feature = "http2")]
+    #[test]
+    fn decode_chunked_body_huge_size_does_not_panic() {
+        assert_eq!(decode_chunked_body(b"ffffffffffffffff\r\nabc"), b"abc");
+        assert_eq!(decode_chunked_body(b"fffffffffffffffff\r\nabc"), b"");
+    }
+
+    /// B-315: Content-Length は数字だけ（`+5`・`-1`・空・空白だけ・桁あふれ・Unicode の空白は不正）
+    #[test]
+    fn parse_content_length_is_strict() {
+        assert_eq!(parse_content_length(b"5"), Some(5));
+        assert_eq!(parse_content_length(b" 12\t"), Some(12));
+        assert_eq!(parse_content_length(b"0"), Some(0));
+        assert_eq!(
+            parse_content_length(b"18446744073709551615"),
+            Some(u64::MAX)
+        );
+        for bad in [
+            &b"+5"[..],
+            b"-1",
+            b"",
+            b"  ",
+            b"5 5",
+            b"0x10",
+            b"18446744073709551616",
+            "\u{3000}5".as_bytes(),
+            b"5,5",
+        ] {
+            assert_eq!(parse_content_length(bad), None, "{:?}", bad);
+        }
     }
 
     // decode_chunked_body は http2 feature でのみ提供されるため、比較テストも同 feature で gate する

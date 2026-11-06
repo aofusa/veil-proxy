@@ -37,7 +37,7 @@ storage_dir = "/var/lib/veil/acme"
 | `directory_url` | `"https://acme-v02.api.letsencrypt.org/directory"` | ACME directory URL. For testing use Let's Encrypt **staging**: `https://acme-staging-v02.api.letsencrypt.org/directory` |
 | `contact` | `[]` | contact URLs for the account, e.g. `["mailto:admin@example.com"]` |
 | `domains` | `[]` | names to put in the certificate (required, at least one; the first becomes the CN and all are SANs) |
-| `storage_dir` | `"/var/lib/veil/acme"` | where the account key and state are kept; created with mode 0700 and must be writable |
+| `storage_dir` | `"/var/lib/veil/acme"` | where the account key and state are kept; created with mode 0700 (on Windows: a DACL that grants only SYSTEM, Administrators and the owner) and must be writable |
 | `accept_terms_of_service` | `false` | you agree to the CA's terms of service. **Must be `true`**, otherwise veil refuses to start |
 | `challenge_listen` | `"0.0.0.0:80"` | address of the plaintext HTTP-01 responder; empty = do not start one (see below) |
 | `renew_before_days` | `30` | renew when the certificate expires within this many days |
@@ -61,7 +61,7 @@ storage_dir = "/var/lib/veil/acme"
    places an order for `domains`, publishes the HTTP-01 token on the responder, waits for the CA to validate it,
    generates a new certificate key and CSR, finalizes, and downloads the chain.
 3. **Installation.** The private key and then the certificate chain are written to `key_path` and `cert_path`
-   **atomically** (temporary file in the same directory, `fsync`, `rename`; key mode 0600), the placeholder marker is
+   **atomically** (temporary file in the same directory, `fsync`, `rename`; key mode 0600, or on Windows a DACL that grants only SYSTEM, Administrators and the owner), the placeholder marker is
    removed, and a certificate reload is triggered immediately. New TLS handshakes (HTTP/1.1, HTTP/2 and HTTP/3) use the
    new certificate; existing connections are not disturbed.
 4. **Renewal.** Every `check_interval_secs` the certificate's expiry is checked and the steps above repeat when it is within

@@ -579,6 +579,7 @@ pub(super) async fn test_http3_quic_keepalive_idle() {
 // テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
 // 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
 #[allow(clippy::await_holding_lock)]
+#[cfg(unix)] // Windows に SIGHUP は無い（Git Bash の kill -HUP は veil.exe を終了させる）
 pub(super) async fn test_http3_goaway_graceful_reload() {
     // リロードは proxy.toml を読み直すので、他のテストが書き換えている最中に走らせない
     let _guard = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2072,6 +2073,7 @@ pub(super) async fn test_http3_redirect_307() {
 // テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
 // 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
 #[allow(clippy::await_holding_lock)]
+#[cfg(unix)] // Windows に SIGHUP は無い（Git Bash の kill -HUP は veil.exe を終了させる）
 pub(super) async fn test_http3_sni_and_cert_reload() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");

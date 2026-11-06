@@ -1017,10 +1017,7 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
             None,
         )
         .await;
-    assert!(matches!(
-        result,
-        BodyFilterResult::Continue { .. } | BodyFilterResult::Pause
-    ));
+    assert!(matches!(result, BodyFilterResult::Continue { .. }));
 
     // 最終チャンク: end_of_stream = true
     let result = engine
@@ -1032,10 +1029,7 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
             None,
         )
         .await;
-    assert!(matches!(
-        result,
-        BodyFilterResult::Continue { .. } | BodyFilterResult::Pause
-    ));
+    assert!(matches!(result, BodyFilterResult::Continue { .. }));
 
     record(
         "Item7: end_of_stream セマンティクス",

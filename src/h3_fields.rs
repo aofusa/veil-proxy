@@ -15,15 +15,21 @@ pub(crate) enum H3FieldSection {
 /// RFC 9114 §4.1.2 / §4.2 / §4.3.1 に従ってフィールドセクションを検査する。
 ///
 /// `Err` は malformed（呼び出し側が H3_MESSAGE_ERROR で扱う）。検査するのは
-/// 疑似ヘッダの重複・未知/禁止（`:status`、拡張 CONNECT を広告していないので `:protocol` も）・
+/// 疑似ヘッダの重複・未知/禁止（`:status`、拡張 CONNECT を広告していない（`extended_connect` が false）なら `:protocol` も）・
 /// 通常フィールドの後ろの疑似ヘッダ・大文字のフィールド名・接続固有フィールド・
 /// リクエストの必須疑似ヘッダ（CONNECT とそれ以外で異なる）。
+///
+/// F-288: `extended_connect`（`SETTINGS_ENABLE_CONNECT_PROTOCOL` を広告した）なら `:protocol` を CONNECT にだけ許し、
+/// 拡張 CONNECT には `:scheme`・`:path`・`:authority` を求める（RFC 9220 §3・RFC 8441 §4）。
 ///
 /// quiche の h3 層はこれらを検査しないため、無ければ `:method` 欠落を GET と見なす等で
 /// malformed なリクエストに 200 を返していた（h3spec で検出）。
 ///
 /// ホットパス（リクエストごと）: 確保なし・フィールド列を 1 回走査するだけ。
-pub(crate) fn h3_check_field_section<'a, I>(fields: I) -> Result<H3FieldSection, &'static str>
+pub(crate) fn h3_check_field_section<'a, I>(
+    fields: I,
+    extended_connect: bool,
+) -> Result<H3FieldSection, &'static str>
 where
     I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
 {
@@ -31,6 +37,7 @@ where
     const SCHEME: u8 = 2;
     const AUTHORITY: u8 = 4;
     const PATH: u8 = 8;
+    const PROTOCOL: u8 = 16;
     let mut seen: u8 = 0;
     let mut regular_seen = false;
     let mut is_connect = false;
@@ -50,6 +57,7 @@ where
                 b"scheme" => SCHEME,
                 b"authority" => AUTHORITY,
                 b"path" => PATH,
+                b"protocol" if extended_connect => PROTOCOL,
                 _ => return Err("unknown or prohibited pseudo-header"),
             };
             if seen & bit != 0 {
@@ -63,6 +71,9 @@ where
                 is_connect = value == b"CONNECT";
             } else if bit == SCHEME {
                 scheme_needs_authority = value == b"https" || value == b"http";
+            } else if bit == PROTOCOL && !crate::http_utils::is_valid_header_name(value) {
+                // `:protocol` の値は token（RFC 8441 §4。上流へ `Upgrade` として渡し得る）
+                return Err("invalid :protocol");
             } else if bit == PATH && value.is_empty() {
                 return Err("empty :path");
             } else if bit == PATH
@@ -95,7 +106,15 @@ where
     if seen & METHOD == 0 {
         return Err("missing :method");
     }
-    if is_connect {
+    if seen & PROTOCOL != 0 {
+        // 拡張 CONNECT（RFC 9220 §3・RFC 8441 §4）: CONNECT だけで、:scheme・:path・:authority が要る
+        if !is_connect {
+            return Err(":protocol without CONNECT");
+        }
+        if seen & (SCHEME | PATH | AUTHORITY) != (SCHEME | PATH | AUTHORITY) {
+            return Err("extended CONNECT without :scheme, :path or :authority");
+        }
+    } else if is_connect {
         // §4.4: CONNECT は :scheme と :path を省き、:authority を必須とする。
         if seen & (SCHEME | PATH) != 0 {
             return Err("CONNECT with :scheme or :path");

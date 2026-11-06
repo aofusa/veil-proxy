@@ -140,6 +140,8 @@ pub enum BackendConfig {
         path: String,
         mode: String,
         index: Option<String>,
+        /// 事前圧縮した兄弟ファイルを使う方式（F-294。既定は使わない）
+        precompressed: crate::config::Precompressed,
     },
     /// Redirect バックエンド設定
     /// - redirect_url: リダイレクト先URL（$request_uri, $host, $path 変数使用可能）
@@ -190,6 +192,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut path: Option<String> = None;
                 let mut mode: Option<String> = None;
                 let mut index: Option<String> = None;
+                let mut precompressed: Option<Vec<String>> = None;
                 // Redirect 用フィールド
                 let mut redirect_url: Option<String> = None;
                 let mut redirect_status: Option<u16> = None;
@@ -217,6 +220,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "path" => path = Some(map.next_value()?),
                         "mode" => mode = Some(map.next_value()?),
                         "index" => index = Some(map.next_value()?),
+                        "precompressed" => precompressed = Some(map.next_value()?),
                         // security, compression, buffering, cache, open_file_cache, modules は route 直下で設定されるため、ここでは無視
                         "security" | "compression" | "buffering" | "cache" | "open_file_cache"
                         | "modules" => {
@@ -316,7 +320,16 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                     _ => {
                         let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
                         let mode = mode.unwrap_or_else(|| "sendfile".to_string());
-                        Ok(BackendConfig::File { path, mode, index })
+                        let precompressed = crate::config::Precompressed::parse(
+                            precompressed.as_deref().unwrap_or(&[]),
+                        )
+                        .map_err(serde::de::Error::custom)?;
+                        Ok(BackendConfig::File {
+                            path,
+                            mode,
+                            index,
+                            precompressed,
+                        })
                     }
                 }
             }

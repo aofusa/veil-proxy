@@ -57,6 +57,7 @@ GET /__metrics
 | `veil_proxy_cache_size_bytes` | Gauge | storage | 現在のキャッシュサイズ（バイト） |
 | `veil_proxy_cache_entries` | Gauge | storage | 現在のキャッシュエントリ数 |
 | `veil_proxy_buffering_used_total` | Counter | host | `[route.buffering]` で応答を溜めるルートの要求数（gRPC を除く） |
+| `veil_proxy_websocket_tunnels` | Gauge | protocol | 上流へ中継している WebSocket のトンネルの数（`protocol` はクライアント側。`http/1.1`・`h2`・`h3`）。`101` の要求は `http_requests_total` には数えるが、所要時間・大きさのヒストグラムには入れない |
 | `veil_circuit_breaker_open_total` | Counter | upstream | サーバーのCBがOpenになった回数（upstream グループごと） |
 | `veil_circuit_breaker_state` | Gauge | upstream | グループの状態: どれかのサーバーがOpenなら1、どれかがHalfOpenなら2、ほかは0 |
 | `veil_retry_total` | Counter | upstream, result | プールの上流の接続が応答の前に切れた冪等な要求の再送（`upstream` はサーバーのアドレス、`result` は `stale_connection`） |
@@ -71,6 +72,7 @@ GET /__metrics
 | `veil_grpc_stream_duration_seconds` | Histogram | method | 中継した gRPC の呼び出しの始まりから `grpc-status` のトレーラーまでの時間 |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASMフィルター実行時間 |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | WASMフィルターの wasmtime fuel 累積消費量 |
+| `veil_wasm_failures_total` | Counter | filter, phase, reason, action | Proxy-Wasm フィルタの失敗（`reason`: trap・fuel・timeout・instantiate・lifecycle・http_call_resume・unsupported_pause、`action`: `failure_policy` による rejected・continued） |
 
 ラベルの値は決まった範囲に収めます。クライアントが自由な値を送っても、新しい系列は増えません（系列はメモリとスクレイプの
 応答に残り続けるため）。
@@ -205,7 +207,7 @@ batch_interval_secs = 30             # エクスポート間隔（デフォル�
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
 | `enabled` | OTLPエクスポートを有効化 | `false` |
-| `endpoint` | OTLP/HTTPエンドポイントURL | `http://localhost:4318` |
+| `endpoint` | OTLP/HTTPエンドポイントURL。`http://` だけ（エクスポータは TLS を持たないので、`https://` は起動時・リロード時に拒否する。ローカルのコレクタ・サイドカーへ送る） | `http://localhost:4318` |
 | `service_name` | `service.name` リソース属性 | `veil-proxy` |
 | `batch_interval_secs` | エクスポート間隔（秒） | `30` |
 

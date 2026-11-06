@@ -35,7 +35,7 @@ storage_dir = "/var/lib/veil/acme"
 | `directory_url` | `"https://acme-v02.api.letsencrypt.org/directory"` | ACME のディレクトリ URL。試験には Let's Encrypt の **staging** `https://acme-staging-v02.api.letsencrypt.org/directory` を使う |
 | `contact` | `[]` | アカウントの連絡先 URL。例: `["mailto:admin@example.com"]` |
 | `domains` | `[]` | 証明書に入れるドメイン名（必須で 1 個以上。1 個目が CN で、すべてが SAN になる） |
-| `storage_dir` | `"/var/lib/veil/acme"` | アカウント鍵や状態の保存先。モード 0700 で作成され、書き込み可能であること |
+| `storage_dir` | `"/var/lib/veil/acme"` | アカウント鍵や状態の保存先。モード 0700（Windows は SYSTEM・Administrators・所有者だけの DACL）で作成され、書き込み可能であること |
 | `accept_terms_of_service` | `false` | CA の利用規約に同意する。**`true` が必須**で、そうでないと veil は起動しない |
 | `challenge_listen` | `"0.0.0.0:80"` | HTTP-01 応答用の平文リスナーのアドレス。空なら起動しない（後述） |
 | `renew_before_days` | `30` | 有効期限がこの日数以内になったら更新する |
@@ -57,7 +57,7 @@ storage_dir = "/var/lib/veil/acme"
    （`storage_dir/account.key`、モード 0600。無ければ生成）を用意し、`domains` で注文し、HTTP-01 のトークンを応答リスナーに公開し、CA の検証を待ち、
    新しい証明書の鍵と CSR を作って finalize し、チェーンをダウンロードします。
 3. **反映。** 秘密鍵、続いて証明書チェーンを `key_path`・`cert_path` へ **原子的に** 書き込みます（同じディレクトリの一時ファイル → `fsync` → `rename`。
-   鍵はモード 0600）。仮証明書の印を消し、すぐに証明書リロードを起こします。以降の新しい TLS ハンドシェイク
+   鍵はモード 0600。Windows は SYSTEM・Administrators・所有者だけの DACL）。仮証明書の印を消し、すぐに証明書リロードを起こします。以降の新しい TLS ハンドシェイク
    （HTTP/1.1・HTTP/2・HTTP/3）は新しい証明書を使い、既存の接続には影響しません。
 4. **更新。** `check_interval_secs` ごとに有効期限を確認し、`renew_before_days` 以内なら上記を繰り返します。失敗したら指数バックオフ
    （5 秒から最大 1 時間）で再試行し、その間も現在の証明書で動き続けます。

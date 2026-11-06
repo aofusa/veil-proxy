@@ -93,7 +93,7 @@ Legend: **=** same meaning, **≈** close (see notes), **—** not available (th
 | `proxy_http_version 1.1;` + keepalive to upstreams | default (pooled connections) | = `max_idle_connections_per_host`, `idle_connection_timeout_secs` |
 | HTTP/2 to the upstream | `use_h2c = true` (plaintext) / ALPN for `https://` | = multiplexed ([routing.md](routing.md#h2c-http2-over-cleartext-proxy)) |
 | `grpc_pass` | `type = "Proxy"` to an h2c / h2 upstream | = gRPC, multiplexed ([routing.md](routing.md#h2c-http2-over-cleartext-proxy)) |
-| WebSocket (`Upgrade` headers) | automatic | = on HTTP/1.1 (WebSocket over HTTP/2 and HTTP/3 is not available) |
+| WebSocket (`Upgrade` headers) | automatic | = on HTTP/1.1; over HTTP/2 and HTTP/3 with `enable_connect_protocol = true` ([protocols.md](protocols.md#websocket-over-http2-and-http3-extended-connect)) |
 | `proxy_connect_timeout` | `backend_connect_timeout_secs` | = |
 | `proxy_read_timeout` / `proxy_send_timeout` | — on TOML routes | ≈ global I/O timeouts; per-route request timeouts are planned (F-226) |
 | `proxy_next_upstream` | idempotent retry once on a closed pooled connection | ≈ no conditional retries on status codes yet (F-226) |

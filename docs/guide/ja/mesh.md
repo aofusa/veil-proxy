@@ -72,7 +72,10 @@ docker build -f docker/Dockerfile.mesh-linkerd -t veil.local/linkerd-proxy:edge-
     ポリシー名付きで警告を出す。
 - 観測: Istio の標準メトリクス（pilot-agent の統合メトリクス経由の `istio_requests_total` 等）、Telemetry API の
   アクセスログ（Envoy の既定の書式）、分散トレース（Zipkin・B3）。
-- WasmPlugin（ECDS → veil の Proxy-Wasm。C++ SDK 製のモジュールも動く。`FAIL_CLOSE` はモジュールが落ちたら 503）。
+- WasmPlugin（ECDS → veil の Proxy-Wasm。C++ SDK 製のモジュールも動く）。リソースの `failStrategy`（既定の `FAIL_CLOSE` か
+  `FAIL_OPEN`。Envoy の `failure_policy` では `FAIL_CLOSED`・`FAIL_OPEN`・`FAIL_RELOAD`）は veil の `failure_policy` になる
+  （[Proxy-Wasm の失敗の扱い](wasm.md#失敗の扱い)）。失敗したフィルタは 503 を返すか、飛ばされる。`FAIL_OPEN` では読み込めない
+  モジュールも設定を拒否せずに飛ばす。
 - ゲートウェイ: HTTP、`credentialName` の HTTPS `SIMPLE` / `MUTUAL`、TLS の `PASSTHROUGH`（SNI）、egress ゲートウェイ、
   Gateway API の `HTTPRoute`。
 - ambient: veil を **waypoint** にする（HBONE: 15008 の mTLS の上の HTTP/2 CONNECT、Envoy の内部リスナー、
@@ -118,6 +121,14 @@ init コンテナ（`linkerd-init`）も同じイメージで動くので、veil
 - 相手の証明書は常にメッシュのトラストバンドルで検証する。xDS の TLS コンテキストに `match_subject_alt_names` が無い
   （Linkerd では期待する ID が無い）ときは、そのバンドルの証明書なら何でも受け入れる。相手の認証はするが名前での認可は
   しない（Envoy と同じ）ので、認可は RBAC・AuthorizationPolicy で行う。
+- 上流への TLS で `match_subject_alt_names` が無いときは、サーバ証明書を SNI の名前で検査する（Envoy の
+  `auto_san_validation` 相当）。SNI の名前が無い接続はトラストバンドルでだけ検証する。`trusted_ca` の無い SAN の条件は
+  拒否（NACK）する（Envoy と同じ）。
+- 証明書の失効リスト（検証コンテキストの `crl`）は未対応。含む設定・SDS の秘密は、失効を検査せずに適用せず拒否（NACK）する。
+- 受けた `x-forwarded-client-cert` ヘッダは、相手が TLS でクライアント証明書を出したときだけ残す（`ALWAYS_FORWARD_ONLY` は
+  常に残す。Envoy と同じ）。
+- Linkerd: inbound のポートのポリシーが 3 秒で届かないときは、既定のポリシー（`LINKERD2_PROXY_INBOUND_DEFAULT_POLICY`）で
+  認可する（ポリシー無しで中継しない）。
 - veil が実装していない Envoy のフィルタは、任意（optional）の指定が無ければ拒否（NACK）する。Envoy と同じく前の設定の
   まま動く。`config_dump` は istioctl が読む項目を返し、全項目ではない。
 - X.509 v1 のクライアント証明書は受け付けない（webpki）。Envoy（BoringSSL）は受け付ける。メッシュが発行する証明書は v3。

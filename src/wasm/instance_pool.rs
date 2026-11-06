@@ -149,11 +149,14 @@ pub(crate) struct InstancePool {
     per_thread: usize,
     /// モジュールが捨てられたら他のスレッドの持ち分も次に触ったときに捨てる
     alive: Arc<()>,
+    /// 作り直しの世代（F-293 の `fail_reload`）。進めると各スレッドの持ち分を次に触ったときに捨てる
+    generation: AtomicU64,
 }
 
 struct LocalEntry {
     id: u64,
     alive: std::sync::Weak<()>,
+    generation: u64,
     slots: Vec<Rc<InstanceSlot>>,
 }
 
@@ -167,7 +170,14 @@ impl InstancePool {
             id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
             per_thread: per_thread.max(1),
             alive: Arc::new(()),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// 全スレッドの使い回しているインスタンスを捨てて作り直させる（F-293 の `fail_reload`。使用中のものは
+    /// コールバックが済んでも戻さず、空いているものは各スレッドが次に触ったときに捨てる）
+    pub(crate) fn reload(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn with_local<R>(&self, f: impl FnOnce(&mut Vec<Rc<InstanceSlot>>) -> R) -> R {
@@ -175,17 +185,25 @@ impl InstancePool {
             let mut l = l.borrow_mut();
             // リロードで捨てられたモジュールの持ち分を捨てる
             l.retain(|e| e.alive.strong_count() > 0);
+            let generation = self.generation.load(Ordering::Relaxed);
             let i = match l.iter().position(|e| e.id == self.id) {
                 Some(i) => i,
                 None => {
                     l.push(LocalEntry {
                         id: self.id,
                         alive: Arc::downgrade(&self.alive),
+                        generation,
                         slots: Vec::new(),
                     });
                     l.len() - 1
                 }
             };
+            if l[i].generation != generation {
+                for s in l[i].slots.drain(..) {
+                    s.discard();
+                }
+                l[i].generation = generation;
+            }
             f(&mut l[i].slots)
         })
     }

@@ -542,8 +542,9 @@ pub struct TcpProxyCfg {
     pub clusters: Vec<(Arc<ClusterSlot>, u32)>,
     pub total_weight: u32,
     pub idle_timeout: Option<Duration>,
-    /// TCP の認可（Envoy の network RBAC。Istio の AuthorizationPolicy の TCP 規則）
-    pub rbac: Option<Arc<RbacCfg>>,
+    /// TCP の認可（Envoy の network RBAC。Istio の AuthorizationPolicy の TCP 規則）。チェーンの順に
+    /// すべてを満たしたときだけ通す（B-316）
+    pub rbac: Vec<Arc<RbacCfg>>,
     pub access_logs: Vec<Arc<crate::mesh::accesslog::AccessLogCfg>>,
     /// HTTP/2 CONNECT のトンネル（HBONE）の `:authority` の書式（`tunneling_config.hostname`）
     pub tunnel: Option<Arc<str>>,

@@ -50,80 +50,15 @@ pub(crate) fn apply_library_default(root: &mut toml::Value) {
     }
 }
 
-/// The q-value the `Accept-Encoding` value gives `coding` (an explicit entry, else `*`); `None` when it is not
-/// acceptable (absent or `q=0`).
-fn accepted_q(accept: &[u8], coding: &[u8]) -> Option<u16> {
-    let mut star = None;
-    for item in accept.split(|&b| b == b',') {
-        let mut parts = item.split(|&b| b == b';');
-        let name = trim(parts.next().unwrap_or(b""));
-        let mut q = 1000u16;
-        for p in parts {
-            // `q=0.5`（`q = 0.5` のような空白も受ける）
-            if let Some(eq) = p.iter().position(|&b| b == b'=') {
-                if trim(&p[..eq]).eq_ignore_ascii_case(b"q") {
-                    q = parse_q(trim(&p[eq + 1..]));
-                }
-            }
-        }
-        if name.eq_ignore_ascii_case(coding) {
-            return (q > 0).then_some(q);
-        }
-        if name == b"*" {
-            star = Some(q);
-        }
-    }
-    star.filter(|&q| q > 0)
-}
-
-fn trim(s: &[u8]) -> &[u8] {
-    let s = match s.iter().position(|b| !b.is_ascii_whitespace()) {
-        Some(i) => &s[i..],
-        None => return &[],
-    };
-    match s.iter().rposition(|b| !b.is_ascii_whitespace()) {
-        Some(i) => &s[..=i],
-        None => &[],
-    }
-}
-
-/// `q` in thousandths (RFC 9110 section 12.4.2: at most three decimals); unparsable values count as 0.
-fn parse_q(v: &[u8]) -> u16 {
-    match v {
-        [b'1', rest @ ..] if rest.is_empty() || rest[0] == b'.' => 1000,
-        [b'0'] => 0,
-        [b'0', b'.', frac @ ..] if frac.len() <= 3 && frac.iter().all(|b| b.is_ascii_digit()) => {
-            let mut q = 0u16;
-            for i in 0..3 {
-                q = q * 10 + frac.get(i).map(|d| (d - b'0') as u16).unwrap_or(0);
-            }
-            q
-        }
-        _ => 0,
-    }
-}
-
 /// Picks the coding: the highest q-value among `preferred` (ties go to the earlier one in `preferred`).
+/// Parsing is shared with the proxy's static and upstream compression (`ClientAccept`).
 pub(crate) fn negotiate(accept: &[u8], preferred: &[String]) -> Option<AcceptedEncoding> {
-    let mut best: Option<(AcceptedEncoding, u16)> = None;
-    for p in preferred {
-        let enc = match p.as_str() {
-            "br" => AcceptedEncoding::Brotli,
-            "gzip" => AcceptedEncoding::Gzip,
-            "zstd" => AcceptedEncoding::Zstd,
-            "deflate" => AcceptedEncoding::Deflate,
-            _ => continue,
-        };
-        if !available(enc) {
-            continue;
-        }
-        if let Some(q) = accepted_q(accept, p.as_bytes()) {
-            if best.map(|(_, b)| q > b).unwrap_or(true) {
-                best = Some((enc, q));
-            }
-        }
+    if !cfg!(feature = "compression") {
+        return None;
     }
-    best.map(|(e, _)| e)
+    crate::config::ClientAccept::parse(accept)
+        .negotiate(preferred)
+        .filter(|&e| available(e))
 }
 
 /// Whether this build can produce `enc`.
@@ -258,9 +193,9 @@ fn encoded_headers(resp: &mut Response, enc: crate::config::AcceptedEncoding) {
 fn add_vary(resp: &mut Response) {
     for (n, v) in resp.headers.iter_mut() {
         if n.eq_ignore_ascii_case(b"vary") {
-            if v.split(|&b| b == b',')
-                .any(|t| trim(t).eq_ignore_ascii_case(b"accept-encoding") || trim(t) == b"*")
-            {
+            if v.split(|&b| b == b',').any(|t| {
+                t.trim_ascii().eq_ignore_ascii_case(b"accept-encoding") || t.trim_ascii() == b"*"
+            }) {
                 return;
             }
             let mut w = Vec::with_capacity(v.len() + 17);
@@ -561,10 +496,6 @@ mod tests {
             n("gzip ; q=1.0 , br ; q = 0.9"),
             Some(AcceptedEncoding::Gzip)
         );
-        assert_eq!(parse_q(b"0.001"), 1);
-        assert_eq!(parse_q(b"0.5"), 500);
-        assert_eq!(parse_q(b"1.000"), 1000);
-        assert_eq!(parse_q(b"x"), 0);
     }
 
     fn json_resp(n: usize) -> Response {

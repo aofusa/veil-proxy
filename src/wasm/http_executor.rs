@@ -17,9 +17,7 @@ use super::types::{HttpCallResponse, LocalResponse};
 
 /// ボディフィルタ適用結果（h1/h2/h3 共有）。
 ///
-/// `BodyFilterResult::Pause` は非同期ボディ処理待ちに相当するが、現状どのプロトコル
-/// 経路も async body pause を実装していない（h1/h2 のヘッダフィルタと同様、警告ログを
-/// 出して元の本文を継続する）。
+/// 守れない Pause はエンジンが失敗として `failure_policy` で扱う（B-300・F-293）ので、ここには来ない。
 pub enum WasmBodyOutcome {
     /// フィルタ後の本文で継続する。
     Continue(bytes::Bytes),
@@ -49,7 +47,7 @@ pub async fn apply_wasm_request_body(
     // 呼び出し元の future に本体（数 KB）を埋め込まない（Wasm を使わない要求の move が重くなる。B-240）
     match Box::pin(engine.on_request_body_with_modules(
         modules,
-        body.clone(),
+        body,
         end_of_stream,
         request,
         modules.sessions(),
@@ -58,13 +56,6 @@ pub async fn apply_wasm_request_body(
     {
         BodyFilterResult::Continue { body } => WasmBodyOutcome::Continue(body),
         BodyFilterResult::LocalResponse(resp) => WasmBodyOutcome::LocalResponse(resp),
-        BodyFilterResult::Pause => {
-            ftlog::warn!(
-                "[wasm] on_request_body requested Pause, but async body pause is not yet \
-                 supported; continuing with the original body"
-            );
-            WasmBodyOutcome::Continue(body)
-        }
     }
 }
 
@@ -83,7 +74,7 @@ pub async fn apply_wasm_response_body(
     // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
     match Box::pin(engine.on_response_body_with_modules(
         modules,
-        body.clone(),
+        body,
         end_of_stream,
         modules.sessions(),
     ))
@@ -91,13 +82,6 @@ pub async fn apply_wasm_response_body(
     {
         BodyFilterResult::Continue { body } => WasmBodyOutcome::Continue(body),
         BodyFilterResult::LocalResponse(resp) => WasmBodyOutcome::LocalResponse(resp),
-        BodyFilterResult::Pause => {
-            ftlog::warn!(
-                "[wasm] on_response_body requested Pause, but async body pause is not yet \
-                 supported; continuing with the original body"
-            );
-            WasmBodyOutcome::Continue(body)
-        }
     }
 }
 

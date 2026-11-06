@@ -3113,6 +3113,8 @@ pub mod capsicum {
             );
             dirs.push((root.clone(), canonical, fd));
         }
+        // 入れ子のルートは内側を先に見る（`cache::resolve` の Linux 版と同じ。B-305）
+        dirs.sort_by_key(|(root, _, _)| std::cmp::Reverse(root.components().count()));
         let _ = STATIC_DIRS.set(dirs);
         STATIC_ACTIVE.store(true, Ordering::Release);
         Ok(())

@@ -217,6 +217,7 @@ pub fn apply(sec: &p::Secret) -> Result<(), String> {
         info!("[sds] certificate '{}' updated", sec.name);
     }
     if let Some(vc) = &sec.validation_context {
+        crate::mesh::xds::translate::reject_crl(vc)?;
         let ca = vc
             .trusted_ca
             .as_ref()

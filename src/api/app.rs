@@ -107,10 +107,14 @@ pub struct ServeOptions {
     pub mode: String,
     /// Enable `[route.open_file_cache]` (file metadata cache; default `true`).
     pub open_file_cache: bool,
-    /// Enable `[route.static_file_cache]` (file contents cache for HTTP/2 and HTTP/3; default `true`).
+    /// Enable `[route.static_file_cache]` (file contents cache: HTTP/2, HTTP/3, and HTTP/1.1 over plaintext on Linux
+    /// or userspace TLS; default `true`).
     pub static_file_cache: bool,
     /// Enable `[route.compression]` for the files (default `false`).
     pub compression: bool,
+    /// Serve precompressed siblings (`app.js.br`, `app.js.gz`, `app.js.zst`) for these encodings, in tie-break order
+    /// (`[route.action] precompressed`, for example `["br", "gzip"]`; default empty = not used).
+    pub precompressed: Vec<String>,
     /// Extra keys merged into the route table (for example `security` or `header`), as TOML.
     pub extra: Option<toml::Table>,
 }
@@ -123,6 +127,7 @@ impl Default for ServeOptions {
             open_file_cache: true,
             static_file_cache: true,
             compression: false,
+            precompressed: Vec::new(),
             extra: None,
         }
     }
@@ -148,6 +153,17 @@ impl ServeOptions {
         action.insert("mode".into(), Value::String(self.mode.clone()));
         if let Some(i) = &self.index {
             action.insert("index".into(), Value::String(i.clone()));
+        }
+        if !self.precompressed.is_empty() {
+            action.insert(
+                "precompressed".into(),
+                Value::Array(
+                    self.precompressed
+                        .iter()
+                        .map(|e| Value::String(e.clone()))
+                        .collect(),
+                ),
+            );
         }
         let mut cond = toml::Table::new();
         cond.insert("path".into(), Value::String(pattern));
@@ -457,8 +473,8 @@ impl App {
     // F-267
     /// Serves the directory `dir` under `prefix` with veil's static file server (a `type = "File"` route with
     /// `open_file_cache` and `static_file_cache`): sendfile, kTLS, Range and ETag work as for the proxy, and requests
-    /// do not go through a handler. Precompressed `.br` / `.gz` files are not used; `ServeOptions::compression`
-    /// compresses files on the fly for HTTP/2 and HTTP/3 (HTTP/1.1 sends them as they are).
+    /// do not go through a handler. `ServeOptions::precompressed` serves precompressed siblings (`.br`, `.gz`, `.zst`);
+    /// `ServeOptions::compression` compresses files on the fly on HTTP/1.1, HTTP/2 and HTTP/3.
     pub fn serve_dir(
         mut self,
         prefix: &str,
@@ -678,40 +694,68 @@ impl App {
         for f in self.setup {
             f()?;
         }
-        let mut pending: Vec<PendingRoute> = Vec::new();
-        if self.include_macro_routes {
-            for def in inventory::iter::<RouteDef> {
-                let f = def.handler;
-                pending.push(PendingRoute {
-                    name: def.name.to_string(),
-                    path: def.path.to_string(),
-                    methods: def.methods.iter().map(|m| m.to_string()).collect(),
-                    func: Arc::new(move |req| f(req)),
-                    meta: (def.meta)(),
-                    streaming_request: def.streaming_request,
-                    compress: def.compress,
-                });
-            }
-        }
-        pending.extend(self.routes);
-        for route in pending {
-            let mut func = route.func;
-            // 登録順に外側へ包む（後から登録したミドルウェアほど外側）。
-            for mw in &self.middleware {
-                if path_has_prefix(&route.path, &mw.prefix) {
-                    func = (mw.wrap)(func);
-                }
-            }
-            let methods: Vec<&str> = route.methods.iter().map(|s| s.as_str()).collect();
-            let entry =
-                HandlerEntry::new(route.name.as_str(), &route.path, &methods, func, route.meta)?
-                    .with_streaming_request(route.streaming_request)
-                    .with_compression(route.compress);
+        for entry in entries(self.include_macro_routes, self.routes, &self.middleware)? {
             handler::register(entry)?;
         }
         let _ = WORKER_START.set(std::mem::take(&mut *PENDING_WORKER_START.lock().unwrap()));
         start(config, self.static_routes)
     }
+
+    // F-291: ソケットを開かずにルートを呼ぶ（C の veil_test_*）。登録表（REGISTRY）には入れないので、同じプロセスで
+    // 後から run してもよい。共有の状態（App::state）はここで確定する
+    /// Builds the routes like [`App::run`] (setup functions, middleware, plugins) without starting a server, for
+    /// in-process tests: [`TestClient::call`](super::testing::TestClient::call) dispatches requests to them.
+    /// Static directories (`serve_dir`), gRPC, L4 and the built-in OpenAPI routes are not served by it.
+    pub fn into_test_client(self) -> Result<super::testing::TestClient, Error> {
+        self.config?;
+        for f in self.setup {
+            f()?;
+        }
+        let list = entries(self.include_macro_routes, self.routes, &self.middleware)?;
+        freeze_state();
+        Ok(super::testing::TestClient::new(list))
+    }
+}
+
+/// The handler entries of the routes (macro-declared ones first when `include_macro`), with the middleware applied.
+fn entries(
+    include_macro: bool,
+    routes: Vec<PendingRoute>,
+    middleware: &[Middleware],
+) -> Result<Vec<HandlerEntry>, Error> {
+    let mut out = Vec::new();
+    let mut pending: Vec<PendingRoute> = Vec::new();
+    if include_macro {
+        for def in inventory::iter::<RouteDef> {
+            let f = def.handler;
+            pending.push(PendingRoute {
+                name: def.name.to_string(),
+                path: def.path.to_string(),
+                methods: def.methods.iter().map(|m| m.to_string()).collect(),
+                func: Arc::new(move |req| f(req)),
+                meta: (def.meta)(),
+                streaming_request: def.streaming_request,
+                compress: def.compress,
+            });
+        }
+    }
+    pending.extend(routes);
+    for route in pending {
+        let mut func = route.func;
+        // 登録順に外側へ包む（後から登録したミドルウェアほど外側）。
+        for mw in middleware {
+            if path_has_prefix(&route.path, &mw.prefix) {
+                func = (mw.wrap)(func);
+            }
+        }
+        let methods: Vec<&str> = route.methods.iter().map(|s| s.as_str()).collect();
+        let entry =
+            HandlerEntry::new(route.name.as_str(), &route.path, &methods, func, route.meta)?
+                .with_streaming_request(route.streaming_request)
+                .with_compression(route.compress);
+        out.push(entry);
+    }
+    Ok(out)
 }
 
 /// Whether `prefix` is a prefix of the path on a segment boundary (`"/"` matches everything).

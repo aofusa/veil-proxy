@@ -73,6 +73,7 @@ impl CacheKey {
     /// * `query` - クエリパラメータ（include_queryがtrueの場合に使用）
     /// * `include_query` - クエリパラメータを含めるか
     /// * `vary_headers` - Varyヘッダーに基づく追加キー値
+    /// * `route_ns` - ルートの名前空間（`CacheConfig::route_ns`。0 なら付けない）
     pub fn from_request(
         method: &[u8],
         host: &str,
@@ -80,6 +81,7 @@ impl CacheKey {
         query: Option<&str>,
         include_query: bool,
         vary_headers: Option<&[(&str, &str)]>,
+        route_ns: u64,
     ) -> Option<Self> {
         let method = CacheableMethod::from_bytes(method)?;
 
@@ -93,15 +95,34 @@ impl CacheKey {
             path.to_string()
         };
 
-        // Varyキーを生成
-        let vary_key = vary_headers.map(|headers| {
+        // Varyキーを生成。
+        // B-321: ルートの名前空間を付ける（条件の違うルートの応答を別のルートの要求へ返さない。F23）。
+        // ヘッダは名前と値を長さ付きで書く（値に `;name:value` を入れて別の組み合わせのキーを作れた。F41）
+        let mut vary_key = String::new();
+        if route_ns != 0 {
+            use std::fmt::Write as _;
+            let _ = write!(vary_key, "route={:016x}", route_ns);
+        }
+        if let Some(headers) = vary_headers {
             let mut parts: Vec<String> = headers
                 .iter()
-                .map(|(name, value)| format!("{}:{}", name.to_lowercase(), value))
+                .map(|(name, value)| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        name.len(),
+                        name.to_lowercase(),
+                        value.len(),
+                        value
+                    )
+                })
                 .collect();
             parts.sort();
-            parts.join(";")
-        });
+            if !vary_key.is_empty() {
+                vary_key.push('|');
+            }
+            vary_key.push_str(&parts.join(";"));
+        }
+        let vary_key = (!vary_key.is_empty()).then_some(vary_key);
 
         Some(Self::new(method, host, &full_path, vary_key.as_deref()))
     }
@@ -204,6 +225,7 @@ mod tests {
             Some("page=1&limit=10"),
             true,
             None,
+            0,
         )
         .unwrap();
 
@@ -219,6 +241,7 @@ mod tests {
             Some("page=1"),
             false, // クエリを含めない
             None,
+            0,
         )
         .unwrap();
 
@@ -236,12 +259,27 @@ mod tests {
             None,
             true,
             Some(&vary_headers),
+            0,
         )
         .unwrap();
 
         let vary_key = key.vary_key().unwrap();
-        assert!(vary_key.contains("accept-encoding:gzip"));
-        assert!(vary_key.contains("accept-language:en-US"));
+        assert!(vary_key.contains("accept-encoding:4:gzip"));
+        assert!(vary_key.contains("accept-language:5:en-US"));
+    }
+
+    /// B-321: 値に区切りを入れても別のヘッダの組み合わせのキーにならない。ルートが違えばキーも違う
+    #[test]
+    fn test_cache_key_vary_is_injective_and_route_scoped() {
+        let key = |h: &[(&str, &str)], ns: u64| {
+            CacheKey::from_request(b"GET", "h", "/", None, true, Some(h), ns).unwrap()
+        };
+        let forged = key(&[("x-a", "1;x-b:2")], 0);
+        let real = key(&[("x-a", "1"), ("x-b", "2")], 0);
+        assert_ne!(forged, real);
+        assert_ne!(forged.hash_value(), real.hash_value());
+        assert_ne!(key(&[("x-a", "1")], 1), key(&[("x-a", "1")], 2));
+        assert_eq!(key(&[("x-a", "1")], 7), key(&[("x-a", "1")], 7));
     }
 
     #[test]
@@ -274,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_invalid_method() {
-        let key = CacheKey::from_request(b"POST", "example.com", "/api/users", None, true, None);
+        let key = CacheKey::from_request(b"POST", "example.com", "/api/users", None, true, None, 0);
 
         assert!(key.is_none());
     }

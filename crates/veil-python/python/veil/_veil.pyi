@@ -339,7 +339,12 @@ def register_cors(
     """Answer CORS for the routes below ``prefix`` in the server (``ValueError`` for invalid settings)."""
 
 def register_static(
-    prefix: str, dir: str, index: str | None = None, cache: bool = True, extra_toml: str | None = None
+    prefix: str,
+    dir: str,
+    index: str | None = None,
+    cache: bool = True,
+    extra_toml: str | None = None,
+    precompressed: list[str] = ...,
 ) -> None:
     """Serve the directory ``dir`` below ``prefix`` with the server's file backend."""
 

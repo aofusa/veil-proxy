@@ -18,6 +18,8 @@ pub enum SettingsId {
     MaxFrameSize = 0x5,
     /// 最大ヘッダーリストサイズ
     MaxHeaderListSize = 0x6,
+    /// 拡張 CONNECT（RFC 8441 §3。`:protocol` 付きの CONNECT を受け付ける）
+    EnableConnectProtocol = 0x8,
 }
 
 impl SettingsId {
@@ -30,6 +32,7 @@ impl SettingsId {
             0x4 => Some(Self::InitialWindowSize),
             0x5 => Some(Self::MaxFrameSize),
             0x6 => Some(Self::MaxHeaderListSize),
+            0x8 => Some(Self::EnableConnectProtocol),
             _ => None, // 未知の ID は無視
         }
     }
@@ -123,6 +126,10 @@ pub struct Http2Settings {
     /// ストリームアイドルタイムアウト (秒)
     /// Slow Loris 対策
     pub stream_idle_timeout_secs: u64,
+
+    /// SETTINGS_ENABLE_CONNECT_PROTOCOL（RFC 8441）を広告して拡張 CONNECT（WebSocket over HTTP/2）を受けるか。
+    /// 既定は false（広告するとブラウザが WebSocket を HTTP/2 の接続へ移すので明示で有効にする。F-288）
+    pub enable_connect_protocol: bool,
 }
 
 impl Default for Http2Settings {
@@ -141,6 +148,7 @@ impl Default for Http2Settings {
             max_continuation_frames: defaults::MAX_CONTINUATION_FRAMES,
             max_header_block_size: defaults::MAX_HEADER_BLOCK_SIZE,
             stream_idle_timeout_secs: defaults::STREAM_IDLE_TIMEOUT_SECS,
+            enable_connect_protocol: false,
         }
     }
 }
@@ -167,12 +175,13 @@ impl Http2Settings {
             max_continuation_frames: defaults::MAX_CONTINUATION_FRAMES,
             max_header_block_size: defaults::MAX_HEADER_BLOCK_SIZE,
             stream_idle_timeout_secs: defaults::STREAM_IDLE_TIMEOUT_SECS,
+            enable_connect_protocol: false,
         }
     }
 
     /// SETTINGS フレームのペイロードにエンコード
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(36); // 6 設定 × 6 bytes
+        let mut buf = Vec::with_capacity(42); // 最大 7 設定 × 6 bytes
 
         // HEADER_TABLE_SIZE
         buf.extend_from_slice(&(SettingsId::HeaderTableSize as u16).to_be_bytes());
@@ -197,6 +206,12 @@ impl Http2Settings {
         // MAX_HEADER_LIST_SIZE
         buf.extend_from_slice(&(SettingsId::MaxHeaderListSize as u16).to_be_bytes());
         buf.extend_from_slice(&self.max_header_list_size.to_be_bytes());
+
+        // ENABLE_CONNECT_PROTOCOL（有効なときだけ送る。無効なら従来と 1 バイトも変えない。F-288）
+        if self.enable_connect_protocol {
+            buf.extend_from_slice(&(SettingsId::EnableConnectProtocol as u16).to_be_bytes());
+            buf.extend_from_slice(&1u32.to_be_bytes());
+        }
 
         buf
     }
@@ -247,6 +262,13 @@ impl Http2Settings {
                 Some(SettingsId::MaxHeaderListSize) => {
                     settings.max_header_list_size = value;
                 }
+                Some(SettingsId::EnableConnectProtocol) => {
+                    // RFC 8441 §3: 0 か 1 以外は PROTOCOL_ERROR
+                    if value > 1 {
+                        return Err("ENABLE_CONNECT_PROTOCOL must be 0 or 1".into());
+                    }
+                    settings.enable_connect_protocol = value == 1;
+                }
                 None => {
                     // 未知の設定は無視 (RFC 7540 Section 6.5)
                 }
@@ -264,6 +286,7 @@ impl Http2Settings {
         self.initial_window_size = other.initial_window_size;
         self.max_frame_size = other.max_frame_size;
         self.max_header_list_size = other.max_header_list_size;
+        self.enable_connect_protocol = other.enable_connect_protocol;
     }
 }
 
@@ -287,6 +310,7 @@ mod tests {
             max_continuation_frames: defaults::MAX_CONTINUATION_FRAMES,
             max_header_block_size: defaults::MAX_HEADER_BLOCK_SIZE,
             stream_idle_timeout_secs: defaults::STREAM_IDLE_TIMEOUT_SECS,
+            enable_connect_protocol: false,
         };
 
         let encoded = original.encode();
@@ -319,5 +343,32 @@ mod tests {
             0x00, 0x00, 0x00, 0x10, // 16 (最小値 16384 未満)
         ];
         assert!(Http2Settings::decode(&payload).is_err());
+    }
+
+    /// F-288: 無効なら 0x8 を送らない（従来の SETTINGS と同じ）。有効なら 0x8 = 1 を足す
+    #[test]
+    fn enable_connect_protocol_is_advertised_only_when_enabled() {
+        let off = Http2Settings::default().encode();
+        assert_eq!(off.len(), 36);
+        assert!(!off.chunks(6).any(|c| c[0] == 0 && c[1] == 0x8));
+        let on = Http2Settings {
+            enable_connect_protocol: true,
+            ..Http2Settings::default()
+        }
+        .encode();
+        assert_eq!(on.len(), 42);
+        assert!(on.chunks(6).any(|c| c == [0, 0x8, 0, 0, 0, 1]));
+        assert!(Http2Settings::decode(&on).unwrap().enable_connect_protocol);
+    }
+
+    /// F-288: ENABLE_CONNECT_PROTOCOL は 0 か 1 だけ（RFC 8441 §3）
+    #[test]
+    fn enable_connect_protocol_rejects_other_values() {
+        assert!(Http2Settings::decode(&[0, 0x8, 0, 0, 0, 2]).is_err());
+        assert!(
+            !Http2Settings::decode(&[0, 0x8, 0, 0, 0, 0])
+                .unwrap()
+                .enable_connect_protocol
+        );
     }
 }

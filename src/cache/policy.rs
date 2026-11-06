@@ -141,6 +141,45 @@ impl CacheControl {
     }
 }
 
+/// HTTP-date の IMF-fixdate（`Sun, 06 Nov 1994 08:49:37 GMT`）を Unix 時刻にする（B-321。Expires 用）
+fn parse_http_date(s: &str) -> Option<i64> {
+    let mut it = s.split_ascii_whitespace();
+    let _wday = it.next()?;
+    let day: u8 = it.next()?.parse().ok()?;
+    let month = match it.next()? {
+        "Jan" => time::Month::January,
+        "Feb" => time::Month::February,
+        "Mar" => time::Month::March,
+        "Apr" => time::Month::April,
+        "May" => time::Month::May,
+        "Jun" => time::Month::June,
+        "Jul" => time::Month::July,
+        "Aug" => time::Month::August,
+        "Sep" => time::Month::September,
+        "Oct" => time::Month::October,
+        "Nov" => time::Month::November,
+        "Dec" => time::Month::December,
+        _ => return None,
+    };
+    let year: i32 = it.next()?.parse().ok()?;
+    let mut hms = it.next()?.split(':');
+    let (h, m, sec): (u8, u8, u8) = (
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+    );
+    if it.next()? != "GMT" || it.next().is_some() {
+        return None;
+    }
+    let date = time::Date::from_calendar_date(year, month, day).ok()?;
+    let t = time::Time::from_hms(h, m, sec).ok()?;
+    Some(
+        time::PrimitiveDateTime::new(date, t)
+            .assume_utc()
+            .unix_timestamp(),
+    )
+}
+
 /// キャッシュポリシー
 ///
 /// リクエストとレスポンスからキャッシュ可否を判定します。
@@ -170,20 +209,50 @@ impl CachePolicy {
             return None;
         }
 
-        // Cache-Controlヘッダーを取得
-        let cache_control = response_headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(b"cache-control"))
-            .map(|(_, value)| CacheControl::parse(value))
-            .unwrap_or_default();
+        // Cache-Controlヘッダーを取得。
+        // B-321: 複数行の Cache-Control はすべて合わせて読む（以前は 1 行目だけで、2 行目の no-store を
+        // 見落とした。F22）
+        let (cache_control, has_cc) = Self::merged_cache_control(response_headers);
 
-        // キャッシュ可能性チェック
-        if !cache_control.is_cacheable() {
+        // キャッシュ可能性チェック。
+        // B-321: no-cache は毎回の再検証が要るが、共有キャッシュは再検証しないので保存しない（RFC 9111 §5.2.2.4。
+        // 以前は既定の TTL で保存し、利用者ごとのページを別の利用者へ返し得た。F22）
+        if !cache_control.is_cacheable() || cache_control.no_cache {
             return None;
+        }
+        // Cache-Control が無いときは Pragma: no-cache と Expires を見る（RFC 9111 §5.3・§5.4）
+        let mut expires_ttl = None;
+        if !has_cc {
+            let header = |n: &[u8]| {
+                response_headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(n))
+                    .map(|(_, v)| &**v)
+            };
+            if header(b"pragma").is_some_and(|v| {
+                v.split(|&b| b == b',')
+                    .any(|d| d.trim_ascii().eq_ignore_ascii_case(b"no-cache"))
+            }) {
+                return None;
+            }
+            if let Some(v) = header(b"expires") {
+                // 読めない Expires（`0` 等）は期限切れとみなす
+                let exp = std::str::from_utf8(v).ok().and_then(parse_http_date)?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                if exp <= now {
+                    return None;
+                }
+                expires_ttl = Some((exp - now) as u64);
+            }
         }
 
         // TTLを計算
-        let ttl = cache_control.effective_ttl(default_ttl);
+        let ttl = match expires_ttl {
+            Some(t) if cache_control.s_maxage.is_none() && cache_control.max_age.is_none() => t,
+            _ => cache_control.effective_ttl(default_ttl),
+        };
 
         // TTLが0の場合はキャッシュしない
         if ttl == 0 {
@@ -191,6 +260,41 @@ impl CachePolicy {
         }
 
         Some(ttl)
+    }
+
+    /// すべての Cache-Control の行を合わせた結果と、Cache-Control があったか（B-321）
+    pub fn merged_cache_control(
+        response_headers: &[(Box<[u8]>, Box<[u8]>)],
+    ) -> (CacheControl, bool) {
+        let mut cc = CacheControl::default();
+        let mut found = false;
+        for (_, value) in response_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(b"cache-control"))
+        {
+            let c = CacheControl::parse(value);
+            found = true;
+            cc.no_cache |= c.no_cache;
+            cc.no_store |= c.no_store;
+            cc.private |= c.private;
+            cc.public |= c.public;
+            cc.must_revalidate |= c.must_revalidate;
+            cc.proxy_revalidate |= c.proxy_revalidate;
+            cc.no_transform |= c.no_transform;
+            cc.immutable |= c.immutable;
+            cc.max_age = cc.max_age.or(c.max_age);
+            cc.s_maxage = cc.s_maxage.or(c.s_maxage);
+            cc.stale_while_revalidate = cc.stale_while_revalidate.or(c.stale_while_revalidate);
+            cc.stale_if_error = cc.stale_if_error.or(c.stale_if_error);
+        }
+        (cc, found)
+    }
+
+    /// 応答が共有キャッシュ向けと明示しているか（`public` か `s-maxage`。B-321: Cookie の付いた要求への
+    /// 応答はこのときだけ保存する）
+    pub fn explicitly_shared(response_headers: &[(Box<[u8]>, Box<[u8]>)]) -> bool {
+        let (cc, _) = Self::merged_cache_control(response_headers);
+        cc.public || cc.s_maxage.is_some()
     }
 
     /// Varyヘッダーを解析
@@ -356,6 +460,53 @@ mod tests {
 
         let ttl = CachePolicy::check_response(200, &headers, &[200], 300);
         assert!(ttl.is_none());
+    }
+
+    /// B-321: no-cache・2 行目の no-store・Pragma・過去の Expires は保存しない。Cookie の要求は共有の明示が要る
+    #[test]
+    fn test_check_response_storage_rules() {
+        let h = |pairs: &[(&str, &str)]| -> Vec<(Box<[u8]>, Box<[u8]>)> {
+            pairs
+                .iter()
+                .map(|(n, v)| (n.as_bytes().into(), v.as_bytes().into()))
+                .collect()
+        };
+        let check =
+            |pairs: &[(&str, &str)]| CachePolicy::check_response(200, &h(pairs), &[200], 300);
+        assert_eq!(check(&[("cache-control", "no-cache")]), None);
+        assert_eq!(
+            check(&[
+                ("cache-control", "max-age=60"),
+                ("cache-control", "no-store")
+            ]),
+            None
+        );
+        assert_eq!(check(&[("pragma", "no-cache")]), None);
+        assert_eq!(check(&[("expires", "0")]), None);
+        assert_eq!(check(&[("expires", "Sun, 06 Nov 1994 08:49:37 GMT")]), None);
+        let ttl = check(&[("expires", "Fri, 01 Jan 2100 00:00:00 GMT")]).unwrap();
+        assert!(ttl > 300);
+        assert_eq!(
+            check(&[("cache-control", "max-age=60"), ("expires", "0")]),
+            Some(60)
+        );
+        assert_eq!(check(&[]), Some(300));
+        assert!(!CachePolicy::explicitly_shared(&h(&[(
+            "cache-control",
+            "max-age=60"
+        )])));
+        assert!(CachePolicy::explicitly_shared(&h(&[(
+            "cache-control",
+            "public"
+        )])));
+        assert!(CachePolicy::explicitly_shared(&h(&[(
+            "cache-control",
+            "s-maxage=5"
+        )])));
+        assert_eq!(
+            super::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784111777)
+        );
     }
 
     #[test]

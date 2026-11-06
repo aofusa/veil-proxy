@@ -342,7 +342,14 @@ impl H2Mux {
             if self.skip(name, value) {
                 continue;
             }
-            list.push((lowered[li].as_slice(), value, false));
+            // B-322: 資格情報は never-indexed で送る。この接続は別のクライアントの要求と共有するので、動的テーブルに
+            // 入れると他の利用者の値を推測でき（符号の長さで当否が分かる）た（F39。RFC 7541 §7.1.3）
+            let name = lowered[li].as_slice();
+            let sensitive = matches!(
+                name,
+                b"authorization" | b"proxy-authorization" | b"cookie" | b"set-cookie"
+            );
+            list.push((name, value, sensitive));
             li += 1;
         }
         let block = match g.hpack_enc.encode(&list) {
@@ -840,6 +847,19 @@ fn on_headers(
         return Ok(());
     };
     if st.reset {
+        return Ok(());
+    }
+    // B-318: 上流の応答のフィールドは名前が token、値に CR・LF・NUL が無いものだけ受ける（RFC 9113 §8.2.1。
+    // HPACK は任意のバイトを運べるので、HTTP/1.1 のクライアントへそのまま書くと応答を分割できた。F15）
+    if fields.iter().any(|f| {
+        !f.name.starts_with(b":")
+            && (!crate::http_utils::is_valid_header_name(&f.name)
+                || !crate::http_utils::is_valid_header_value(&f.value))
+    }) {
+        st.reset = true;
+        st.remote_closed = true;
+        st.resp_queue.push_back(UpResp::Reset { retryable: false });
+        rst(g, stream_id, ERR_PROTOCOL);
         return Ok(());
     }
     if !st.head_seen {

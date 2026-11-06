@@ -13,11 +13,13 @@
 | **複数アルゴリズム対応** | Gzip、Brotli、Zstd、Deflateをサポート |
 | **Content-Typeフィルタリング** | text/HTML/JSON等のみ圧縮 |
 | **最小サイズ閾値** | 小さなレスポンスは圧縮スキップ |
-| **Accept-Encodingネゴシエーション** | 最適なエンコーディングを自動選択 |
+| **Accept-Encodingネゴシエーション** | `preferred_encodings` の中からクライアントが受け付ける q 値の最も高い方式を選ぶ（同点は `preferred_encodings` の順。`q=0` はその方式を拒否、`*` は挙げていない方式すべて、名前の大文字小文字は区別しない、`x-gzip` は gzip とみなす） |
 
 ### 有効化
 
 圧縮はデフォルトで**無効**です（kTLS最適化のゼロコピーsendfileを維持）。
+圧縮には `compression` feature（`full` に含まれる）付きのビルドが要ります。無いビルドで `enabled = true` にするとロード時に警告し、
+応答は圧縮せずに送ります。
 ルートごとに `compression` セクションで有効化します：
 
 ```toml
@@ -50,7 +52,7 @@ url = "http://localhost:8080"
 | `zstd_level` | Zstd圧縮レベル（1-22） | 3 |
 | `min_size` | 圧縮する最小サイズ（バイト） | 1024 |
 | `compressible_types` | 圧縮対象のMIMEタイプ（プレフィックスマッチ） | text/*, application/json等 |
-| `skip_types` | スキップするMIMEタイプ（プレフィックスマッチ） | image/*, video/*, audio/*等 |
+| `skip_types` | スキップするMIMEタイプ（プレフィックスマッチ）。両方に一致したら長く一致した方が勝つ（`compressible_types` の `image/svg+xml` はここの `image/` に勝つ） | image/*, video/*, audio/*等 |
 
 ### 圧縮レベルガイドライン
 
@@ -134,9 +136,15 @@ path = "/var/www/static"
 
 - `text/event-stream`（Server-Sent Events）。圧縮には本文の全体が要りますが、イベントのストリームは終わらないので、常にそのまま流します。
 - `Content-Length` が 64 MiB を超える応答。圧縮せずに流します。
-- 8 MiB を超える静的ファイル（`type = "File"`）。圧縮するには要求ごとにファイル全体を読み込むので、圧縮せずに `sendfile` で送ります。
+- 8 MiB を超える静的ファイル（`type = "File"`）。圧縮するには要求ごとにファイル全体を読み込むので、圧縮せずに送ります（HTTP/1.1 は `sendfile`、HTTP/2・HTTP/3 は他のファイルと同じく読んで送ります）。
 
 圧縮するときは、上流の本文の全体を先に溜めます（上限 64 MiB）。長さ不明の応答や chunked の応答がこれを超えたら、打ち切って 502 を返します。
+
+### 事前圧縮した静的ファイル
+
+静的ファイルは前もって圧縮しておくこともできます。`type = "File"` のルートの `[route.action]` に
+`precompressed = ["br", "gzip"]` と書くと、`app.js` の隣の `app.js.br`・`app.js.gz` を圧縮せずに返します（`sendfile`・kTLS のまま）。
+[事前圧縮したファイル](routing.md#事前圧縮したファイル) を参照してください。
 
 ### HTTP/3圧縮設定
 
@@ -152,7 +160,10 @@ compression_enabled = true
   gzip_level = 5
 ```
 
-> **Note**: 圧縮を有効にすると、圧縮されたレスポンスに対してはkTLSのゼロコピーsendfile最適化は使用されません。大きなファイルの最大スループットを得るには、静的ファイルルートでは圧縮を無効にすることを検討してください。
+> **Note**: 圧縮するとゼロコピー（`sendfile`・`splice`。平文も kTLS も）を使いません。静的ファイルでは実際に圧縮する応答だけをユーザー空間で
+> 読んで圧縮します。HTTP/1.1 のプロキシでは、`Accept-Encoding` がルートの方式のどれかを受け付ける要求はすべて（判定に応答ヘッダが
+> 要るので、結果として圧縮しない応答も）ユーザー空間を通します。大きなファイルの最大スループットを得るには、そのルートの圧縮を無効に
+> することを検討してください。
 
 ## プロキシキャッシュ
 
@@ -249,8 +260,15 @@ url = "http://localhost:8080"
 
 - プロキシのキャッシュは、**HTTP/1.1 のクライアント**から**平文（`http://`）の上流**への要求に効きます。HTTP/2・HTTP/3 の要求と、
   `https://` の上流の応答は、まだキャッシュしません（F-257）。
-- `streaming` バッファリングモード使用時、kTLSのゼロコピー転送は維持されます
-- キャッシュは `Cache-Control: no-cache`、`no-store`、`private` ヘッダーを尊重します
+- キャッシュのあるルートでは、キャッシュに入り得る要求はユーザー空間を通ります（キャッシュに入れるため）。`streaming` モードの
+  ゼロコピー（`splice`）の経路を使うのはそれ以外の要求だけです
+- `Cache-Control: no-cache`・`no-store`・`private` の応答は保存しません（`Cache-Control` の行はすべて読みます）。
+  `Cache-Control` が無いときは、`Pragma: no-cache` と過去の（または日付として読めない）`Expires` の応答を保存せず、
+  未来の `Expires` を TTL にします
+- `Cookie` の付いた要求への応答は、共有してよいと応答が示したとき（`Cache-Control: public` か `s-maxage`）だけ保存します
+  （`key_headers` に `Cookie` があれば別）
+- キャッシュはルートごとに分かれます。同じホスト・パスの 2 つのルート（例えば `source_ip` で絞ったもの）が互いの要求に
+  キャッシュから答えることはありません
 - `respect_vary = true` の場合、`Vary: *` レスポンスはキャッシュされません
 - `respect_vary = true` の場合、`Vary` が `key_headers` に無いヘッダを挙げる応答はキャッシュされません（キーでその要求を
   区別できないため）。値ごとにキャッシュするには、そのヘッダを `key_headers` に足します（例: `key_headers = ["Accept-Encoding"]`）
@@ -400,6 +418,10 @@ Content-Length <= adaptive_threshold → フルバッファリング
 Content-Length > adaptive_threshold  → ストリーミング
 Content-Length 不明（chunked）       → ストリーミング
 ```
+
+判定には**応答の** `Content-Length`（上流の応答ヘッダ）を使います（要求の長さではありません）。`veil_proxy_buffering_used_total` は
+溜めた応答だけを数えます。HTTP/2・HTTP/3 のクライアント（ストリームごとにフロー制御がある）では `adaptive` は `streaming` と同じく
+流し、溜めるのは `full` だけです。応答本文を読む Proxy-Wasm モジュールのあるルートは常に溜めます。
 
 ### kTLS互換性
 

@@ -472,6 +472,7 @@ fn drain_plaintext(dst: &mut Vec<u8>, rd: &mut dyn std::io::Read) {
 }
 
 /// `libc::read` ラッパー（ノンブロッキング fd 用）。
+#[cfg(unix)]
 fn raw_fd_read(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<usize> {
     let n = unsafe {
         libc::read(
@@ -488,6 +489,7 @@ fn raw_fd_read(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<
 }
 
 /// `libc::write` ラッパー（ノンブロッキング fd 用）。
+#[cfg(unix)]
 fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usize> {
     let n = unsafe {
         libc::write(
@@ -498,6 +500,55 @@ fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usi
     };
     if n < 0 {
         Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// Winsock 版の `raw_fd_read`（B-312）。Windows の `libc::read` は CRT のファイル記述子を取り、
+/// ソケットを渡すと CRT の不正引数ハンドラがプロセスを `__fastfail` で落とす。
+#[cfg(windows)]
+fn raw_fd_read(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    use windows_sys::Win32::Networking::WinSock;
+    let len = buf.len().min(i32::MAX as usize) as i32;
+    // SAFETY: fd はこの接続が所有する有効なソケット。buf は len バイト書き込める可変スライス。
+    let n = unsafe {
+        WinSock::recv(
+            crate::runtime::handle::win::to_socket(fd),
+            buf.as_mut_ptr(),
+            len,
+            0,
+        )
+    };
+    if n < 0 {
+        // SAFETY: 引数を取らず、このスレッドの直前の Winsock の誤りを返すだけ。
+        Err(io::Error::from_raw_os_error(unsafe {
+            WinSock::WSAGetLastError()
+        }))
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// Winsock 版の `raw_fd_write`（B-312）。
+#[cfg(windows)]
+fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usize> {
+    use windows_sys::Win32::Networking::WinSock;
+    let len = buf.len().min(i32::MAX as usize) as i32;
+    // SAFETY: fd はこの接続が所有する有効なソケット。buf は len バイト読める。
+    let n = unsafe {
+        WinSock::send(
+            crate::runtime::handle::win::to_socket(fd),
+            buf.as_ptr(),
+            len,
+            0,
+        )
+    };
+    if n < 0 {
+        // SAFETY: 引数を取らず、このスレッドの直前の Winsock の誤りを返すだけ。
+        Err(io::Error::from_raw_os_error(unsafe {
+            WinSock::WSAGetLastError()
+        }))
     } else {
         Ok(n as usize)
     }
@@ -594,9 +645,9 @@ pub(crate) struct BackendTaskParams {
     /// リクエストボディを chunked で転送するか（`true` のとき head は `Transfer-Encoding: chunked`）。
     pub has_request_body: bool,
     /// レスポンス圧縮設定。
-    pub compression: CompressionConfig,
+    pub compression: std::sync::Arc<CompressionConfig>,
     /// クライアントの受理エンコーディング。
-    pub client_encoding: AcceptedEncoding,
+    pub client_encoding: crate::config::ClientAccept,
     /// 接続/読み取りタイムアウト秒。
     pub timeout_secs: u64,
     /// リクエストボディ上限（0 = 無制限）。メインループ側の `ProxyStream` が強制する。
@@ -1374,7 +1425,7 @@ async fn exchange(
 async fn stream_response(
     backend: &BackendIo,
     compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
+    client_encoding: crate::config::ClientAccept,
     timeout_secs: u64,
     no_response_body: bool,
     resp_tx: &Sender<RespMsg>,
@@ -2022,6 +2073,13 @@ async fn buffered_round_trip(
         _ => None,
     };
     let eof_framed = matches!(parsed.framing, Framing::Eof);
+    // B-322: 上流の Content-Length（信用できない）で確保しない。上限を超えるものは読む前に断る（F35）
+    if remaining.is_some_and(|n| n > crate::pool::MAX_COLLECTED_RESPONSE_BODY) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "upstream response body exceeds the buffering limit",
+        ));
+    }
     let mut body: Vec<u8> = Vec::with_capacity(remaining.unwrap_or(leftover.len()));
     let mut exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &leftover);
     let mut done =

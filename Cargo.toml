@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "fuzz", "crates/veil-macros", "crates/veil-capi", "crates/veil-python", "crates/veil-build", "crates/veil-kit"]
+members = [".", "fuzz", "crates/veil-macros", "crates/veil-capi-core", "crates/veil-capi", "crates/veil-capi-helpers", "crates/veil-python", "crates/veil-build", "crates/veil-kit"]
 # third_party/wasmtime は crates.io wasmtime 36.0.20（LTS）の vendoring（B-55 / B-79、path 依存）で
 # あり、独立した crate ではあるがワークスペースメンバーではないため除外する
 # （メンバーに含めると `cargo test`/`cargo clippy --workspace` 等が第三者コードである
@@ -40,7 +40,7 @@ resolver = "2"
 # （ルートから veil-macros への依存の版と、ワークスペース外の Cargo.lock も一緒に更新する）。
 # 公開の workflow（.github/workflows/release.yml）はタグとこの版が違えば何も公開しない。
 [workspace.package]
-version = "0.10.1"
+version = "0.11.0-rc.1"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 authors = ["aofusa"]
@@ -73,6 +73,9 @@ include = [
     "/LICENSE*",
     # F-264: ライブラリの /docs が同梱する Swagger UI（openapi-ui-embedded）
     "/third_party/swagger-ui-dist/**",
+    # F-290: build.rs が Windows の veil.exe に埋め込むアイコンと版の情報の雛形
+    "/packaging/windows/veil.rc",
+    "/packaging/icons/veil.ico",
 ]
 build = "build.rs"
 
@@ -306,9 +309,7 @@ cache = ["dep:dashmap", "dep:glob"]
 # ビルド方法: cargo build --features metrics
 metrics = ["dep:prometheus"]
 
-# WebSocket プロキシサポート
-# Upgrade ヘッダー検出による双方向プロキシ
-# ビルド方法: cargo build --features websocket
+# 互換のためだけに残す（何も切り替えない。WebSocket のプロキシはどの feature の組み合わせでも使える。B-308）
 websocket = []
 
 # レートリミット・接続制限
@@ -712,7 +713,7 @@ regex = { version = "1", optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 # マクロで定義したルート・L4 ハンドラの静的登録（リンク時に収集）
 inventory = { version = "0.3", optional = true }
-veil-macros = { package = "veil-proxy-macros", path = "crates/veil-macros", version = "0.10.1", optional = true }
+veil-macros = { package = "veil-proxy-macros", path = "crates/veil-macros", version = "0.11.0-rc.1", optional = true }
 tower-service = { version = "0.3", optional = true }
 tower-layer = { version = "0.3", optional = true }
 http = { version = "1.4", optional = true }
@@ -807,6 +808,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     "Win32_Foundation",
     "Win32_Security",
+    # ACME の鍵ファイルの DACL（SetNamedSecurityInfoW。B-325）
+    "Win32_Security_Authorization",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_System_IO",

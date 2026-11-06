@@ -32,6 +32,7 @@ pub(crate) fn build_request(
         // HTTP/3 は常に TLS。HTTP/1.1・HTTP/2 は呼び出し側が接続を見て立てる（B-204）
         tls: version == HttpVersion::Http3,
         body_stream: None,
+        protocol: None,
         extensions: Default::default(),
     }
 }
@@ -166,6 +167,103 @@ impl futures::Stream for AfterSendStream {
     }
 }
 
+// F-288: HTTP/2・HTTP/3 の拡張 CONNECT（WebSocket over HTTP/2・HTTP/3）をハンドラへ渡す。ハンドラが `:protocol` と
+// 同じプロトコルへのアップグレードを返したら 200 を送り、ストリームの上でアップグレードの関数を動かす。
+// それ以外の応答はそのまま返す。戻り値 `(status, 応答の本文のバイト数, 要求のバイト数)`。
+/// Serves an extended CONNECT request (RFC 8441 / RFC 9220) on a handler route.
+pub(crate) async fn serve_extended_connect(
+    req: &crate::proxy::ws_tunnel::TunnelRequest,
+    entry: &HandlerEntry,
+    comp: Option<&crate::config::CompressionConfig>,
+    req_rx: Option<crate::stream_channel::Receiver<Bytes>>,
+    out: crate::proxy::ws_tunnel::TunnelOut,
+) -> (u16, u64, u64) {
+    use super::stream::BodyChunk;
+    use futures::StreamExt;
+    let mut headers = req.headers.clone();
+    if !req.authority.is_empty() && !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(b"host")) {
+        headers.push((Bytes::from_static(b"host"), req.authority.clone()));
+    }
+    let version = if out.is_h3() {
+        HttpVersion::Http3
+    } else {
+        HttpVersion::Http2
+    };
+    let mut r = build_request(
+        Bytes::from_static(b"CONNECT"),
+        req.path.clone(),
+        headers,
+        Bytes::new(),
+        &req.client_ip,
+        version,
+    );
+    r.tls = req.tls;
+    r.protocol = Some(req.protocol.clone());
+    let mut cache = CallCache {
+        upgrade_allowed: true,
+        ..Default::default()
+    };
+    let mut resp = call_with(entry, r, &mut cache, comp).await;
+    h2_h3_headers(&mut resp);
+    if let Some(up) = resp.upgrade.take() {
+        if up.protocol.eq_ignore_ascii_case(&req.protocol) {
+            // 拡張 CONNECT の成功は 200（101 ではない）。ハンドシェイクの鍵の応答は HTTP/1.1 だけのもの
+            let headers: Vec<(Bytes, Bytes)> = resp
+                .headers
+                .drain(..)
+                .filter(|(n, _)| {
+                    !n.eq_ignore_ascii_case(b"sec-websocket-accept")
+                        && !n.eq_ignore_ascii_case(b"content-length")
+                })
+                .collect();
+            if out.head(200, headers, true, false).await.is_err() {
+                return (0, 0, 0);
+            }
+            super::upgrade::run_on_stream(up.on_upgrade, req_rx, out, &req.client_ip).await;
+            return (200, 0, 0);
+        }
+        // 開発時の誤り: 要求と違うプロトコルへのアップグレード
+        ftlog::warn!(
+            "[api] a handler answered an extended CONNECT for '{}' with an upgrade to '{}'",
+            String::from_utf8_lossy(&req.protocol),
+            String::from_utf8_lossy(&up.protocol)
+        );
+        resp = Response::error(500, "Internal Server Error");
+        h2_h3_headers(&mut resp);
+    }
+    // アップグレードしなかった（認可の失敗・400 等）: 応答をそのまま返す
+    let status = resp.status_code();
+    let stream = resp.take_stream();
+    let body = std::mem::take(&mut resp.body);
+    let headers = std::mem::take(&mut resp.headers);
+    let end = stream.is_none() && body.is_empty();
+    if out.head(status, headers, true, end).await.is_err() {
+        return (status, 0, 0);
+    }
+    let mut sent = body.len() as u64;
+    if !body.is_empty() && out.body(body).await.is_err() {
+        return (status, sent, 0);
+    }
+    if let Some(mut stream) = stream {
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                BodyChunk::Data(b) => {
+                    sent += b.len() as u64;
+                    if out.body(b).await.is_err() {
+                        break;
+                    }
+                }
+                BodyChunk::Trailers(_) => break,
+                BodyChunk::Abort(_) => {
+                    out.reset().await;
+                    break;
+                }
+            }
+        }
+    }
+    (status, sent, 0)
+}
+
 /// Lowercases header names for HTTP/2 and HTTP/3 and removes connection-specific headers (RFC 9113 section 8.2.2).
 pub(crate) fn h2_h3_headers(resp: &mut Response) {
     resp.headers.retain(|(n, _)| {
@@ -213,7 +311,11 @@ pub(crate) fn write_http1_head(out: &mut Vec<u8>, resp: &Response, keep_alive: b
     out.extend_from_slice(b"\r\n");
     let mut has_len = false;
     for (n, v) in &resp.headers {
-        if n.eq_ignore_ascii_case(b"connection") || n.eq_ignore_ascii_case(b"transfer-encoding") {
+        // B-318: CR・LF を含むヘッダは書かない（ハンドラはデコード済みのクエリ・パスを返し得る）
+        if n.eq_ignore_ascii_case(b"connection")
+            || n.eq_ignore_ascii_case(b"transfer-encoding")
+            || !crate::http_utils::is_writable_h1_field(n, v)
+        {
             continue;
         }
         if n.eq_ignore_ascii_case(b"content-length") {

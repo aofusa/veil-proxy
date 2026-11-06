@@ -7,6 +7,11 @@
 //! dependencies such as `inventory` or `serde_json`.
 // F-241: docs.rs にソースの表示を出さない（コメントは日本語のため）。
 #![doc(html_no_source)]
+// F-290: docs.rs の左上とタブのロゴ（packaging/icons。tools/release/render-icons.sh の生成物）
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/aofusa/veil-proxy/main/packaging/icons/hicolor/128x128/apps/veil.png",
+    html_favicon_url = "https://raw.githubusercontent.com/aofusa/veil-proxy/main/packaging/icons/hicolor/32x32/apps/veil.png"
+)]
 use proc_macro::TokenStream;
 
 mod l4;

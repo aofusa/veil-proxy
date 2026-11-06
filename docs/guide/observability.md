@@ -57,6 +57,7 @@ only move on HTTP/1.1, because the proxy response cache (`[route.cache]`) serves
 | `veil_proxy_cache_size_bytes` | Gauge | storage | Current cache size in bytes |
 | `veil_proxy_cache_entries` | Gauge | storage | Current number of cache entries |
 | `veil_proxy_buffering_used_total` | Counter | host | Requests on routes whose `[route.buffering]` mode buffers the response (gRPC excluded) |
+| `veil_proxy_websocket_tunnels` | Gauge | protocol | Open WebSocket tunnels relayed to upstreams (`protocol` = client side: `http/1.1`, `h2` or `h3`). The `101` request is counted in `http_requests_total` but kept out of the duration and size histograms |
 | `veil_circuit_breaker_open_total` | Counter | upstream | Times a server's breaker opened, per upstream group |
 | `veil_circuit_breaker_state` | Gauge | upstream | Group state: 1 if any server's breaker is Open, 2 if any is HalfOpen, otherwise 0 |
 | `veil_retry_total` | Counter | upstream, result | Retries of idempotent requests whose pooled upstream connection closed before the response (`upstream` = server address, `result` = `stale_connection`) |
@@ -71,6 +72,7 @@ only move on HTTP/1.1, because the proxy response cache (`[route.cache]`) serves
 | `veil_grpc_stream_duration_seconds` | Histogram | method | Time from the start of a relayed gRPC call to its `grpc-status` trailer |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASM filter execution time |
 | `veil_wasm_fuel_consumed_total` | Counter | filter, phase | Total wasmtime fuel consumed by WASM filters |
+| `veil_wasm_failures_total` | Counter | filter, phase, reason, action | Proxy-Wasm filter failures (`reason`: trap, fuel, timeout, instantiate, lifecycle, http_call_resume, unsupported_pause; `action`: rejected, continued per `failure_policy`) |
 
 Label values are kept to a fixed set, so a client cannot create new time series by sending arbitrary values
 (each series stays in memory and in every scrape):
@@ -210,7 +212,7 @@ batch_interval_secs = 30             # Export interval (default: 30s)
 | Option | Description | Default |
 |--------|-------------|---------|
 | `enabled` | Enable OTLP export | `false` |
-| `endpoint` | OTLP/HTTP endpoint URL | `http://localhost:4318` |
+| `endpoint` | OTLP/HTTP endpoint URL. Only `http://`: the exporter does not speak TLS, and an `https://` endpoint is rejected at startup and reload (send to a local collector or sidecar) | `http://localhost:4318` |
 | `service_name` | `service.name` resource attribute | `veil-proxy` |
 | `batch_interval_secs` | Export interval (seconds) | `30` |
 

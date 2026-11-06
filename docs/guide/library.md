@@ -93,7 +93,7 @@ allocator is chosen). API reference: [docs.rs/veil-proxy](https://docs.rs/veil-p
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
 # or the repository / a local checkout:
 # veil = { package = "veil-proxy", git = "https://github.com/aofusa/veil-proxy", default-features = false, features = ["full", "api"] }
 # veil = { package = "veil-proxy", path = "../veil-proxy", default-features = false, features = ["full", "api"] }
@@ -389,8 +389,8 @@ async fn upper(req: &Request) -> Response {
 ### Protocol upgrades (HTTP/1.1)
 
 A handler can take over the connection with `101 Switching Protocols`. `Request::upgrade_protocol()` returns the
-`Upgrade` value when the request asks for an upgrade (`Connection: upgrade` plus `Upgrade`; always `None` on HTTP/2 and
-HTTP/3), and `Response::switching_protocols(protocol, f)` writes the 101 and then calls `f` with an
+`Upgrade` value when the request asks for an upgrade (`Connection: upgrade` plus `Upgrade`; on HTTP/2 and HTTP/3 the
+`:protocol` of an extended CONNECT, see below), and `Response::switching_protocols(protocol, f)` writes the 101 and then calls `f` with an
 `veil::api::upgrade::Upgraded` connection:
 
 ```rust
@@ -439,8 +439,8 @@ Example: [examples/api/rust-websocket/](../../examples/api/rust-websocket/).
 
 `veil::api::ws` terminates WebSocket (RFC 6455) in a handler. `WebSocketUpgrade` is an extractor that checks the
 handshake (HTTP/1.1, `GET`, `Upgrade: websocket`, `Connection: upgrade`, `Sec-WebSocket-Version: 13`, a 16-byte
-`Sec-WebSocket-Key`); a malformed handshake is answered with 400 and another version with 426 and
-`Sec-WebSocket-Version: 13`. `on_upgrade` answers 101 with `Sec-WebSocket-Accept` and runs your function with the
+`Sec-WebSocket-Key`); a request other than `GET` is answered with 405, another malformed handshake with 400, and
+another version with 426 and `Sec-WebSocket-Version: 13`. `on_upgrade` answers 101 with `Sec-WebSocket-Accept` and runs your function with the
 connection:
 
 ```rust
@@ -485,8 +485,11 @@ async fn ws(upgrade: WebSocketUpgrade) -> Response {
   cookies (cross-site WebSocket hijacking).
 - permessage-deflate (RFC 7692) is negotiated only with `[api] websocket_compression = true` (default off; the
   decompressed size is limited by `websocket_max_message_size`).
-- WebSocket works on HTTP/1.1 only: over HTTP/2 and HTTP/3 the handshake is answered with 400 (RFC 8441 / RFC 9220
-  are not supported).
+- WebSocket over HTTP/2 and HTTP/3 (extended CONNECT, RFC 8441 / RFC 9220) works when `[http2]` / `[http3]
+  enable_connect_protocol = true`: `WebSocketUpgrade` accepts `CONNECT` with `:protocol = websocket` (no
+  `Sec-WebSocket-Key`), `on_upgrade` answers `200`, and the `WebSocket` runs over the stream. Other handshakes on
+  HTTP/2 and HTTP/3 are answered with 400. `Response::switching_protocols` works the same way on an extended CONNECT
+  whose `:protocol` matches (a mismatch is answered with 500); `Upgraded::into_tokio_io()` is HTTP/1.1 only.
 - Metrics (`metrics` feature): `veil_proxy_websocket_connections` (open connections) and
   `veil_proxy_websocket_messages_total{direction="received"|"sent"}`.
 - The connection counts against `[security] max_concurrent_connections` like any upgraded connection.
@@ -748,7 +751,7 @@ which re-exports `veil::tokio`):
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
 tokio = { version = "1", features = ["full"] }        # resolved to the shim
 reqwest = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
@@ -756,8 +759,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 [patch.crates-io]
 # the shim is not on crates.io (its package name is `tokio`), so it comes from the repository. Take veil from the
 # same tag so that the shim and your code use one copy of veil (two copies would mean two runtimes).
-tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.10.1", package = "tokio" }   # crates/veil-tokio/tokio-shim
-veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.10.1" }
+tokio = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.11.0-rc.1", package = "tokio" }   # crates/veil-tokio/tokio-shim
+veil-proxy = { git = "https://github.com/aofusa/veil-proxy", tag = "v0.11.0-rc.1" }
 ```
 
 Code that names `veil::tokio` directly (`use veil::tokio as tokio;`) works without the patch.
@@ -831,7 +834,7 @@ anchors from `[tls_client] ca`, or `ClientBuilder::ca`; `client_cert` for mTLS),
 per-worker HTTP/1.1 pool. `Http2::Auto` (default) negotiates h2 or HTTP/1.1 by ALPN over TLS and uses HTTP/1.1 in
 plain text, `Http2::On` uses h2 and h2c with prior knowledge, `Http2::Off` HTTP/1.1. With
 `ClientBuilder::unix_sockets(true)`, `http://unix:/path.sock:/x` connects to a Unix socket (off by default). Response bodies are read whole (`max_response_size`, 64 MiB by default). Errors have a
-`kind()` and convert into a 502 or 504 `Response`. Details: [library-kit.md](library-kit.md#http-client).
+`kind()` and convert into a 502 or 504 `Response` with a generic body (log the error for the details). Details: [library-kit.md](library-kit.md#http-client).
 
 ## GraphQL
 
@@ -1192,6 +1195,68 @@ you serialize messages with the library of your choice (protobuf-c, nanopb, upb,
 Example of all of these: [examples/api/c-features/](../../examples/api/c-features/) (it passes the same tonic
 interoperability checks as the Rust gRPC example).
 
+**Middleware, hooks and app helpers.** These are part of `libveil` too:
+
+- Headers: `veil_response_add_header` (adds another header of the same name, for example a second `Set-Cookie`),
+  `veil_request_header_count` / `veil_request_header_at` / `veil_request_header_next` (every value of a repeated
+  header), `veil_request_version` (`VEIL_HTTP_1_1`, `VEIL_HTTP_2`, `VEIL_HTTP_3`), `veil_request_is_tls`.
+- Request-scoped values: `veil_request_set_local(req, key, ptr, free_fn)` / `veil_request_get_local(req, key)`
+  (freed when the request ends).
+- Middleware: `veil_register_middleware(cfg, prefix, before, after, ud)`. `before` returns `VEIL_MW_CONTINUE` or
+  `VEIL_MW_STOP` (the response it set is sent); `after` sees the final response (not called for streamed
+  responses). Middleware runs on the handler pool in the same call as the handler; the one registered last runs
+  first (outermost), as with Rust's `wrap_on`.
+- After the response: `veil_response_after_send(resp, fn, ud)` runs `fn(ud)` on the handler pool once the response
+  has been sent (after the end of a streamed body).
+- Lifecycle: `veil_config_on_startup` (before the listeners open; a non-zero return stops the start and `veil_run` returns `VEIL_ERR_RUNTIME`),
+  `veil_config_on_worker_start` (`veil_worker_info_t`), `veil_config_on_shutdown` (after the server stopped).
+- `veil_config_cors(cfg, &veil_cors_t)` (CORS with preflight answers), `veil_config_serve_dir(cfg, prefix, dir,
+  &veil_serve_options_t)` (veil's file server), `veil_grpc_reflection(cfg, data, len)` (gRPC server reflection from a
+  `FileDescriptorSet`).
+- WebSocket: `veil_ws_accept_ex(req, resp, &cb, ud, &veil_ws_options_t)` picks a subprotocol, checks `Origin`
+  (403) and sets the message size limit and automatic pong; `veil_ws_protocol(ws, &len)` returns the chosen one.
+
+**Outgoing calls, deferred responses, validation and tests.** Also in `libveil`:
+
+- HTTP client: `veil_client_new(&veil_client_options_t)` (timeouts, HTTP/2, CA / client certificate, user agent,
+  response size limit, Unix sockets) and `veil_client_send(c, &veil_client_request_t, &resp)` (waits), or
+  `veil_client_send_async(c, &req, done, ud)` (`done(rc, resp, ud)` runs on the handler pool). Responses:
+  `veil_client_response_status / header / header_count / header_at / body / free`. Errors are `VEIL_ERR_TIMEOUT`
+  and `VEIL_ERR_CLIENT`; any status code is a successful call.
+- gRPC client: `veil_grpc_channel_new(url, &veil_grpc_channel_options_t)` (h2c or TLS with ALPN h2, gzip, message
+  size, default deadline). `veil_grpc_channel_unary(ch, path, msg, len, &veil_grpc_call_options_t, &call)` and
+  `veil_grpc_channel_unary_async`, or `veil_grpc_channel_call` for every kind of method with
+  `veil_grpc_client_send / close_send / recv / finish / status_message / metadata / cancel / call_free`. Messages
+  are encoded bytes, as on the server side.
+- Calls run on a veil thread shared with the Python bindings, never on a worker. The waiting forms (`veil_client_send`,
+  `veil_grpc_channel_unary`, `veil_grpc_client_recv`, `veil_grpc_client_finish`) are for handlers on the handler pool,
+  setup functions and your own threads; on a worker (`VEIL_ROUTE_INLINE` routes, worker-start functions) they return
+  `VEIL_ERR_STATE`. Use the `_async` forms there.
+- Deferred responses: `veil_deferred_t *d = veil_response_defer(resp)` lets the handler return at once and frees the
+  pool thread. Build the response on `veil_deferred_response(d)` with the usual setters, from any thread (for example
+  from the `done` callback of an asynchronous call), then call `veil_deferred_complete(d)` (`VEIL_ERR_CLOSED` when the
+  client left). `veil_deferred_free(d)` answers 500 instead. Not on `VEIL_ROUTE_INLINE` routes. Middleware "after"
+  steps do not run on a deferred response.
+- JSON body validation: `veil_register_route_ex2(cfg, path, methods, fn, ud, &veil_route_options_t)` with
+  `body_schema_json` (a JSON Schema). A body that is not JSON or does not match is answered with 422 and
+  `{"detail": [{"type", "loc", "msg"}]}` (the format of Rust's `Validate` and FastAPI; `loc` starts with `"body"`)
+  before the handler runs, and the schema becomes the route's `requestBody` in OpenAPI. Supported keywords: `type`
+  (also `null` and lists of types), `properties`, `required`, `additionalProperties`, `items`, `minItems`,
+  `maxItems`, `minLength`, `maxLength`, `pattern`, `enum`, `const`, `minimum`, `maximum`, `exclusiveMinimum`,
+  `exclusiveMaximum`, `multipleOf`, `format` (`email`, `uri`), `nullable`, `allOf`, `anyOf`, `oneOf`, `not`;
+  annotations are ignored. `$ref` and other keywords are rejected when the route is registered (inline referenced
+  schemas). The schema is compiled once at registration.
+- In-process tests: `veil_test_t *t = veil_test_new(cfg)` builds the app (setup functions run, no socket is opened)
+  and `veil_test_request(t, &veil_test_request_t, &resp)` calls it with the same routing (404 / 405), middleware,
+  plugins (CORS, sessions), validation and handler pool as the server, collecting streamed bodies.
+  `veil_test_response_status / header / header_count / header_at / body / trailer / free`; `veil_test_free` runs the
+  shutdown functions. Rust has the same through `App::into_test_client()`.
+
+Cookies, sessions, authentication (Basic, API keys, JWT), redirects, files, app tasks, dependency injection, client
+helpers, a balanced gRPC channel, GraphQL and a test client with a cookie jar for C are in the separate
+library `libveil_kit` (a superset of `libveil`; link one of the two): see
+[Helper crate, C](library-kit.md#c-libveil_kit). Example: [examples/api/c-kit/](../../examples/api/c-kit/).
+
 ## Python
 
 `crates/veil-python` is a PyO3 extension (abi3, Python 3.9+) imported as `veil`:
@@ -1310,8 +1375,10 @@ packaging/scripts/build-lib.sh [--kind all|rust|c|python] [--docker]
 
 builds the selected kinds (`all` is the default; `--docker` runs the build in a container using
 `docker/Dockerfile.lib`) and writes a single archive `veil-lib-<version>-<arch>-linux-gnu.zip` to
-`packaging/output/lib/`. It contains `libveil.so`/`libveil.a` with `veil.h` (C), the Python wheel, and the
-Rust source/usage notes. See [Building](building.md) for the proxy packages.
+`packaging/output/lib/`. It contains `libveil.so`/`libveil.a` with `veil.h` and the helpers kit
+`libveil_kit.so`/`libveil_kit.a` with `veil_kit.h` (C; pkg-config files `veil.pc` and `veil-kit.pc`, and a CMake
+package: `find_package(veil CONFIG)` gives `veil::veil` and `veil::kit`, plus `veil::veil_static` and
+`veil::kit_static`), the Python wheel, and the Rust source/usage notes. Link one of `veil` and `veil-kit`. See [Building](building.md) for the proxy packages.
 
 ## Performance
 
@@ -1417,7 +1484,7 @@ and `tests/standalone_e2e.rs` (F-203, 2026-10):
 ## Testing
 
 ```bash
-tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|python|nonregression|all]     # default: all
+tests/api/library_e2e.sh [rust|grpc|upgrade|websocket|c|c-kit|python|nonregression|all]     # default: all
 ```
 
 builds and starts the Rust showcase, the C example (dynamic and static) and the Python examples and calls them
@@ -1433,7 +1500,7 @@ and the `nonregression` step checks that the proxy binary is unaffected. It runs
 NetBSD and Windows (Git Bash) and picks the `full*` feature set of the system. Needs cargo, a C compiler and make
 (GNU make on BSD; MSVC on Windows), curl with HTTP/2, openssl, protoc (for gRPC) and python3 (set `PY3` when it has
 another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
---lib --features full,api`, `cargo test -p veil-capi`, and `tests/test_binding.py` and `tests/test_aio.py` for Python. See also
+--lib --features full,api`, `cargo test -p veil-capi-core -p veil-capi-helpers`, and `tests/test_binding.py` and `tests/test_aio.py` for Python. See also
 [Testing](testing.md).
 
 ## Limitations
@@ -1446,7 +1513,7 @@ another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
   cookies.
 - Python handlers are bound by the GIL; C callbacks must be thread-safe. Blocking code in an `async def` handler
   stalls its event loop (see above).
-- Protocol upgrades and WebSocket exist only on HTTP/1.1 (HTTP/2 and HTTP/3 extended CONNECT, RFC 8441 / RFC 9220,
-  is not supported).
+- Protocol upgrades and WebSocket over HTTP/2 and HTTP/3 need `enable_connect_protocol = true` (extended CONNECT,
+  off by default); `Upgraded::into_tokio_io()` works on HTTP/1.1 only.
 - Library mode does not use a configuration file in `/etc/veil`: `config.toml` in the current directory (or the path
   you pass) is the only file.

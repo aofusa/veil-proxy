@@ -25,7 +25,10 @@ pub(super) fn compute_upstream_request_path(
     target_path_prefix: &str,
     preserve_full_path: bool,
 ) -> String {
-    if preserve_full_path {
+    // B-322: gRPC（クライアントの content-type で決まる）でフルパスを保つのは、上流の URL にパスが無いときだけ。
+    // パスを書いたルートはいつもその書き換えに従う（以前はクライアントが content-type で書き換えを外し、
+    // 設定の対応付けの外のパスを上流へ要求できた。F45）
+    if preserve_full_path && target_path_prefix.trim_matches('/').is_empty() {
         return if path_str.is_empty() {
             "/".to_string()
         } else {

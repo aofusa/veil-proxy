@@ -8,6 +8,14 @@ use crate::wasm::context::HostState;
 // B-19: マップ直列化は SDK 互換のワイヤ形式を実装する共通モジュールへ集約
 use super::abi::{deserialize_headers, serialize_headers};
 
+/// ゲストの書くヘッダが名前は token（擬似ヘッダの `:` は許す）、値に CR・LF・NUL が無いか。
+/// B-318: 満たさないものは BadArgument にする（HTTP/1.1 の上流への要求・クライアントへの応答へそのまま
+/// 書かれ、要求の密輸・応答の分割になっていた。F40）
+fn guest_field_ok(name: &[u8], value: &[u8]) -> bool {
+    let n = name.strip_prefix(b":").unwrap_or(name);
+    crate::http_utils::is_valid_header_name(n) && crate::http_utils::is_valid_header_value(value)
+}
+
 /// Get headers by map type
 fn get_headers(state: &HostState, map_type: i32) -> Option<&Vec<(Vec<u8>, Vec<u8>)>> {
     match map_type {
@@ -170,7 +178,14 @@ async fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -
         .or_else(|| caller.get_export("malloc"))?;
     let func = func.into_func()?;
     let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
-    typed.call_async(&mut *caller, size as i32).await.ok()
+    let size = i32::try_from(size).ok()?;
+    // B-320: 0 はゲストのアロケータの失敗（以前は有効な場所として先頭からクライアントのバイトを
+    // 書き込んでいた。F49）
+    typed
+        .call_async(&mut *caller, size)
+        .await
+        .ok()
+        .filter(|&p| p != 0 || size == 0)
 }
 
 /// Helper to write to WASM memory
@@ -289,6 +304,9 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 Some(h) => h,
                 None => return PROXY_RESULT_PARSE_FAILURE,
             };
+            if !headers.iter().all(|(k, v)| guest_field_ok(k, v)) {
+                return PROXY_RESULT_BAD_ARGUMENT;
+            }
 
             // Set headers
             let state = caller.data_mut();
@@ -419,6 +437,9 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 Some(v) => v,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
+            if !guest_field_ok(key.as_bytes(), value.as_bytes()) {
+                return PROXY_RESULT_BAD_ARGUMENT;
+            }
 
             let state = caller.data_mut();
             let headers = match get_headers_mut(state, map_type) {
@@ -471,6 +492,9 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 Some(v) => v,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
+            if !guest_field_ok(key.as_bytes(), value.as_bytes()) {
+                return PROXY_RESULT_BAD_ARGUMENT;
+            }
 
             let state = caller.data_mut();
             let headers = match get_headers_mut(state, map_type) {
@@ -543,4 +567,17 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// B-318: ゲストの書くヘッダは CR・LF・NUL を含めない（擬似ヘッダの名前は許す）
+    #[test]
+    fn guest_field_ok_rejects_crlf() {
+        assert!(super::guest_field_ok(b"x-a", b"v"));
+        assert!(super::guest_field_ok(b":path", b"/a"));
+        assert!(!super::guest_field_ok(b"x-a", b"v\r\nx: y"));
+        assert!(!super::guest_field_ok(b"x-a", b"v\0"));
+        assert!(!super::guest_field_ok(b"x\na", b"v"));
+    }
 }

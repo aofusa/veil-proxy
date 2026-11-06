@@ -158,6 +158,8 @@ pub(super) async fn handle_requests(
     let mut first_read = true;
     // B-129: 蓄積に次の要求のヘッダが揃っている（パイプライン）
     let mut pipelined_ready = false;
+    // B-317: 今の要求の前に捨てた空行のバイト数
+    let mut skipped_empty_lines = 0usize;
     // ネイティブハンドラの呼び出しで要求をまたいで使い回す状態（F-202）
     #[cfg(feature = "handler")]
     let mut api_cache = crate::api::dispatch::CallCache::default();
@@ -222,6 +224,30 @@ pub(super) async fn handle_requests(
             }
         }
 
+        // B-317: 要求行の前の空行（RFC 9112 §2.2）はここで捨てる。httparse は先頭の空行を飛ばして読むが、
+        // 下のヘッダの大きさの検査は最初の CRLFCRLF の位置で測るので、`\r\n\r\n` で始まる要求は検査を
+        // すり抜け、蓄積が際限なく伸びる（F8）うえ、8KB を超えるヘッダの位置を u16 に詰めて別のバイトを
+        // ヘッダとして読んでいた（F7）。捨てる量にも上限を掛ける
+        if matches!(accumulated.first(), Some(b'\r' | b'\n')) {
+            let lead = accumulated
+                .iter()
+                .take_while(|&&b| b == b'\r' || b == b'\n')
+                .count();
+            bytes::Buf::advance(&mut accumulated, lead);
+            skipped_empty_lines += lead;
+            if skipped_empty_lines > MAX_HEADER_SIZE {
+                let _ = timeout(
+                    WRITE_TIMEOUT,
+                    tls_stream.write_all(ERR_MSG_BAD_REQUEST.to_vec()),
+                )
+                .await;
+                return;
+            }
+            if accumulated.is_empty() {
+                continue;
+            }
+        }
+
         // ヘッダーサイズ制限チェック（RFC 6585: 431 Request Header Fields Too Large）
         // ヘッダー終端 \r\n\r\n が見つかった場合はヘッダー部分のみをチェック。
         // まだヘッダーが完全でない場合は蓄積サイズで判定する。
@@ -266,7 +292,18 @@ pub(super) async fn handle_requests(
         let mut req = Request::new(&mut headers_storage);
 
         match req.parse(&accumulated) {
+            // B-317: httparse が読んだヘッダの長さでも上限を確かめる（下でヘッダの位置を u16 に詰める前提）
+            Ok(Status::Complete(header_len)) if header_len > MAX_HEADER_SIZE => {
+                let _ = timeout(
+                    WRITE_TIMEOUT,
+                    tls_stream.write_all(ERR_MSG_REQUEST_HEADER_TOO_LARGE.to_vec()),
+                )
+                .await;
+                lingering_drain_before_close(&mut tls_stream).await;
+                return;
+            }
             Ok(Status::Complete(header_len)) => {
+                skipped_empty_lines = 0;
                 // 各フィールドの (offset, len) を req の借用中（accumulated への参照が
                 // 生きている間）に確定する。以後は accumulated を可変利用するため、
                 // ここでオフセットをすべて集め終えたら直ちに req をドロップする。
@@ -282,8 +319,7 @@ pub(super) async fn handle_requests(
                     .iter()
                     .find(|h| h.name.eq_ignore_ascii_case("user-agent"))
                     .map(|h| slice_range(&accumulated, h.value));
-                // F-261: HTTP/1.0 の要求はアップグレードできない（ハンドラの判定にだけ使う）
-                #[cfg(feature = "handler")]
+                // F-261・B-307: HTTP/1.0 の要求はアップグレードできない
                 let http10 = req.version == Some(0);
                 // ヘッダの位置はスタックの配列に控える（要求ごとに Vec を確保しない。F-202）。
                 // httparse の格納先と同じ 64 個が上限。ヘッダ部は上の検査で MAX_HEADER_SIZE（8KB）以下なので
@@ -390,10 +426,11 @@ pub(super) async fn handle_requests(
                     return;
                 }
 
+                // B-317: 値は数字だけを受ける（`+5`・Unicode の空白を受け付けると、生の値を受け取る上流と本文の
+                // 長さの解釈が食い違う。F17）
                 let content_length: usize = if let Some((_, cl_value)) = cl_first {
-                    match std::str::from_utf8(cl_value)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<usize>().ok())
+                    match crate::http_utils::parse_content_length(cl_value)
+                        .and_then(|n| usize::try_from(n).ok())
                     {
                         Some(len) => len,
                         None => {
@@ -426,32 +463,29 @@ pub(super) async fn handle_requests(
                     }
                 };
 
-                // Connection ヘッダーチェック（Keep-Alive / Upgrade対応）
-                let connection_header: Option<&[u8]> = headers_for_proxy
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(b"connection"))
-                    .map(|(_, value)| value.as_ref());
+                // Connection ヘッダーチェック（Keep-Alive / Upgrade対応）。B-307: 全ての `Connection` ヘッダを
+                // トークンに分けて比べる（確保しない。`close, foo` も close、`x-upgrade-hint` は upgrade ではない）
+                let client_wants_close: bool = crate::http_utils::header_has_token(
+                    &headers_for_proxy,
+                    b"connection",
+                    b"close",
+                );
+                let is_upgrade_connection: bool = crate::http_utils::header_has_token(
+                    &headers_for_proxy,
+                    b"connection",
+                    b"upgrade",
+                );
 
-                let client_wants_close: bool = connection_header
-                    .map(|v| v.eq_ignore_ascii_case(b"close"))
-                    .unwrap_or(false);
-
-                // WebSocket Upgrade チェック
-                // Connection: upgrade と Upgrade: websocket の両方が必要
-                let is_upgrade_connection: bool = connection_header
-                    .map(|v| {
-                        // "upgrade" または "keep-alive, upgrade" などのパターンに対応
-                        v.to_ascii_lowercase().windows(7).any(|w| w == b"upgrade")
-                    })
-                    .unwrap_or(false);
-
-                let is_websocket_upgrade: bool = headers_for_proxy
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(b"upgrade"))
-                    .map(|(_, value)| value.eq_ignore_ascii_case(b"websocket"))
-                    .unwrap_or(false);
-
-                let is_websocket: bool = is_upgrade_connection && is_websocket_upgrade;
+                // WebSocket Upgrade チェック: Connection: upgrade と Upgrade: websocket の両方が要る。
+                // RFC 6455 §4.1: GET・HTTP/1.1 だけ（それ以外はアップグレードせず通常の要求として扱う）
+                let is_websocket: bool = is_upgrade_connection
+                    && !http10
+                    && method_bytes.as_ref() == b"GET"
+                    && crate::http_utils::header_has_token(
+                        &headers_for_proxy,
+                        b"upgrade",
+                        b"websocket",
+                    );
 
                 // F-266: ライブラリのビルドでは、上限を超える本文は経路を見てから判断する（ストリーミング受信の
                 // ハンドラは本文を溜めないので通す）。本体のビルドは今までどおりここで 413
@@ -788,10 +822,9 @@ pub(super) async fn handle_requests(
                     }
                 };
 
-                // F-261: ハンドラのルートの WebSocket の要求は 400 にせず、通常のハンドラの経路へ進める
-                // （ハンドラが 101 を返して接続を引き取る）。先読みの残りはパイプラインの分として取っておく。
-                #[cfg(feature = "handler")]
-                let is_websocket = is_websocket && !matches!(backend, Backend::Handler(..));
+                // B-307: WebSocket のトンネルは Proxy のルートだけ。他のルート（ハンドラ・File・Respond・Redirect）は
+                // 通常の経路へ進める（ハンドラは 101 を返して接続を引き取る。F-261。認可・fault の応答はそのまま返る）
+                let is_websocket = is_websocket && matches!(backend, Backend::Proxy(..));
 
                 // セキュリティ設定を取得
                 let security = backend.security();
@@ -943,7 +976,9 @@ pub(super) async fn handle_requests(
                                     Arc::from(method_str),
                                     headers_vec,
                                     Arc::from(client_ip),
-                                    content_length == 0 && !is_chunked, // end_of_stream
+                                    // end_of_stream。B-320: WebSocket は本文の段を走らせないので、本文を待つ
+                                    // Pause を決めずに通さないよう、本文が無いものとして渡す（F57）
+                                    (content_length == 0 && !is_chunked) || is_websocket,
                                 )
                                 .await;
 
@@ -1021,11 +1056,6 @@ pub(super) async fn handle_requests(
                                             accumulated.windows(4).any(|w| w == b"\r\n\r\n");
                                     }
                                     continue;
-                                }
-                                crate::wasm::FilterResult::Pause => {
-                                    // 非同期処理待ち（現在は未実装）
-                                    warn!("WASM module requested pause, but async operations are not yet supported");
-                                    headers_for_proxy
                                 }
                             }
                         } else {
@@ -1183,7 +1213,7 @@ pub(super) async fn handle_requests(
 
                 // WebSocket Upgrade の場合は専用ハンドラーを使用
                 if is_websocket {
-                    // WebSocket はプロキシバックエンドでのみサポート
+                    // WebSocket はプロキシバックエンドでのみ（上で Proxy 以外は外した）
                     if let Backend::Proxy(ref upstream_group, ref security, _, _, _, _) = backend {
                         debug!(
                             "WebSocket upgrade request detected for path: {}",
@@ -1258,11 +1288,6 @@ pub(super) async fn handle_requests(
                             }
                         }
                         // WebSocket 接続終了後は HTTP 接続も終了
-                        return;
-                    } else {
-                        // ファイルバックエンドでは WebSocket 非対応
-                        let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
-                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                         return;
                     }
                 }
@@ -1560,32 +1585,54 @@ pub(super) async fn handle_backend(
                 method,
                 headers.iter().map(|(n, v)| (n.as_ref(), v.as_ref())),
             );
+            // F-294: 事前圧縮した兄弟があればそれを返す（圧縮はしない）
+            let sibling = data.select_sibling(sreq.accept_encoding, route_compression);
+            let (rep_len, rep_validators, rep_compression) = match sibling {
+                Some(sib) => (
+                    sib.body.len() as u64,
+                    &sib.validators,
+                    crate::static_response::no_compression(),
+                ),
+                None => (data.len(), &data.validators, route_compression),
+            };
             let plan = crate::static_response::plan(
                 &sreq,
-                data.len(),
+                rep_len,
                 &mime_type,
-                Some(&data.validators),
-                route_compression,
+                Some(rep_validators),
+                rep_compression,
             );
             let status = plan.status();
-            let vary = crate::static_response::compression_applies(
-                route_compression,
-                &mime_type,
-                data.len(),
-            );
-            let body = data.body_for(&plan, route_compression);
+            let vary = data.uses_precompressed()
+                || crate::static_response::compression_applies(
+                    route_compression,
+                    &mime_type,
+                    data.len(),
+                );
+            let body = match sibling {
+                Some(sib) => crate::static_response::slice_for_plan(&sib.body, &plan),
+                None => data.body_for(&plan, route_compression),
+            };
             let header = sendfile::build_h1_static_head(
                 &plan,
-                data.len(),
-                body.len() as u64,
+                rep_len,
+                Some(body.len() as u64),
                 &mime_type,
-                Some(&data.validators),
+                Some(rep_validators),
                 vary,
                 &security,
             );
             // WASMレスポンスヘッダーフィルタを適用（後段で Connection ヘッダーを追記するため mut）
             #[cfg(feature = "wasm")]
-            let mut header = sendfile::h1_wasm_response_head(header, status, &wasm_modules).await;
+            let mut header =
+                match sendfile::h1_wasm_response_head(header, status, &wasm_modules).await {
+                    Ok(h) => h,
+                    Err(resp) => {
+                        return sendfile::write_h1_wasm_local(&mut tls_stream, &resp, sreq.head)
+                            .await
+                            .map(|(st, n)| (tls_stream, st, n, client_wants_close));
+                    }
+                };
             #[cfg(not(feature = "wasm"))]
             let mut header = header;
 
@@ -1618,6 +1665,7 @@ pub(super) async fn handle_backend(
             canonical_base,
             static_file_cache_config,
             _,
+            precompressed,
         ) => {
             let sreq = crate::static_response::StaticRequest::from_headers(
                 method,
@@ -1638,6 +1686,7 @@ pub(super) async fn handle_backend(
                 canonical_base.as_deref(),
                 wasm_modules,
                 static_file_cache_config.as_deref(),
+                precompressed,
             )
             .await
         }
@@ -2139,7 +2188,11 @@ pub(super) async fn write_api_chunked(
     }
     let mut tail = Vec::with_capacity(5 + trailers.len() * 32);
     tail.extend_from_slice(b"0\r\n");
-    for (n, v) in &trailers {
+    // B-318: CR・LF を含むトレーラは書かない
+    for (n, v) in trailers
+        .iter()
+        .filter(|(n, v)| crate::http_utils::is_writable_h1_field(n, v))
+    {
         tail.extend_from_slice(n);
         tail.extend_from_slice(b": ");
         tail.extend_from_slice(v);
@@ -2252,30 +2305,10 @@ pub(super) async fn handle_redirect(
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
     let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
 
-    // パス部分（prefix除去後）
-    let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
-        &path_str[prefix_str.len()..]
-    } else {
-        path_str
-    };
-
-    // 変数置換とパス追加
-    let mut final_url = redirect_url
-        .replace("$request_uri", path_str)
-        .replace("$path", sub_path);
-
-    // preserve_path が true の場合、元のパスを追加
-    if preserve_path && !sub_path.is_empty() {
-        // URLにすでにパスがある場合は結合
-        if final_url.ends_with('/') && sub_path.starts_with('/') {
-            final_url.push_str(&sub_path[1..]);
-        } else if !final_url.ends_with('/') && !sub_path.starts_with('/') {
-            final_url.push('/');
-            final_url.push_str(sub_path);
-        } else {
-            final_url.push_str(sub_path);
-        }
-    }
+    // B-322: `$path` は常に `/` で始める（ルートが `/` のとき `/@evil.com` から `@evil.com` になり、
+    // `https://new.example.com$path` が別のホストを指した。F56）
+    let final_url =
+        crate::http_utils::build_redirect_url(redirect_url, path_str, prefix_str, preserve_path);
 
     // ステータス行を構築
     let status_line = match status_code {

@@ -496,7 +496,9 @@ reuseport_balancing = "cbpf"
 # チャンクサイズ設定 (sendfile/splice)
 # ------------------------------------------
 #
-# kTLSのsendfile/splice転送時のチャンクサイズを制御します。
+# プロキシの本文を splice(2) で転送するときのチャンクサイズを制御します（平文・kTLS の HTTP/1.1）。
+# Linux の静的ファイルの sendfile(2) は 1 回 1MB まで送るごとにワーカーへ譲ります（この設定は使いません）。
+# FreeBSD の kTLS の静的ファイルの sendfile(2) はこの大きさで送ります。
 #
 # モード:
 #   "dynamic" - ファイルサイズに基づいて自動調整（デフォルト）
@@ -512,7 +514,7 @@ reuseport_balancing = "cbpf"
 # Per-Stream パイプ割当 (kTLS splice)
 # ------------------------------------------
 #
-# splice転送で使用するパイプの割当方式を制御します。
+# splice転送（平文・kTLS の HTTP/1.1 のプロキシの本文）で使用するパイプの割当方式を制御します。
 #
 # false（デフォルト）: スレッドローカルパイプを再利用
 #   - メモリ効率が良い
@@ -1277,6 +1279,11 @@ watch = false
 # デフォルト: 60
 # stream_idle_timeout_secs = 60
 
+# 拡張 CONNECT（RFC 8441）: SETTINGS_ENABLE_CONNECT_PROTOCOL を広告し、HTTP/2 の上の WebSocket を受ける
+# （:protocol = websocket の CONNECT を GET と同じにルーティングし、上流へは HTTP/1.1 のアップグレードで中継する）
+# デフォルト: false
+# enable_connect_protocol = false
+
 
 # ==========================================
 # HTTP/3 詳細設定 (RFC 9114, QUIC RFC 9000)
@@ -1427,12 +1434,16 @@ watch = false
 # HEADERS の長さの宣言の時点と QPACK の復号（1 フィールドにつき 32 バイトを足す）で検査する。超えた接続は閉じる。
 # veil の要求ヘッダの上限（8KB）を超えてこれ以下の要求は 431。デフォルト: 65536（[http2] max_header_list_size と同じ）
 # max_field_section_size = 65536
+#
+# enable_connect_protocol: 拡張 CONNECT（RFC 9220）。SETTINGS_ENABLE_CONNECT_PROTOCOL を広告し、
+# HTTP/3 の上の WebSocket を受ける（上流へは HTTP/1.1 のアップグレードで中継する）。デフォルト: false
+# enable_connect_protocol = false
 
 # ------------------------------------------
 # HTTP/3 専用圧縮設定
 # ------------------------------------------
 # HTTP/3接続時のみ圧縮を常に有効化できます。
-# パスごとの設定で compression.enabled = false の場合はそちらが優先されます。
+# compression_enabled = true はパスごとの設定の enabled = false より優先されます（その経路も HTTP/3 では圧縮する）。
 #
 # compression_enabled = true  # HTTP/3接続時は常に圧縮を有効化
 #
@@ -1612,6 +1623,12 @@ watch = false
 # 止まるので instance_reuse のインスタンスが同時に多く開き、要求ごとの費用が増える
 # デフォルト: 1000
 # yield_interval_us = 1000
+# フィルタが失敗した（トラップ・CPU や時間の上限・インスタンスを作れない・起動時のコールバックの失敗・
+# 待てない Pause）ときの扱い。"fail_closed"（503）・"fail_open"（そのモジュールを飛ばして続ける）・
+# "fail_reload"（503 にして使い回しているインスタンスを作り直す）。[[wasm.modules]] の failure_policy で上書きできる。
+# 0.11.0 より前は常に fail_open 相当だった
+# デフォルト: "fail_closed"
+# failure_policy = "fail_closed"
 
 # Poolingアロケータ設定
 # [wasm.defaults.pooling]
@@ -1644,6 +1661,9 @@ watch = false
 # # （`proxy_on_context_create`）とコールバックだけになる（Envoy と同じ寿命。フィルタのグローバル変数・
 # # root context の状態が要求をまたいで残る）。トラップしたインスタンスは捨てて作り直す。
 # instance_reuse = false
+#
+# # F-293: このモジュールが失敗したときの扱い（[wasm.defaults] の failure_policy を上書き）
+# # failure_policy = "fail_open"
 #
 # # F-271: 起動時（と設定のリロード時）に読むファイル。値はプロパティ `plugin_data.<名前>` で読める
 # # （capabilities の allowed_properties を書くなら "plugin_data.*" を含める）。要求ごとのファイルの読み取りは無い。
@@ -2005,13 +2025,28 @@ watch = false
 # max_entries = 50000
 # watch = true  # ディスクの変更を通知で追従する（F-272。既定は [performance] open_file_cache_watch）
 # # 静的ファイル本体キャッシュ設定（F-146、ルーティングごと、グローバル設定を上書き）
-# # HTTP/2・HTTP/3 のファイル本体をユーザ空間メモリに保持し、リクエストごとの
-# # オフロード読み込みを削減します（HTTP/1.1 は sendfile(2) 使用のため対象外）
+# # ファイル本体をユーザ空間メモリに保持し、リクエストごとのオフロード読み込みを削減します。
+# # HTTP/1.1 は kTLS と FreeBSD の平文では sendfile(2) で送るので対象外（Linux の平文・rustls は使う）
 # [route.static_file_cache]
 # enabled = true
 # valid_duration_secs = 300
 # max_file_size_bytes = 2097152  # 2 MiB
 # watch = true  # ディスクの変更を通知で追従する（F-272。既定は [static_file_cache] watch）
+
+# 事前圧縮したファイル（F-294。nginx の gzip_static / brotli_static 相当）
+# app.js の隣の app.js.br・app.js.gz・app.js.zst を圧縮せずに返す（sendfile・kTLS のまま）。
+# 値は "br"（.br）・"gzip"（.gz）・"zstd"（.zst）。並びは同じ q のときの優先順。
+# 元のファイルより古い兄弟は使わない。このルートの応答には常に Vary: Accept-Encoding を付ける。
+# open_file_cache が有効なら兄弟の有無を有効期間だけ覚える（無効だと要求ごとに探す）。
+# [[route]]
+# [route.conditions]
+# path = "/assets/*"
+# [route.action]
+# type = "File"
+# path = "/var/www/assets/"
+# precompressed = ["br", "gzip"]
+# [route.open_file_cache]
+# enabled = true
 
 # カスタムインデックス (profile.html)
 # [[route]]
@@ -2116,18 +2151,9 @@ watch = false
 # "Server"・"Alt-Svc" を書くと veil 自身の Server・HTTP/3 の広告も付けない）
 # remove_response_headers = ["Server", "X-Powered-By"]
 #
-# WebSocket 転送のポーリングモード（"adaptive" | "fixed"）
-# adaptive: アイドル時にタイムアウトを指数的に伸ばして CPU を節約（デフォルト）
-# websocket_poll_mode = "adaptive"
-#
-# WebSocket adaptive ポーリングの初期タイムアウト（ミリ秒）
-# websocket_poll_timeout_ms = 1
-#
-# WebSocket adaptive ポーリングの最大タイムアウト（ミリ秒）
-# websocket_poll_max_timeout_ms = 100
-#
-# WebSocket adaptive ポーリングのバックオフ倍率
-# websocket_poll_backoff_multiplier = 2.0
+# WebSocket のポーリングの設定（websocket_poll_mode・websocket_poll_timeout_ms・websocket_poll_max_timeout_ms・
+# websocket_poll_backoff_multiplier）は v0.11.0 で廃止し、無視する（中継は両方向を同時に待つのでポーリングしない。B-306）。
+# 既存の設定が読めるようキーは受け付ける。
 # アップグレード（101）の後のトンネルで、どちらの向きにもこの秒数データが流れなければ閉じる（0 = 無制限。デフォルト: 0）
 # websocket_idle_timeout_secs = 0
 
@@ -2218,7 +2244,8 @@ watch = false
 # 
 # 注意:
 #   - デフォルトは無効（enabled = false）
-#   - 有効にするとkTLSのゼロコピー最適化は迂回されます
+#   - 有効にすると、Accept-Encoding でルートの方式を受け付ける要求はゼロコピー（平文・kTLS の splice）を
+#     使わずユーザー空間を通ります（結果として圧縮しない応答も）
 #   - 帯域節約が重要なAPIエンドポイントでの使用を推奨
 #
 # [route.action]
@@ -2231,6 +2258,8 @@ watch = false
 #   
 #   # 圧縮方式の優先順位（クライアントのAccept-Encodingと照合）
 #   # サポート: "zstd", "br" (Brotli), "gzip", "deflate"
+#   # この中からクライアントの q 値が最も高い方式を選ぶ（同点はこの順。q=0 の方式・ここに無い方式は使わない）
+#   # 圧縮には compression feature 付きのビルドが要る（無ければロード時に警告し、圧縮せずに送る）
 #   preferred_encodings = ["zstd", "br", "gzip"]
 #   
 #   # Gzip圧縮レベル (1-9)
@@ -2254,7 +2283,7 @@ watch = false
 #     "image/svg+xml",
 #   ]
 #   
-#   # 圧縮をスキップするMIMEタイプ（プレフィックスマッチ）
+#   # 圧縮をスキップするMIMEタイプ（プレフィックスマッチ。compressible_types と両方に一致したら長く一致した方が勝つ）
 #   skip_types = [
 #     "image/",
 #     "video/",

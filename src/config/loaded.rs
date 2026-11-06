@@ -622,8 +622,9 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
             // F-219: ルート単位のトラフィック制御（分割先の Backend・固定応答をここで作る）
             route.resolved_traffic =
                 crate::route_traffic::resolve(&route, &upstream_groups, build_loaded)?;
-            route.resolved_compression =
-                Some(Arc::new(route.compression.clone().unwrap_or_default()));
+            let compression = route.compression.clone().unwrap_or_default();
+            compression.warn_if_unbuilt();
+            route.resolved_compression = Some(Arc::new(compression));
             route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
             routes_vec.push(route);
         }
@@ -848,8 +849,9 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
             // F-219: ルート単位のトラフィック制御（分割先の Backend・固定応答をここで作る）
             route.resolved_traffic =
                 crate::route_traffic::resolve(&route, &upstream_groups, build_loaded)?;
-            route.resolved_compression =
-                Some(Arc::new(route.compression.clone().unwrap_or_default()));
+            let compression = route.compression.clone().unwrap_or_default();
+            compression.warn_if_unbuilt();
+            route.resolved_compression = Some(Arc::new(compression));
             route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
             routes_vec.push(route);
         }
@@ -1505,8 +1507,18 @@ fn apply_global_cache_settings(
 /// File のルートが `watch = true` なら、ルートの `path` を監視して世代をキャッシュの設定に持たせる（F-272）
 #[cfg(feature = "cache")]
 fn attach_static_watch(backend: Backend, defaults: WatchDefaults) -> Backend {
-    let Backend::SendFile(path, is_dir, index, security, cache_cfg, ofc, canonical, sfc, modules) =
-        backend
+    let Backend::SendFile(
+        path,
+        is_dir,
+        index,
+        security,
+        cache_cfg,
+        ofc,
+        canonical,
+        sfc,
+        modules,
+        pre,
+    ) = backend
     else {
         return backend;
     };
@@ -1538,7 +1550,7 @@ fn attach_static_watch(backend: Backend, defaults: WatchDefaults) -> Backend {
         None => (ofc, sfc),
     };
     Backend::SendFile(
-        path, is_dir, index, security, cache_cfg, ofc, canonical, sfc, modules,
+        path, is_dir, index, security, cache_cfg, ofc, canonical, sfc, modules, pre,
     )
 }
 
@@ -1555,6 +1567,32 @@ fn attach_static_watch(backend: Backend, defaults: WatchDefaults) -> Backend {
 /// B-64 で判明したコストの大きい `canonicalize`/`metadata` は `canonical_base_memoized` /
 /// `is_dir_memoized` で設定パスごとに 1 回だけ実行するようメモ化してある（2 回目以降は
 /// syscall なし）。
+/// ルートのキャッシュの名前空間（B-321）。条件とアクションから決める（再読み込み・再起動で同じルートなら同じ値。
+/// HashMap の条件は並べ替えて書く）
+fn route_cache_namespace(route: &Route) -> u64 {
+    use std::fmt::Write as _;
+    let c = &route.conditions;
+    fn sorted(m: &Option<HashMap<String, String>>) -> Vec<(&String, &String)> {
+        let mut v: Vec<_> = m.iter().flatten().collect();
+        v.sort();
+        v
+    }
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}",
+        c.host,
+        c.path,
+        sorted(&c.header),
+        c.method,
+        sorted(&c.query),
+        c.source_ip,
+        route.action,
+        route.traffic
+    );
+    xxhash_rust::xxh3::xxh3_64(s.as_bytes()).max(1)
+}
+
 #[allow(clippy::disallowed_methods)]
 pub(super) fn build_backend(
     route: &Route,
@@ -1564,7 +1602,8 @@ pub(super) fn build_backend(
     let security = route.security.clone().unwrap_or_default();
     let compression = route.compression.clone().unwrap_or_default();
     let buffering = route.buffering.clone().unwrap_or_default();
-    let cache = route.cache.clone().unwrap_or_default();
+    let mut cache = route.cache.clone().unwrap_or_default();
+    cache.route_ns = route_cache_namespace(route);
     // F-148: 設定ロード時に解決済みの `resolved_modules` を Arc clone するだけ
     // （従来あった `Arc::new(m.clone())` = リクエストごとの `Vec<String>` ディープコピーを排除）。
     // `resolved_modules` が未設定（安全網）の場合のみ、名前のみの `ModuleRef` を都度組み立てる。
@@ -1686,10 +1725,16 @@ pub(super) fn build_backend(
                 modules_arc.clone(),
             ))
         }
-        BackendConfig::File { path, mode, index } => {
+        BackendConfig::File {
+            path,
+            mode,
+            index,
+            precompressed,
+        } => {
             // Routeレベルの設定のみを使用
             let security = route.security.clone().unwrap_or_default();
-            let cache = route.cache.clone().unwrap_or_default();
+            let mut cache = route.cache.clone().unwrap_or_default();
+            cache.route_ns = route_cache_namespace(route);
             let access_err = |e: io::Error| {
                 let error_msg = format!(
                     "Failed to access file '{}': {} (error code: {})",
@@ -1768,12 +1813,17 @@ pub(super) fn build_backend(
                     );
                     let mime_type = mime_guess::from_path(path).first_or_octet_stream();
 
+                    let mut content = crate::static_response::MemoryContent::new(
+                        data,
+                        modified,
+                        mime_type.as_ref(),
+                    );
+                    // F-294: 事前圧縮した兄弟もロード時に読む（元より古い・通常のファイルでないものは使わない）
+                    if !precompressed.is_empty() {
+                        content.load_precompressed(*precompressed, Path::new(path), modified);
+                    }
                     Ok(Backend::MemoryFile(
-                        Arc::new(crate::static_response::MemoryContent::new(
-                            data,
-                            modified,
-                            mime_type.as_ref(),
-                        )),
+                        Arc::new(content),
                         Arc::from(mime_type.as_ref()),
                         security,
                         modules_arc.clone(),
@@ -1809,6 +1859,7 @@ pub(super) fn build_backend(
                         canonical_base,
                         static_file_cache_arc,
                         modules_arc.clone(),
+                        *precompressed,
                     ))
                 }
                 _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid mode")),

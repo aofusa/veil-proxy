@@ -304,13 +304,16 @@ type TextCheck = fn(&[u8]) -> bool;
 
 /// The WebSocket handshake of a request (an extractor). Checks the request (HTTP/1.1, `GET`,
 /// `Upgrade: websocket`, `Connection: upgrade`, `Sec-WebSocket-Version: 13` and a 16-byte `Sec-WebSocket-Key`):
-/// a malformed handshake is 400, another version is 426 with `Sec-WebSocket-Version: 13`.
+/// a malformed handshake is 400, another version is 426 with `Sec-WebSocket-Version: 13`. On HTTP/2 and HTTP/3
+/// the handshake is an extended CONNECT with `:protocol` `websocket` (RFC 8441 / RFC 9220; enable
+/// `[http2] enable_connect_protocol` / `[http3] enable_connect_protocol`), answered with `200`.
 pub struct WebSocketUpgrade {
     key: Bytes,
     offered: Option<Bytes>,
     origin: Option<Bytes>,
+    // B-308: `Sec-WebSocket-Extensions` の全部の行
     #[cfg(feature = "compression")]
-    extensions: Option<Bytes>,
+    extensions: Vec<Bytes>,
     supported: Vec<String>,
     allowed_origins: Option<Vec<String>>,
     max_message: Option<usize>,
@@ -342,8 +345,21 @@ fn has_token(v: &[u8], token: &[u8]) -> bool {
 impl super::extract::FromRequest for WebSocketUpgrade {
     fn from_request(req: &Request) -> Result<Self, Response> {
         let bad = |m: &str| Err(Response::error(400, m));
+        // F-288: HTTP/2・HTTP/3 の拡張 CONNECT（RFC 8441・RFC 9220）。鍵の交換は無く、成功は 200
         if req.version != super::request::HttpVersion::Http11 {
-            return bad("WebSocket requires HTTP/1.1");
+            if &req.method[..] != b"CONNECT"
+                || !req
+                    .protocol
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case(b"websocket"))
+            {
+                return bad("not a WebSocket handshake (HTTP/2 and HTTP/3 need an extended CONNECT with :protocol websocket)");
+            }
+            if header(req, "sec-websocket-version").map(|v| v.trim_ascii()) != Some(&b"13"[..]) {
+                return Err(Response::error(426, "Unsupported Sec-WebSocket-Version")
+                    .with_header("sec-websocket-version", "13"));
+            }
+            return Ok(Self::handshake(req, Bytes::new()));
         }
         if &req.method[..] != b"GET" {
             return Err(Response::error(405, "Method Not Allowed"));
@@ -368,19 +384,31 @@ impl super::extract::FromRequest for WebSocketUpgrade {
             }
             _ => return bad("invalid Sec-WebSocket-Key"),
         };
-        Ok(WebSocketUpgrade {
+        Ok(Self::handshake(req, key))
+    }
+}
+
+impl WebSocketUpgrade {
+    /// The handshake of a checked request (`key` is empty for an extended CONNECT).
+    fn handshake(req: &Request, key: Bytes) -> WebSocketUpgrade {
+        WebSocketUpgrade {
             key,
             offered: header(req, "sec-websocket-protocol").cloned(),
             origin: header(req, "origin").cloned(),
             #[cfg(feature = "compression")]
-            extensions: header(req, "sec-websocket-extensions").cloned(),
+            extensions: req
+                .headers
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case(b"sec-websocket-extensions"))
+                .map(|(_, v)| v.clone())
+                .collect(),
             supported: Vec::new(),
             allowed_origins: None,
             max_message: None,
             auto_pong: true,
             typed_check: None,
             validate: false,
-        })
+        }
     }
 }
 
@@ -462,14 +490,14 @@ impl WebSocketUpgrade {
                 return Response::error(403, "Forbidden: origin not allowed");
             }
         }
-        let accept = codec::accept_key(&self.key);
+        // 拡張 CONNECT（鍵が無い）は Accept を返さない
+        let accept = (!self.key.is_empty()).then(|| codec::accept_key(&self.key));
         let protocol = self.selected_protocol().map(str::to_string);
         #[cfg(feature = "compression")]
-        let deflate = match &self.extensions {
-            Some(e) if COMPRESSION.load(Ordering::Relaxed) => {
-                deflate::negotiate(std::iter::once(&e[..]))
-            }
-            _ => None,
+        let deflate = if !self.extensions.is_empty() && COMPRESSION.load(Ordering::Relaxed) {
+            deflate::negotiate(self.extensions.iter().map(|e| &e[..]))
+        } else {
+            None
         };
         let opts = Options {
             max_message: self.max_message,
@@ -484,8 +512,10 @@ impl WebSocketUpgrade {
             deflate: deflate.as_ref().map(|(_, p)| *p),
         };
         let mut resp =
-            Response::switching_protocols("websocket", move |up: Upgraded| serve(up, opts, f))
-                .with_header("sec-websocket-accept", accept);
+            Response::switching_protocols("websocket", move |up: Upgraded| serve(up, opts, f));
+        if let Some(accept) = accept {
+            resp = resp.with_header("sec-websocket-accept", accept);
+        }
         if let Some(p) = protocol {
             resp = resp.with_header("sec-websocket-protocol", p);
         }

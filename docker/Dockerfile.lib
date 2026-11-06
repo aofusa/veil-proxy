@@ -33,7 +33,7 @@ WORKDIR /app
 COPY . /app
 RUN set -eux; \
     if echo ",${LIB_KINDS}," | grep -q ",c,"; then \
-      cargo build --locked --profile "${CARGO_PROFILE}" -p veil-capi; \
+      cargo build --locked --profile "${CARGO_PROFILE}" -p veil-capi -p veil-capi-helpers; \
     fi; \
     mkdir -p /wheels; \
     if echo ",${LIB_KINDS}," | grep -q ",python,"; then \

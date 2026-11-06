@@ -121,6 +121,8 @@ packaging/
 ├── README.md                    # 本ファイル
 ├── debian/DEBIAN/               # .deb メタデータ
 ├── rpm/veil.spec                # .rpm spec ファイル
+├── icons/                       # ロゴから作ったアイコン（tools/release/render-icons.sh の生成物）と AppStream のメタデータ
+├── windows/                     # MSI（veil.wxs）と veil.exe のリソースの雛形（veil.rc。build.rs が使う）
 ├── scripts/
 │   ├── build.sh                 # 統合ビルド（.deb + .rpm）
 │   ├── build-bsd.sh             # FreeBSD/OpenBSD/NetBSD tar.gz（VM ネイティブビルド）
@@ -494,6 +496,14 @@ zip には `veil.exe`・`config.toml.default`・`www/index.html`・`INSTALL.txt`
 （`ACTIVE_PROCESS=1`、`KILL_ON_JOB_CLOSE`）を適用するのみで、seccomp/Landlock
 相当のシステムコールフィルタではない。
 
+**アイコンと版の情報（F-290）**: `build.rs` が `packaging/windows/veil.rc`（`packaging/icons/veil.ico` と版）を
+llvm-rc で `.res` にして `veil.exe` にリンクする。Dockerfile は `VEIL_REQUIRE_WIN_RESOURCES=1` を設定しているので、
+リソースコンパイラが無ければビルドが失敗する（手元の cargo では警告だけで続く）。`dist.yml` の `cross` の job が
+`tools/release/check-pe-resources.py` でリソースがあることを、`windows-test` の job がエクスプローラと同じ API で版の情報を確かめる。
+MSI は同じ ico を `ARPPRODUCTICON` に使う。deb・rpm・ports は `packaging/icons/hicolor/` と AppStream のメタデータを入れる。
+ロゴを差し替えたら `tools/release/render-icons.sh` で作り直してコミットする（CI の `--check` が検出する）。
+Docker Hub・ghcr.io のリポジトリのロゴはレジストリの画面で人が設定する（`packaging/icons/hicolor/256x256/apps/veil.png`）。
+
 **`AWS_LC_SYS_NO_PREFIX` について（B-47）**: `http3` / `full` ビルドで
 `aws-lc-sys` と `quiche` のシンボルをどう扱うかは
 **`.cargo/config.toml` の `[env]`（ターゲット接尾辞付き変数）が唯一の設定箇所**である
@@ -539,10 +549,10 @@ veil-<version>-<target>/
 例:
 
 ```
-packaging/output/veil_0.10.1_amd64.deb
-packaging/output/veil-0.10.1-1.x86_64.rpm
-packaging/output/veil-0.10.1-x86_64-unknown-linux-gnu.tar.gz
-packaging/output/veil-0.10.1-x86_64-unknown-linux-musl.tar.gz
+packaging/output/veil_0.11.0-rc.1_amd64.deb
+packaging/output/veil-0.11.0-rc.1-1.x86_64.rpm
+packaging/output/veil-0.11.0-rc.1-x86_64-unknown-linux-gnu.tar.gz
+packaging/output/veil-0.11.0-rc.1-x86_64-unknown-linux-musl.tar.gz
 ```
 
 ### ビルド処理の流れ
@@ -626,8 +636,8 @@ git tag v0.9.0      && git push origin v0.9.0        # 本番の draft を作る
 手元で作ったパッケージを入れるときは:
 
 ```bash
-sudo apt install ./packaging/output/veil_0.10.1_amd64.deb      # 入れると起動する
-sudo dnf install ./packaging/output/veil-0.10.1-1.x86_64.rpm && sudo systemctl enable --now veil
+sudo apt install ./packaging/output/veil_0.11.0-rc.1_amd64.deb      # 入れると起動する
+sudo dnf install ./packaging/output/veil-0.11.0-rc.1-1.x86_64.rpm && sudo systemctl enable --now veil
 curl http://127.0.0.1:8080/
 ```
 
@@ -648,7 +658,7 @@ TLS の証明書は作らない（既定の設定は `127.0.0.1:8080` の平文�
 ```bash
 ./packaging/scripts/test-deb.sh                      # ubuntu:24.04（VEIL_TEST_BASE で変える）
 ./packaging/scripts/test-rpm.sh                      # amazonlinux:2023
-./packaging/scripts/test-package.sh deb debian:12 packaging/output/veil_0.10.1_amd64.deb
+./packaging/scripts/test-package.sh deb debian:12 packaging/output/veil_0.11.0-rc.1_amd64.deb
 ```
 
 `test-package.sh` は systemd の動くコンテナで、新しく入れる（deb は入れただけで有効・起動、rpm は `enable --now`）→

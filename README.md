@@ -136,7 +136,7 @@ A fully commented reference of every key is in [examples/config.toml](examples/c
 ```toml
 # Cargo.toml (the crate is `veil-proxy` on crates.io; keep the name `veil`, the macros refer to it)
 [dependencies]
-veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
+veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
 serde_json = "1"
 ```
 

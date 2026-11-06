@@ -437,6 +437,11 @@ impl TcpStream {
         self.readable()
     }
 
+    /// `unix.rs` の `readable_confirmed` に対応する（B-69）。WSAPoll にはヒントが無く、常に確かめる。
+    pub fn readable_confirmed(&self) -> Readable<'_> {
+        self.readable()
+    }
+
     pub fn writable(&self) -> Writable<'_> {
         Writable {
             fd: self.fd,

@@ -4,7 +4,9 @@
 //! HTTP/2・HTTP/3 のヘッダの名前は小文字（`HttpResponse::header` は大文字小文字を区別しない）。
 
 use super::*;
-use bytes::{Buf, Bytes};
+#[cfg(feature = "http3")]
+use bytes::Buf;
+use bytes::Bytes;
 use std::sync::Arc;
 
 /// クライアントのプロトコル
@@ -454,6 +456,7 @@ pub async fn h3_connect(
 }
 
 /// HTTP/3 の要求（ヘッダだけ）を作る
+#[cfg(feature = "http3")]
 pub fn h3_request(
     port: u16,
     method: &str,

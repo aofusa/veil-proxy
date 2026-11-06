@@ -57,7 +57,15 @@ ENV CMAKE_SYSTEM_NAME=Windows \
     XWIN_CACHE_DIR=/xwin-cache \
     CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
     CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
-    CMAKE=/usr/local/bin/cmake-msvc-static
+    CMAKE=/usr/local/bin/cmake-msvc-static \
+    VEIL_REQUIRE_WIN_RESOURCES=1
+
+# F-290: build.rs は veil.exe のアイコンと版の情報を llvm-rc で .res にする（上の VEIL_REQUIRE_WIN_RESOURCES=1 で、
+# 見つからなければビルドを失敗させる）。イメージによっては版の付いた名前（llvm-rc-<版>）しか無いので、無ければ足す
+RUN command -v llvm-rc >/dev/null 2>&1 \
+    || { rc="$(ls -1 /usr/bin/llvm-rc-* /usr/lib/llvm-*/bin/llvm-rc 2>/dev/null | sort -V | tail -n 1)" \
+         && [ -n "$rc" ] && ln -s "$rc" /usr/local/bin/llvm-rc; } \
+    || { apt-get update -y && apt-get install -y --no-install-recommends llvm && rm -rf /var/lib/apt/lists/*; }
 
 # B-167: cargo-xwin が作る CMake の toolchain は `set(CMAKE_MSVC_RUNTIME_LIBRARY CACHE STRING "MultiThreaded")` で、値が
 # 説明の欄に入って変数が空のままになる（cargo-xwin 0.23 で確認）。CMake 3.15 以降の既定（/MD）で BoringSSL（boring-sys）が
@@ -82,6 +90,9 @@ ARG RUST_TARGET=x86_64-pc-windows-msvc
 COPY Cargo.toml Cargo.lock /app/
 COPY .cargo/config.toml /app/.cargo/config.toml
 COPY build.rs /app/build.rs
+# F-290: build.rs が veil.exe に埋め込むアイコンと版の情報（cacher 段でも build.rs は走る）
+COPY packaging/windows/veil.rc /app/packaging/windows/veil.rc
+COPY packaging/icons/veil.ico /app/packaging/icons/veil.ico
 COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
 # third_party/wasmtime はルート Cargo.toml が参照するパス依存クレート（B-55）。
 # 本ターゲットではビルドされなくても、マニフェストが無いと cargo のワークスペース解決自体が失敗する

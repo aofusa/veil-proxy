@@ -1,0 +1,37 @@
+// F-290: Windows の veil.exe に埋め込むリソース（アイコンと版の情報）の雛形。
+// build.rs が @...@ を埋めて OUT_DIR に書き出し、リソースコンパイラ（llvm-rc か rc.exe）で .res にして
+// veil の bin だけにリンクする。プリプロセッサに頼らない（#include・#define を使わない）ので、llvm-rc が
+// clang を見つけられない環境でも同じ結果になる。// で始まる行は build.rs が取り除く。
+// 数値: VS_FF_* は無し、VOS_NT_WINDOWS32 = 0x40004、VFT_APP = 0x1。言語は 0x0409（英語・米国）、
+// 文字コードは 1200（Unicode）。
+
+1 ICON "@ICON_PATH@"
+
+1 VERSIONINFO
+FILEVERSION @VERSION_COMMA@
+PRODUCTVERSION @VERSION_COMMA@
+FILEFLAGSMASK 0x3f
+FILEFLAGS 0x0
+FILEOS 0x40004
+FILETYPE 0x1
+FILESUBTYPE 0x0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName", "aofusa"
+      VALUE "FileDescription", "veil reverse proxy and web server"
+      VALUE "FileVersion", "@VERSION@"
+      VALUE "InternalName", "veil"
+      VALUE "LegalCopyright", "Licensed under Apache-2.0 OR MIT"
+      VALUE "OriginalFilename", "veil.exe"
+      VALUE "ProductName", "veil"
+      VALUE "ProductVersion", "@VERSION@"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

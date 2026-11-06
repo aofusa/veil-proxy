@@ -485,9 +485,16 @@ impl UpstreamGroup {
     }
 
     /// H2C設定を変更したコピーを作成
+    ///
+    /// B-322: h2c は TLS の上流には付けない（`ProxyTarget::with_h2c` と同じ）。以前はグループ全体に付け、
+    /// HTTP/2・HTTP/3 の経路が `https://` のサーバへ平文の h2c で要求（Authorization・Cookie・本文）を送っていた（F47）。
+    /// サーバごとに付け、グループの印は全サーバが平文のときだけ立てる
     pub fn with_h2c(&self, use_h2c: bool) -> Self {
         let mut new_group = self.clone();
-        new_group.use_h2c = use_h2c;
+        for s in &mut new_group.servers {
+            s.target = s.target.clone().with_h2c(use_h2c);
+        }
+        new_group.use_h2c = use_h2c && new_group.servers.iter().all(|s| !s.target.use_tls);
         new_group
     }
 
@@ -827,5 +834,23 @@ impl UpstreamGroup {
     /// H2C (HTTP/2 over cleartext) を強制するかどうかを取得
     pub fn use_h2c(&self) -> bool {
         self.use_h2c
+    }
+}
+
+#[cfg(test)]
+mod h2c_tests {
+    use super::*;
+
+    /// B-322: h2c は TLS の上流に付けない（グループの印も立てない）
+    #[test]
+    fn with_h2c_never_overrides_tls() {
+        let tls = UpstreamGroup::single(ProxyTarget::parse("https://a.example:443").unwrap())
+            .with_h2c(true);
+        assert!(!tls.use_h2c());
+        assert!(!tls.servers[0].target.use_h2c);
+        let plain = UpstreamGroup::single(ProxyTarget::parse("http://a.example:80").unwrap())
+            .with_h2c(true);
+        assert!(plain.use_h2c());
+        assert!(plain.servers[0].target.use_h2c);
     }
 }

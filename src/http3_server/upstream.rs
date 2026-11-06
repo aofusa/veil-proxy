@@ -26,33 +26,25 @@ pub(super) async fn apply_h3_wasm_response_headers(
     wasm_modules: &crate::wasm_plugin_config::WasmModules,
     status: u16,
     header_store: Vec<(Vec<u8>, Vec<u8>)>,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, crate::wasm::LocalResponse> {
     if wasm_modules.is_empty() {
-        return header_store;
+        return Ok(header_store);
     }
     let config = CURRENT_CONFIG.load();
     let Some(ref wasm_engine) = config.wasm_filter_engine else {
-        return header_store;
+        return Ok(header_store);
     };
 
-    let wasm_result = wasm_engine
+    // ヘッダはエンジンへムーブする（エンジンは成功でも失敗でも回収して返す。F-43）
+    match wasm_engine
         .clone()
-        .on_response_headers_with_modules_async(
-            wasm_modules.clone(),
-            status,
-            header_store.clone(),
-            true,
-        )
-        .await;
-
-    if let crate::wasm::FilterResult::Continue {
-        headers: modified_headers,
-        ..
-    } = wasm_result
+        .on_response_headers_with_modules_async(wasm_modules.clone(), status, header_store, true)
+        .await
     {
-        return modified_headers;
+        crate::wasm::FilterResult::Continue { headers, .. } => Ok(headers),
+        // 応答ヘッダの段のローカルレスポンス（B-300。呼び出し元が元の応答の代わりに送る）
+        crate::wasm::FilterResult::LocalResponse(resp) => Err(resp),
     }
-    header_store
 }
 
 /// F-132: HTTP/3 経路の WASM ライフサイクル終端ヘルパ（`on_log` = `on_request_complete_async`）。
@@ -380,6 +372,7 @@ pub async fn run_http3_server_async(
         config.handshake_timeout,
     );
     configure_max_field_section_size(config.max_field_section_size);
+    configure_extended_connect(config.enable_connect_protocol);
     let mut mmsg_scratch = crate::udp::socket::MmsgRecvScratch::with_batch(mmsg_batch);
 
     // F-130 C1/C2: io_uring RECVMSG バックエンド（Linux uring バックエンド）。

@@ -254,36 +254,59 @@ Supports WebSocket (RFC 6455) proxying.
 Automatically detects `Connection: Upgrade` and `Upgrade: websocket` headers
 and performs bidirectional data transfer.
 
-WebSocket is accepted on HTTP/1.1 connections only (plain and TLS). veil does not advertise
-`SETTINGS_ENABLE_CONNECT_PROTOCOL`, so WebSocket over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) is not available;
-browsers then open a separate HTTP/1.1 connection for the WebSocket. A listener that only serves HTTP/3 cannot carry
+WebSocket is accepted on HTTP/1.1 connections (plain and TLS) and, when enabled, over HTTP/2 (RFC 8441) and HTTP/3
+(RFC 9220) with the extended CONNECT method. Extended CONNECT is off by default: set `[http2] enable_connect_protocol =
+true` and/or `[http3] enable_connect_protocol = true` to advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL`. Without it,
+browsers open a separate HTTP/1.1 connection for the WebSocket, and a listener that only serves HTTP/3 cannot carry
 WebSocket.
+
+### WebSocket over HTTP/2 and HTTP/3 (extended CONNECT)
+
+```toml
+[http2]
+enable_connect_protocol = true   # advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441)
+
+[http3]
+enable_connect_protocol = true   # advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 9220)
+```
+
+- The client sends `CONNECT` with `:protocol = websocket`, `:scheme`, `:path` and `:authority` on one stream. The
+  request is routed and checked like a `GET` to `:path` (host, path, `[route.security]`, Proxy-Wasm request headers).
+- On a `Proxy` route veil opens an HTTP/1.1 WebSocket upgrade to the upstream (always HTTP/1.1, with its own
+  `Sec-WebSocket-Key`, and checks `Sec-WebSocket-Accept`). The upstream's `101` becomes `200` on the client stream;
+  `Sec-WebSocket-Protocol` and `Sec-WebSocket-Extensions` are kept and the route's response-header policy applies. An
+  upstream that does not upgrade has its status, headers and body returned on the stream.
+- The stream's DATA frames then carry the WebSocket bytes in both directions. Flow control follows consumption (a
+  slow upstream slows the client down instead of buffering). The client ending its stream half-closes the upstream
+  connection; the upstream closing ends the stream. Errors, `websocket_idle_timeout_secs` and graceful shutdown
+  reset the stream (`RST_STREAM(CANCEL)` on HTTP/2, `H3_REQUEST_CANCELLED` on HTTP/3), so a cut tunnel never looks
+  like a clean close.
+- Tunnel streams are not subject to `stream_idle_timeout_secs` or the request body timeout (they are idle by design);
+  use `websocket_idle_timeout_secs` on the route instead. Each tunnel counts toward the connection's
+  `max_concurrent_streams`.
+- `:protocol` values other than `websocket` are answered with 501 on `Proxy` routes, and routes that are not `Proxy`
+  (or a library handler) answer 400. A plain `CONNECT` without `:protocol` is still refused with 405.
+- `:protocol` is accepted only on `CONNECT` and only when the setting is advertised; otherwise the stream (HTTP/2) or
+  the request (HTTP/3) is rejected as malformed.
 
 ### Behavior
 
-1. Detect Upgrade request from client
-2. Forward Upgrade request to backend
-3. Receive 101 Switching Protocols
-4. Start bidirectional bypass transfer (operates in configured polling mode)
-5. Continue until either connection closes
+1. Detect an Upgrade request from the client (`GET` over HTTP/1.1, or extended `CONNECT` over HTTP/2 / HTTP/3, on a
+   `Proxy` route)
+2. Forward the Upgrade request to the backend (always over HTTP/1.1)
+3. Receive 101 Switching Protocols (other responses are returned whole and the connection is closed)
+4. Relay bytes in both directions: the relay waits on both sides at once and copies from whichever side has data
+   (through a userspace buffer; idle tunnels cost no CPU)
+5. Continue until either connection closes, the idle limit (`websocket_idle_timeout_secs`) passes, or graceful shutdown starts
 
-### Polling Modes
-
-Control polling behavior during WebSocket bidirectional transfer via configuration.
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `adaptive` (default) | Short during data transfer, longer when idle | General purpose, CPU efficiency focused |
-| `fixed` | Always uses fixed timeout | Real-time games, low latency priority |
-
-See the "[WebSocket Configuration](routing.md#websocket-configuration)" section for detailed configuration options.
+The `websocket_poll_*` options of older versions are deprecated and ignored. See
+"[WebSocket Configuration](routing.md#websocket-configuration)" for the details.
 
 ### Configuration Examples
 
 WebSocket is automatically supported with regular Proxy backends:
 
 ```toml
-# WebSocket application (default settings)
 [[route]]
 [route.conditions]
 host = "example.com"
@@ -292,18 +315,9 @@ path = "/ws/*"
 type = "Proxy"
 url = "http://localhost:3000"
 
-# Low latency configuration (for real-time games)
-[[route]]
-[route.conditions]
-host = "game.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3001"
-
+# Close tunnels that carry no data for 10 minutes
 [route.security]
-  websocket_poll_mode = "fixed"
-  websocket_poll_timeout_ms = 1
+websocket_idle_timeout_secs = 600
 ```
 
 ### Supported Backends

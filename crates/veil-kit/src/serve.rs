@@ -3,7 +3,8 @@
 //! Static files.
 //!
 //! Directories are served by veil's own file server, outside the handler path (sendfile, kTLS, Range, ETag and the
-//! file caches all apply; `compression` compresses files for HTTP/2 and HTTP/3, precompressed files are not used):
+//! file caches all apply; `compression` compresses files on HTTP/1.1, HTTP/2 and HTTP/3, and `precompressed` serves
+//! precompressed `.br` / `.gz` / `.zst` siblings):
 //!
 //! ```no_run
 //! use veil::prelude::*;

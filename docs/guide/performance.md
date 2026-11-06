@@ -20,7 +20,7 @@ threads = 0  # If unspecified or 0, uses same number as CPU cores
 | `threads = 0` | Same number of threads as CPU cores |
 | `threads = 4` | Start with 4 threads |
 
-- Each worker thread is pinned to a CPU core (CPU affinity)
+- Each worker thread is pinned to a CPU core (CPU affinity). macOS does not support pinning (Apple silicon), so workers run unpinned there
 - If thread count exceeds core count, assigned round-robin
 - Recommend setting lower in memory-constrained environments
 - `0` / unspecified honors the cgroup CPU quota (`cpu.max` / `cpu.cfs_quota_us`): a container started with `--cpus 0.25` gets 1 worker, not one per host core
@@ -229,11 +229,12 @@ HTTP/1.1 response bodies are passed to the kernel without copying them through v
 |---|---|---|
 | Plaintext, Linux | `sendfile(2)`, header sent with `MSG_MORE` (files in the static content cache are sent from the cache) | `splice(2)` |
 | Plaintext, FreeBSD | `sendfile(2)` with the header in the same call | copied |
-| kTLS | `sendfile(2)` | `splice(2)` (Linux) |
+| kTLS | `sendfile(2)`, header sent separately without `MSG_MORE` (the kernel encrypts; Linux uses the same path as plaintext) | `splice(2)` (Linux) |
 | Userspace TLS (rustls) | copied (and encrypted) | copied |
 
 The proxy path is not used on routes that compress, cache, buffer (`buffering`), run Proxy-Wasm or add CORS headers,
-or for chunked bodies. HTTP/2 and HTTP/3 always copy: each DATA frame or QUIC packet needs its own framing, and one
+or for chunked bodies. HTTPS upstreams (even with kTLS on both ends), WebSocket and HTTP/2 over kTLS also copy.
+HTTP/2 and HTTP/3 always copy: each DATA frame or QUIC packet needs its own framing, and one
 `writev` of copied data is cheaper than several system calls per frame.
 
 ### FreeBSD: zero-copy h2c static files (F-240)

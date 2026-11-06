@@ -201,6 +201,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/pe"
           for z in packaging/output/*.zip; do unzip -q -o "$z" -d "$RUNNER_TEMP/pe"; done
           python3 tools/release/check-pe-imports.py "$RUNNER_TEMP"/pe/*/veil.exe
+      # F-290: veil.exe にアイコンと版の情報のリソースがある（build.rs が埋め込む）
+      - name: icon and version information in veil.exe
+        if: matrix.target == 'windows'
+        run: python3 tools/release/check-pe-resources.py "$RUNNER_TEMP"/pe/*/veil.exe
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.target }}
@@ -217,7 +221,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-14, macos-15-intel]
+        runner: [macos-15, macos-15-intel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -242,7 +246,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-14, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm]
+        runner: [macos-15, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -310,6 +314,17 @@ jobs:
           n="veil-$v-${{ matrix.arch }}-pc-windows-msvc"
           mkdir -p x && (cd x && unzip -q "../dist/$n.zip")
           tools/release/binary-smoke.sh "x/$n" "$v"
+      # F-290: veil.exe の版の情報をエクスプローラのプロパティと同じ API で読む（アイコンの有無は cross の job が
+      # check-pe-resources.py で確かめる）
+      - name: version information in veil.exe
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $exe = (Resolve-Path "x/veil-$v-${{ matrix.arch }}-pc-windows-msvc/veil.exe").Path
+          $vi = (Get-Item $exe).VersionInfo
+          $vi | Format-List ProductName, ProductVersion, FileVersion, FileDescription, CompanyName
+          if ($vi.ProductName -ne 'veil' -or $vi.ProductVersion -ne $v) { Write-Output "::error title=Windows::veil.exe has no version information (ProductName '$($vi.ProductName)', ProductVersion '$($vi.ProductVersion)')"; exit 1 }
+          Write-Output "ok veil.exe has its version information ($($vi.ProductVersion))"
       # B-167: runner には Visual C++ 再頒布パッケージが入っているので、それが無い Windows（Nano Server のコンテナ）でも起動する
       - name: run on a Windows without the Visual C++ runtime (Nano Server)
         if: matrix.arch == 'x86_64'
@@ -360,11 +375,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
-      # VM の起動が止まることがある（rc.2 の NetBSD は起動の途中で 3 時間止まった。いつもは 40 分以内）。
+      # VM の中のコマンドが止まることがある（B-292: v0.9.0-rc.4・v0.10.1-rc.3 の NetBSD は 100 分の時間切れまで止まった。
+      # いつもは 40 分以内）。ログは job にも流し（tee）、bsd-guest-build.sh が段ごとに時間を切る。
       # ビルドの失敗はこの step を失敗にしない（BUILD_FAILED を書く）ので、失敗・時間切れは VM の不調として 1 回だけやり直す
       - name: build, unit tests and smoke test in the VM
         id: vm
-        timeout-minutes: 100
+        timeout-minutes: 60
         continue-on-error: true
         uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
         with:
@@ -376,7 +392,8 @@ jobs:
           shell: bash
           run: |
             mkdir -p out
-            sudo sh tools/release/bsd-guest-build.sh ${{ matrix.os }} ${{ matrix.arch }} out > out/build.log 2>&1 || { echo "BUILD_FAILED" >> out/build.log; }
+            { sudo sh tools/release/bsd-guest-build.sh ${{ matrix.os }} ${{ matrix.arch }} out; echo $? > out/rc; } 2>&1 | tee out/build.log
+            [ "$(cat out/rc)" = 0 ] || echo "BUILD_FAILED" >> out/build.log
             sudo chown -R "$(id -u)" out || true
       - name: stop the stuck VM
         if: steps.vm.outcome != 'success'
@@ -386,7 +403,7 @@ jobs:
           rm -rf out
       - name: build, unit tests and smoke test in the VM (retry)
         if: steps.vm.outcome != 'success'
-        timeout-minutes: 100
+        timeout-minutes: 60
         uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
         with:
           operating_system: ${{ matrix.os }}
@@ -397,7 +414,8 @@ jobs:
           shell: bash
           run: |
             mkdir -p out
-            sudo sh tools/release/bsd-guest-build.sh ${{ matrix.os }} ${{ matrix.arch }} out > out/build.log 2>&1 || { echo "BUILD_FAILED" >> out/build.log; }
+            { sudo sh tools/release/bsd-guest-build.sh ${{ matrix.os }} ${{ matrix.arch }} out; echo $? > out/rc; } 2>&1 | tee out/build.log
+            [ "$(cat out/rc)" = 0 ] || echo "BUILD_FAILED" >> out/build.log
             sudo chown -R "$(id -u)" out || true
       - name: report
         if: always()

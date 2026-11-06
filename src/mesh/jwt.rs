@@ -144,6 +144,8 @@ pub struct Provider {
     /// (小文字のヘッダ名, 接頭辞)
     pub from_headers: Vec<(String, String)>,
     pub from_params: Vec<String>,
+    /// B-314: Cookie から取る名前（Envoy の `from_cookies`）
+    pub from_cookies: Vec<String>,
     pub payload_in_metadata: String,
     pub space_delimited: Vec<String>,
     pub clock_skew: u64,
@@ -238,6 +240,7 @@ pub fn translate(any: &p::Any) -> Result<JwtCfg, String> {
                 forward: pp.forward,
                 from_headers,
                 from_params,
+                from_cookies: pp.from_cookies.clone(),
                 payload_in_metadata: pp.payload_in_metadata.clone(),
                 space_delimited: pp
                     .normalize_payload_in_metadata
@@ -324,16 +327,22 @@ fn token_from(
 ) -> Option<(String, Option<Bytes>)> {
     for (name, prefix) in &prov.from_headers {
         if let Some(v) = header(name) {
-            let s = String::from_utf8_lossy(&v).into_owned();
-            let t = if prefix.is_empty() {
-                Some(s.trim().to_string())
-            } else if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-                Some(s[prefix.len()..].trim().to_string())
+            // B-314: 接頭辞はバイト列で比べる。文字列にしてから `s[..prefix.len()]` で切ると、その位置に
+            // 多バイト文字がまたがる値（`Bearer` の途中に UTF-8 を置いた Authorization）で panic し、
+            // ワーカーごと落ちていた
+            let p = prefix.as_bytes();
+            let rest = if p.is_empty() {
+                Some(&v[..])
+            } else if v.len() >= p.len() && v[..p.len()].eq_ignore_ascii_case(p) {
+                Some(&v[p.len()..])
             } else {
                 None
             };
-            if let Some(t) = t.filter(|t| !t.is_empty()) {
-                return Some((t, Some(Bytes::from(name.clone()))));
+            if let Some(rest) = rest {
+                let t = String::from_utf8_lossy(rest).trim().to_string();
+                if !t.is_empty() {
+                    return Some((t, Some(Bytes::from(name.clone()))));
+                }
             }
         }
     }
@@ -344,7 +353,39 @@ fn token_from(
             }
         }
     }
+    // B-314: `from_cookies` を読んでいなかった（Cookie だけのプロバイダではトークンが「無い」扱いになり、
+    // `allow_missing` と組むと偽造・期限切れのトークンでも検証されずに通っていた）
+    if !prov.from_cookies.is_empty() {
+        if let Some(c) = header("cookie") {
+            for name in &prov.from_cookies {
+                if let Some(v) = cookie_value(&c, name.as_bytes()) {
+                    if !v.is_empty() {
+                        return Some((String::from_utf8_lossy(v).into_owned(), None));
+                    }
+                }
+            }
+        }
+    }
     None
+}
+
+/// `Cookie: a=b; c=d` から名前の一致する最初の値を取る（名前は大文字小文字を区別する。RFC 6265）
+fn cookie_value<'a>(header: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    header.split(|&b| b == b';').find_map(|pair| {
+        let pair = pair.trim_ascii();
+        let eq = pair.iter().position(|&b| b == b'=')?;
+        if pair[..eq].trim_ascii() == name {
+            let v = pair[eq + 1..].trim_ascii();
+            // 引用符で囲んだ値（RFC 6265 の cookie-value）は外す
+            Some(
+                v.strip_prefix(b"\"")
+                    .and_then(|x| x.strip_suffix(b"\""))
+                    .unwrap_or(v),
+            )
+        } else {
+            None
+        }
+    })
 }
 
 fn verify_sig(alg: &str, key: &Key, msg: &[u8], sig: &[u8]) -> bool {
@@ -475,7 +516,11 @@ fn eval(
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    out.add_headers.push((h.clone(), Bytes::from(s)));
+                    // B-314: クレームの文字列は JSON のエスケープで CR・LF・NUL を含み得る。そのまま上流の
+                    // HTTP/1.1 のヘッダに書くとヘッダ・要求の注入になるので、フィールド値として正しくない値は付けない
+                    if crate::http_utils::is_valid_h2_field_value(s.as_bytes()) {
+                        out.add_headers.push((h.clone(), Bytes::from(s)));
+                    }
                 }
             }
             let key = if prov.payload_in_metadata.is_empty() {
@@ -560,7 +605,11 @@ mod tests {
     const TOKEN_GROUP: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6IkRIRmJwb0lVcXJZOHQyenBBMnFYZkNtcjVWTzVaRXI0UnpIVV8tZW52dlEiLCJ0eXAiOiJKV1QifQ.eyJleHAiOjM1MzczOTExMDQsImdyb3VwcyI6WyJncm91cDEiLCJncm91cDIiXSwiaWF0IjoxNTM3MzkxMTA0LCJpc3MiOiJ0ZXN0aW5nQHNlY3VyZS5pc3Rpby5pbyIsInNjb3BlIjpbInNjb3BlMSIsInNjb3BlMiJdLCJzdWIiOiJ0ZXN0aW5nQHNlY3VyZS5pc3Rpby5pbyJ9.EdJnEZSH6X8hcyEii7c8H5lnhgjB5dwo07M5oheC8Xz8mOllyg--AHCFWHybM48reunF--oGaG6IXVngCEpVF0_P5DwsUoBgpPmK1JOaKN6_pe9sh0ZwTtdgK_RP01PuI7kUdbOTlkuUi2AO-qUyOm7Art2POzo36DLQlUXv8Ad7NBOqfQaKjE9ndaPWT7aexUsBHxmgiGbz1SyLH879f7uHYPbPKlpHU6P9S-DaKnGLaEchnoKnov7ajhrEhGXAQRukhDPKUHO9L30oPIr5IJllEQfHYtt6IZvlNUGeLUcif3wpry1R5tBXRicx2sXMQ7LyuDremDbcNy_iE76Upg";
 
     fn cfg() -> JwtCfg {
-        let prov = Provider {
+        cfg_with(|_| {})
+    }
+
+    fn cfg_with(edit: impl FnOnce(&mut Provider)) -> JwtCfg {
+        let mut prov = Provider {
             name: "origins-0".into(),
             issuer: "testing@secure.istio.io".into(),
             audiences: vec![],
@@ -568,12 +617,14 @@ mod tests {
             forward: true,
             from_headers: vec![("authorization".into(), "Bearer ".into())],
             from_params: vec!["access_token".into()],
+            from_cookies: vec![],
             payload_in_metadata: "payload".into(),
             space_delimited: vec!["scope".into()],
             clock_skew: 60,
             claim_to_headers: vec![],
             keys: parse_jwks(JWKS),
         };
+        edit(&mut prov);
         let mut providers = HashMap::new();
         providers.insert("origins-0".into(), Arc::new(prov));
         JwtCfg {
@@ -608,5 +659,71 @@ mod tests {
             authenticate(&c, b"GET", b"/", &hb).err(),
             Some((401, "Jwt verification fails"))
         );
+    }
+
+    /// B-314: 接頭辞の長さの位置に多バイト文字がまたがる Authorization で panic しない
+    #[test]
+    fn multibyte_at_prefix_boundary_does_not_panic() {
+        let c = cfg();
+        for v in [
+            "Bearer\u{00e9}x",
+            "Beare\u{3042}token",
+            "\u{1f600}\u{1f600}",
+        ] {
+            let h = |n: &str| (n == "authorization").then(|| Bytes::from(v.to_string()));
+            // 接頭辞に合わないので「無し」（allow_missing で通る）。panic しないことが本題
+            assert!(authenticate(&c, b"GET", b"/", &h).is_ok());
+        }
+    }
+
+    /// B-314: from_cookies のトークンも検証する（読まずに「無し」として通していた）
+    #[test]
+    fn from_cookies_token_is_verified() {
+        let c = cfg_with(|p| {
+            p.from_headers.clear();
+            p.from_params.clear();
+            p.from_cookies = vec!["session".into()];
+        });
+        let good = format!("a=1; session={}; b=2", TOKEN_GROUP);
+        let hg = |n: &str| (n == "cookie").then(|| Bytes::from(good.clone()));
+        let out = authenticate(&c, b"GET", b"/", &hg).unwrap();
+        assert!(lookup(&out.payloads, &["payload".into(), "groups".into()]).is_some());
+        let bad = format!("session={}x", TOKEN_GROUP);
+        let hb = |n: &str| (n == "cookie").then(|| Bytes::from(bad.clone()));
+        assert_eq!(
+            authenticate(&c, b"GET", b"/", &hb).err(),
+            Some((401, "Jwt verification fails"))
+        );
+        // 別の名前の Cookie は「無し」
+        let other = format!("sess={}", TOKEN_GROUP);
+        let ho = |n: &str| (n == "cookie").then(|| Bytes::from(other.clone()));
+        assert!(authenticate(&c, b"GET", b"/", &ho).is_ok());
+    }
+
+    #[test]
+    fn cookie_value_parsing() {
+        assert_eq!(cookie_value(b"a=1; b=2", b"b"), Some(&b"2"[..]));
+        assert_eq!(cookie_value(b"a=1;b=\"q\"", b"b"), Some(&b"q"[..]));
+        assert_eq!(cookie_value(b"ab=1", b"a"), None);
+        assert_eq!(cookie_value(b"", b"a"), None);
+    }
+
+    /// B-314: CR・LF を含むクレームはヘッダにしない（上流の HTTP/1.1 への注入）
+    #[test]
+    fn claim_with_crlf_is_not_copied_to_headers() {
+        let c = cfg_with(|p| {
+            p.claim_to_headers = vec![
+                (Bytes::from_static(b"x-sub"), "sub".into()),
+                (Bytes::from_static(b"x-iss"), "iss".into()),
+            ];
+        });
+        let auth = format!("Bearer {}", TOKEN_GROUP);
+        let h = |n: &str| (n == "authorization").then(|| Bytes::from(auth.clone()));
+        let out = authenticate(&c, b"GET", b"/", &h).unwrap();
+        assert!(out.add_headers.iter().any(|(n, _)| &n[..] == b"x-sub"));
+        // 直接: CR・LF を含む値は付けない
+        assert!(!crate::http_utils::is_valid_h2_field_value(
+            b"a\r\nx-evil: 1"
+        ));
     }
 }

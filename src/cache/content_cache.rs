@@ -764,6 +764,7 @@ mod tests {
             &path,
             crate::config::AcceptedEncoding::Zstd,
             3,
+            0,
             &cfg,
             || {
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -778,6 +779,7 @@ mod tests {
             &path,
             crate::config::AcceptedEncoding::Zstd,
             3,
+            0,
             &cfg,
             || {
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -797,6 +799,7 @@ mod tests {
             &path,
             crate::config::AcceptedEncoding::Zstd,
             3,
+            0,
             &cfg,
             || {
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -836,6 +839,7 @@ mod tests {
             &path,
             crate::config::AcceptedEncoding::Zstd,
             3,
+            0,
             &cfg,
             || {
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -848,6 +852,7 @@ mod tests {
             &path,
             crate::config::AcceptedEncoding::Zstd,
             3,
+            0,
             &cfg,
             || {
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -877,6 +882,7 @@ mod tests {
             &path,
             crate::config::AcceptedEncoding::Zstd,
             3,
+            0,
             &cfg,
             || {
                 calls.fetch_add(1, Ordering::Relaxed);

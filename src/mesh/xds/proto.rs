@@ -1352,7 +1352,8 @@ pub struct WasmPluginConfig {
     pub configuration: Option<Any>,
     #[prost(bool, tag = "5")]
     pub fail_open: bool,
-    /// 0 = FAIL_CLOSED, 1 = FAIL_OPEN, 2 = FAIL_RELOAD
+    /// `envoy.extensions.wasm.v3.FailurePolicy`: 0 = UNSPECIFIED（`fail_open` に従う）, 1 = FAIL_RELOAD,
+    /// 2 = FAIL_CLOSED, 3 = FAIL_OPEN
     #[prost(int32, tag = "7")]
     pub failure_policy: i32,
 }
@@ -1527,6 +1528,9 @@ pub struct SdsSecretConfig {
 pub struct CertificateValidationContext {
     #[prost(message, optional, tag = "1")]
     pub trusted_ca: Option<DataSource>,
+    /// 失効リスト。検査を実装していないので、あれば拒否する（黙って捨てない。B-323）
+    #[prost(message, optional, tag = "7")]
+    pub crl: Option<DataSource>,
     #[prost(message, repeated, tag = "9")]
     pub match_subject_alt_names: Vec<StringMatcher>,
     #[prost(message, repeated, tag = "15")]

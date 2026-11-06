@@ -869,6 +869,17 @@ where
                     // MAX_HEADER_LIST_SIZE
                     self.remote_settings.max_header_list_size = value;
                 }
+                0x8 => {
+                    // ENABLE_CONNECT_PROTOCOL（RFC 8441 §3）: 0・1 以外と、1 の後の 0 は PROTOCOL_ERROR。
+                    // サーバは相手の値を使わない（検査だけ。F-288）
+                    if value > 1 || (value == 0 && self.remote_settings.enable_connect_protocol) {
+                        return Err(Http2Error::connection_error(
+                            Http2ErrorCode::ProtocolError,
+                            "Invalid ENABLE_CONNECT_PROTOCOL",
+                        ));
+                    }
+                    self.remote_settings.enable_connect_protocol = value == 1;
+                }
                 _ => {
                     // 未知の設定は無視
                 }
@@ -1112,8 +1123,13 @@ where
             Http2Error::compression_error(format!("HPACK decode error: {}", e))
         })?;
 
-        // ヘッダーを検証 (RFC 7540 Section 8.1.2)
-        Self::validate_request_headers(&headers, stream_id, is_trailer)?;
+        // ヘッダーを検証 (RFC 7540 Section 8.1.2)。拡張 CONNECT（`:protocol`）は 0x8 を広告したときだけ受ける（F-288）
+        let extended_connect = Self::validate_request_headers(
+            &headers,
+            stream_id,
+            is_trailer,
+            self.local_settings.enable_connect_protocol,
+        )?;
         // :path を正規化する（ルートの照合・検査・上流への要求に同じパスを使う。F-236 の再走査の F7）
         if !is_trailer {
             if let Some(h) = headers.iter_mut().find(|h| h.name.as_ref() == b":path") {
@@ -1135,6 +1151,8 @@ where
             }
         } else {
             stream.request_headers = headers;
+            // F-288: トンネル（拡張 CONNECT）のストリームは受信の打ち切り（B-274・B-276）の対象にしない
+            stream.tunnel = extended_connect;
 
             // Content-Length を解析
             if let Some(cl) = stream
@@ -1166,17 +1184,22 @@ where
     /// - 擬似ヘッダーの重複チェック (8.1.2.3)
     /// - 接続固有ヘッダーの禁止 (8.1.2.2)
     /// - TE ヘッダーの値チェック (8.1.2.2)
+    /// - `:protocol`（RFC 8441 §4）は `extended_connect`（SETTINGS_ENABLE_CONNECT_PROTOCOL を広告した）ときの
+    ///   CONNECT だけ。拡張 CONNECT には `:scheme`・`:path`・`:authority` が要る（F-288）
+    ///
+    /// 戻り値は拡張 CONNECT（`:protocol` 付き）か。
     fn validate_request_headers(
         headers: &[crate::http2::hpack::HeaderField],
         stream_id: u32,
         is_trailer: bool,
-    ) -> Http2Result<()> {
+        extended_connect: bool,
+    ) -> Http2Result<bool> {
         let mut seen_regular = false;
         let mut method_count = 0u8;
         let mut scheme_count = 0u8;
         let mut path_count = 0u8;
         let mut authority_count = 0u8;
-        #[cfg(feature = "mesh")]
+        let mut protocol_count = 0u8;
         let mut is_connect = false;
 
         for header in headers {
@@ -1224,7 +1247,7 @@ where
 
                 match name.as_ref() {
                     b":method" => {
-                        method_count += 1;
+                        method_count = method_count.saturating_add(1);
                         if !crate::http_utils::is_valid_method(&header.value) {
                             return Err(Http2Error::stream_error(
                                 stream_id,
@@ -1232,16 +1255,15 @@ where
                                 "Invalid :method",
                             ));
                         }
-                        #[cfg(feature = "mesh")]
                         if header.value.as_ref() == b"CONNECT" {
                             is_connect = true;
                         }
                     }
                     b":scheme" => {
-                        scheme_count += 1;
+                        scheme_count = scheme_count.saturating_add(1);
                     }
                     b":path" => {
-                        path_count += 1;
+                        path_count = path_count.saturating_add(1);
                         // 空の :path は禁止 (RFC 7540 8.1.2.3)
                         if header.value.is_empty() {
                             return Err(Http2Error::stream_error(
@@ -1262,7 +1284,18 @@ where
                         }
                     }
                     b":authority" => {
-                        authority_count += 1;
+                        authority_count = authority_count.saturating_add(1);
+                    }
+                    b":protocol" if extended_connect => {
+                        protocol_count = protocol_count.saturating_add(1);
+                        // 値は token（上流へ `Upgrade` として渡し得る）
+                        if !crate::http_utils::is_valid_header_name(&header.value) {
+                            return Err(Http2Error::stream_error(
+                                stream_id,
+                                Http2ErrorCode::ProtocolError,
+                                "Invalid :protocol",
+                            ));
+                        }
                     }
                     b":status" => {
                         // リクエストにレスポンス用擬似ヘッダーは禁止 (RFC 7540 8.1.2.1)
@@ -1334,6 +1367,22 @@ where
                     },
                 ));
             }
+            // 拡張 CONNECT（RFC 8441 §4）: CONNECT だけで、:scheme・:path・:authority がそれぞれ 1 つ要る
+            if protocol_count > 0 {
+                if protocol_count > 1
+                    || !is_connect
+                    || scheme_count != 1
+                    || path_count != 1
+                    || authority_count != 1
+                {
+                    return Err(Http2Error::stream_error(
+                        stream_id,
+                        Http2ErrorCode::ProtocolError,
+                        "Malformed extended CONNECT",
+                    ));
+                }
+                return Ok(true);
+            }
             #[cfg(feature = "mesh")]
             if is_connect
                 && scheme_count == 0
@@ -1341,8 +1390,10 @@ where
                 && authority_count == 1
                 && ALLOW_CONNECT.load(std::sync::atomic::Ordering::Relaxed)
             {
-                return Ok(());
+                return Ok(false);
             }
+            #[cfg(not(feature = "mesh"))]
+            let _ = is_connect;
             if scheme_count != 1 {
                 return Err(Http2Error::stream_error(
                     stream_id,
@@ -1375,7 +1426,7 @@ where
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// DATA フレームを処理
@@ -1878,12 +1929,13 @@ where
 
         // エラーコードが 0 以外の場合はログを出力
         if error_code != 0 {
-            let debug_str = String::from_utf8_lossy(debug_data);
+            // B-318: 相手の送るデバッグデータは改行・制御文字をエスケープし、長さも切って書く
+            // （そのまま書くとログの行を偽造できた。F36）
             ftlog::warn!(
                 "HTTP/2 GOAWAY received: error_code={}, last_stream_id={}, debug={}",
                 error_code,
                 last_stream_id,
-                debug_str
+                debug_data[..debug_data.len().min(256)].escape_ascii()
             );
         } else {
             ftlog::debug!("HTTP/2 GOAWAY received: last_stream_id={}", last_stream_id);
@@ -2571,12 +2623,15 @@ where
         let mut method = bytes::Bytes::new();
         let mut path = bytes::Bytes::new();
         let mut authority = None;
+        let mut protocol = None;
         let mut headers = Vec::with_capacity(all_headers.len());
         for h in all_headers {
             match h.name.as_ref() {
                 b":method" => method = h.value,
                 b":path" => path = h.value,
                 b":authority" => authority = Some(h.value),
+                // 拡張 CONNECT（F-288。検査で 0x8 を広告した接続の CONNECT にだけ許している）
+                b":protocol" => protocol = Some(h.value),
                 _ => headers.push(h),
             }
         }
@@ -2585,6 +2640,7 @@ where
             method,
             path,
             authority,
+            protocol,
             headers,
             body,
             #[cfg(feature = "wasm")]
@@ -2665,6 +2721,8 @@ pub struct H2RequestParts {
     /// `:authority` 疑似ヘッダーの値（無ければ `None`。host ヘッダーへの
     /// フォールバックは呼び出し側で行う）。
     pub authority: Option<bytes::Bytes>,
+    /// `:protocol` 疑似ヘッダーの値（拡張 CONNECT のときだけ `Some`。F-288）
+    pub protocol: Option<bytes::Bytes>,
     /// 抽出済み疑似ヘッダー（`:method`/`:path`/`:authority`）以外のヘッダー一覧
     /// （`:scheme` 等の残余疑似ヘッダーを含む）。
     pub headers: Vec<crate::http2::hpack::HeaderField>,
@@ -2780,7 +2838,7 @@ mod tests {
             for (n, v) in extra {
                 h.push(HF::new(n.to_vec(), v.to_vec()));
             }
-            Http2Connection::<NullIo>::validate_request_headers(&h, 1, false)
+            Http2Connection::<NullIo>::validate_request_headers(&h, 1, false, false)
         };
         assert!(req(&[(b"x-a", b"ok value")], b"GET", b"/").is_ok());
         assert!(req(&[(b"x-a", b"v\r\nx-injected: 1")], b"GET", b"/").is_err());
@@ -2792,6 +2850,51 @@ mod tests {
         assert!(req(&[], b"GET /x HTTP/1.1\r\n", b"/").is_err());
         assert!(req(&[], b"GET", b"/a b").is_err());
         assert!(req(&[], b"GET", b"/a\r\nb").is_err());
+    }
+
+    /// F-288: `:protocol` は 0x8 を広告したときの CONNECT だけ（RFC 8441 §4）
+    #[test]
+    fn request_headers_extended_connect() {
+        use crate::http2::hpack::HeaderField as HF;
+        let req = |fields: &[(&[u8], &[u8])], ext: bool| {
+            let h: Vec<HF> = fields
+                .iter()
+                .map(|(n, v)| HF::new(n.to_vec(), v.to_vec()))
+                .collect();
+            Http2Connection::<NullIo>::validate_request_headers(&h, 1, false, ext)
+        };
+        let ws: &[(&[u8], &[u8])] = &[
+            (b":method", b"CONNECT"),
+            (b":protocol", b"websocket"),
+            (b":scheme", b"https"),
+            (b":path", b"/chat"),
+            (b":authority", b"example.com"),
+        ];
+        assert!(matches!(req(ws, true), Ok(true)));
+        // 広告していなければ未知の擬似ヘッダ
+        assert!(req(ws, false).is_err());
+        // CONNECT 以外・必須の擬似ヘッダの欠け・重複・不正な値
+        let mut get = ws.to_vec();
+        get[0] = (b":method", b"GET");
+        assert!(req(&get, true).is_err());
+        for i in 2..5 {
+            let mut f = ws.to_vec();
+            f.remove(i);
+            assert!(req(&f, true).is_err());
+        }
+        let mut dup = ws.to_vec();
+        dup.push((b":protocol", b"websocket"));
+        assert!(req(&dup, true).is_err());
+        let mut bad = ws.to_vec();
+        bad[1] = (b":protocol", b"web socket");
+        assert!(req(&bad, true).is_err());
+        // 通常の要求は拡張 CONNECT ではない
+        let get_ok: &[(&[u8], &[u8])] = &[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":path", b"/"),
+        ];
+        assert!(matches!(req(get_ok, true), Ok(false)));
     }
 
     /// 読むと EOF、書いたものは捨てるだけのソケット（フレーム処理の単体テスト用）。

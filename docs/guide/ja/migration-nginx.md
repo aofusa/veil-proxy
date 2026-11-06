@@ -92,7 +92,7 @@ veil は、当たった接頭辞を外してから上流の URL のパスに繋�
 | `proxy_http_version 1.1;` + 上流への keepalive | 既定（接続をプールする） | = `max_idle_connections_per_host`・`idle_connection_timeout_secs` |
 | 上流への HTTP/2 | `use_h2c = true`（平文）・`https://` は ALPN | = 多重化（[routing.md](routing.md#h2c-http2-over-cleartext-proxy)） |
 | `grpc_pass` | h2c・h2 の上流への `type = "Proxy"` | = gRPC、多重化（[routing.md](routing.md)） |
-| WebSocket（`Upgrade` ヘッダ） | 自動 | = HTTP/1.1（HTTP/2・HTTP/3 の上の WebSocket は使えない） |
+| WebSocket（`Upgrade` ヘッダ） | 自動 | = HTTP/1.1。HTTP/2・HTTP/3 の上は `enable_connect_protocol = true` で（[protocols.md](protocols.md)） |
 | `proxy_connect_timeout` | `backend_connect_timeout_secs` | = |
 | `proxy_read_timeout` / `proxy_send_timeout` | TOML のルートには無い | ≈ 全体の I/O のタイムアウト。ルートごとの要求のタイムアウトは予定（F-226） |
 | `proxy_next_upstream` | 閉じていたプールの接続での冪等な要求の 1 回の再送 | ≈ 状態コードによる再試行はまだ無い（F-226） |

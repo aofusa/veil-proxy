@@ -50,6 +50,7 @@ pub(super) async fn handle_sendfile(
     canonical_base: Option<&Path>, // base_path の canonical 形（F-145、config ロード時に一度だけ解決）
     wasm_modules: crate::wasm_plugin_config::WasmModules,
     static_file_cache_config: Option<&cache::StaticContentCacheRouteConfig>, // F-150: HTTP/1.1 ユーザー空間 TLS 経路向け静的コンテンツキャッシュ設定
+    precompressed: crate::config::Precompressed, // F-294: 事前圧縮した兄弟ファイル
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // --- パス解決ロジック（Nginx風） ---
     //
@@ -143,39 +144,68 @@ pub(super) async fn handle_sendfile(
     // `file_info` / `idx_info` は所有値なのでフィールドをムーブする（clone による
     // PathBuf / String の確保をしない）。open_file_cache が開いた fd を共有していれば
     // それを使い、open/close を省く（nginx の open_file_cache と同じ）。
-    let (final_path, file_size, mime_type, shared_file, validators) = if !file_info.is_file {
-        let filename = index_filename.unwrap_or("index.html");
-        let index_path = file_info.canonical_path.join(filename);
+    let (mut final_path, mut file_size, mime_type, mut shared_file, mut validators) =
+        if !file_info.is_file {
+            let filename = index_filename.unwrap_or("index.html");
+            let index_path = file_info.canonical_path.join(filename);
 
-        // インデックスファイルの情報をキャッシュから取得
-        match cache::get_file_info_with_config(&index_path, open_file_cache_config).await {
-            Some(idx_info) if idx_info.is_file => {
-                let shared = idx_info.shared_file().cloned();
-                (
-                    idx_info.canonical_path,
-                    idx_info.file_size,
-                    idx_info.mime_type,
-                    shared,
-                    idx_info.validators,
-                )
+            // インデックスファイルの情報をキャッシュから取得
+            match cache::get_file_info_with_config(&index_path, open_file_cache_config).await {
+                Some(idx_info) if idx_info.is_file => {
+                    let shared = idx_info.shared_file().cloned();
+                    (
+                        idx_info.canonical_path,
+                        idx_info.file_size,
+                        idx_info.mime_type,
+                        shared,
+                        idx_info.validators,
+                    )
+                }
+                _ => {
+                    // インデックスファイルが存在しない場合は403 Forbidden
+                    let err_buf = ERR_MSG_FORBIDDEN.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                    return Some((tls_stream, 403, 0, true));
+                }
             }
-            _ => {
-                // インデックスファイルが存在しない場合は403 Forbidden
-                let err_buf = ERR_MSG_FORBIDDEN.to_vec();
-                let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                return Some((tls_stream, 403, 0, true));
-            }
-        }
-    } else {
-        let shared = file_info.shared_file().cloned();
-        (
-            file_info.canonical_path,
-            file_info.file_size,
-            file_info.mime_type,
-            shared,
-            file_info.validators,
+        } else {
+            let shared = file_info.shared_file().cloned();
+            (
+                file_info.canonical_path,
+                file_info.file_size,
+                file_info.mime_type,
+                shared,
+                file_info.validators,
+            )
+        };
+
+    // F-294: 事前圧縮した兄弟（`app.js.br` 等）があればそれを返す（圧縮はしない。表現が変わるので Vary は常に付ける）
+    let mut compression = compression;
+    let force_vary = !precompressed.is_empty();
+    if force_vary {
+        if let Some(sib) = cache::precompressed::select(
+            &final_path,
+            file_size,
+            &validators,
+            &mime_type,
+            sreq.accept_encoding,
+            precompressed,
+            compression,
+            open_file_cache_config,
+            is_dir.then_some(cache::RouteContainment {
+                root: base_path,
+                canonical_base,
+            }),
         )
-    };
+        .await
+        {
+            shared_file = sib.info.shared_file().cloned();
+            file_size = sib.info.file_size;
+            final_path = sib.path;
+            validators = sib.validators;
+            compression = crate::static_response::no_compression();
+        }
+    }
 
     // ファイルを開く（キャッシュが fd を保持していれば共有するだけで syscall 無し）
     let file = match shared_file {
@@ -196,22 +226,26 @@ pub(super) async fn handle_sendfile(
     let plan =
         crate::static_response::plan(sreq, file_size, &mime_type, Some(&validators), compression);
     let response_status = plan.status();
-    let vary = crate::static_response::compression_applies(compression, &mime_type, file_size);
+    let vary = force_vary
+        || crate::static_response::compression_applies(compression, &mime_type, file_size);
 
     // 圧縮して返すときは本体を読んで圧縮する（静的コンテンツキャッシュ・圧縮結果のキャッシュが有効なら再利用）
     let compressed: Option<bytes::Bytes> = match plan {
+        // HEAD は本文を送らないので、長さのためだけにファイルを読んで圧縮しない（Content-Length を付けない。B-304）
         crate::static_response::Plan::Full {
             encoding: Some(enc),
-        } => {
+        } if !sreq.head => {
             let content_cfg =
                 cache::effective_static_content_cache_config(static_file_cache_config);
             match load_file_bytes(&file, &final_path, file_size, &mime_type, &content_cfg).await {
                 Some(data) => {
                     let level = cache::compressed::compression_level(enc, compression);
+                    let ident = cache::compressed::file_ident(file_size, validators.mtime_secs);
                     Some(cache::compressed::get_or_compress(
                         &final_path,
                         enc,
                         level,
+                        ident,
                         &content_cfg,
                         || crate::static_response::compress_body(&data, enc, compression),
                     ))
@@ -236,10 +270,15 @@ pub(super) async fn handle_sendfile(
         _ => (0i64, 0u64),
     };
 
+    let head_of_compressed = sreq.head
+        && matches!(
+            plan,
+            crate::static_response::Plan::Full { encoding: Some(_) }
+        );
     let header_buf = build_h1_static_head(
         &plan,
         file_size,
-        transfer_length,
+        (!head_of_compressed).then_some(transfer_length),
         &mime_type,
         Some(&validators),
         vary,
@@ -248,7 +287,15 @@ pub(super) async fn handle_sendfile(
 
     // WASMレスポンスヘッダーフィルタを適用（後段で Connection ヘッダーを追記するため mut）
     #[cfg(feature = "wasm")]
-    let mut header_buf = h1_wasm_response_head(header_buf, response_status, &wasm_modules).await;
+    let mut header_buf =
+        match h1_wasm_response_head(header_buf, response_status, &wasm_modules).await {
+            Ok(h) => h,
+            Err(resp) => {
+                return write_h1_wasm_local(&mut tls_stream, &resp, sreq.head)
+                    .await
+                    .map(|(st, n)| (tls_stream, st, n, client_wants_close));
+            }
+        };
     #[cfg(not(feature = "wasm"))]
     let mut header_buf = header_buf;
 
@@ -346,8 +393,37 @@ pub(super) async fn handle_sendfile(
         }
     }
 
-    // kTLS が有効な場合は sendfile によるゼロコピー送信を使用（ヘッダーを先に送る）
-    #[cfg(veil_ktls)]
+    // kTLS（Linux）は平文と同じ sendfile(2) の経路（F-292）。カーネルが暗号化する。ヘッダは MSG_MORE を付けずに送る
+    // （本文の最後の送信まで 16KB 未満のレコードが保留されるのを避ける。B-25）。sendfile(2) に対応しないファイルは
+    // 本文だけ下の読み書きで送る（kTLS のソケットへの平文の書き込みも暗号化される）
+    #[cfg(all(veil_ktls, target_os = "linux"))]
+    let mut header_buf = Some(header_buf);
+    #[cfg(all(veil_ktls, target_os = "linux"))]
+    if tls_stream.is_ktls_send_enabled() {
+        match sendfile_body(
+            &tls_stream,
+            header_buf.take(),
+            false,
+            &file,
+            transfer_offset,
+            transfer_length,
+        )
+        .await
+        {
+            BodySend::Sent(n) => {
+                // 長さに届かなければ Content-Length と食い違うので接続を閉じる
+                let close = client_wants_close || n < transfer_length;
+                return Some((tls_stream, response_status, n, close));
+            }
+            BodySend::HeaderFailed => return None,
+            BodySend::Unsupported => {}
+        }
+    }
+    #[cfg(all(veil_ktls, target_os = "linux"))]
+    let header_buf = header_buf.unwrap_or_default();
+
+    // kTLS（FreeBSD）は sendfile によるゼロコピー送信を使用（ヘッダーを先に送る）
+    #[cfg(all(veil_ktls, not(target_os = "linux")))]
     {
         if tls_stream.is_ktls_send_enabled() {
             let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
@@ -388,7 +464,7 @@ pub(super) async fn handle_sendfile(
 ///
 /// kTLS が有効な場合に使用されます。
 /// ファイルの内容をカーネル空間で直接 TLS 暗号化して送信します。
-#[cfg(veil_ktls)]
+#[cfg(all(veil_ktls, not(target_os = "linux")))]
 pub(super) async fn handle_sendfile_zerocopy(
     tls_stream: ServerTls,
     file: &crate::runtime::io::File,
@@ -563,23 +639,24 @@ pub(super) async fn handle_sendfile_userspace(
     let mut header_buf = Some(header_buf);
     #[cfg(all(veil_ktls, target_os = "linux"))]
     if tls_stream.is_plain() && transfer_length > 0 {
-        match sendfile_plain(
+        match sendfile_body(
             &tls_stream,
             header_buf.take(),
+            true,
             file,
             transfer_offset,
             transfer_length,
         )
         .await
         {
-            PlainSend::Sent(n) => {
+            BodySend::Sent(n) => {
                 // 長さに届かなければ Content-Length と食い違うので接続を閉じる
                 let close = client_wants_close || n < transfer_length;
                 return Some((tls_stream, response_status, n, close));
             }
-            PlainSend::HeaderFailed => return None,
+            BodySend::HeaderFailed => return None,
             // ファイルが sendfile(2) に対応しない: ヘッダは送ったので本文だけ下の読み書きで送る
-            PlainSend::Unsupported => {}
+            BodySend::Unsupported => {}
         }
     }
     #[cfg(all(veil_ktls, target_os = "linux"))]
@@ -646,9 +723,9 @@ pub(super) async fn handle_sendfile_userspace(
 #[cfg(all(veil_ktls, target_os = "linux"))]
 const SENDFILE_PLAIN_CHUNK: usize = 1024 * 1024;
 
-/// 平文の sendfile(2) の結果
+/// 平文・kTLS の sendfile(2) の結果
 #[cfg(all(veil_ktls, target_os = "linux"))]
-enum PlainSend {
+enum BodySend {
     /// ヘッダを送り、本文をこのバイト数だけ送った（途中で切れたら長さに届かない）
     Sent(u64),
     /// ヘッダを送れなかった（接続は使えない）
@@ -657,29 +734,32 @@ enum PlainSend {
     Unsupported,
 }
 
-/// 平文の接続へヘッダ（`MSG_MORE`）と本文（`sendfile(2)`）を送る（Linux）。
+/// 平文・kTLS の接続へヘッダ（`header_more` なら `MSG_MORE`。kTLS には付けない）と本文（`sendfile(2)`）を送る（Linux）。
+/// kTLS はカーネルが送るときに暗号化する（F-292。以前の kTLS の経路は譲らず・書き込み待ちに時間の上限が無く・短い本文でも
+/// 接続を閉じなかった）。
 ///
 /// 受理したソケットは非ブロッキング（`SOCK_NONBLOCK`）なので、送信バッファが一杯なら `EAGAIN` で戻り、書き込み可能を
 /// 待って続きから送る（`sendfile(2)` が `offset` を進める）。ファイルの読み込みはページキャッシュから行う（kTLS の
 /// `handle_sendfile_zerocopy` と同じ）。`sendfile(2)` に `MSG_NOSIGNAL` は付けられないが、相手が閉じたときの SIGPIPE は
 /// プロセスで無視している（Rust の実行時が `main` の前に `SIG_IGN` にする）ので `EPIPE` として返る。
 #[cfg(all(veil_ktls, target_os = "linux"))]
-async fn sendfile_plain(
+async fn sendfile_body(
     tls_stream: &ServerTls,
     header: Option<Vec<u8>>,
+    header_more: bool,
     file: &crate::runtime::io::File,
     transfer_offset: i64,
     transfer_length: u64,
-) -> PlainSend {
+) -> BodySend {
     use std::os::unix::io::AsRawFd;
 
     let sock = tls_stream.get_ref();
     if let Some(h) = header {
         if !matches!(
-            timeout(WRITE_TIMEOUT, async_raw_send_more_all(sock, &h)).await,
+            timeout(WRITE_TIMEOUT, async_raw_send_all(sock, &h, header_more)).await,
             Ok(Ok(()))
         ) {
-            return PlainSend::HeaderFailed;
+            return BodySend::HeaderFailed;
         }
     }
 
@@ -720,15 +800,15 @@ async fn sendfile_plain(
                 ) =>
             {
                 debug!("sendfile(2) is not supported for this file: {}", e);
-                return PlainSend::Unsupported;
+                return BodySend::Unsupported;
             }
             _ => {
-                debug!("sendfile(2) error (plain): {}", e);
+                debug!("sendfile(2) error: {}", e);
                 break;
             }
         }
     }
-    PlainSend::Sent(sent)
+    BodySend::Sent(sent)
 }
 
 /// ファイル全体を `Bytes` で得る（静的コンテンツキャッシュが有効ならキャッシュから、無ければ開いている fd から 1 回の
@@ -805,7 +885,7 @@ fn push_h1_header(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
 pub(super) fn build_h1_static_head(
     plan: &crate::static_response::Plan,
     size: u64,
-    content_length: u64,
+    content_length: Option<u64>,
     mime: &str,
     validators: Option<&crate::static_response::Validators>,
     vary: bool,
@@ -816,7 +896,7 @@ pub(super) fn build_h1_static_head(
     h.extend_from_slice(match plan {
         Plan::Full { .. } => b"HTTP/1.1 200 OK\r\n".as_slice(),
         Plan::Partial { .. } => b"HTTP/1.1 206 Partial Content\r\n",
-        Plan::NotModified => b"HTTP/1.1 304 Not Modified\r\n",
+        Plan::NotModified { .. } => b"HTTP/1.1 304 Not Modified\r\n",
         Plan::Unsatisfiable => b"HTTP/1.1 416 Range Not Satisfiable\r\n",
     });
     let removes = !security.remove_response_headers.is_empty();
@@ -829,10 +909,11 @@ pub(super) fn build_h1_static_head(
     if !removes || !security.removes_response_header(b"server") {
         crate::pool::append_server_header_line(&mut h);
     }
-    if !matches!(plan, Plan::NotModified) {
+    // 長さが分からない（HEAD の圧縮表現で、圧縮していない）ときは付けない（B-304）
+    if let (false, Some(len)) = (matches!(plan, Plan::NotModified { .. }), content_length) {
         h.extend_from_slice(b"Content-Length: ");
         let mut num = itoa::Buffer::new();
-        h.extend_from_slice(num.format(content_length).as_bytes());
+        h.extend_from_slice(num.format(len).as_bytes());
         h.extend_from_slice(b"\r\n");
     }
     // 追加レスポンスヘッダー（セキュリティヘッダーなど）
@@ -855,22 +936,25 @@ pub(super) fn build_h1_static_head(
 /// ステータス行と本文の区切り（`Content-Length`・`Transfer-Encoding`・`Connection`）は元のまま残し、モジュールには
 /// 変えさせない（送る本文と食い違うと接続が壊れる。以前の静的配信は 206・304 でも 200 に作り直し、`Content-Length` を
 /// 二重に付けていた。B-268）。
+///
+/// モジュールがローカルレスポンスを返した（`send_local_response`、または `failure_policy` で拒否した）ら `Err` で返す。
+/// 呼び出し元は元の応答の代わりにそれを送る（B-300。以前は捨てて元の応答を送っていた）。
 #[cfg(feature = "wasm")]
 pub(super) async fn h1_wasm_response_head(
     head: Vec<u8>,
     status: u16,
     wasm_modules: &crate::wasm_plugin_config::WasmModules,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, crate::wasm::LocalResponse> {
     if wasm_modules.is_empty() {
-        return head;
+        return Ok(head);
     }
     let config = CURRENT_CONFIG.load();
     let Some(ref wasm_engine) = config.wasm_filter_engine else {
-        return head;
+        return Ok(head);
     };
     let status_end = match head.windows(2).position(|w| w == b"\r\n") {
         Some(i) => i + 2,
-        None => return head,
+        None => return Ok(head),
     };
     let is_framing = |name: &[u8]| {
         name.eq_ignore_ascii_case(b"content-length")
@@ -892,15 +976,17 @@ pub(super) async fn h1_wasm_response_head(
         .clone()
         .on_response_headers_with_modules_async(wasm_modules.clone(), status, current, true)
         .await;
-    let crate::wasm::FilterResult::Continue {
-        headers: modified, ..
-    } = result
-    else {
-        return head;
+    let modified = match result {
+        crate::wasm::FilterResult::Continue { headers, .. } => headers,
+        crate::wasm::FilterResult::LocalResponse(resp) => return Err(resp),
     };
     let mut out = Vec::with_capacity(head.len() + 64);
     out.extend_from_slice(&head[..status_end]);
-    for (name, value) in modified.iter().filter(|(n, _)| !is_framing(n)) {
+    // B-318: Wasm が書き換えたヘッダは CR・LF を含むものを書かない（応答の分割。F40）
+    for (name, value) in modified
+        .iter()
+        .filter(|(n, v)| !is_framing(n) && crate::http_utils::is_writable_h1_field(n, v))
+    {
         out.extend_from_slice(name);
         out.extend_from_slice(b": ");
         out.extend_from_slice(value);
@@ -913,5 +999,34 @@ pub(super) async fn h1_wasm_response_head(
             out.extend_from_slice(line);
         }
     }
-    out
+    Ok(out)
+}
+
+/// 応答ヘッダの段のローカルレスポンス（B-300）。`wasm` feature が無ければ作られない
+#[cfg(feature = "wasm")]
+pub(super) type HeadLocal = crate::wasm::LocalResponse;
+#[cfg(not(feature = "wasm"))]
+pub(super) type HeadLocal = std::convert::Infallible;
+
+/// 応答ヘッダの段のローカルレスポンスを、元の応答の代わりに送る（B-300）。元の応答の本文は送らないので、
+/// 接続は続けられる（`client_wants_close` に従う）。戻り値は `(ステータス, 書いた長さ)`、書けなければ `None`。
+pub(super) async fn write_h1_wasm_local<S: crate::runtime::io::AsyncWriteRentExt>(
+    stream: &mut S,
+    resp: &HeadLocal,
+    head_method: bool,
+) -> Option<(u16, u64)> {
+    #[cfg(feature = "wasm")]
+    {
+        let bytes = super::h1::wasm_local_response_h1(resp, head_method);
+        let len = bytes.len() as u64;
+        match timeout(WRITE_TIMEOUT, stream.write_all(bytes)).await {
+            Ok((Ok(_), _)) => Some((resp.status_code, len)),
+            _ => None,
+        }
+    }
+    #[cfg(not(feature = "wasm"))]
+    {
+        let _ = (stream, head_method);
+        match *resp {}
+    }
 }

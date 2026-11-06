@@ -258,14 +258,20 @@ impl Forward {
         &self.table.vhosts[self.vh]
     }
 
-    /// 応答ヘッダの段の Wasm のフィルタ（無ければ何もしない）。
-    pub async fn response_filters(&self, status: u16, headers: &mut Vec<(Bytes, Bytes)>) {
+    /// 応答ヘッダの段の Wasm のフィルタ（無ければ何もしない）。プラグインのローカル応答（`failure_policy` の
+    /// 拒否を含む）は `Err`。呼び出し元は上流の応答の代わりにそれを返す（B-300）。
+    pub async fn response_filters(
+        &self,
+        status: u16,
+        headers: &mut Vec<(Bytes, Bytes)>,
+    ) -> Result<(), LocalReply> {
         #[cfg(feature = "wasm")]
         if !self.wasm.is_empty() {
-            super::wasm::on_response(&self.wasm, status, headers).await;
+            return super::wasm::on_response(&self.wasm, status, headers).await;
         }
         #[cfg(not(feature = "wasm"))]
         let _ = (status, headers);
+        Ok(())
     }
 }
 
@@ -1012,12 +1018,15 @@ pub fn upstream_request_headers(
         ));
     }
     // XFCC
+    // B-323: 受けた XFCC を残すのは相手がクライアント証明書を出したときだけ（Envoy と同じ）。以前は TLS の
+    // チェーンなら証明書の無い相手の XFCC も残していて、任意の身元を上流へ信じさせられた（F28）
+    let peer_cert = ctx.tls && ctx.peer_cert_hash.is_some();
     let elem = if ctx.tls { xfcc_element(ctx) } else { None };
     match ctx.hcm.xfcc {
         XfccMode::Sanitize => {}
         XfccMode::ForwardOnly | XfccMode::AlwaysForwardOnly => {
             if let Some(x) = xfcc {
-                if ctx.tls || ctx.hcm.xfcc == XfccMode::AlwaysForwardOnly {
+                if peer_cert || ctx.hcm.xfcc == XfccMode::AlwaysForwardOnly {
                     out.push((Bytes::from_static(b"x-forwarded-client-cert"), x));
                 }
             }
@@ -1030,7 +1039,7 @@ pub fn upstream_request_headers(
                     e
                 ))),
                 (None, Some(e)) => Some(Bytes::from(e)),
-                (Some(x), None) if ctx.tls => Some(x),
+                (Some(x), None) if peer_cert => Some(x),
                 _ => None,
             };
             if let Some(v) = v {

@@ -53,18 +53,22 @@ else
     fails=$((fails + 1))
 fi
 
-# W-06: fuel 枯渇モジュール（応答がタイムアウト内に返りプロセスが生存）
+# W-06: fuel 枯渇モジュール（タイムアウト内に 503 が返りプロセスが生存）
 fuel_start=$(date +%s%N 2>/dev/null || date +%s)
 fuel_code=$(curl -sk --http1.1 -o /dev/null -w "%{http_code}" --max-time 8 \
     "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/wasm-fuel/" 2>/dev/null || echo "000")
 fuel_end=$(date +%s%N 2>/dev/null || date +%s)
 log "wasm_fuel_route: code=${fuel_code}"
 
+# F-293: 既定の failure_policy = "fail_closed" なので、fuel を使い切ったフィルタの要求は 503（素通しにしない）
 if [[ "${fuel_code}" == "000" ]]; then
     log "FAIL wasm_fuel_timeout (hang?)"
     fails=$((fails + 1))
+elif [[ "${fuel_code}" != "503" ]]; then
+    log "FAIL wasm_fuel_fail_closed code=${fuel_code} (expected 503)"
+    fails=$((fails + 1))
 else
-    log "PASS wasm_fuel_no_hang code=${fuel_code}"
+    log "PASS wasm_fuel_fail_closed code=${fuel_code}"
 fi
 
 hc=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \

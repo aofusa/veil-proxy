@@ -249,7 +249,8 @@ fn proxy_grpc_call_impl(
     {
         let state = caller.data();
         if !state.http_ctx.capabilities.allow_http_calls {
-            ftlog::warn!(
+            crate::logging::log_throttled!(
+                warn,
                 "[wasm:{}] gRPC call denied: allow_http_calls=false",
                 state.http_ctx.plugin_name
             );
@@ -270,7 +271,8 @@ fn proxy_grpc_call_impl(
     {
         let state = caller.data();
         if !state.http_ctx.capabilities.is_upstream_allowed(&upstream) {
-            ftlog::warn!(
+            crate::logging::log_throttled!(
+                warn,
                 "[wasm:{}] gRPC call to '{}' denied: not in allowed_upstreams",
                 state.http_ctx.plugin_name,
                 upstream
@@ -431,7 +433,8 @@ fn proxy_grpc_stream_impl(
     {
         let state = caller.data();
         if !state.http_ctx.capabilities.allow_http_calls {
-            ftlog::warn!(
+            crate::logging::log_throttled!(
+                warn,
                 "[wasm:{}] gRPC stream denied: allow_http_calls=false",
                 state.http_ctx.plugin_name
             );
@@ -448,7 +451,8 @@ fn proxy_grpc_stream_impl(
     {
         let state = caller.data();
         if !state.http_ctx.capabilities.is_upstream_allowed(&upstream) {
-            ftlog::warn!(
+            crate::logging::log_throttled!(
+                warn,
                 "[wasm:{}] gRPC stream to '{}' denied: not in allowed_upstreams",
                 state.http_ctx.plugin_name,
                 upstream
@@ -482,8 +486,7 @@ fn proxy_grpc_stream_impl(
 
     // Allocate stream ID
     let state = caller.data_mut();
-    let stream_id = state.http_ctx.next_grpc_stream_id;
-    state.http_ctx.next_grpc_stream_id += 1;
+    let stream_id = state.http_ctx.next_grpc_stream_id();
 
     // Create the stream
     let stream = GrpcStream {

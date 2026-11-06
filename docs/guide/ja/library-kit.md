@@ -12,8 +12,8 @@ Python では、パッケージ `veil-api-kit`（`import veil_kit`）が同じ�
 
 ```toml
 [dependencies]
-veil = { package = "veil-proxy", version = "0.10", default-features = false, features = ["full", "api"] }
-veil-kit = { package = "veil-proxy-kit", version = "0.10", features = ["full"] }
+veil = { package = "veil-proxy", version = "0.11", default-features = false, features = ["full", "api"] }
+veil-kit = { package = "veil-proxy-kit", version = "0.11", features = ["full"] }
 ```
 
 | モジュール | feature | 内容 |
@@ -90,8 +90,9 @@ App::new().state(Key::derive_from(secret_bytes)?)   // 署名付き・暗号化�
 
 `serve::dir("/assets", "/srv/www")` は既定の設定の `App::serve_dir` です: `open_file_cache` と `static_file_cache` を付けた
 `type = "File"` のルートで、要求はハンドラを通りません。sendfile・kTLS・Range・ETag がプロキシと同じく効きます。
-事前圧縮した `.br`・`.gz` のファイルは使いません。`compression` は HTTP/2・HTTP/3 でファイルをその場で圧縮します（HTTP/1.1 はそのまま送ります）。
-`serve::dir_with(prefix, dir, ServeOptions { .. })` は `index`・`mode`・2 つのキャッシュ・`compression`・その他のルートのキーを
+`precompressed`（例: `vec!["br".into(), "gzip".into()]`）は事前圧縮した `.br`・`.gz`・`.zst` の兄弟を返し、`compression` は
+HTTP/1.1・HTTP/2・HTTP/3 でファイルをその場で圧縮します。
+`serve::dir_with(prefix, dir, ServeOptions { .. })` は `index`・`mode`・2 つのキャッシュ・`compression`・`precompressed`・その他のルートのキーを
 取ります。File バックエンドには SPA のフォールバックがありません。必要なら `index.html` を返すルートをハンドラで書いてください。
 
 `serve::file(path, max_size).await` はファイル 1 個をファイル用の offload のプールで読み、拡張子からメディアタイプを決めて返します
@@ -193,7 +194,8 @@ let created: Item = res.error_for_status()?.json()?;
 - HTTP/1.1 の接続はワーカーごとにプールします（`pool_idle_timeout`、既定 60 秒）。プールの接続が切れていた冪等な要求は、新しい接続で
   1 回だけ送り直します。
 - 本文は全部読みます（`max_response_size`、既定 64 MiB）。エラーには `kind()`（`Connect`・`Timeout`・`Protocol`・`Status` 等）があり、
-  502・504 の `Response` に変換できます。
+  502・504 の `Response` に変換できます（本文は `Bad Gateway` / `Gateway Timeout` だけ。詳細はエラー自体をログに出してください。
+  エラーの文に URL のクエリ・userinfo は入りません）。
 - クライアントは起動時に作ってください。独自の CA・クライアント証明書はクライアントを作るときにディスクから読みます。
 
 `veil_kit::client::{get_json, post_json, retry}` は JSON の往復と、接続エラー・タイムアウト・502〜504 での指数バックオフの再試行を足します。
@@ -285,3 +287,71 @@ App::new().with(
 `ValidateRequestHeaderLayer::custom`、ヘッダだけで書く Cookie とリダイレクト、`veil::tokio`（`tokio` を shim に差し替え）の上で
 `App::tokio_service` に載せた `ServeDir` と、推奨の `App::serve_dir`。tower-cookies の `Cookies` は `http` の要求の拡張領域にあり、
 veil のハンドラには届きません。
+
+## C（`libveil_kit`）
+
+クレート `veil-capi-helpers` は `libveil_kit`（`.so`・`.dylib`・`.dll` と静的ライブラリ）とヘッダ
+[`veil_kit.h`](../../../crates/veil-capi-helpers/include/veil_kit.h) を作ります。[`libveil`](library.md#c-api) の C API をすべて含み、
+その上に `veil_kit_*` の補助を足したものなので、プログラムは 2 つのライブラリの **どちらか 1 つ** とリンクします（両方は不可）。
+Cookie・署名付き/暗号化 Cookie・セッションは Rust の kit と 1 バイトも違わない形式で（同じ秘密から導いた同じ `Key` で互いの
+Cookie を読めます）、HS256・RS256・ES256 のトークンは片方が発行したものをもう片方で検証できます。
+
+```sh
+cargo build -p veil-capi-helpers --release      # target/release/libveil_kit.{so,a}
+cc app.c -Icrates/veil-capi/include -Icrates/veil-capi-helpers/include -Ltarget/release -lveil_kit -lpthread -ldl -lm
+```
+
+| 分野 | 関数 |
+|---|---|
+| Cookie | `veil_kit_cookie_get`、`veil_kit_set_cookie`（`veil_kit_cookie_t`: path・domain・`Max-Age`・`Secure`・`HttpOnly`・`SameSite`・`Partitioned`）、`veil_kit_remove_cookie` |
+| 鍵・署名付き/暗号化 Cookie | `veil_kit_key_derive / from / generate / add_fallback / free`、`veil_kit_signed_get / set`（HMAC-SHA256）、`veil_kit_private_get / set`（AES-256-GCM） |
+| セッション | `veil_kit_sessions_install`（`veil_kit_sessions_t`: 接頭辞・Cookie 名・寿命・メモリ保存）、`veil_kit_session_get / get_str / set / set_str / remove / clear / destroy / cycle_id` |
+| 資格情報 | `veil_kit_basic_auth`、`veil_kit_basic_matches`、`veil_kit_bearer`、`veil_kit_api_key`、`veil_kit_api_key_matches`（定数時間）、`veil_kit_unauthorized` |
+| 主体（Principal） | `veil_kit_principal_new / add_scope / add_role / set_attributes / free`、`veil_kit_set_principal`、`veil_kit_principal`、`veil_kit_principal_subject / has_scope / has_role / attributes`、`veil_kit_require_scope` |
+| JWT | `veil_kit_jwt_verifier_new / add_hmac / add_pem / add_jwks / set_jwks / issuer / audience / require_exp / leeway / free`、`veil_kit_jwt_verify`、`veil_kit_jwt_encode_hmac`、`veil_kit_jwt_authenticate` |
+| リダイレクト・ファイル | `veil_kit_redirect`、`veil_kit_redirect_safe`（オープンリダイレクト対策）、`veil_kit_send_file` |
+| 小物 | `veil_kit_form_get`、`veil_kit_error`（`{"detail": ...}`）、`veil_kit_json_string`、`veil_kit_oauth2_security_scheme`、`veil_kit_free`、`veil_kit_version` |
+| タスク | `veil_kit_every`、`veil_kit_cron`（ハンドラ用プールで動くアプリのタスク。応答の後の処理は `libveil` の `veil_response_after_send`） |
+| ルート表 | `veil_kit_route_t`、`VEIL_KIT_GET / POST / PUT / PATCH / DELETE`、`veil_kit_register_all`（ヘッダだけ） |
+| 依存性注入 | `veil_kit_di_new / free / register / value / override / override_value / get`（文字列の鍵。`VEIL_KIT_DI_SINGLETON`・`_SCOPED`（要求ごと）・`_TRANSIENT`。工場は他の鍵を取り出せ、循環は誤り） |
+| HTTP クライアント | `veil_kit_client_get_json`、`veil_kit_client_post_json`（2xx と JSON の本文。違えば応答を残したまま `VEIL_KIT_ERR_STATUS`・`VEIL_KIT_ERR_JSON`）、`veil_kit_client_send_retry` / `_async`（`veil_kit_retry_t`: 回数・指数バックオフ・502/503/504） |
+| gRPC | `veil_kit_grpc_balanced_new / pick / unary / unary_async / free`（順番に回し、単項が `UNAVAILABLE` で失敗したら次のサーバ） |
+| GraphQL | `veil_kit_graphql`（トランスポートだけ。実行器は C のコールバック）、`veil_kit_graphql_query / operation_name / variables / extensions / request / set_result` |
+| 試験 | `veil_kit_test_new / free / request / get / post_json / header / set_cookie / cookie / clear_cookies`（`veil_test_*` + Cookie の入れ物・既定のヘッダ） |
+| JSON の書き出し | `veil_kit_jw_t`、`veil_kit_jw_object / array / end / key / string / string_n / int / double / bool / null / json`（ヘッダだけ） |
+
+CORS・静的ディレクトリ・ミドルウェア・要求ごとの値・ライフサイクルのフック・WebSocket のサブプロトコル・gRPC リフレクションは
+`libveil` 自体にあります（`veil_config_cors`、`veil_config_serve_dir`、`veil_register_middleware`、`veil_request_set_local`、
+`veil_config_on_startup / on_shutdown / on_worker_start`、`veil_ws_accept_ex`、`veil_grpc_reflection`。[library.md](library.md#c-api) を参照）。
+
+- C のミドルウェアと kit のガードは、ハンドラと同じ呼び出しの中でハンドラ用プールで動きます。最後に登録したミドルウェアが
+  最初に動くので、同じ接頭辞では `veil_kit_require_scope` を `veil_kit_jwt_authenticate` より先に登録します。
+  `veil_kit_jwt_authenticate` はトークンが無い・不正なとき `WWW-Authenticate: Bearer` 付きの 401 を返し（`VEIL_KIT_JWT_OPTIONAL`
+  では無いときは通す）、`sub`・`scope` / `scp`・`roles` から主体を設定します。
+- `veil_kit_free` で解放しない文字列（`veil_kit_cookie_get`・`veil_kit_session_get`・`veil_kit_form_get` など）は NUL 終端されず
+  （長さを使う）、コールバックが戻るまで有効です。「`veil_kit_free` で解放する」とある文字列は NUL 終端で、呼び出し側のものです。
+- `veil_kit_send_file` はコールバックの中でファイルを読むので `VEIL_ROUTE_INLINE` のルートでは拒否されます。ディレクトリは
+  `veil_config_serve_dir` で出します。
+- サンプル [`examples/api/c-kit`](../../../examples/api/c-kit/) は全分野を使い、`tests/api/library_e2e.sh c-kit` が動かします
+  （Cookie とトークンは独立した実装とも突き合わせます）。
+- HTTP・gRPC のクライアント、遅延応答、JSON 本文の検証（422）、ソケットを開かない試験は `libveil` にあります
+  （`veil_client_*`・`veil_grpc_channel_*`・`veil_response_defer`・`veil_register_route_ex2`・`veil_test_*`。
+  [library.md](library.md#c-api)）。kit のクライアントの補助と `Balanced` はその上にあり、同じ規則に従います: 待つ形は
+  ワーカーでは `VEIL_ERR_STATE`、`_async` の形はハンドラ用プールで呼び返します。
+- C には型が無いので、依存性注入の鍵は文字列、値は解放関数（省略可）付きの `void *` です。singleton と値はコンテナと
+  同じだけ生き、scoped と transient は要求の終わりに解放します。`veil_kit_di_override` は試験で登録を差し替えます
+  （`Container::replace` と同じ）。
+- `veil_kit_grpc_balanced_*` は `veil_kit::grpc::Balanced` と同じ規則です（順番に回し、`UNAVAILABLE` なら 1 サーバにつき
+  1 回まで次へ）。メッセージはバイト列なのでコーデックの引数はありません。`pick` はストリーミングの呼び出し用のチャネルを返します。
+- GraphQL: C には GraphQL の実行器が無いので、`veil_kit_graphql` は Rust の kit の `mount` の HTTP のトランスポートで、
+  実行器はコールバックです（クエリ・操作名・変数の JSON のテキストを受け取り、結果の JSON を設定する）。HTTP の規則は
+  同じです: `POST` は JSON だけ（違えば 415）でバッチも受け、`GET` はクエリ文字列で mutation は 405、`Accept` で
+  `application/graphql-response+json` を選び、`text/event-stream` には GraphQL over SSE で結果を返し、有効にすれば
+  GraphiQL を出します。サブスクリプションには実行器からの結果の列が要るので、いちばん近いものとして `upgrade` を
+  用意しました: そのパスの WebSocket のアップグレードを C のハンドラへ回し、`veil_ws_accept_ex` で
+  `graphql-transport-ws` を受けて結果を送ります。
+- JSON の書き出しはヘッダだけ（ライブラリは確保しない）で、文字列をエスケープし、カンマを入れ、確保の失敗・深すぎる入れ子・
+  対応しない `end` を `failed` で知らせます。
+- 配布: ライブラリのアーカイブ（`packaging/scripts/build-lib.sh`）は `libveil` の隣に `libveil_kit` と `veil_kit.h` を入れ、
+  pkg-config の `veil-kit.pc`（`libveil_kit` が `veil` を含むので `Requires: veil` にしない）と CMake のターゲット
+  `veil::kit`・`veil::kit_static` を付けます。

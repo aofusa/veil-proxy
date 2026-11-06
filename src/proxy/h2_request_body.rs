@@ -96,20 +96,20 @@ pub(super) async fn apply_h2_wasm_response_headers(
     wasm_modules: &crate::wasm_plugin_config::WasmModules,
     status: u16,
     header_store: Vec<(Bytes, Bytes)>,
-) -> Vec<(Bytes, Bytes)> {
+) -> Result<Vec<(Bytes, Bytes)>, crate::wasm::LocalResponse> {
     if wasm_modules.is_empty() {
-        return header_store;
+        return Ok(header_store);
     }
     let config = CURRENT_CONFIG.load();
     let Some(ref wasm_engine) = config.wasm_filter_engine else {
-        return header_store;
+        return Ok(header_store);
     };
 
     // WASM エンジン API（`src/wasm/engine.rs`）は `Vec<(Vec<u8>, Vec<u8>)>` 前提
     // （エンジン内部の型は本タスクの対象ファイル範囲外のため変更しない）。
     // wasm_modules が空でない稀なケースのみこの境界変換コストを払う。
     let vec_headers: Vec<(Vec<u8>, Vec<u8>)> = header_store
-        .iter()
+        .into_iter()
         .map(|(k, v)| (k.to_vec(), v.to_vec()))
         .collect();
 
@@ -118,17 +118,16 @@ pub(super) async fn apply_h2_wasm_response_headers(
         .on_response_headers_with_modules_async(wasm_modules.clone(), status, vec_headers, true)
         .await;
 
-    if let crate::wasm::FilterResult::Continue {
-        headers: modified_headers,
-        ..
-    } = wasm_result
-    {
-        modified_headers
+    match wasm_result {
+        crate::wasm::FilterResult::Continue {
+            headers: modified_headers,
+            ..
+        } => Ok(modified_headers
             .into_iter()
             .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
-            .collect()
-    } else {
-        header_store
+            .collect()),
+        // 応答ヘッダの段のローカルレスポンス（B-300。呼び出し元が元の応答の代わりに送る）
+        crate::wasm::FilterResult::LocalResponse(resp) => Err(resp),
     }
 }
 
@@ -164,13 +163,14 @@ pub(super) async fn apply_h2_wasm_response_trailers(
             .into_iter()
             .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
             .collect(),
-        crate::wasm::FilterResult::Pause | crate::wasm::FilterResult::LocalResponse(_) => {
-            // gRPC トレイラー送出時点で HEADERS/DATA は送出済みのため Pause/LocalResponse は
+        crate::wasm::FilterResult::LocalResponse(_) => {
+            // gRPC トレイラー送出時点で HEADERS/DATA は送出済みのためローカルレスポンスは
             // 適用できない（既存の送出済みレスポンスを差し替えられない）。元のトレイラーを
             // そのまま通す（grpc-status 欠落によるクライアントハングを避ける）。
-            warn!(
-                "WASM module requested Pause/LocalResponse on gRPC response trailers, \
-                 but response head is already sent; keeping original trailers"
+            crate::logging::log_throttled!(
+                warn,
+                "WASM module requested a local response on gRPC response trailers, \
+                 but the response head is already sent; keeping the original trailers"
             );
             trailers
         }
@@ -190,6 +190,7 @@ pub(super) fn build_h2_static_response(
     compression: &CompressionConfig,
     static_ctx: Option<(&Path, &cache::StaticContentCacheConfig)>,
     memory: Option<&crate::static_response::MemoryContent>,
+    force_vary: bool,
 ) -> (u16, Vec<(Bytes, Bytes)>, Bytes) {
     let (status, mut header_store, body) = crate::static_response::build_bytes_response(
         sreq,
@@ -200,6 +201,7 @@ pub(super) fn build_h2_static_response(
         compression,
         static_ctx,
         memory,
+        force_vary,
     );
     if let Some(ref g) = get_server_header_guard() {
         if !security.removes_response_header(b"server") {

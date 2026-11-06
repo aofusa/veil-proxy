@@ -4,3 +4,12 @@ share/examples/rc.d/veil
 share/examples/veil/config.toml
 share/veil/www/index.html
 share/veil/www/quickstart.html
+share/veil/www/favicon.ico
+share/icons/hicolor/16x16/apps/veil.png
+share/icons/hicolor/32x32/apps/veil.png
+share/icons/hicolor/48x48/apps/veil.png
+share/icons/hicolor/64x64/apps/veil.png
+share/icons/hicolor/128x128/apps/veil.png
+share/icons/hicolor/256x256/apps/veil.png
+share/icons/hicolor/512x512/apps/veil.png
+share/metainfo/io.github.aofusa.veil.metainfo.xml

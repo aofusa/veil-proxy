@@ -468,7 +468,8 @@ Request-level hardening that came out of the audit:
   `[route.security] trusted_proxies` are not forwarded; `X-Forwarded-For` carries the client IP instead
   (`forwarded_headers = "passthrough"` restores the old pass-through).
 - The response cache does not store `Set-Cookie` responses, responses that `Vary` on headers outside `key_headers`,
-  or responses to `Authorization` requests (unless `key_headers` includes `Authorization`).
+  `no-cache` responses, or responses to `Authorization` requests (unless `key_headers` includes `Authorization`);
+  responses to `Cookie` requests are stored only when marked `public` or `s-maxage`. Entries are kept per route.
 - IP allow/deny lists match IPv4-mapped IPv6 addresses as IPv4.
 - Request paths are normalized before routing and `[route.security]` checks and forwarded normalized
   (`[security] path_normalization`); absolute-form targets become origin-form, other non-origin targets get 400.

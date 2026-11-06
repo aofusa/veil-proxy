@@ -89,6 +89,91 @@ pub enum StaticFileOutcome {
     Directory(CachedFileInfo),
     /// per-route の封じ込め検査に失敗（403 相当）。**本体は読んでいない。**
     Forbidden,
+    /// キャッシュに入らない大きさのファイルを丸ごと読む量の上限に達した（503 相当。本体は読んでいない）。
+    /// B-321: HTTP/2・HTTP/3 の静的配信はファイルを丸ごと読むので、大きなファイルへの並行の要求でメモリを
+    /// 使い切れた（F24）
+    Busy,
+}
+
+/// この大きさまではコンテンツキャッシュに入る（入らないものだけ読む量を数える）
+fn cache_limit(cfg: &StaticContentCacheConfig) -> u64 {
+    if cfg.enabled {
+        cfg.max_file_size_bytes
+    } else {
+        0
+    }
+}
+
+/// キャッシュに入らないファイルを丸ごと読んでいる量（`Busy` の判定。B-321）
+static UNCACHED_INFLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// その上限。1 つも読んでいなければ上限を超える大きさのファイルも 1 つは読む
+const UNCACHED_INFLIGHT_MAX: u64 = 256 * 1024 * 1024;
+
+/// 読む量を予約する。返した値を落とすと戻す
+struct UncachedRead {
+    counter: &'static std::sync::atomic::AtomicU64,
+    len: u64,
+}
+
+impl UncachedRead {
+    fn reserve_in(
+        counter: &'static std::sync::atomic::AtomicU64,
+        max: u64,
+        len: u64,
+    ) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut cur = counter.load(Ordering::Relaxed);
+        loop {
+            if cur != 0 && cur.saturating_add(len) > max {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                cur,
+                cur + len,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { counter, len }),
+                Err(c) => cur = c,
+            }
+        }
+    }
+}
+
+impl Drop for UncachedRead {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(self.len, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 予約を本文の寿命（送り終えて落とすまで）に結び付ける
+struct ChargedBytes {
+    data: Bytes,
+    _reserved: UncachedRead,
+}
+
+impl AsRef<[u8]> for ChargedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+/// キャッシュに入らない大きさ（`cache_limit` を超える）なら予約する。`Err` は上限に達した
+fn reserve_uncached(len: u64, cache_limit: u64) -> Result<Option<UncachedRead>, ()> {
+    if len <= cache_limit {
+        return Ok(None);
+    }
+    UncachedRead::reserve_in(&UNCACHED_INFLIGHT, UNCACHED_INFLIGHT_MAX, len)
+        .map(Some)
+        .ok_or(())
+}
+
+fn charge(data: Bytes, reserved: Option<UncachedRead>) -> Bytes {
+    match reserved {
+        Some(r) => Bytes::from_owner(ChargedBytes { data, _reserved: r }),
+        None => data,
+    }
 }
 
 /// 静的配信用: メタデータと本体を **1 回の offload** で取得する（B-65）。
@@ -153,14 +238,20 @@ pub async fn get_static_file_with_content(
             // F-272: 開く前に監視の世代を読む（読み込み中の差し替えを新しい世代で残さない）
             let meta_stamp = super::watch::stamp(ofc.and_then(|c| c.watch_gen));
             let content_stamp = super::watch::stamp(content_cfg.watch_gen);
+            // B-321: 外側のルートで開いたものは共有のキャッシュへ入れない（`resolve::is_strictest_root`）
+            #[cfg(target_os = "linux")]
+            let shareable = containment.is_none_or(|c| resolve::is_strictest_root(c.root, path));
+            #[cfg(target_os = "freebsd")]
+            let shareable = true;
             let owned = path.to_path_buf();
             // containment が不要な場合（固定ファイルルート）は余分な確保をしない。
             let owned_root: Option<PathBuf> = containment.map(|c| c.root.to_path_buf());
+            let limit = cache_limit(content_cfg);
             // 理由付き allow: offload 専用ワーカースレッド内で実行され、イベントループを
             // ブロックしない（F-153 の open_beneath_for_request/open_static_ro と同じ許容箇所）。
             #[allow(clippy::disallowed_methods)]
             let loaded = crate::runtime::offload::offload(move || {
-                open_and_read_fast(&owned, owned_root.as_deref(), reuse.as_ref())
+                open_and_read_fast(&owned, owned_root.as_deref(), reuse.as_ref(), limit)
             })
             .await;
             let outcome = loaded?;
@@ -170,19 +261,24 @@ pub async fn get_static_file_with_content(
                     // 両方のキャッシュへ登録する（各キャッシュの既存の有効化・上限判定を
                     // そのまま使う）。
                     meta.set_stamp(meta_stamp);
-                    file_cache::get_file_cache().insert_with_config(path, meta.clone(), ofc);
-                    content_cache::insert_bytes_stamped(
-                        path,
-                        data.clone(),
-                        meta.mime_type.clone(),
-                        content_cfg,
-                        content_stamp,
-                    );
+                    if shareable {
+                        file_cache::get_file_cache().insert_with_config(path, meta.clone(), ofc);
+                        content_cache::insert_bytes_stamped(
+                            path,
+                            data.clone(),
+                            meta.mime_type.clone(),
+                            content_cfg,
+                            content_stamp,
+                        );
+                    }
                     return Some(StaticFileOutcome::File(meta, data));
                 }
+                FastOutcome::Busy => return Some(StaticFileOutcome::Busy),
                 FastOutcome::Directory(mut meta) => {
                     meta.set_stamp(meta_stamp);
-                    file_cache::get_file_cache().insert_with_config(path, meta.clone(), ofc);
+                    if shareable {
+                        file_cache::get_file_cache().insert_with_config(path, meta.clone(), ofc);
+                    }
                     return Some(StaticFileOutcome::Directory(meta));
                 }
                 // 高速経路が使えないと分かった（seccomp が openat2 を EPERM にする等）。下の
@@ -206,8 +302,11 @@ pub async fn get_static_file_with_content(
     if !meta.is_file {
         return Some(StaticFileOutcome::Directory(meta));
     }
+    let Ok(reserved) = reserve_uncached(meta.file_size, cache_limit(content_cfg)) else {
+        return Some(StaticFileOutcome::Busy);
+    };
     let data = content_cache::get_or_load(path, content_cfg).await?;
-    Some(StaticFileOutcome::File(meta, data))
+    Some(StaticFileOutcome::File(meta, charge(data, reserved)))
 }
 
 /// `path`（`containment` が `None` の場合）または `containment.root`
@@ -268,6 +367,8 @@ enum FastOutcome {
     /// 高速経路で判定できない（openat2 が使えない・登録済みルートでない）。呼び出し側は
     /// canonicalize の経路へ進む（404 ではない）。
     Unavailable,
+    /// 読む量の上限に達した（B-321。本体は読んでいない）
+    Busy,
 }
 
 /// offload 専用ワーカースレッド内で実行する同期関数: 登録済みルート配下の
@@ -291,6 +392,7 @@ fn open_and_read_fast(
     path: &Path,
     root: Option<&Path>,
     prev: Option<&file_cache::ReusableFileInfo>,
+    cache_limit: u64,
 ) -> Option<FastOutcome> {
     #[cfg(target_os = "linux")]
     {
@@ -305,7 +407,7 @@ fn open_and_read_fast(
             return Some(FastOutcome::Unavailable);
         };
         match opened {
-            Ok((file, meta)) => finish_fast(path, file, meta, prev),
+            Ok((file, meta)) => finish_fast(path, file, meta, prev, cache_limit),
             // 登録済みルート配下と判定された上での失敗（404 相当）。
             Err(_) => None,
         }
@@ -322,7 +424,7 @@ fn open_and_read_fast(
                 // 伴わないため、本体読み込みが必須の本関数では fd を再利用できる
                 // `open_static_ro` を使い、その fd から fstat する）。
                 let meta = file.metadata().ok()?;
-                finish_fast(path, file, meta, prev)
+                finish_fast(path, file, meta, prev, cache_limit)
             }
             Err(_) => None,
         }
@@ -339,14 +441,19 @@ fn finish_fast(
     mut file: std::fs::File,
     meta: std::fs::Metadata,
     prev: Option<&file_cache::ReusableFileInfo>,
+    cache_limit: u64,
 ) -> Option<FastOutcome> {
     let info = CachedFileInfo::from_open_metadata(path, &meta, prev);
     if !info.is_file {
         return Some(FastOutcome::Directory(info));
     }
 
+    // B-321: キャッシュに入らない大きさなら、読む前に読む量を予約する
+    let Ok(reserved) = reserve_uncached(meta.len(), cache_limit) else {
+        return Some(FastOutcome::Busy);
+    };
     let data = read_into_bytes(&mut file, &meta)?;
-    Some(FastOutcome::File(info, data))
+    Some(FastOutcome::File(info, charge(data, reserved)))
 }
 
 /// 既に開いている `File` と、それから取得済みの `Metadata` から本体を読む（新規 open を発生させない）。
@@ -366,6 +473,25 @@ mod tests {
     use crate::runtime::offload::{offload_call_count, reset_offload_call_count};
     use std::io::Write;
     use tempfile::tempdir;
+
+    /// B-321: キャッシュに入らない大きさの読み込みは上限まで。予約は本文を落とすと戻る
+    #[test]
+    fn uncached_read_budget() {
+        static C: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        assert!(matches!(reserve_uncached(10, 100), Ok(None)));
+        let first = UncachedRead::reserve_in(&C, 100, 101).expect("one read is always allowed");
+        let data = charge(Bytes::from_static(b"x"), Some(first));
+        assert!(UncachedRead::reserve_in(&C, 100, 1).is_none());
+        let copy = data.clone();
+        drop(data);
+        assert!(UncachedRead::reserve_in(&C, 100, 1).is_none());
+        drop(copy);
+        let a = UncachedRead::reserve_in(&C, 100, 60).expect("released");
+        assert!(UncachedRead::reserve_in(&C, 100, 50).is_none());
+        let b = UncachedRead::reserve_in(&C, 100, 40).expect("fits");
+        drop((a, b));
+        assert_eq!(C.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
 
     fn test_ofc() -> OpenFileCacheConfig {
         OpenFileCacheConfig {
@@ -447,7 +573,15 @@ mod tests {
         REGISTERED_TEST_ROOTS.get_or_init(|| {
             let root_a = tempdir().unwrap();
             let root_b = tempdir().unwrap();
-            register_test_roots(&[root_a.path().to_path_buf(), root_b.path().to_path_buf()]);
+            // root_a の中に入れ子のルート（`nested`）も登録する。外側を先に並べ、内側が先に引かれることを
+            // 確かめる（B-305）
+            let nested = root_a.path().join("nested");
+            std::fs::create_dir_all(&nested).unwrap();
+            register_test_roots(&[
+                root_a.path().to_path_buf(),
+                root_b.path().to_path_buf(),
+                nested,
+            ]);
             RegisteredTestRoots {
                 dirs: [root_a, root_b],
             }
@@ -547,11 +681,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_file(&dir, "fallback.txt", b"fallback");
         assert!(matches!(
-            open_and_read_fast(&path, Some(dir.path()), None),
+            open_and_read_fast(&path, Some(dir.path()), None, u64::MAX),
             Some(FastOutcome::Unavailable)
         ));
         assert!(matches!(
-            open_and_read_fast(&path, None, None),
+            open_and_read_fast(&path, None, None, u64::MAX),
             Some(FastOutcome::Unavailable)
         ));
     }
@@ -807,6 +941,7 @@ mod tests {
                 panic!("containment 検査に失敗した（テスト前提が崩れている）")
             }
             StaticFileOutcome::Directory(_) => panic!("ファイルのはずが Directory になった"),
+            StaticFileOutcome::Busy => panic!("小さなファイルで読む量の上限に達した"),
         }
 
         // 高速経路が使えるプラットフォーム（Linux/FreeBSD）でのみ、offload が
@@ -821,6 +956,33 @@ mod tests {
         {
             let _ = call_count;
         }
+    }
+
+    /// B-305: 入れ子のルート（外側 root_a・内側 root_a/nested）では、内側のルートの相対シンボリックリンクで
+    /// 外側のルートのファイル（内側の外）を開けない（HTTP/1.1 の「どれかの登録済みルート」探索も内側の
+    /// dirfd を使う）。外側のルートの中のパスは外側の dirfd で開ける
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nested_root_link_cannot_escape_through_outer_root() {
+        let roots = registered_test_roots();
+        let outer = roots.dirs[0].path();
+        let nested = outer.join("nested");
+        let secret = write_file_in(outer, "b305_outer_secret.txt", b"outer secret");
+        let link = nested.join("b305_link");
+        // 理由付き allow: テストのフィクスチャ作成（ホットパス外）。
+        #[allow(clippy::disallowed_methods)]
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("../b305_outer_secret.txt", &link).unwrap();
+
+        let via_link = resolve::open_beneath_for_request(&link);
+        assert!(
+            matches!(via_link, Some(Err(_))),
+            "a relative link in the nested root must not reach the outer root"
+        );
+        assert!(matches!(
+            resolve::open_beneath_for_request(&secret),
+            Some(Ok(_))
+        ));
     }
 
     /// **最重要（F-154）**: 2 つの登録済みルート A・B があるとき、A を `containment.root`

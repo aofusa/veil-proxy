@@ -80,12 +80,12 @@ Install:
 
 ```bash
 # Debian/Ubuntu
-sudo dpkg -i packaging/output/veil_0.10.1_amd64.deb
+sudo dpkg -i packaging/output/veil_0.11.0-rc.1_amd64.deb
 sudo apt-get install -f
 sudo systemctl enable --now veil
 
 # Amazon Linux 2023
-sudo dnf install -y packaging/output/veil-0.10.1-1.x86_64.rpm
+sudo dnf install -y packaging/output/veil-0.11.0-rc.1-1.x86_64.rpm
 sudo systemctl enable --now veil
 ```
 
@@ -108,7 +108,7 @@ See [packaging/README.md](../../packaging/README.md) for details (Docker build, 
 > **Cargo features**: The complete list of available feature flags is defined in the [`[features]` section of `Cargo.toml`](../../Cargo.toml).
 > Key notes:
 > - **Default features**: `ktls`, `http2`, `mimalloc`
-> - **`full`**: enables everything (`ktls`, `http2`, `http3`, `grpc-full`, `wasm`, `compression`, `cache`, `metrics`, `websocket`, `rate-limit`, `buffering`, `veil-alloc`). On unix the global allocator is **veil-alloc**; on Windows (where veil-alloc is not built) it falls back to mimalloc from the default features (or the system allocator with `--no-default-features`). Release builds for Windows and macOS use `full-windows` / `full-macos` instead (below)
+> - **`full`**: enables everything (`ktls`, `http2`, `http3`, `grpc-full`, `wasm`, `compression`, `cache`, `metrics`, `websocket` (kept for compatibility; it switches nothing, WebSocket proxying is always built), `rate-limit`, `buffering`, `veil-alloc`). On unix the global allocator is **veil-alloc**; on Windows (where veil-alloc is not built) it falls back to mimalloc from the default features (or the system allocator with `--no-default-features`). Release builds for Windows and macOS use `full-windows` / `full-macos` instead (below)
 > - **`full-freebsd` / `full-openbsd` / `full-netbsd`**: same feature set as `full`, but without mimalloc — all three use the **system allocator** (FreeBSD's `malloc(3)` is jemalloc already; bundling tikv-jemalloc on FreeBSD overrides libthr's malloc hooks and crashes the libc allocator, so the `jemalloc` feature is rejected at compile time on FreeBSD — B-89). All three include `wasm`; `full-openbsd`/`full-netbsd` run it through wasmtime's **Pulley interpreter** (B-52/B-55). All three use vendored TLS (rustls+aws_lc_rs on FreeBSD, rustls+ring on OpenBSD/NetBSD; quiche+bundled BoringSSL on all three). These sets are **architecture-independent** — the former `full-freebsd-aarch64` / `full-openbsd-aarch64` / `full-netbsd-aarch64` variants were byte-identical to their base sets and have been removed; use `--features full-freebsd` etc. on both x86_64 and aarch64. On NetBSD (any arch), FreeBSD aarch64, and OpenBSD aarch64, `wasm` builds against a vendored `third_party/wasmtime` (Pulley-only, see `third_party/wasmtime/README.veil.md`) instead of crates.io wasmtime, since crates.io wasmtime (36 / 40 alike) has no signal-handling support for these targets; every other platform is unaffected and keeps unmodified crates.io wasmtime. Cargo has no per-target default features, so the packaging scripts pass these explicitly with `--no-default-features` (`packaging/scripts/build-cross.sh --target freebsd`, `tools/qemu/bsd-vm.sh <os> <arch> build|e2e`). Plain `--features full` is unchanged.
 > - **`full-windows` / `full-macos`** (F-184): same feature set as `full`, but with a different allocator instead of the unix-only veil-alloc: **mimalloc** on Windows, the **system allocator** (libmalloc) on macOS. Like the BSD sets, Cargo has no per-target default features, so `packaging/scripts/build-cross.sh --target windows|macos` (`docker/Dockerfile.windows` / `docker/Dockerfile.macos`) pass them with `--no-default-features`
 > - **`full-container`** (F-144): same feature set as `full`, plus `epoll` — an explicit epoll-based readiness runtime (`veil_rt_reactor`, Linux only) instead of the default io_uring completion-based runtime (`veil_rt_uring`). Intended for container/orchestration environments (Docker, Kubernetes, gVisor) where seccomp profiles or the container runtime's syscall emulation frequently block or restrict io_uring. `default` is unchanged; build with `cargo build --features full-container` (or `--no-default-features --features full-container` if you also want to swap the allocator).
@@ -117,6 +117,38 @@ See [packaging/README.md](../../packaging/README.md) for details (Docker build, 
 > - **Allocator features** (`veil-alloc`, `mimalloc`, `jemalloc`, `system-allocator`) are mutually exclusive — enable at most one (to pick one other than the default `mimalloc`, use `--no-default-features`; if several are on anyway, the precedence is veil-alloc > mimalloc > jemalloc)
 > - HTTP/3 is UDP-based and cannot be combined with kTLS
 
+
+### Application icon and version information
+
+The logo ([docs/images/veil_logo.webp](../images/veil_logo.webp)) is shipped where each platform looks for it:
+
+| Artifact | What it carries |
+|---|---|
+| Windows `veil.exe` (`*-pc-windows-msvc`) | Icon and version information (product name, version, description) as PE resources, shown by Explorer, the file's Properties and Task Manager |
+| Windows MSI (winget) | The icon of the entry in *Installed apps* |
+| deb / rpm, BSD ports | `share/icons/hicolor/<size>/apps/veil.png` and AppStream metadata (`share/metainfo/io.github.aofusa.veil.metainfo.xml`) for software centers |
+| Container image, Helm chart | `io.artifacthub.package.logo-url` label and the chart's `icon` (Artifact Hub) |
+| docs.rs, default pages | The rustdoc logo and favicon; `favicon.ico` next to the default pages |
+
+ELF and Mach-O command-line programs have no standard place for an icon, so the Linux, BSD and macOS binaries
+and the release archives (tar.gz, zip) carry none.
+
+On Windows targets, `build.rs` compiles [packaging/windows/veil.rc](../../packaging/windows/veil.rc) with a resource
+compiler and links it into the `veil` binary only (programs that use veil as a library get nothing). It looks for
+the compiler in this order: the `RC_<target>` or `RC` environment variable, `llvm-rc` (also `llvm-rc-<version>`,
+used by cross builds with cargo-xwin), then — on a Windows host — `rc.exe` in `PATH` or in the Windows SDK. When
+none is found the build continues with a warning and the executable has no icon; set
+`VEIL_REQUIRE_WIN_RESOURCES=1` to make that an error ([docker/Dockerfile.windows](../../docker/Dockerfile.windows)
+does).
+
+The icons in [packaging/icons/](../../packaging/icons/) are generated from the logo and committed (no image tools
+are needed to build veil). After replacing the logo, regenerate them with ImageMagick and commit the result;
+CI runs the check:
+
+```bash
+tools/release/render-icons.sh            # needs ImageMagick (magick or convert) with WebP support
+tools/release/render-icons.sh --check    # the logo is the one the icons were made from; validates the AppStream file
+```
 
 ### Library artifacts (Rust source, C library, Python wheel)
 

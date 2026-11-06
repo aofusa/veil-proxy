@@ -11,7 +11,24 @@ OS="$1"; ARCH="$2"; OUT="$3"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TARGET="${ARCH}-unknown-${OS}"
 mkdir -p "$OUT"
-log() { echo "==> $*"; }
+log() { echo "==> $(date -u '+%H:%M:%S') $*"; }
+# B-292: 段ごとの時間の上限（timeout(1) は FreeBSD・OpenBSD 7 以降・NetBSD 7 以降の base にある）。時間切れは 124
+limit() {
+    m="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 30 "${m}m" "$@"
+    else
+        "$@"
+    fi
+}
+# 終了コードをファイルに残しながら出力をログと job の両方へ流す（sh に pipefail が無い OS がある）
+tee_rc() {
+    logf="$1"; shift
+    rcf="$logf.rc"
+    { if "$@"; then echo 0 > "$rcf"; else echo $? > "$rcf"; fi; } 2>&1 | tee "$logf"
+    rc="$(cat "$rcf" 2>/dev/null || echo 1)"; rm -f "$rcf"
+    return "$rc"
+}
 
 case "$OS" in
 freebsd)
@@ -54,8 +71,10 @@ netbsd)
     export PKG_PATH="https://cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/${ARCH}/$(uname -r | cut -d. -f1).0/All/"
     log "pkgin ($PKG_PATH)"
     [ -x /usr/pkg/bin/pkgin ] || /usr/sbin/pkg_add pkgin
-    pkgin -y update
-    pkgin -y install rust-bin cmake llvm clang protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl
+    # 取得が止まることがある（libfetch に全体の時間切れが無い）ので 10 分で切って 1 回やり直す
+    limit 10 pkgin -y update || limit 10 pkgin -y update
+    limit 10 pkgin -y install rust-bin cmake llvm clang protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl \
+        || limit 10 pkgin -y install rust-bin cmake llvm clang protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl
     mozilla-rootcerts-openssl install >/dev/null 2>&1 || true
     LIBCLANG_PATH="$(find -L /usr/pkg -name 'libclang.so*' 2>/dev/null | head -1 | xargs dirname)"; export LIBCLANG_PATH
     [ "$ARCH" = aarch64 ] && export CFLAGS_aarch64_unknown_netbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'
@@ -68,7 +87,7 @@ cd "$ROOT"
 # bsd-vm.sh は fuzz/ を VM へ送らないので Cargo.toml から外しているが、ここは checkout した木そのまま（--locked が通る）
 cargo --version
 log "cargo build --profile dist --features $FEATURES"
-cargo build --locked --profile dist --no-default-features --features "$FEATURES"
+limit 45 cargo build --locked --profile dist --no-default-features --features "$FEATURES"
 BIN="$ROOT/target/dist/veil"
 # B-60: NetBSD は PaX MPROTECT がシステム全体で有効。wasmtime のために解除しておく（ELF の注記に残る）
 [ "$OS" = netbsd ] && /usr/sbin/paxctl +m "$BIN"
@@ -80,10 +99,9 @@ bash packaging/scripts/build-bsd.sh --os "$OS" --arch "$ARCH" --binary "$BIN" --
 mv "packaging/output/$NAME.tar.gz" "$OUT/"
 log "smoke test"
 mkdir -p "$OUT/smoke" && tar -C "$OUT/smoke" -xzf "$OUT/$NAME.tar.gz"
-if ! bash tools/release/binary-smoke.sh "$OUT/smoke/$NAME" "$VER" > "$OUT/smoke-$TARGET.log" 2>&1; then
-    cat "$OUT/smoke-$TARGET.log"; exit 1
+if ! tee_rc "$OUT/smoke-$TARGET.log" limit 5 bash tools/release/binary-smoke.sh "$OUT/smoke/$NAME" "$VER"; then
+    exit 1
 fi
-cat "$OUT/smoke-$TARGET.log"
 rm -rf "$OUT/smoke"
 if [ "${VEIL_BSD_UNIT_TESTS:-1}" = 1 ]; then
     # 配布物は作り終えたので dist の出力を消して容量を空ける（NetBSD の VM のルートは 6GB しか空いていない）
@@ -94,24 +112,28 @@ if [ "${VEIL_BSD_UNIT_TESTS:-1}" = 1 ]; then
         export CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_RUNNER=/tmp/paxrun.sh
     fi
     # パイプで繋がない（sh に pipefail が無い OS があり、失敗が tail の終了コードに隠れる）
+    # B-292: 単体試験は 25 分で切る（止まった試験で VM の step の時間切れまで待たない）
     unit() {
         CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 \
-            cargo test --locked --lib --no-default-features --features "$FEATURES" "$@"
+            limit 25 cargo test --locked --lib --no-default-features --features "$FEATURES" "$@"
     }
-    if unit > "$OUT/unit-$TARGET.log" 2>&1; then
+    # 出力は job のログにも流す（止まったときに 60 秒を超えた試験の名前が残る）
+    if tee_rc "$OUT/unit-$TARGET.log" unit; then
         grep '^test result' "$OUT/unit-$TARGET.log"
     else
         # 負荷のかかった VM では、ローカルの模擬サーバを使う試験がまれに時間切れで落ちる（v0.9.0 の OpenBSD で
-        # test_perform_grpc_health_check_success）。落ちた試験だけを 1 回やり直し、通れば FLAKY として報告して続ける。
-        failed="$(sed -n 's/^---- \([^ ]*\) stdout ----$/\1/p' "$OUT/unit-$TARGET.log")"
-        tail -60 "$OUT/unit-$TARGET.log"
+        # test_perform_grpc_health_check_success）。落ちた試験・止まった試験（60 秒を超えたもの）だけを 1 回やり直し、
+        # 通れば FLAKY として報告して続ける。
+        failed="$( { sed -n 's/^---- \([^ ]*\) stdout ----$/\1/p' "$OUT/unit-$TARGET.log"
+                    sed -n 's/^test \([^ ]*\) has been running for over 60 seconds$/\1/p' "$OUT/unit-$TARGET.log"; } | sort -u)"
         [ -n "$failed" ] || exit 1
+        log "retry: $failed"
         # shellcheck disable=SC2086
-        if unit -- --exact $failed > "$OUT/unit-retry-$TARGET.log" 2>&1; then
+        if tee_rc "$OUT/unit-retry-$TARGET.log" unit -- --exact $failed; then
             for t in $failed; do echo "FLAKY: $t failed once and passed on retry"; done
             grep '^test result' "$OUT/unit-retry-$TARGET.log"
         else
-            tail -40 "$OUT/unit-retry-$TARGET.log"; exit 1
+            exit 1
         fi
     fi
 fi

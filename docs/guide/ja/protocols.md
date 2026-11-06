@@ -255,35 +255,54 @@ WebSocket（RFC 6455）のプロキシに対応しています。
 `Connection: Upgrade` と `Upgrade: websocket` ヘッダーを自動検出し、
 双方向のデータ転送を行います。
 
-WebSocket を受けるのは HTTP/1.1 の接続（平文・TLS）だけです。veil は `SETTINGS_ENABLE_CONNECT_PROTOCOL` を広告しないので、
-HTTP/2（RFC 8441）・HTTP/3（RFC 9220）の上の WebSocket は使えません。ブラウザは WebSocket 用に HTTP/1.1 の別の接続を張ります。
+WebSocket は HTTP/1.1 の接続（平文・TLS）で受けます。有効にすれば HTTP/2（RFC 8441）・HTTP/3（RFC 9220）の拡張 CONNECT でも受けます。
+拡張 CONNECT は既定で無効です。`[http2] enable_connect_protocol = true`・`[http3] enable_connect_protocol = true` で
+`SETTINGS_ENABLE_CONNECT_PROTOCOL` を広告します。無効のときブラウザは WebSocket 用に HTTP/1.1 の別の接続を張り、
 HTTP/3 だけを受けるリスナーでは WebSocket を使えません。
+
+### HTTP/2・HTTP/3 の上の WebSocket（拡張 CONNECT）
+
+```toml
+[http2]
+enable_connect_protocol = true   # SETTINGS_ENABLE_CONNECT_PROTOCOL を広告する（RFC 8441）
+
+[http3]
+enable_connect_protocol = true   # SETTINGS_ENABLE_CONNECT_PROTOCOL を広告する（RFC 9220）
+```
+
+- クライアントは 1 本のストリームで `CONNECT` と `:protocol = websocket`・`:scheme`・`:path`・`:authority` を送ります。
+  要求は `:path` への `GET` と同じにルーティング・検査します（ホスト・パス・`[route.security]`・Proxy-Wasm の要求ヘッダ）。
+- `Proxy` のルートでは上流へ HTTP/1.1 の WebSocket のアップグレードを送ります（常に HTTP/1.1。`Sec-WebSocket-Key` は veil が作り、
+  `Sec-WebSocket-Accept` を確かめます）。上流の `101` はクライアントのストリームでは `200` になります。`Sec-WebSocket-Protocol`・
+  `Sec-WebSocket-Extensions` は残し、ルートの応答ヘッダの方針を通します。上流がアップグレードしなければ、その状態・ヘッダ・本文を
+  ストリームで返します。
+- その後はストリームの DATA フレームが両方向の WebSocket のバイト列を運びます。フロー制御は消費に連動します（遅い上流はバッファを
+  溜めずにクライアントを遅くします）。クライアントがストリームを終えると上流の接続を半分閉じ、上流が閉じるとストリームを終えます。
+  エラー・`websocket_idle_timeout_secs`・graceful shutdown はストリームをリセットします（HTTP/2 は `RST_STREAM(CANCEL)`、
+  HTTP/3 は `H3_REQUEST_CANCELLED`）。切れたトンネルを正常な終わりに見せません。
+- トンネルのストリームには `stream_idle_timeout_secs`・要求本文のタイムアウトを適用しません（そもそもアイドルになるため）。
+  ルートの `websocket_idle_timeout_secs` を使ってください。トンネルは接続の `max_concurrent_streams` に数えます。
+- `Proxy` のルートで `:protocol` が `websocket` 以外なら 501、`Proxy` 以外のルート（ライブラリのハンドラを除く）は 400 です。
+  `:protocol` の無い素の `CONNECT` は従来どおり 405 で断ります。
+- `:protocol` は `CONNECT` にだけ、かつ設定を広告しているときだけ受け付けます。それ以外はストリーム（HTTP/2）・要求（HTTP/3）を
+  不正として拒否します。
 
 ### 動作
 
-1. クライアントからの Upgrade リクエストを検出
-2. バックエンドに Upgrade リクエストを転送
-3. 101 Switching Protocols を受信
-4. 双方向のバイパス転送を開始（設定されたポーリングモードで動作）
-5. どちらかの接続が閉じるまで継続
+1. クライアントからの Upgrade リクエストを検出（`Proxy` のルートへの HTTP/1.1 の `GET`、または HTTP/2・HTTP/3 の拡張 `CONNECT`）
+2. バックエンドに Upgrade リクエストを転送（常に HTTP/1.1）
+3. 101 Switching Protocols を受信（それ以外の応答は全体を返して接続を閉じる）
+4. 両方向にバイトを中継する。中継は両側を同時に待ち、データの届いた側からコピーする（ユーザー空間のバッファを通す。
+   アイドルのトンネルは CPU を使わない）
+5. どちらかの接続が閉じる・アイドルの上限（`websocket_idle_timeout_secs`）を過ぎる・graceful shutdown が始まるまで継続
 
-### ポーリングモード
-
-WebSocket双方向転送時のポーリング動作を設定で制御できます。
-
-| モード | 説明 | 用途 |
-|--------|------|------|
-| `adaptive`（デフォルト） | データ転送時は短く、アイドル時は長くなる | 汎用、CPU効率重視 |
-| `fixed` | 常に固定のタイムアウトを使用 | リアルタイムゲーム、低レイテンシ最優先 |
-
-詳細な設定オプションは「[WebSocket設定](routing.md#websocket設定)」セクションを参照してください。
+以前の版の `websocket_poll_*` は廃止し、無視します。詳細は「[WebSocket設定](routing.md#websocket設定)」を参照してください。
 
 ### 設定例
 
-WebSocketは通常のProxyバックエンドで自動的にサポートされます：
+WebSocketは通常のProxyバックエンドで自動的にサポートされます:
 
 ```toml
-# WebSocketアプリケーション（デフォルト設定）
 [[route]]
 [route.conditions]
 host = "example.com"
@@ -292,18 +311,9 @@ path = "/ws/*"
 type = "Proxy"
 url = "http://localhost:3000"
 
-# 低レイテンシ設定（リアルタイムゲーム向け）
-[[route]]
-[route.conditions]
-host = "game.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3001"
-
+# 10 分データが流れないトンネルを閉じる
 [route.security]
-  websocket_poll_mode = "fixed"
-  websocket_poll_timeout_ms = 1
+websocket_idle_timeout_secs = 600
 ```
 
 ### 対応バックエンド

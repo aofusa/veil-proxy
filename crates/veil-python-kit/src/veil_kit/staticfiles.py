@@ -7,7 +7,8 @@
     app.mount("/static", StaticFiles(directory="public"), name="static")
 
 The directory is served by the server's file backend (Rust): ``sendfile``, kTLS, Range and ``ETag`` work as for the
-proxy, and requests do not reach Python. Precompressed ``.br`` / ``.gz`` files are not used. ``html=True`` serves ``index.html`` for directories.
+proxy, and requests do not reach Python. ``precompressed=["br", "gzip"]`` serves precompressed ``.br`` / ``.gz`` /
+``.zst`` siblings. ``html=True`` serves ``index.html`` for directories.
 """
 
 # F-268: 本体の File バックエンドのルートを注入する（app.serve_dir と同じ）
@@ -20,17 +21,20 @@ __all__ = ["StaticFiles"]
 class StaticFiles:
     """A directory to mount with ``app.mount(path, StaticFiles(directory=...))``."""
 
-    def __init__(self, *, directory, html=False, check_dir=True, follow_symlink=False, cache=True, **route_options):
+    def __init__(self, *, directory, html=False, check_dir=True, follow_symlink=False, cache=True, precompressed=None,
+                 **route_options):
         """``directory`` is served below the mount path; ``cache=False`` turns off the open-file and content caches;
+        ``precompressed`` lists the precompressed siblings to serve (``"br"``, ``"gzip"``, ``"zstd"``);
         ``route_options`` are extra ``[[route]]`` keys."""
         if check_dir and not os.path.isdir(directory):
             raise RuntimeError("Directory '%s' does not exist" % directory)
         self.directory = os.path.abspath(directory)
         self.html = html
         self.cache = cache
+        self.precompressed = precompressed
         self.route_options = route_options
 
     def _veil_mount(self, app, path):
         """Called by ``app.mount``."""
         app.serve_dir(path, self.directory, index="index.html" if self.html else None, cache=self.cache,
-                      **self.route_options)
+                      precompressed=self.precompressed, **self.route_options)

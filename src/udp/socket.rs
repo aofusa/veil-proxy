@@ -1641,6 +1641,10 @@ impl QuicUdpSocket {
     pub fn bind_reuseport(addr: SocketAddr) -> io::Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
+        // B-310: 閉じたクライアントへの送信の ICMP を受信のエラーにしない
+        crate::runtime::udp::disable_udp_connreset(
+            std::os::windows::io::AsRawSocket::as_raw_socket(&socket) as _,
+        );
         let local_addr = socket.local_addr()?;
 
         Ok(Self {

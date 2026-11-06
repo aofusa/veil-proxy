@@ -94,6 +94,11 @@ pub struct WasmDefaults {
     /// Pooling allocator settings
     #[serde(default)]
     pub pooling: PoolingConfig,
+
+    /// フィルタが失敗した（トラップ・実行時間の超過・インスタンスを作れない・守れない Pause 等）ときの扱い（F-293）。
+    /// 既定は `fail_closed`（要求を 503 で拒否する。Envoy の既定と同じ）。モジュールごとに上書きできる。
+    #[serde(default)]
+    pub failure_policy: FailurePolicy,
 }
 
 impl Default for WasmDefaults {
@@ -102,6 +107,48 @@ impl Default for WasmDefaults {
             max_execution_time_ms: default_max_execution_time(),
             yield_interval_us: default_yield_interval_us(),
             pooling: PoolingConfig::default(),
+            failure_policy: FailurePolicy::default(),
+        }
+    }
+}
+
+/// フィルタが失敗したときの扱い（F-293。Envoy の `envoy.extensions.wasm.v3.FailurePolicy` に対応）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailurePolicy {
+    /// 要求を 503（gRPC は `grpc-status: 14`）で拒否する。応答を送り始めた後ならストリームを打ち切る
+    #[default]
+    FailClosed,
+    /// フィルタの失敗を記録し、その段のそのフィルタが無かったものとして続ける（失敗の前に加えたヘッダの変更は残る）
+    FailOpen,
+    /// `fail_closed` と同じく拒否し、そのモジュールの使い回しているインスタンスを捨てて作り直す
+    FailReload,
+}
+
+impl FailurePolicy {
+    /// 失敗した要求を拒否するか
+    pub fn rejects(self) -> bool {
+        !matches!(self, FailurePolicy::FailOpen)
+    }
+
+    /// Envoy の `PluginConfig` の `fail_open`（非推奨の bool）と `failure_policy`（UNSPECIFIED=0・FAIL_RELOAD=1・
+    /// FAIL_CLOSED=2・FAIL_OPEN=3）から決める。明示の `failure_policy` を優先する（B-298）。
+    pub fn from_envoy(fail_open: bool, failure_policy: i32) -> Self {
+        match failure_policy {
+            1 => FailurePolicy::FailReload,
+            2 => FailurePolicy::FailClosed,
+            3 => FailurePolicy::FailOpen,
+            _ if fail_open => FailurePolicy::FailOpen,
+            _ => FailurePolicy::FailClosed,
+        }
+    }
+
+    /// メトリクス・ログの表記
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailurePolicy::FailClosed => "fail_closed",
+            FailurePolicy::FailOpen => "fail_open",
+            FailurePolicy::FailReload => "fail_reload",
         }
     }
 }
@@ -176,6 +223,10 @@ pub struct ModuleConfig {
     /// `plugin_data.<名前>` で中身を読める（WASI の `path_open` は足さない）
     #[serde(default)]
     pub data_files: std::collections::BTreeMap<String, String>,
+
+    /// このモジュールが失敗したときの扱い（F-293）。未設定なら `[wasm.defaults] failure_policy`
+    #[serde(default)]
+    pub failure_policy: Option<FailurePolicy>,
 }
 
 /// Filter action returned by callbacks

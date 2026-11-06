@@ -63,6 +63,8 @@ pub enum Backend {
         Option<Arc<cache::StaticContentCacheRouteConfig>>,
         /// このバックエンドに適用するWASMモジュール参照のリスト（F-148）
         Option<Arc<Vec<ModuleRef>>>,
+        /// 事前圧縮した兄弟ファイルを使う方式（F-294）
+        super::Precompressed,
     ),
     /// Redirect バックエンド
     /// - `Arc<str>`: リダイレクト先URL
@@ -113,7 +115,7 @@ impl Backend {
         match self {
             Backend::Proxy(_, security, _, _, _, _) => security,
             Backend::MemoryFile(_, _, security, _) => security,
-            Backend::SendFile(_, _, _, security, _, _, _, _, _) => security,
+            Backend::SendFile(_, _, _, security, _, _, _, _, _, _) => security,
             Backend::Redirect(_, _, _, _, security) => security,
             Backend::Respond(r) => &r.security,
             #[cfg(feature = "handler")]
@@ -127,7 +129,7 @@ impl Backend {
         match self {
             Backend::Proxy(_, security, _, _, _, _) => security,
             Backend::MemoryFile(_, _, security, _) => security,
-            Backend::SendFile(_, _, _, security, _, _, _, _, _) => security,
+            Backend::SendFile(_, _, _, security, _, _, _, _, _, _) => security,
             Backend::Redirect(_, _, _, _, security) => security,
             Backend::Respond(r) => &r.security,
             #[cfg(feature = "handler")]
@@ -145,7 +147,7 @@ impl Backend {
             Backend::MemoryFile(a, b, _, d) => {
                 Backend::MemoryFile(a.clone(), b.clone(), sec, d.clone())
             }
-            Backend::SendFile(a, b, c, _, e, f, g, h, i) => Backend::SendFile(
+            Backend::SendFile(a, b, c, _, e, f, g, h, i, j) => Backend::SendFile(
                 a.clone(),
                 *b,
                 c.clone(),
@@ -155,6 +157,7 @@ impl Backend {
                 g.clone(),
                 h.clone(),
                 i.clone(),
+                *j,
             ),
             Backend::Redirect(a, b, c, d, _) => {
                 Backend::Redirect(a.clone(), *b, *c, d.clone(), sec)
@@ -172,7 +175,7 @@ impl Backend {
         match self {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_ref(),
             Backend::MemoryFile(_, _, _, modules) => modules.as_ref(),
-            Backend::SendFile(_, _, _, _, _, _, _, _, modules) => modules.as_ref(),
+            Backend::SendFile(_, _, _, _, _, _, _, _, modules, _) => modules.as_ref(),
             Backend::Redirect(_, _, _, modules, _) => modules.as_ref(),
             Backend::Respond(r) => r.modules.as_ref(),
             #[cfg(feature = "handler")]
@@ -188,7 +191,7 @@ impl Backend {
             Backend::MemoryFile(_, _, _, modules) => {
                 modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
             }
-            Backend::SendFile(_, _, _, _, _, _, _, _, modules) => {
+            Backend::SendFile(_, _, _, _, _, _, _, _, modules, _) => {
                 modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
             }
             Backend::Redirect(_, _, _, modules, _) => {
@@ -266,6 +269,11 @@ impl ProxyTarget {
             }
             None => (host_port.to_string(), if scheme { 443 } else { 80 }),
         };
+        // B-324: ホスト名 `unix` は接続先表記が `unix:<port>` になり、接続で UDS（相対パス）と取り違えるので拒否する
+        // （API クライアントの unix_sockets = false を `http://unix/` で越えられた）
+        if host.eq_ignore_ascii_case("unix") {
+            return None;
+        }
 
         // host が IP アドレスリテラルであれば、設定ロード時に一度だけ SocketAddr を
         // 構築しておく（ホットパスでのブロッキング DNS 解決・to_socket_addrs() の
@@ -506,6 +514,14 @@ pub(super) mod proxy_target_socket_addr_tests {
         let t = ProxyTarget::parse("http://backend.example.com:8080/").unwrap();
         let expected = crate::http_utils::HostPortStr::new(&t.host, t.port);
         assert_eq!(t.conn_addr().as_str(), expected.as_str());
+    }
+
+    // B-324
+    #[test]
+    fn host_named_unix_is_rejected() {
+        assert!(ProxyTarget::parse("http://unix/").is_none());
+        assert!(ProxyTarget::parse("http://UNIX:8080/").is_none());
+        assert!(ProxyTarget::parse("http://unixhost/").is_some());
     }
 
     #[cfg(unix)]

@@ -584,7 +584,7 @@ fn tcp_cfg(clusters: Vec<(Arc<ClusterSlot>, u32)>) -> TcpProxyCfg {
         clusters,
         total_weight,
         idle_timeout: None,
-        rbac: None,
+        rbac: Vec::new(),
         access_logs: Vec::new(),
         tunnel: None,
     }
@@ -1430,7 +1430,7 @@ fn translate_inbound(cfg: &Config, port: u16, srv: &p::Server) -> Result<InCfg, 
 }
 
 /// ポリシーが届かないときの既定（`LINKERD2_PROXY_INBOUND_DEFAULT_POLICY`）。
-fn default_inbound(cfg: &Config, port: u16) -> InCfg {
+pub(super) fn default_inbound(cfg: &Config, port: u16) -> InCfg {
     let any_net = |permit: Option<p::authn::Permit>| p::Authz {
         networks: vec![p::Network {
             net: Some(p::IpNetwork {

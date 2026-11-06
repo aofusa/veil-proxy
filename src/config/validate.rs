@@ -233,6 +233,21 @@ pub(super) fn warn_unbuilt_sections(_config: &Config) {
 
 pub(super) fn validate_config(config: &Config) -> io::Result<()> {
     validate_listeners(config)?;
+    validate_ip_list("[security] blocked_ips", &config.security.blocked_ips)?;
+    // B-322: OTLP のエクスポータは TLS を持たない（https:// を平文で送らない。F37）
+    if config.opentelemetry.enabled
+        && config
+            .opentelemetry
+            .endpoint
+            .get(..8)
+            .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "[opentelemetry] endpoint: https:// is not supported (the OTLP exporter sends plain HTTP); \
+             use http:// to a local collector or sidecar",
+        ));
+    }
 
     // F-220: SAN の許可リストはクライアント証明書を要求するときだけ意味がある（黙って無視しない）
     if !config.tls.client_allowed_sans.is_empty() && config.tls.client_auth == ClientAuthMode::None
@@ -489,11 +504,35 @@ pub(super) fn validate_config(config: &Config) -> io::Result<()> {
 }
 
 /// ルート設定の妥当性チェック
+/// IP・CIDR のリストの全要素が読めるか（B-322: 読めない要素は黙って捨てていて、`allowed_ips` が全部読めないと
+/// 空＝全許可になっていた。F46）
+fn validate_ip_list(what: &str, list: &[String]) -> io::Result<()> {
+    match list
+        .iter()
+        .find(|s| super::net_policy::CidrRange::parse(s.trim()).is_none())
+    {
+        Some(bad) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what}: invalid IP address or CIDR range: {bad:?}"),
+        )),
+        None => Ok(()),
+    }
+}
+
 pub(super) fn validate_route_config(
     route: &Route,
     route_name: &str,
     #[cfg(feature = "wasm")] wasm_config: Option<&crate::wasm::WasmConfig>,
 ) -> io::Result<()> {
+    if let Some(sec) = &route.security {
+        for (key, list) in [
+            ("allowed_ips", &sec.allowed_ips),
+            ("denied_ips", &sec.denied_ips),
+            ("trusted_proxies", &sec.trusted_proxies),
+        ] {
+            validate_ip_list(&format!("route '{route_name}' security.{key}"), list)?;
+        }
+    }
     match &route.action {
         BackendConfig::Proxy { url, .. } => {
             if ProxyTarget::parse(url).is_none() {

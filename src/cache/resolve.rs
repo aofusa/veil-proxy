@@ -194,6 +194,23 @@ pub fn has_fast_path_in_root(root: &Path) -> bool {
     }
 }
 
+/// `root` が `full_path` を含む登録済みルートのうち最も深いもの（`open_beneath_for_request` が選ぶもの）か。
+///
+/// B-321: 外側のルートの dirfd で開いたエントリは、内側のルートの封じ込め（内側の外を指すシンボリックリンクの
+/// 拒否）を経ていない。共有のキャッシュへ入れると、内側のルートの要求がヒットしてそのまま配っていた（F50）。
+/// 共有してよいのは最も深いルートで開いたものだけ。Linux 以外は per-route の dirfd を使わないので常に true
+pub fn is_strictest_root(root: &Path, full_path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::strictest_root(full_path).is_none_or(|r| r == root)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, full_path);
+        true
+    }
+}
+
 /// `open_beneath_for_request` が実際に高速経路（登録済みルート＋openat2 利用可）を
 /// 使えるかどうかを **syscall を一切発行せず** 事前判定する（B-65）。
 ///
@@ -392,6 +409,10 @@ mod linux_impl {
                 dirfd: fd,
             });
         }
+        // 入れ子のルート（`/srv` と `/srv/public`）では内側を先に見る（B-305）。パスが前方一致した最初のルートの
+        // dirfd で開くので、外側が先だと内側のルートの相対シンボリックリンク（`../private/x`）を外側の封じ込めで
+        // 許してしまい、別のルート（認証・IP 制限付き）配下のファイルを配れた
+        dirs.sort_by_key(|r| std::cmp::Reverse(r.root.components().count()));
         // 複数回呼ばれても 2 回目以降は無視される（設定ロードは通常起動時 1 回のみ）。
         let _ = LINUX_ROOTS.set(dirs);
     }
@@ -535,6 +556,15 @@ mod linux_impl {
     }
 
     /// 登録済み dirfd を使う高速経路（ホットパス用。ルート open をやり直さない）。
+    /// `full_path` を含む登録済みルートのうち最も深いもの（ルートは深い順に並ぶ）
+    pub(super) fn strictest_root(full_path: &Path) -> Option<&'static Path> {
+        LINUX_ROOTS
+            .get()?
+            .iter()
+            .find(|r| full_path.starts_with(&r.root))
+            .map(|r| r.root.as_path())
+    }
+
     pub(super) fn open_for_request(
         full_path: &Path,
     ) -> Option<io::Result<(File, std::fs::Metadata)>> {

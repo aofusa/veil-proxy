@@ -4543,11 +4543,36 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "veil-capi"
-version = "0.10.1"
+version = "0.11.0-rc.1"
+dependencies = [
+ "veil-capi-core",
+]
+
+[[package]]
+name = "veil-capi-core"
+version = "0.11.0-rc.1"
 dependencies = [
  "bytes",
+ "ftlog",
+ "regex",
  "serde_json",
+ "toml",
  "veil-proxy",
+ "veil-proxy-kit",
+]
+
+[[package]]
+name = "veil-capi-helpers"
+version = "0.11.0-rc.1"
+dependencies = [
+ "bytes",
+ "ftlog",
+ "futures",
+ "serde",
+ "serde_json",
+ "veil-capi-core",
+ "veil-proxy",
+ "veil-proxy-kit",
 ]
 
 [[package]]
@@ -4561,7 +4586,7 @@ dependencies = [
 
 [[package]]
 name = "veil-proxy"
-version = "0.10.1"
+version = "0.11.0-rc.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4646,14 +4671,14 @@ dependencies = [
 
 [[package]]
 name = "veil-proxy-build"
-version = "0.10.1"
+version = "0.11.0-rc.1"
 dependencies = [
  "prost-build",
 ]
 
 [[package]]
 name = "veil-proxy-kit"
-version = "0.10.1"
+version = "0.11.0-rc.1"
 dependencies = [
  "arc-swap",
  "async-graphql",
@@ -4670,7 +4695,7 @@ dependencies = [
 
 [[package]]
 name = "veil-proxy-macros"
-version = "0.10.1"
+version = "0.11.0-rc.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4767,7 +4792,7 @@ dependencies = [
 
 [[package]]
 name = "veil-python"
-version = "0.10.1"
+version = "0.11.0-rc.1"
 dependencies = [
  "bytes",
  "futures",

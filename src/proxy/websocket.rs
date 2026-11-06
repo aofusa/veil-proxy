@@ -46,19 +46,8 @@ pub(super) async fn handle_websocket_proxy(
 
     // リクエストパス構築
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-    let sub_path = if prefix.is_empty() {
-        path_str.to_string()
-    } else {
-        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
-            let base = target.path_prefix.trim_end_matches('/');
-            build_sub_path(base, remaining)
-        } else {
-            path_str.to_string()
-        }
-    };
-
-    let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
+    let final_path = ws_upstream_path(target, path_str, prefix);
+    let final_path = final_path.as_str();
 
     // WebSocket アップグレードリクエスト構築（プール使用）
     // Connection: Upgrade と Upgrade: websocket を維持
@@ -81,8 +70,13 @@ pub(super) async fn handle_websocket_proxy(
     // `remove_request_headers` に入っている名前・不正な名前と値は送らず、`add_request_headers` を足す
     // （以前は削除・追加の指定が WebSocket の経路にだけ効いていなかった。F-236 の再走査の F2）。
     let added = expanded_added_headers(security, client_ip, host, path_str);
+    // B-307: `Connection` は `Upgrade` だけにし、`Connection` に挙がったホップバイホップのヘッダは送らない
+    request.extend_from_slice(b"Connection: Upgrade\r\n");
     for (name, value) in headers {
         if name.eq_ignore_ascii_case(b"host")
+            || name.eq_ignore_ascii_case(b"connection")
+            || (!name.eq_ignore_ascii_case(b"upgrade")
+                && crate::http_utils::connection_lists(headers, name))
             || name.eq_ignore_ascii_case(b"keep-alive")
             || name.eq_ignore_ascii_case(b"transfer-encoding")
             || name.eq_ignore_ascii_case(b"proxy-connection")
@@ -132,6 +126,7 @@ pub(super) async fn handle_websocket_proxy(
             request,
             after_upgrade,
             &poll_config,
+            security,
         )
         .await
     } else {
@@ -143,8 +138,30 @@ pub(super) async fn handle_websocket_proxy(
             request,
             after_upgrade,
             &poll_config,
+            security,
         )
         .await
+    }
+}
+
+/// WebSocket の上流へ送るパス（ルートの接頭辞を外して上流の `path_prefix` を前に付ける。HTTP/1.1 と
+/// HTTP/2・HTTP/3 の拡張 CONNECT（F-288）で共有）
+pub(super) fn ws_upstream_path(target: &ProxyTarget, path_str: &str, prefix: &[u8]) -> String {
+    let sub_path = if prefix.is_empty() {
+        path_str.to_string()
+    } else {
+        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
+            let base = target.path_prefix.trim_end_matches('/');
+            build_sub_path(base, remaining)
+        } else {
+            path_str.to_string()
+        }
+    };
+    if sub_path.is_empty() {
+        "/".to_string()
+    } else {
+        sub_path
     }
 }
 
@@ -156,6 +173,7 @@ pub(super) async fn handle_websocket_proxy_http(
     request: Vec<u8>,
     after_upgrade: &[u8],
     poll_config: &WebSocketPollConfig,
+    security: &SecurityConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに接続
     let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
@@ -183,97 +201,15 @@ pub(super) async fn handle_websocket_proxy_http(
         }
     };
 
-    // アップグレードリクエストを送信
-    let (write_res, returned_request) = backend_stream.write_all(request).await;
-    request_buf_put(returned_request);
-    if write_res.is_err() {
-        let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-        return Some((502, 0));
-    }
-
-    // バックエンドからのレスポンスを読み取り
-    let mut response_buf = Vec::with_capacity(4096);
-    let status_code;
-
-    loop {
-        // B-17: ハンドシェイク応答の読取にタイムアウトを設け、無応答上流で
-        // クライアントを待たせない
-        let buf = buf_get();
-        let read_result = timeout(BACKEND_HEADER_TIMEOUT, backend_stream.read(buf)).await;
-        let (res, mut returned_buf) = match read_result {
-            Ok(result) => result,
-            Err(_) => {
-                let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
-                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                return Some((504, 0));
-            }
-        };
-
-        let n = match res {
-            Ok(0) => {
-                buf_put(returned_buf);
-                let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                return Some((502, 0));
-            }
-            Ok(n) => n,
-            Err(_) => {
-                buf_put(returned_buf);
-                let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                return Some((502, 0));
-            }
-        };
-
-        returned_buf.set_valid_len(n);
-        response_buf.extend_from_slice(returned_buf.as_valid_slice());
-        buf_put(returned_buf);
-
-        // レスポンスヘッダーを解析
-        if let Some(parsed) = parse_http_response(&response_buf) {
-            status_code = parsed.status_code;
-
-            // クライアントにレスポンスを転送
-            let resp_data = response_buf.clone();
-            let (write_res, _) = client_stream.write_all(resp_data).await;
-            if write_res.is_err() {
-                return None;
-            }
-
-            // 101 Switching Protocols の場合は双方向転送開始
-            if status_code == 101 {
-                debug!("WebSocket upgrade successful, starting bidirectional transfer");
-                // ハンドシェイクと同じ読み取りで届いていたクライアントのフレーム
-                if !after_upgrade.is_empty() {
-                    let (w, _) = backend_stream.write_all(after_upgrade.to_vec()).await;
-                    if w.is_err() {
-                        return Some((101, 0));
-                    }
-                }
-                let total = websocket_bidirectional_transfer(
-                    &mut client_stream,
-                    &mut backend_stream,
-                    poll_config,
-                )
-                .await;
-                return Some((101, total));
-            } else {
-                // アップグレード失敗（通常の HTTP レスポンス）
-                return Some((status_code, response_buf.len() as u64));
-            }
-        }
-
-        // ヘッダーが大きすぎる
-        // B-234: ヘッダが 65 個以上・不正な応答は待たずに 502
-        if response_buf.len() > MAX_HEADER_SIZE
-            || crate::http_utils::response_head_invalid(&response_buf)
-        {
-            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-            return Some((502, 0));
-        }
-    }
+    websocket_handshake_and_relay(
+        &mut client_stream,
+        &mut backend_stream,
+        request,
+        after_upgrade,
+        security,
+        poll_config.idle_timeout,
+    )
+    .await
 }
 
 /// HTTPS バックエンドへの WebSocket プロキシ
@@ -285,6 +221,7 @@ pub(super) async fn handle_websocket_proxy_https(
     request: Vec<u8>,
     after_upgrade: &[u8],
     poll_config: &WebSocketPollConfig,
+    security: &SecurityConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに TCP 接続（事前解決済み SocketAddr があればブロッキング DNS を迂回）
     let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
@@ -338,8 +275,40 @@ pub(super) async fn handle_websocket_proxy_https(
         }
     };
 
-    // アップグレードリクエストを送信
-    let (write_res, returned_request) = backend_stream.write_all(request).await;
+    websocket_handshake_and_relay(
+        &mut client_stream,
+        &mut backend_stream,
+        request,
+        after_upgrade,
+        security,
+        poll_config.idle_timeout,
+    )
+    .await
+}
+
+/// 上流へアップグレードの要求を送り、応答を返す。101 なら双方向の中継に移る（B-306・B-307）。
+///
+/// - 1xx（101 以外）は読み捨てる。
+/// - 応答の head は通常のプロキシと同じく書き直す（`remove_response_headers`・`add_response_headers`・`Server`・Alt-Svc）。
+/// - 101 以外は本文（`Content-Length`・chunked・接続の終わりまで）も返してから閉じる（以前は head を読んだ時点で受け取って
+///   いたバイトだけを返し、本文を切り詰めていた）。
+async fn websocket_handshake_and_relay<B: RelayIo>(
+    client_stream: &mut ServerTls,
+    backend_stream: &mut B,
+    request: Vec<u8>,
+    after_upgrade: &[u8],
+    security: &SecurityConfig,
+    idle_timeout: Option<Duration>,
+) -> Option<(u16, u64)> {
+    let (write_res, returned_request) =
+        match timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await {
+            Ok(r) => r,
+            Err(_) => {
+                let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                return Some((504, 0));
+            }
+        };
     request_buf_put(returned_request);
     if write_res.is_err() {
         let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
@@ -347,79 +316,37 @@ pub(super) async fn handle_websocket_proxy_https(
         return Some((502, 0));
     }
 
-    // バックエンドからのレスポンスを読み取り
+    // 上流の応答の head を読む（B-17: 時間切れで無応答の上流にクライアントを待たせない）
     let mut response_buf = Vec::with_capacity(4096);
-    let status_code;
-
-    loop {
-        // B-17: ハンドシェイク応答の読取にタイムアウトを設け、無応答上流で
-        // クライアントを待たせない
+    let parsed = loop {
         let buf = buf_get();
-        let read_result = timeout(BACKEND_HEADER_TIMEOUT, backend_stream.read(buf)).await;
-        let (res, mut returned_buf) = match read_result {
-            Ok(result) => result,
-            Err(_) => {
-                let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
-                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                return Some((504, 0));
-            }
-        };
-
+        let (res, mut returned_buf) =
+            match timeout(BACKEND_HEADER_TIMEOUT, backend_stream.read(buf)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                    return Some((504, 0));
+                }
+            };
         let n = match res {
-            Ok(0) => {
-                buf_put(returned_buf);
-                let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                return Some((502, 0));
-            }
-            Ok(n) => n,
-            Err(_) => {
+            Ok(n) if n > 0 => n,
+            _ => {
                 buf_put(returned_buf);
                 let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
                 let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
                 return Some((502, 0));
             }
         };
-
         returned_buf.set_valid_len(n);
         response_buf.extend_from_slice(returned_buf.as_valid_slice());
         buf_put(returned_buf);
 
-        // レスポンスヘッダーを解析
+        // B-307: 101 以外の 1xx は最終の応答ではない
+        crate::http_utils::drain_interim_responses(&mut response_buf);
         if let Some(parsed) = parse_http_response(&response_buf) {
-            status_code = parsed.status_code;
-
-            // クライアントにレスポンスを転送
-            let resp_data = response_buf.clone();
-            let (write_res, _) = client_stream.write_all(resp_data).await;
-            if write_res.is_err() {
-                return None;
-            }
-
-            // 101 Switching Protocols の場合は双方向転送開始
-            if status_code == 101 {
-                debug!("WebSocket upgrade successful (TLS), starting bidirectional transfer");
-                // ハンドシェイクと同じ読み取りで届いていたクライアントのフレーム
-                if !after_upgrade.is_empty() {
-                    let (w, _) = backend_stream.write_all(after_upgrade.to_vec()).await;
-                    if w.is_err() {
-                        return Some((101, 0));
-                    }
-                }
-                let total = websocket_bidirectional_transfer_tls(
-                    &mut client_stream,
-                    &mut backend_stream,
-                    poll_config,
-                )
-                .await;
-                return Some((101, total));
-            } else {
-                // アップグレード失敗
-                return Some((status_code, response_buf.len() as u64));
-            }
+            break parsed;
         }
-
-        // ヘッダーが大きすぎる
         // B-234: ヘッダが 65 個以上・不正な応答は待たずに 502
         if response_buf.len() > MAX_HEADER_SIZE
             || crate::http_utils::response_head_invalid(&response_buf)
@@ -428,231 +355,327 @@ pub(super) async fn handle_websocket_proxy_https(
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             return Some((502, 0));
         }
+    };
+    let status_code = parsed.status_code;
+    let head = super::compress::render_response_head(
+        &response_buf[..parsed.header_len],
+        status_code,
+        security,
+    );
+    let rest = &response_buf[parsed.header_len..];
+
+    if status_code == 101 {
+        debug!("WebSocket upgrade successful, starting bidirectional transfer");
+        let mut out = head;
+        // 101 の後ろに上流のフレームが続いて届いていれば一緒に送る
+        out.extend_from_slice(rest);
+        let early = rest.len() as u64;
+        match timeout(WRITE_TIMEOUT, client_stream.write_all(out)).await {
+            Ok((Ok(_), _)) => {}
+            _ => return None,
+        }
+        // ハンドシェイクと同じ読み取りで届いていたクライアントのフレーム
+        if !after_upgrade.is_empty() {
+            match timeout(
+                WRITE_TIMEOUT,
+                backend_stream.write_all(after_upgrade.to_vec()),
+            )
+            .await
+            {
+                Ok((Ok(_), _)) => {}
+                _ => return Some((101, early)),
+            }
+        }
+        let total = websocket_relay(client_stream, backend_stream, idle_timeout).await;
+        return Some((101, early + after_upgrade.len() as u64 + total));
+    }
+
+    // アップグレードしなかった: 応答全体を返して閉じる（B-307）
+    let mut sent = rest.len() as u64;
+    let mut out = head;
+    out.extend_from_slice(rest);
+    match timeout(WRITE_TIMEOUT, client_stream.write_all(out)).await {
+        Ok((Ok(_), _)) => {}
+        _ => return None,
+    }
+    // 本文の残り
+    enum Framing {
+        Length(u64),
+        Chunked(crate::http_utils::ChunkedDecoder),
+        UntilClose,
+        Done,
+    }
+    let no_body = (100..200).contains(&status_code) || status_code == 204 || status_code == 304;
+    let mut framing = if no_body {
+        Framing::Done
+    } else if parsed.is_chunked {
+        let mut d = crate::http_utils::ChunkedDecoder::new(0);
+        match d.feed_counted(rest).0 {
+            crate::http_utils::ChunkedFeedResult::Continue => Framing::Chunked(d),
+            _ => Framing::Done,
+        }
+    } else if let Some(cl) = parsed.content_length {
+        let cl = cl as u64;
+        if sent >= cl {
+            Framing::Done
+        } else {
+            Framing::Length(cl - sent)
+        }
+    } else {
+        Framing::UntilClose
+    };
+    while !matches!(framing, Framing::Done) {
+        let buf = buf_get();
+        let (res, mut buf) = match timeout(READ_TIMEOUT, backend_stream.read(buf)).await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let n = match res {
+            Ok(n) if n > 0 => n,
+            _ => {
+                buf_put(buf);
+                break;
+            }
+        };
+        buf.set_valid_len(n);
+        let mut take = n;
+        framing = match framing {
+            Framing::Length(left) => {
+                take = (left.min(n as u64)) as usize;
+                if left <= n as u64 {
+                    Framing::Done
+                } else {
+                    Framing::Length(left - n as u64)
+                }
+            }
+            Framing::Chunked(mut d) => {
+                let (r, used) = d.feed_counted(&buf.as_valid_slice()[..n]);
+                take = used;
+                match r {
+                    crate::http_utils::ChunkedFeedResult::Continue => Framing::Chunked(d),
+                    _ => Framing::Done,
+                }
+            }
+            other => other,
+        };
+        buf.set_valid_len(take);
+        match timeout(WRITE_TIMEOUT, client_stream.write_all(buf.into_truncated())).await {
+            Ok((Ok(_), returned)) => buf_put_vec(returned),
+            _ => break,
+        }
+        sent += take as u64;
+    }
+    Some((status_code, sent))
+}
+
+/// 中継する片側（B-306）。読み取り可能の待ちに使う TCP と、TLS が手元に抱えた未読の平文の有無
+pub(super) trait RelayIo:
+    crate::runtime::io::AsyncReadRent
+    + crate::runtime::io::AsyncWriteRentExt
+    + crate::runtime::io::BufferedReadState
+{
+    fn relay_tcp(&self) -> &TcpStream;
+}
+
+impl RelayIo for TcpStream {
+    #[inline]
+    fn relay_tcp(&self) -> &TcpStream {
+        self
     }
 }
 
-/// WebSocket 双方向転送（HTTP バックエンド）
-///
-/// クライアント ⇔ バックエンド間でデータを双方向に転送。
-/// 2 方向の読み取りを、タイムアウト付きで交互に待つ（select の代わり）。
-///
-/// ## ポーリングモード
-///
-/// ### Fixed モード
-/// 設定されたタイムアウト値を固定で使用。
-/// 低レイテンシが最優先の場合（リアルタイムゲームなど）に推奨。
-///
-/// ### Adaptive モード（デフォルト）
-/// データ転送があればタイムアウトをリセット（初期値に戻す）。
-/// アイドル時はバックオフ方式でタイムアウトを延長（最大値まで）。
-/// CPU効率とレイテンシのバランスを取る場合に推奨。
-///
-/// ## 将来的な改善
-///
-/// 2 方向の読み取りを `FuturesUnordered` 等で同時に待つイベント駆動型に移行すれば、
-/// タイムアウトの周回が無くなる（同時待ちで `futures::join!` を使わない。F-173）。
-pub(super) async fn websocket_bidirectional_transfer(
-    client: &mut ServerTls,
-    backend: &mut TcpStream,
-    poll_config: &WebSocketPollConfig,
-) -> u64 {
-    let mut total = 0u64;
-
-    // 現在のタイムアウト値（Adaptive モードで動的に変更）
-    let mut current_timeout_ms = poll_config.initial_timeout_ms;
-    // アイドルになった時刻（F-282）
-    let mut idle_since: Option<std::time::Instant> = None;
-
-    loop {
-        let poll_timeout = Duration::from_millis(current_timeout_ms);
-        let mut had_activity = false;
-
-        // クライアント → バックエンド
-        let client_buf = buf_get();
-        let read_result = timeout(poll_timeout, client.read(client_buf)).await;
-
-        match read_result {
-            Ok((Ok(0), buf)) => {
-                buf_put(buf);
-                break; // クライアントが接続を閉じた
-            }
-            Ok((Ok(n), mut buf)) => {
-                buf.set_valid_len(n);
-                let write_buf = buf.into_truncated();
-                let (write_res, returned) = backend.write_all(write_buf).await;
-                buf_put_vec(returned);
-                if write_res.is_err() {
-                    break;
-                }
-                total += n as u64;
-                had_activity = true;
-            }
-            Ok((Err(_), buf)) => {
-                buf_put(buf);
-                break;
-            }
-            Err(_) => {
-                // タイムアウト - 反対方向をチェック
-            }
-        }
-
-        // バックエンド → クライアント
-        let backend_buf = buf_get();
-        let read_result = timeout(poll_timeout, backend.read(backend_buf)).await;
-
-        match read_result {
-            Ok((Ok(0), buf)) => {
-                buf_put(buf);
-                break; // バックエンドが接続を閉じた
-            }
-            Ok((Ok(n), mut buf)) => {
-                buf.set_valid_len(n);
-                let write_buf = buf.into_truncated();
-                let (write_res, returned) = client.write_all(write_buf).await;
-                buf_put_vec(returned);
-                if write_res.is_err() {
-                    break;
-                }
-                total += n as u64;
-                had_activity = true;
-            }
-            Ok((Err(_), buf)) => {
-                buf_put(buf);
-                break;
-            }
-            Err(_) => {
-                // タイムアウト - ループ継続
-            }
-        }
-
-        // F-282: どちらの向きにもデータが流れない時間が上限を超えたら閉じる（活動のある周回では時刻を読まない）
-        if had_activity {
-            idle_since = None;
-        } else if let Some(limit) = poll_config.idle_timeout {
-            let now = std::time::Instant::now();
-            if now.duration_since(*idle_since.get_or_insert(now)) >= limit {
-                debug!("WebSocket tunnel idle for {:?}; closing", limit);
-                break;
-            }
-        }
-
-        // Adaptive モードでのタイムアウト調整
-        if poll_config.mode == WebSocketPollMode::Adaptive {
-            if had_activity {
-                // データ転送があった場合: タイムアウトをリセット（初期値に戻す）
-                current_timeout_ms = poll_config.initial_timeout_ms;
-            } else {
-                // タイムアウトした場合: バックオフ（最大値まで延長）
-                let new_timeout =
-                    (current_timeout_ms as f64 * poll_config.backoff_multiplier) as u64;
-                current_timeout_ms = new_timeout.min(poll_config.max_timeout_ms);
-            }
-        }
-        // Fixed モードでは current_timeout_ms は変更されない
+impl RelayIo for ServerTls {
+    #[inline]
+    fn relay_tcp(&self) -> &TcpStream {
+        self.get_ref()
     }
-
-    total
 }
 
-/// WebSocket 双方向転送（HTTPS バックエンド）
-///
-/// HTTP版と同様のポーリングモード（Fixed/Adaptive）をサポート。
-/// 詳細は `websocket_bidirectional_transfer` のドキュメントを参照。
-pub(super) async fn websocket_bidirectional_transfer_tls(
-    client: &mut ServerTls,
-    backend: &mut ClientTls,
-    poll_config: &WebSocketPollConfig,
-) -> u64 {
-    let mut total = 0u64;
+impl RelayIo for ClientTls {
+    #[inline]
+    fn relay_tcp(&self) -> &TcpStream {
+        self.get_ref()
+    }
+}
 
-    // 現在のタイムアウト値（Adaptive モードで動的に変更）
-    let mut current_timeout_ms = poll_config.initial_timeout_ms;
-    // アイドルになった時刻（F-282）
-    let mut idle_since: Option<std::time::Instant> = None;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    A,
+    B,
+}
 
-    loop {
-        let poll_timeout = Duration::from_millis(current_timeout_ms);
-        let mut had_activity = false;
+/// 片側の読み取り可能の待ちを起こした印（どちらの待ちが起きたかを親に伝える。F-173: 起きていない側を
+/// poll し直さない＝reactor で `poll(2)` を空打ちしない）
+struct SideWaker {
+    woken: std::sync::atomic::AtomicBool,
+    parent: futures::task::AtomicWaker,
+}
 
-        // クライアント → バックエンド
-        let client_buf = buf_get();
-        let read_result = timeout(poll_timeout, client.read(client_buf)).await;
-
-        match read_result {
-            Ok((Ok(0), buf)) => {
-                buf_put(buf);
-                break;
-            }
-            Ok((Ok(n), mut buf)) => {
-                buf.set_valid_len(n);
-                let write_buf = buf.into_truncated();
-                let (write_res, returned) = backend.write_all(write_buf).await;
-                buf_put_vec(returned);
-                if write_res.is_err() {
-                    break;
-                }
-                total += n as u64;
-                had_activity = true;
-            }
-            Ok((Err(_), buf)) => {
-                buf_put(buf);
-                break;
-            }
-            Err(_) => {}
-        }
-
-        // バックエンド → クライアント
-        let backend_buf = buf_get();
-        let read_result = timeout(poll_timeout, backend.read(backend_buf)).await;
-
-        match read_result {
-            Ok((Ok(0), buf)) => {
-                buf_put(buf);
-                break;
-            }
-            Ok((Ok(n), mut buf)) => {
-                buf.set_valid_len(n);
-                let write_buf = buf.into_truncated();
-                let (write_res, returned) = client.write_all(write_buf).await;
-                buf_put_vec(returned);
-                if write_res.is_err() {
-                    break;
-                }
-                total += n as u64;
-                had_activity = true;
-            }
-            Ok((Err(_), buf)) => {
-                buf_put(buf);
-                break;
-            }
-            Err(_) => {}
-        }
-
-        // F-282: どちらの向きにもデータが流れない時間が上限を超えたら閉じる（活動のある周回では時刻を読まない）
-        if had_activity {
-            idle_since = None;
-        } else if let Some(limit) = poll_config.idle_timeout {
-            let now = std::time::Instant::now();
-            if now.duration_since(*idle_since.get_or_insert(now)) >= limit {
-                debug!("WebSocket tunnel idle for {:?}; closing", limit);
-                break;
-            }
-        }
-
-        // Adaptive モードでのタイムアウト調整
-        if poll_config.mode == WebSocketPollMode::Adaptive {
-            if had_activity {
-                // データ転送があった場合: タイムアウトをリセット（初期値に戻す）
-                current_timeout_ms = poll_config.initial_timeout_ms;
-            } else {
-                // タイムアウトした場合: バックオフ（最大値まで延長）
-                let new_timeout =
-                    (current_timeout_ms as f64 * poll_config.backoff_multiplier) as u64;
-                current_timeout_ms = new_timeout.min(poll_config.max_timeout_ms);
-            }
-        }
-        // Fixed モードでは current_timeout_ms は変更されない
+impl std::task::Wake for SideWaker {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
     }
 
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.woken.store(true, std::sync::atomic::Ordering::Release);
+        self.parent.wake();
+    }
+}
+
+/// 両側の読み取り可能を同時に待つ（読み取り可能の待ちは drop しても受信したデータを失わない。B-306）
+async fn ready_either(
+    a: &TcpStream,
+    b: &TcpStream,
+    wakers: &(
+        std::sync::Arc<SideWaker>,
+        std::task::Waker,
+        std::sync::Arc<SideWaker>,
+        std::task::Waker,
+    ),
+    prefer_b: bool,
+) -> io::Result<Side> {
+    use std::future::Future;
+    use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll};
+    let (fa, wa, fb, wb) = wakers;
+    // 最初は両方を poll する
+    fa.woken.store(true, Ordering::Relaxed);
+    fb.woken.store(true, Ordering::Relaxed);
+    let mut ra = std::pin::pin!(a.readable_confirmed());
+    let mut rb = std::pin::pin!(b.readable_confirmed());
+    std::future::poll_fn(|cx| {
+        fa.parent.register(cx.waker());
+        fb.parent.register(cx.waker());
+        let order = if prefer_b {
+            [Side::B, Side::A]
+        } else {
+            [Side::A, Side::B]
+        };
+        for side in order {
+            let (flag, waker, fut) = match side {
+                Side::A => (fa, wa, ra.as_mut()),
+                Side::B => (fb, wb, rb.as_mut()),
+            };
+            if flag.woken.swap(false, Ordering::AcqRel) {
+                if let Poll::Ready(r) = fut.poll(&mut Context::from_waker(waker)) {
+                    return Poll::Ready(r.map(|()| side));
+                }
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// `from` から 1 回読んで `to` へ全部書く（読めたバイト数。終わり・エラー・時間切れは None）
+async fn relay_once<R: RelayIo, W: RelayIo>(
+    from: &mut R,
+    to: &mut W,
+    wait: Duration,
+) -> Option<u64> {
+    let buf = buf_get();
+    // 読み取り可能になった側（または TLS が平文を抱えている側）なので普通はすぐ返る。TLS のレコードの途中で
+    // 止まった相手は時間切れで閉じる（閉じるので、取り消しで受信データを失っても構わない）
+    let (res, mut buf) = match timeout(wait, from.read(buf)).await {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    let n = match res {
+        Ok(0) | Err(_) => {
+            buf_put(buf);
+            return None;
+        }
+        Ok(n) => n,
+    };
+    buf.set_valid_len(n);
+    // 読まない相手で中継が止まり続けないよう、書き込みに時間の上限（B-306）
+    match timeout(WRITE_TIMEOUT, to.write_all(buf.into_truncated())).await {
+        Ok((Ok(_), returned)) => {
+            buf_put_vec(returned);
+            Some(n as u64)
+        }
+        Ok((Err(_), returned)) => {
+            buf_put_vec(returned);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// アイドルの上限が無いときの 1 回の待ちの長さ（満了したら待ち直す）
+const RELAY_WAIT_CHUNK: Duration = Duration::from_secs(3600);
+
+/// WebSocket（アップグレード後のトンネル）の双方向の中継（B-306）。
+///
+/// 両側の読み取り可能を同時に待ち、起きた側から読んで反対側へ書く（以前は両側を短い時間切れで交互に読み、
+/// io_uring では時間切れで drop した読み取りが受信済みのデータを捨て得た）。待っている間は SQE もタイマーの
+/// 周回も出さない。`idle_timeout`（`websocket_idle_timeout_secs`）は両方向の最後の活動から数え、graceful
+/// shutdown（F-187）は待ちを満了させてトンネルを閉じる（B-308）。
+pub(super) async fn websocket_relay<A: RelayIo, B: RelayIo>(
+    client: &mut A,
+    backend: &mut B,
+    idle_timeout: Option<Duration>,
+) -> u64 {
+    let _tunnel = crate::metrics::websocket_tunnel_opened("http/1.1");
+    let wakers = {
+        let mk = || {
+            let f = std::sync::Arc::new(SideWaker {
+                woken: std::sync::atomic::AtomicBool::new(true),
+                parent: futures::task::AtomicWaker::new(),
+            });
+            let w = std::task::Waker::from(f.clone());
+            (f, w)
+        };
+        let (fa, wa) = mk();
+        let (fb, wb) = mk();
+        (fa, wa, fb, wb)
+    };
+    let wait = idle_timeout.unwrap_or(RELAY_WAIT_CHUNK);
+    let mut total = 0u64;
+    let mut prefer_b = false;
+    loop {
+        let side = if client.has_buffered_read_data() {
+            Side::A
+        } else if backend.has_buffered_read_data() {
+            Side::B
+        } else {
+            let started = std::time::Instant::now();
+            match crate::runtime::time::timeout_idle(
+                wait,
+                true,
+                ready_either(client.relay_tcp(), backend.relay_tcp(), &wakers, prefer_b),
+            )
+            .await
+            {
+                Ok(Ok(side)) => side,
+                // 待ちのエラーは読み取りで確かめる（EOF・エラーで閉じる）
+                Ok(Err(_)) => {
+                    if prefer_b {
+                        Side::B
+                    } else {
+                        Side::A
+                    }
+                }
+                Err(_) => {
+                    // 上限が無く、満了まで待った（graceful shutdown ではない）なら待ち直す
+                    if idle_timeout.is_none() && started.elapsed() >= wait {
+                        continue;
+                    }
+                    debug!("WebSocket tunnel idle or shutting down; closing");
+                    break;
+                }
+            }
+        };
+        // 公平に: 次は反対側を先に見る
+        prefer_b = side == Side::A;
+        let moved = match side {
+            Side::A => relay_once(client, backend, wait).await,
+            Side::B => relay_once(backend, client, wait).await,
+        };
+        match moved {
+            Some(n) => total += n,
+            None => break,
+        }
+    }
     total
 }

@@ -928,6 +928,8 @@ pub const VEIL_WS_BINARY: c_int = 2;
 #[allow(non_camel_case_types)]
 pub struct veil_ws_t {
     tx: veil::api::ws::WsSender,
+    /// 選ばれたサブプロトコル（`veil_ws_accept_ex`。F-291）
+    pub(crate) protocol: Option<String>,
     /// 相手の IP アドレス（NUL 終端で持つ。返す長さは NUL を含まない）
     peer: String,
     /// 利用者のデータ（他のスレッドの `veil_ws_send` と同時に触れられるので原子的に置く）
@@ -1024,6 +1026,21 @@ pub unsafe extern "C" fn veil_ws_accept(
     cb: *const veil_ws_callbacks_t,
     user_data: *mut c_void,
 ) -> c_int {
+    ws_accept(req, resp, cb, user_data, |up| up)
+}
+
+/// `veil_ws_accept` と `veil_ws_accept_ex`（F-291）の本体。`configure` でハンドシェイクの設定を足す。
+///
+/// # Safety
+///
+/// `veil_ws_accept` と同じ。
+pub(crate) unsafe fn ws_accept(
+    req: *const veil_request_t,
+    resp: *mut veil_response_t,
+    cb: *const veil_ws_callbacks_t,
+    user_data: *mut c_void,
+    configure: impl FnOnce(veil::api::ws::WebSocketUpgrade) -> veil::api::ws::WebSocketUpgrade,
+) -> c_int {
     let (Some(q), Some(r)) = (req.as_ref(), resp.as_mut()) else {
         return fail(VEIL_ERR_INVALID_ARG, "NULL request or response");
     };
@@ -1032,12 +1049,13 @@ pub unsafe extern "C" fn veil_ws_accept(
     };
     use veil::api::FromRequest as _;
     let up = match veil::api::ws::WebSocketUpgrade::from_request(&q.req) {
-        Ok(u) => u,
+        Ok(u) => configure(u),
         Err(e) => {
             r.resp = e;
             return fail(VEIL_ERR_STATE, "not a valid WebSocket handshake");
         }
     };
+    let protocol = up.selected_protocol().map(str::to_string);
     let ud = UserData(user_data);
     let mut peer = q.req.client_ip().to_string();
     peer.push('\0');
@@ -1047,6 +1065,7 @@ pub unsafe extern "C" fn veil_ws_accept(
             ud,
             ws: Box::new(veil_ws_t {
                 tx,
+                protocol,
                 peer,
                 data: std::sync::atomic::AtomicPtr::new(ptr::null_mut()),
             }),
@@ -1064,6 +1083,11 @@ pub unsafe extern "C" fn veil_ws_accept(
         }
         Some(Box::new(s) as Box<dyn veil::api::ws::WsSession>)
     });
+    // F-291: Origin を断ったとき（veil_ws_accept_ex）は 101 ではなく 403
+    if ws.status_code() != 101 {
+        r.resp = ws;
+        return fail(VEIL_ERR_STATE, "the WebSocket origin is not allowed");
+    }
     for (n, v) in r.resp.headers() {
         ws = ws.with_header(n.clone(), v.clone());
     }

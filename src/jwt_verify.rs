@@ -176,15 +176,27 @@ pub fn verify(c: &Check<'_>, token: &str) -> Option<serde_json::Value> {
         return None;
     }
     let skew = c.clock_skew_secs;
-    match payload.get("exp").and_then(|e| e.as_u64()) {
-        Some(exp) if exp.saturating_add(skew) < c.now => return None,
+    // B-322: NumericDate は小数も取り得る（RFC 7519 §2）。あるのに負でない数でない `exp`・`nbf` は拒否する
+    // （以前は `as_u64` が None を返し、`exp` が無いのと同じに扱って期限の無いトークンとして通していた。F33）
+    let numeric_date = |v: &serde_json::Value| -> Result<u64, ()> {
+        match v.as_u64() {
+            Some(n) => Ok(n),
+            None => match v.as_f64() {
+                Some(f) if f.is_finite() && f >= 0.0 => Ok(f as u64),
+                _ => Err(()),
+            },
+        }
+    };
+    match payload.get("exp").map(numeric_date) {
+        Some(Err(())) => return None,
+        Some(Ok(exp)) if exp.saturating_add(skew) < c.now => return None,
         None if c.require_expiration => return None,
         _ => {}
     }
-    if let Some(nbf) = payload.get("nbf").and_then(|e| e.as_u64()) {
-        if nbf > c.now.saturating_add(skew) {
-            return None;
-        }
+    match payload.get("nbf").map(numeric_date) {
+        Some(Err(())) => return None,
+        Some(Ok(nbf)) if nbf > c.now.saturating_add(skew) => return None,
+        _ => {}
     }
     if !c.audiences.is_empty() {
         let aud_ok = match payload.get("aud") {
@@ -301,5 +313,32 @@ pub(crate) mod tests {
         let i = bad.len() - 10;
         bad[i] = if bad[i] == b'A' { b'B' } else { b'A' };
         assert!(verify(&c, std::str::from_utf8(&bad).unwrap()).is_none());
+    }
+
+    /// B-322: 小数の NumericDate は読み、数でない `exp`・`nbf` は拒否する（期限の無いトークンとして通さない）
+    #[test]
+    fn numeric_dates_fractional_and_invalid() {
+        let check = |payload: &str, now: u64| {
+            let (tok, jwks) = es256_token(payload);
+            let keys = parse_jwks(&jwks);
+            let c = Check {
+                keys: &keys,
+                issuer: "",
+                audiences: &[],
+                allowed_algs: &[],
+                require_expiration: false,
+                clock_skew_secs: 0,
+                now,
+            };
+            verify(&c, &tok).is_some()
+        };
+        assert!(check(r#"{"exp":1700000000.5}"#, 1_600_000_000));
+        assert!(!check(r#"{"exp":1700000000.5}"#, 1_800_000_000));
+        assert!(!check(r#"{"exp":"2000000000"}"#, 1_600_000_000));
+        assert!(!check(r#"{"exp":-1}"#, 1_600_000_000));
+        assert!(!check(r#"{"nbf":1700000000.5}"#, 1_600_000_000));
+        assert!(!check(r#"{"nbf":"x"}"#, 1_600_000_000));
+        assert!(check(r#"{"nbf":1500000000}"#, 1_600_000_000));
+        assert!(check(r#"{}"#, 1_600_000_000));
     }
 }

@@ -259,9 +259,9 @@ mod context_tests {
         let token2 = ctx.allocate_http_call_token();
         let token3 = ctx.allocate_http_call_token();
 
-        assert_eq!(token1, 1);
-        assert_eq!(token2, 2);
-        assert_eq!(token3, 3);
+        // B-320: トークンはプロセスで一意（並行する試験とも重ならない）
+        assert!(token1 > 0 && token2 > 0 && token3 > 0);
+        assert!(token1 != token2 && token2 != token3 && token1 != token3);
     }
 
     #[test]
@@ -450,7 +450,6 @@ mod interpreter_tests {
         fn variant_tag(r: &FilterResult) -> &'static str {
             match r {
                 FilterResult::Continue { .. } => "continue",
-                FilterResult::Pause => "pause",
                 FilterResult::LocalResponse(_) => "local_response",
             }
         }
@@ -934,9 +933,9 @@ mod host_function_tests {
         let token2 = ctx.allocate_http_call_token();
         let token3 = ctx.allocate_http_call_token();
 
-        assert_eq!(token1, 1);
-        assert_eq!(token2, 2);
-        assert_eq!(token3, 3);
+        // B-320: トークンはプロセスで一意（並行する試験とも重ならない）
+        assert!(token1 > 0 && token2 > 0 && token3 > 0);
+        assert!(token1 != token2 && token2 != token3 && token1 != token3);
     }
 
     #[test]
@@ -1129,7 +1128,7 @@ mod lifecycle_callback_tests {
 
         // Create some pending state
         let token = ctx.allocate_http_call_token();
-        assert_eq!(token, 1);
+        assert!(token > 0);
 
         // Verify modifications tracked
         assert!(ctx.has_request_modifications());
@@ -1312,9 +1311,14 @@ mod p3_grpc_callback_tests {
         let call_id_2 = ctx.next_grpc_call_id();
         let call_id_3 = ctx.next_grpc_call_id();
 
-        assert_eq!(call_id_1, 1);
-        assert_eq!(call_id_2, 2);
-        assert_eq!(call_id_3, 3);
+        // B-320: ID はプロセスで一意（別のコンテキストとも重ならない）
+        let other =
+            HttpContext::new(1, CapabilityPreset::Extended.to_capabilities()).next_grpc_call_id();
+        let ids = [call_id_1, call_id_2, call_id_3, other];
+        for (i, a) in ids.iter().enumerate() {
+            assert!(*a > 0 && *a <= i32::MAX as u32);
+            assert!(ids[i + 1..].iter().all(|b| b != a), "{ids:?}");
+        }
     }
 
     /// Test gRPC stream state
@@ -1782,7 +1786,7 @@ mod instance_reuse_tests {
         assert!(s1 < s2 && s2 < s3, "{s1} {s2} {s3}");
         assert_eq!(engine.pooled_instances("baseline"), 1);
 
-        // トラップしたインスタンスは捨てる（ローカル応答にならずに続く）
+        // トラップしたインスタンスは捨てる（既定の fail_closed で 503。F-293）
         let r = futures::executor::block_on(engine.on_request_headers_with_modules(
             &modules(),
             &Arc::from("/trap"),
@@ -1792,7 +1796,10 @@ mod instance_reuse_tests {
             true,
             None,
         ));
-        assert!(matches!(r, FilterResult::Continue { .. }));
+        assert!(
+            matches!(&r, FilterResult::LocalResponse(resp) if resp.status_code == 503),
+            "a trap is rejected with 503 under the default fail_closed"
+        );
         assert_eq!(engine.pooled_instances("baseline"), 0);
         let (_, _, c4, s4) = get(&engine, "/baseline11");
         assert_eq!((c4, s4), (1, 1));
@@ -1980,7 +1987,10 @@ mod instance_reuse_tests {
             true,
             None,
         ));
-        assert!(matches!(r, FilterResult::Continue { .. }));
+        assert!(
+            matches!(&r, FilterResult::LocalResponse(resp) if resp.status_code == 503),
+            "a trap is rejected with 503 under the default fail_closed"
+        );
         assert_eq!(engine.pooled_instances("baseline"), 0);
         // a の context は捨てたインスタンスにあったので、本文のフェーズは新しいインスタンスの新しい context で
         // フィルタを通る（フィルタを飛ばさない）
@@ -2024,5 +2034,302 @@ mod instance_reuse_tests {
             BodyFilterResult::Continue { body } => assert_eq!(&body[..], b"rewritten:hi"),
             _ => panic!("expected the rewritten body"),
         }
+    }
+}
+
+// F-293・B-299・B-300・B-301: 失敗の扱い（failure_policy）。インラインの WAT でモジュールを作る
+// （tests/ のフィクスチャに依存しない）
+mod failure_policy_tests {
+    use crate::wasm::{
+        BodyFilterResult, FailurePolicy, FilterEngine, FilterResult, ModuleCapabilities,
+        ModuleConfig, WasmConfig, WasmDefaults,
+    };
+    use std::sync::Arc;
+
+    /// `on_request_headers`（と任意で他のコールバック）の本体を差し替えた最小の Proxy-Wasm モジュール
+    fn wat(configure: &str, request_headers: &str, extra: &str) -> String {
+        format!(
+            r#"(module
+  (import "env" "proxy_send_local_response"
+    (func $slr (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "denied")
+  (func (export "proxy_on_context_create") (param i32 i32))
+  (func (export "proxy_on_vm_start") (param i32 i32) (result i32) (i32.const 1))
+  (func (export "proxy_on_configure") (param i32 i32) (result i32) {configure})
+  (func (export "proxy_on_request_headers") (param i32 i32 i32) (result i32) {request_headers})
+  {extra}
+)"#
+        )
+    }
+
+    const LOCAL_403: &str = "(drop (call $slr (i32.const 403) (i32.const 0) (i32.const 0) \
+                             (i32.const 0) (i32.const 6) (i32.const 0) (i32.const 0) \
+                             (i32.const 0)))";
+
+    struct Fixture {
+        engine: FilterEngine,
+        _dir: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self._dir);
+        }
+    }
+
+    fn build(
+        module_wat: &str,
+        policy: Option<FailurePolicy>,
+        reuse: bool,
+        tweak: impl FnOnce(&mut WasmDefaults),
+    ) -> anyhow::Result<Fixture> {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "veil-f293-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("m.wat");
+        // 理由付き allow: テストのフィクスチャ作成（ホットパス外）。
+        #[allow(clippy::disallowed_methods)]
+        std::fs::write(&path, module_wat)?;
+        let mut defaults = WasmDefaults::default();
+        tweak(&mut defaults);
+        let config = WasmConfig {
+            enabled: true,
+            defaults,
+            modules: vec![ModuleConfig {
+                name: "m".to_string(),
+                path: path.to_string_lossy().into_owned(),
+                capabilities: ModuleCapabilities {
+                    allow_send_local_response: true,
+                    allow_request_body_read: true,
+                    allow_response_body_read: true,
+                    ..Default::default()
+                },
+                instance_reuse: reuse,
+                failure_policy: policy,
+                ..Default::default()
+            }],
+            interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+        };
+        let engine = FilterEngine::new(&config)?;
+        engine.validate()?;
+        Ok(Fixture { engine, _dir: dir })
+    }
+
+    fn modules() -> Vec<crate::wasm_plugin_config::ModuleRef> {
+        vec![crate::wasm_plugin_config::ModuleRef::from_name("m")]
+    }
+
+    fn request(engine: &FilterEngine, end_of_stream: bool) -> FilterResult {
+        futures::executor::block_on(engine.on_request_headers_with_modules(
+            &modules(),
+            &Arc::from("/"),
+            &Arc::from("GET"),
+            vec![(b"x-a".to_vec(), b"1".to_vec())],
+            &Arc::from("127.0.0.1"),
+            end_of_stream,
+            None,
+        ))
+    }
+
+    fn status(r: &FilterResult) -> Option<u16> {
+        match r {
+            FilterResult::LocalResponse(resp) => Some(resp.status_code),
+            FilterResult::Continue { .. } => None,
+        }
+    }
+
+    #[test]
+    fn policy_serde_and_envoy_mapping() {
+        #[derive(serde::Deserialize)]
+        struct T {
+            p: FailurePolicy,
+        }
+        for (s, p) in [
+            ("fail_closed", FailurePolicy::FailClosed),
+            ("fail_open", FailurePolicy::FailOpen),
+            ("fail_reload", FailurePolicy::FailReload),
+        ] {
+            let t: T = toml::from_str(&format!("p = \"{s}\"")).unwrap();
+            assert_eq!(t.p, p);
+            assert_eq!(p.as_str(), s);
+        }
+        assert!(toml::from_str::<T>("p = \"open\"").is_err());
+        assert_eq!(FailurePolicy::default(), FailurePolicy::FailClosed);
+        // Envoy: UNSPECIFIED=0（fail_open に従う）・FAIL_RELOAD=1・FAIL_CLOSED=2・FAIL_OPEN=3（B-298）
+        for (fail_open, policy, want) in [
+            (false, 0, FailurePolicy::FailClosed),
+            (true, 0, FailurePolicy::FailOpen),
+            (false, 1, FailurePolicy::FailReload),
+            (true, 1, FailurePolicy::FailReload),
+            (false, 2, FailurePolicy::FailClosed),
+            (true, 2, FailurePolicy::FailClosed),
+            (false, 3, FailurePolicy::FailOpen),
+            (true, 3, FailurePolicy::FailOpen),
+        ] {
+            assert_eq!(
+                FailurePolicy::from_envoy(fail_open, policy),
+                want,
+                "fail_open={fail_open} failure_policy={policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn trap_is_rejected_by_default_and_continues_when_fail_open() {
+        let m = wat("(i32.const 1)", "unreachable", "");
+        let closed = build(&m, None, false, |_| {}).unwrap();
+        assert_eq!(status(&request(&closed.engine, true)), Some(503));
+        let reload = build(&m, Some(FailurePolicy::FailReload), true, |_| {}).unwrap();
+        assert_eq!(status(&request(&reload.engine, true)), Some(503));
+        let open = build(&m, Some(FailurePolicy::FailOpen), false, |_| {}).unwrap();
+        match request(&open.engine, true) {
+            // 失敗したモジュールを飛ばし、ヘッダはそのまま続く
+            FilterResult::Continue { headers, .. } => {
+                assert_eq!(headers, vec![(b"x-a".to_vec(), b"1".to_vec())])
+            }
+            FilterResult::LocalResponse(_) => panic!("fail_open must continue"),
+        }
+    }
+
+    #[test]
+    fn defaults_policy_applies_when_the_module_has_none() {
+        let m = wat("(i32.const 1)", "unreachable", "");
+        let open = build(&m, None, false, |d| {
+            d.failure_policy = FailurePolicy::FailOpen
+        })
+        .unwrap();
+        assert_eq!(status(&request(&open.engine, true)), None);
+        // モジュールの設定が `[wasm.defaults]` より優先
+        let closed = build(&m, Some(FailurePolicy::FailClosed), false, |d| {
+            d.failure_policy = FailurePolicy::FailOpen
+        })
+        .unwrap();
+        assert_eq!(status(&request(&closed.engine, true)), Some(503));
+    }
+
+    #[test]
+    fn fuel_exhaustion_is_a_failure() {
+        let m = wat("(i32.const 1)", "(loop $l (br $l)) (i32.const 0)", "");
+        let f = build(&m, None, false, |d| d.max_execution_time_ms = 1).unwrap();
+        assert_eq!(status(&request(&f.engine, true)), Some(503));
+    }
+
+    #[test]
+    fn local_response_before_a_trap_is_still_sent() {
+        // B-299: 拒否を決めた後でトラップしても、ポリシーに関係なく 403 を返す
+        let m = wat("(i32.const 1)", &format!("{LOCAL_403} unreachable"), "");
+        for policy in [FailurePolicy::FailOpen, FailurePolicy::FailClosed] {
+            let f = build(&m, Some(policy), false, |_| {}).unwrap();
+            assert_eq!(status(&request(&f.engine, true)), Some(403), "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn configure_returning_false_rejects_the_configuration() {
+        // B-301: Envoy と同じく、on_configure が false なら設定を拒否する
+        let m = wat("(i32.const 0)", "(i32.const 0)", "");
+        let err = build(&m, None, false, |_| {})
+            .err()
+            .expect("must be rejected");
+        assert!(format!("{err:#}").contains("proxy_on_configure"), "{err:#}");
+    }
+
+    #[test]
+    fn pause_without_anything_to_wait_for_is_a_failure() {
+        // B-300: 待つ呼び出しも本文も無い Pause は守れない
+        let m = wat("(i32.const 1)", "(i32.const 1)", "");
+        let closed = build(&m, None, false, |_| {}).unwrap();
+        assert_eq!(status(&request(&closed.engine, true)), Some(503));
+        let open = build(&m, Some(FailurePolicy::FailOpen), false, |_| {}).unwrap();
+        assert_eq!(status(&request(&open.engine, true)), None);
+        // 本文を待つ Pause（end_of_stream=false・本文の段を読むモジュール）は本文の段で続きを決める
+        assert_eq!(status(&request(&closed.engine, false)), None);
+    }
+
+    #[test]
+    fn body_and_response_header_phase_failures_follow_the_policy() {
+        let extra = r#"(func (export "proxy_on_request_body") (param i32 i32 i32) (result i32) unreachable)
+  (func (export "proxy_on_response_headers") (param i32 i32 i32) (result i32) unreachable)"#;
+        let m = wat("(i32.const 1)", "(i32.const 0)", extra);
+        let closed = build(&m, None, false, |_| {}).unwrap();
+        let body = futures::executor::block_on(closed.engine.on_request_body_with_modules(
+            &modules(),
+            bytes::Bytes::from_static(b"x"),
+            true,
+            None,
+            None,
+        ));
+        assert!(matches!(body, BodyFilterResult::LocalResponse(r) if r.status_code == 503));
+        let resp = futures::executor::block_on(closed.engine.on_response_headers_with_modules(
+            &modules(),
+            200,
+            vec![],
+            true,
+            None,
+        ));
+        assert_eq!(status(&resp), Some(503));
+
+        let open = build(&m, Some(FailurePolicy::FailOpen), false, |_| {}).unwrap();
+        let body = futures::executor::block_on(open.engine.on_request_body_with_modules(
+            &modules(),
+            bytes::Bytes::from_static(b"x"),
+            true,
+            None,
+            None,
+        ));
+        assert!(matches!(body, BodyFilterResult::Continue { body } if &body[..] == b"x"));
+    }
+
+    #[test]
+    // OpenBSD は OnDemand アロケータで pooling の枠が無い（B-52）。枠が埋まる状況が起きない
+    #[cfg(not(target_os = "openbsd"))]
+    fn exhausted_instance_slots_wait_briefly_then_follow_the_policy() {
+        // 待ちはランタイムのタイマーを使う（ワーカーのランタイムの中で動かす）
+        #[cfg(veil_rt_uring)]
+        if crate::runtime::ring::IoUring::new(8, 0).is_err() {
+            eprintln!("io_uring unavailable; skipping");
+            return;
+        }
+        // B-299: 枠（total_memories = 1）が埋まっている間に来た要求は少し待ち、それでも空かなければ失敗
+        let m = wat("(i32.const 1)", "(i32.const 0)", "");
+        let f = build(&m, None, false, |d| d.pooling.total_memories = 1).unwrap();
+        crate::runtime::block_on(async move {
+            let engine = &f.engine;
+            let module = engine.get_module("m").unwrap();
+            let mods = modules();
+            let (path, method, ip) = (Arc::from("/"), Arc::from("GET"), Arc::from("127.0.0.1"));
+            // 枠を 1 つ握ったままにする
+            let mut store = wasmtime::Store::new(
+                engine.registry_engine(),
+                crate::wasm::context::HostState::new(
+                    crate::wasm::context::HttpContext::for_module(1, &module),
+                ),
+            );
+            assert!(module
+                .instance_pre
+                .instantiate_async(&mut store)
+                .await
+                .is_ok());
+            let started = std::time::Instant::now();
+            let r = engine
+                .on_request_headers_with_modules(&mods, &path, &method, vec![], &ip, true, None)
+                .await;
+            assert_eq!(status(&r), Some(503));
+            assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+            drop(store);
+            // 空いたら通る
+            let r = engine
+                .on_request_headers_with_modules(&mods, &path, &method, vec![], &ip, true, None)
+                .await;
+            assert_eq!(status(&r), None);
+        });
     }
 }

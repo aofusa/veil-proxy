@@ -14,9 +14,9 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap(
         "env",
         "proxy_continue_stream",
-        |_caller: Caller<'_, HostState>, _stream_type: i32| -> i32 {
-            // This is typically handled by the filter engine
-            // by checking the return value of callbacks
+        |mut caller: Caller<'_, HostState>, _stream_type: i32| -> i32 {
+            // B-320: Pause の後で再開したかを記録する（`FilterEngine::settle` が見る）
+            caller.data_mut().http_ctx.stream_resumed = true;
             PROXY_RESULT_OK
         },
     )?;

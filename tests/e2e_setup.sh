@@ -24,6 +24,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Windows の Git Bash（MSYS）では設定ファイルに書くパスを veil.exe が読める "C:/..." の形にする
 # （"/c/..." のままだと TLS 証明書などが見つからない）。bash も "C:/..." をそのまま扱える。
 case "$(uname -s)" in MINGW*|MSYS*) SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W)" ;; esac
+# Windows（Git Bash）で動いているか
+is_windows_host() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; esac; return 1; }
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # ワークスペース構成の場合、バイナリはワークスペースルートにある
 WORKSPACE_DIR="$(dirname "$PROJECT_DIR")"
@@ -162,6 +164,11 @@ ensure_veil_binary() {
     elif ! cargo build ${VEIL_E2E_NO_DEFAULT_ARG} --features "${VEIL_E2E_FEATURES}"; then
         log_error "cargo build --features ${VEIL_E2E_FEATURES} failed"
         exit 1
+    elif is_windows_host && ! cargo test --test e2e_tests ${VEIL_E2E_NO_DEFAULT_ARG} --features "${VEIL_E2E_FEATURES}" --no-run; then
+        # Windows は実行中の veil.exe を置き換えられない。E2E の試験のビルドは dev-dependencies の feature の統合で
+        # veil を作り直すので、サーバを起動する前に済ませておく（起動後の cargo test がリンクで失敗していた）
+        log_error "cargo test --test e2e_tests --no-run failed"
+        exit 1
     fi
     if ! (cd "${SCRIPT_DIR}/grpc_server" && cargo build --quiet); then
         log_error "grpc_server build failed"
@@ -280,6 +287,16 @@ prepare_fixtures() {
     dd if=/dev/zero bs=40000 count=1 2>/dev/null | tr '\0' 'F' \
         > "${FIXTURES_DIR}/f150_cache/cached.txt"
 
+    # F-294: 事前圧縮した兄弟ファイル（中身は判別用の ASCII。サーバは中身を検査しない）。
+    # old.css.br は元のファイルより古いので使われない。
+    mkdir -p "${FIXTURES_DIR}/f294_pre"
+    dd if=/dev/zero bs=2000 count=1 2>/dev/null | tr '\0' 'C' > "${FIXTURES_DIR}/f294_pre/app.css"
+    printf 'BR-SIBLING-CONTENT' > "${FIXTURES_DIR}/f294_pre/app.css.br"
+    printf 'GZ-SIBLING-CONTENT' > "${FIXTURES_DIR}/f294_pre/app.css.gz"
+    printf 'OLD-BR-SIBLING' > "${FIXTURES_DIR}/f294_pre/old.css.br"
+    touch -t 202001010000 "${FIXTURES_DIR}/f294_pre/old.css.br"
+    printf 'old-original-content' > "${FIXTURES_DIR}/f294_pre/old.css"
+
     # ルーティングテスト用フィクスチャ（各テストが使用するサブパス）
     for backend in backend1 backend2; do
         mkdir -p "${FIXTURES_DIR}/${backend}/api/v1"
@@ -344,6 +361,9 @@ prepare_fixtures() {
     copy_wasm_module "network_filter.wasm"
     # F-133: gRPC トレーラー/リクエストヘッダ書き換え E2E 用
     copy_wasm_module "grpc_trailer_filter.wasm"
+    # F-293: 失敗の扱い（failure_policy）の E2E 用（応答ヘッダの段で fuel を使い切る・/trap でトラップする）
+    copy_wasm_module "fuel_burner.wasm"
+    copy_wasm_module "baseline_filter.wasm"
 }
 
 # 設定ファイルを生成
@@ -603,6 +623,59 @@ EOF
     esac
     
     # 基本設定
+    # F-170 の UDS 上流。Windows は UDS の上流を受け付けない（設定のロードが失敗する）ので入れない
+    local UDS_UPSTREAMS=""
+    if ! is_windows_host; then
+        UDS_UPSTREAMS="$(cat << EOF
+# F-170: UDS バックエンド（Unix ドメインソケット上流）
+# http(s)://unix:<socket-path>[:<path-prefix>] は nginx の
+# "proxy_pass http://unix:/path:/uri;" と同じ表記。Host ヘッダは既定で "localhost"。
+[upstreams."uds-tls-pool"]
+algorithm = "round_robin"
+servers = [
+    "https://unix:${BACKEND_UDS_TLS_SOCK}"
+]
+tls_insecure = true
+
+[upstreams."uds-h2c-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}", use_h2c = true }
+]
+
+# パスプレフィックス付き（/uds-prefix/v1/test -> バックエンドの /api/v1/test）
+[upstreams."uds-prefix-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}:/api", use_h2c = true }
+]
+
+# 存在しないソケットへの接続（502 になること）
+[upstreams."uds-missing-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_MISSING_SOCK}", use_h2c = true }
+]
+
+# UDS 上流に対する TCP ヘルスチェック（unix: アドレスでプローブできること）
+[upstreams."uds-health-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}", use_h2c = true }
+]
+
+[upstreams."uds-health-pool".health_check]
+enabled = true
+check_type = "tcp"
+interval_secs = 2
+timeout_secs = 2
+healthy_threshold = 1
+unhealthy_threshold = 3
+
+EOF
+)
+"
+    fi
     cat > "${FIXTURES_DIR}/proxy.toml" << EOF
 [server]
 listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
@@ -646,10 +719,15 @@ enabled = true
 path_prefix = "/__admin"
 secret = "test-admin-secret"
 
+# F-288: 拡張 CONNECT（WebSocket over HTTP/2・HTTP/3）
+[http2]
+enable_connect_protocol = true
+
 [http3]
 enabled = true
 listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
 compression_enabled = true
+enable_connect_protocol = true
 
 # L4 TCP プロキシ（TLS パススルー、F-30 splice 検証用）
 # クライアントの TLS は backend1/2(HTTPS) へ透過転送され、L4 は生バイトを双方向中継する。
@@ -803,52 +881,7 @@ servers = [
 ]
 tls_insecure = true
 
-# F-170: UDS バックエンド（Unix ドメインソケット上流）
-# http(s)://unix:<socket-path>[:<path-prefix>] は nginx の
-# "proxy_pass http://unix:/path:/uri;" と同じ表記。Host ヘッダは既定で "localhost"。
-[upstreams."uds-tls-pool"]
-algorithm = "round_robin"
-servers = [
-    "https://unix:${BACKEND_UDS_TLS_SOCK}"
-]
-tls_insecure = true
-
-[upstreams."uds-h2c-pool"]
-algorithm = "round_robin"
-servers = [
-    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}", use_h2c = true }
-]
-
-# パスプレフィックス付き（/uds-prefix/v1/test -> バックエンドの /api/v1/test）
-[upstreams."uds-prefix-pool"]
-algorithm = "round_robin"
-servers = [
-    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}:/api", use_h2c = true }
-]
-
-# 存在しないソケットへの接続（502 になること）
-[upstreams."uds-missing-pool"]
-algorithm = "round_robin"
-servers = [
-    { url = "http://unix:${BACKEND_UDS_MISSING_SOCK}", use_h2c = true }
-]
-
-# UDS 上流に対する TCP ヘルスチェック（unix: アドレスでプローブできること）
-[upstreams."uds-health-pool"]
-algorithm = "round_robin"
-servers = [
-    { url = "http://unix:${BACKEND_UDS_H2C_SOCK}", use_h2c = true }
-]
-
-[upstreams."uds-health-pool".health_check]
-enabled = true
-check_type = "tcp"
-interval_secs = 2
-timeout_secs = 2
-healthy_threshold = 1
-unhealthy_threshold = 3
-
-# B-83 回帰テスト用: backend_h2c.toml は http2_enabled = true のため TLS リスナー
+${UDS_UPSTREAMS}# B-83 回帰テスト用: backend_h2c.toml は http2_enabled = true のため TLS リスナー
 # （BACKEND_H2C_TLS_PORT）が ALPN で h2 を広告する。この上流を https:// で参照し、
 # 上流クライアントの ALPN から h2 を外しても中継が壊れないことを確認する。
 [upstreams."alpn-h2-pool"]
@@ -1094,8 +1127,9 @@ rate_limit_requests_per_min = 10
 EOF
     fi
 
-    # F-170: UDS バックエンド検証ルート
-    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+    if ! is_windows_host; then
+        # F-170: UDS バックエンド検証ルート
+        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
 [[route]]
 [route.conditions]
@@ -1177,6 +1211,7 @@ path = "/uds-health/*"
 type = "Proxy"
 upstream = "uds-health-pool"
 EOF
+    fi
 
     # バックエンド接続オプション検証ルート（SNI / 厳密証明書 / ヘルスチェック種別）
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
@@ -1771,6 +1806,55 @@ allow_response_headers_write = true
 EOF
             fi
 
+            # F-293: failure_policy（既定 fail_closed と fail_open）。fuel_burner は応答ヘッダの段で fuel を使い切り、
+            # baseline は /trap でトラップする
+            if [ -f "${FIXTURES_DIR}/wasm/fuel_burner.wasm" ] && [ -f "${FIXTURES_DIR}/wasm/baseline_filter.wasm" ]; then
+                cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[wasm.modules]]
+name = "fuel_burner"
+path = "${FIXTURES_DIR}/wasm/fuel_burner.wasm"
+
+[[wasm.modules]]
+name = "fuel_burner_open"
+path = "${FIXTURES_DIR}/wasm/fuel_burner.wasm"
+failure_policy = "fail_open"
+
+[[wasm.modules]]
+name = "baseline"
+path = "${FIXTURES_DIR}/wasm/baseline_filter.wasm"
+
+[wasm.modules.capabilities]
+allow_send_local_response = true
+allow_request_headers_read = true
+allowed_properties = ["request.*"]
+
+[[route]]
+modules = ["fuel_burner"]
+[route.conditions]
+path = "/wasm-fuel-closed/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+modules = ["fuel_burner_open"]
+[route.conditions]
+path = "/wasm-fuel-open/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+modules = ["baseline"]
+[route.conditions]
+path = "/trap"
+[route.action]
+type = "Respond"
+status = 404
+EOF
+            fi
+
             # WASMモジュールを適用するルートを追加
             # 注意: modulesはroute直下（[route.action]配下ではなく）に設定する必要がある
             cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
@@ -1952,6 +2036,19 @@ path = "${FIXTURES_DIR}/f150_cache/"
 enabled = true
 valid_duration_secs = 300
 max_file_size_bytes = 1048576
+
+# F-294: 事前圧縮した兄弟ファイル
+[[route]]
+[route.conditions]
+path = "/f294/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/f294_pre/"
+precompressed = ["br", "gzip"]
+[route.open_file_cache]
+enabled = true
+[route.static_file_cache]
+enabled = true
 EOF
 
     # リダイレクトルート（302/307/308テスト用）
