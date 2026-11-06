@@ -249,6 +249,13 @@ Envoy の `FAIL_CLOSED` と違い、1 つの要求の失敗で後の要求は失
 モジュールが本文を読む（`allow_request_body_read`）なら本文のフェーズで続きを決める（応答も同じ）。`proxy_grpc_call`・`proxy_grpc_stream` を
 待つ `Pause` や、待つものの無い `Pause` は `unsupported_pause` の失敗になる。
 
+L4 のネットワークフィルタ（`[[l4]] wasm_modules`）も同じ `failure_policy` に従う: `fail_closed`（既定）では
+`proxy_on_new_connection`・`proxy_on_downstream_data`・`proxy_on_upstream_data` が失敗すると接続を閉じる（`phase` は
+`new_connection`・`downstream_data`・`upstream_data`）。`fail_open` ではそのモジュールを飛ばす。
+`proxy_on_downstream_data`・`proxy_on_upstream_data` が `Pause` を返すと、veil はそのバイトを転送せずに持ち、次に読んだ
+バイトを後ろに付けて次の呼び出しでもう一度渡す。持つ量が 1 MiB を超えると接続を閉じる。0.11.0 より前の L4 のフィルタは
+失敗しても常に続け、`Pause` でもバイトを転送していた。
+
 起動時とリロード時に、各モジュールの `_start`・`proxy_on_vm_start`・`proxy_on_configure` を 1 回走らせる。トラップしたり `false` を
 返したり（プラグインが設定を拒否した等）したら設定を拒否する（起動は失敗し、リロードは前の設定のまま）。
 

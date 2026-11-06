@@ -287,6 +287,19 @@ struct DirectionDone {
     waker: std::cell::Cell<Option<std::task::Waker>>,
 }
 
+/// 片方向のタスクが完了を通知せずに終わった（パニック）ときに 0 バイトで完了させる（B-319）
+#[cfg(not(target_os = "linux"))]
+struct CompleteOnDrop(std::rc::Rc<DirectionDone>);
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for CompleteOnDrop {
+    fn drop(&mut self) {
+        if self.0.bytes.get().is_none() {
+            self.0.complete(0);
+        }
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 impl DirectionDone {
     fn complete(&self, n: usize) {
@@ -343,6 +356,57 @@ where
         }
     }
     (c2u_bytes, u2c_bytes)
+}
+
+/// L4 の Proxy-Wasm のフィルタが Pause した（判断にもっとデータが要る）データの持ち置き（B-319）。
+///
+/// 以前は Pause を警告して転送していたので、2 回の read にまたがる語をフィルタが止められなかった（F19）。
+/// 持ったデータは次に読んだ分の前に付けてもう一度フィルタへ渡す（フィルタは毎回新しいインスタンスで
+/// 走るので、まとめて見せる）。上限を超えたら接続を閉じる。
+#[cfg(feature = "wasm")]
+#[derive(Default)]
+struct PauseHold {
+    held: Vec<u8>,
+}
+
+#[cfg(feature = "wasm")]
+impl PauseHold {
+    /// 持てる量の上限
+    const MAX: usize = 16 * BUF_SIZE;
+
+    /// 読んだ分（持っている分があればその後ろに付けたもの）をフィルタへ渡す形にする
+    fn input(&mut self, chunk: &[u8]) -> bytes::Bytes {
+        if self.held.is_empty() {
+            bytes::Bytes::copy_from_slice(chunk)
+        } else {
+            self.held.extend_from_slice(chunk);
+            bytes::Bytes::from(std::mem::take(&mut self.held))
+        }
+    }
+
+    /// Pause したデータを持つ。上限を超えるなら `false`（呼び出し側は閉じる）
+    fn hold(&mut self, data: bytes::Bytes) -> bool {
+        if data.len() > Self::MAX {
+            return false;
+        }
+        self.held = Vec::from(data);
+        true
+    }
+}
+
+/// `wn` バイト送れた後の未送信の分をバッファの先頭へ詰め、残りのバイト数を返す。
+///
+/// B-319: 以前は元の長さ `n` を基準に `copy_within(written..n, 0)` していたので、2 回目のショートライトで
+/// 縮めたバッファの外を指して panic していた（F11）
+fn shift_unsent(b: &mut Vec<u8>, wn: usize) -> usize {
+    let len = b.len();
+    if wn >= len {
+        b.clear();
+        return 0;
+    }
+    b.copy_within(wn..len, 0);
+    b.truncate(len - wn);
+    len - wn
 }
 
 /// 1方向の転送ループ
@@ -428,18 +492,14 @@ async fn forward_direction(
         unsafe { b.set_len(n) };
 
         // ショートライトをリトライ（追加アロケーションなし）
-        let mut written = 0;
-        while written < n {
-            if written > 0 {
-                // 未送信バイトをバッファ先頭にシフト（memmove 相当、ゼロコピー）
-                b.copy_within(written..n, 0);
-                unsafe { b.set_len(n - written) };
-            }
+        let mut remaining = n;
+        while remaining > 0 {
             let (wres, wb) = dst.write(b).await;
             b = wb;
             match wres {
                 Ok(0) | Err(_) => break 'outer,
-                Ok(wn) => written += wn,
+                // 未送信バイトをバッファ先頭にシフト（memmove 相当、ゼロコピー）
+                Ok(wn) => remaining = shift_unsent(&mut b, wn),
             }
         }
         total += n;
@@ -489,6 +549,8 @@ async fn forward_direction_wasm(
     };
 
     let mut total = 0usize;
+    // B-319: Pause したデータ
+    let mut pause_hold = PauseHold::default();
     'outer: loop {
         // B-57: `futures::join!` は c→u/u→c の 2 方向を同一タスク内で協調動作させるだけで、
         // 一方が WASM フィルタから `NetworkAction::Close` を受け取っても他方には伝わらない
@@ -521,7 +583,7 @@ async fn forward_direction_wasm(
         // WASM フィルタ経由（この経路自体が「ユーザー空間バッファを通す」選択の結果
         // なので、Bytes 化・書き換え時のコピーは許容する）。読み取りバッファ `b` は
         // 次の read で使い回すため copy_from_slice でコピーし、b の所有権は手元に残す。
-        let data = bytes::Bytes::copy_from_slice(&b);
+        let data = pause_hold.input(&b);
         let engine = CURRENT_CONFIG.load().wasm_filter_engine.clone();
         let out = if let Some(engine) = engine {
             let result = if is_downstream_data {
@@ -550,13 +612,18 @@ async fn forward_direction_wasm(
                     let _ = dst.shutdown(std::net::Shutdown::Both);
                     break 'outer;
                 }
+                // B-319: Pause は転送せずに持ち、次に読んだ分と合わせてもう一度フィルタへ渡す
                 crate::wasm::NetworkFilterResult::Pause => {
-                    warn!(
-                        "[L4:{}] WASM module requested Pause on network data, \
-                         but async resume is not yet supported for L4; continuing",
-                        name
-                    );
-                    data
+                    if !pause_hold.hold(data) {
+                        warn!(
+                            "[L4:{}] WASM module paused past the hold limit; closing",
+                            name
+                        );
+                        break 'outer;
+                    }
+                    unsafe { b.set_len(BUF_SIZE) };
+                    buf = b;
+                    continue;
                 }
             }
         } else {
@@ -578,17 +645,13 @@ async fn forward_direction_wasm(
 
         let out_len = out.len();
         let mut pending = out.to_vec();
-        let mut written = 0usize;
-        while written < out_len {
-            if written > 0 {
-                pending.copy_within(written..out_len, 0);
-                pending.truncate(out_len - written);
-            }
+        let mut remaining = out_len;
+        while remaining > 0 {
             let (wres, wb) = dst.write(pending).await;
             pending = wb;
             match wres {
                 Ok(0) | Err(_) => break 'outer,
-                Ok(wn) => written += wn,
+                Ok(wn) => remaining = shift_unsent(&mut pending, wn),
             }
         }
         total += n;
@@ -803,9 +866,12 @@ pub async fn bidirectional_forward(
         {
             let (c, u, d) = (client.clone(), upstream.clone(), done.clone());
             let name: std::rc::Rc<str> = std::rc::Rc::from(listener_name);
-            crate::runtime::spawn(async move {
+            // B-319: パニックはタスクで止め（ワーカーのスレッドを落とさない）、そのときも相手の方向が
+            // 待ち続けないように完了を通知する
+            crate::system::spawn_with_panic_catch(async move {
+                let done = CompleteOnDrop(d);
                 let n = forward_direction(&c, &u, idle_timeout, &name).await;
-                d.complete(n);
+                done.0.complete(n);
             });
         }
         let u2c_bytes = forward_direction(&upstream, &client, idle_timeout, listener_name).await;
@@ -1135,6 +1201,9 @@ async fn bidirectional_forward_tls_terminate<C>(
         b
     };
 
+    // B-319: Pause したデータ（方向ごと）
+    #[cfg(feature = "wasm")]
+    let (mut down_hold, mut up_hold) = (PauseHold::default(), PauseHold::default());
     'outer: loop {
         let mut had_activity = false;
 
@@ -1149,10 +1218,10 @@ async fn bidirectional_forward_tls_terminate<C>(
                 // 従来どおり b をそのまま転送する）。
                 #[cfg(feature = "wasm")]
                 if wasm_active {
-                    let data = bytes::Bytes::copy_from_slice(&b[..n]);
+                    let data = down_hold.input(&b[..n]);
                     if let Some(ref engine) = engine {
                         let result = engine
-                            .on_downstream_data_with_modules(wasm_modules, data, false)
+                            .on_downstream_data_with_modules(wasm_modules, data.clone(), false)
                             .await;
                         match result {
                             crate::wasm::NetworkFilterResult::Continue { data } => {
@@ -1170,12 +1239,16 @@ async fn bidirectional_forward_tls_terminate<C>(
                                 );
                                 break 'outer;
                             }
+                            // B-319: Pause は転送せずに持ち、次に読んだ分と合わせてもう一度渡す
                             crate::wasm::NetworkFilterResult::Pause => {
-                                warn!(
-                                    "[L4:{}] WASM module requested Pause on network data, \
-                                     but async resume is not yet supported for L4; continuing",
-                                    listener_name
-                                );
+                                if !down_hold.hold(data) {
+                                    warn!(
+                                        "[L4:{}] WASM module paused past the hold limit; closing",
+                                        listener_name
+                                    );
+                                    break 'outer;
+                                }
+                                b.clear();
                             }
                         }
                     }
@@ -1183,17 +1256,13 @@ async fn bidirectional_forward_tls_terminate<C>(
 
                 let n = b.len();
                 let mut pending = b;
-                let mut written = 0usize;
-                while written < n {
-                    if written > 0 {
-                        pending.copy_within(written..n, 0);
-                        unsafe { pending.set_len(n - written) };
-                    }
+                let mut remaining = n;
+                while remaining > 0 {
                     let (wres, returned) = upstream.write(pending).await;
                     pending = returned;
                     match wres {
                         Ok(0) | Err(_) => break 'outer,
-                        Ok(wn) => written += wn,
+                        Ok(wn) => remaining = shift_unsent(&mut pending, wn),
                     }
                 }
                 had_activity = true;
@@ -1211,10 +1280,10 @@ async fn bidirectional_forward_tls_terminate<C>(
                 // upstream (backend → client) データを WASM フィルタへ通す。
                 #[cfg(feature = "wasm")]
                 if wasm_active {
-                    let data = bytes::Bytes::copy_from_slice(&b[..n]);
+                    let data = up_hold.input(&b[..n]);
                     if let Some(ref engine) = engine {
                         let result = engine
-                            .on_upstream_data_with_modules(wasm_modules, data, false)
+                            .on_upstream_data_with_modules(wasm_modules, data.clone(), false)
                             .await;
                         match result {
                             crate::wasm::NetworkFilterResult::Continue { data } => {
@@ -1232,20 +1301,26 @@ async fn bidirectional_forward_tls_terminate<C>(
                                 );
                                 break 'outer;
                             }
+                            // B-319: Pause は転送せずに持ち、次に読んだ分と合わせてもう一度渡す
                             crate::wasm::NetworkFilterResult::Pause => {
-                                warn!(
-                                    "[L4:{}] WASM module requested Pause on network data, \
-                                     but async resume is not yet supported for L4; continuing",
-                                    listener_name
-                                );
+                                if !up_hold.hold(data) {
+                                    warn!(
+                                        "[L4:{}] WASM module paused past the hold limit; closing",
+                                        listener_name
+                                    );
+                                    break 'outer;
+                                }
+                                b.clear();
                             }
                         }
                     }
                 }
 
-                let (wres, _) = client.write_all(b).await;
-                if wres.is_err() {
-                    break;
+                if !b.is_empty() {
+                    let (wres, _) = client.write_all(b).await;
+                    if wres.is_err() {
+                        break;
+                    }
                 }
                 had_activity = true;
             }
@@ -1817,18 +1892,31 @@ mod tests {
         assert_eq!(BUF_SIZE, 64 * 1024);
     }
 
+    /// B-319: Pause したデータは次に読んだ分の前に付けて渡し直す。上限を超えたら持たない
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn pause_hold_prepends_held_bytes() {
+        let mut h = super::PauseHold::default();
+        let d = h.input(b"ab");
+        assert_eq!(&d[..], b"ab");
+        assert!(h.hold(d));
+        assert_eq!(&h.input(b"cd")[..], b"abcd");
+        assert_eq!(&h.input(b"ef")[..], b"ef");
+        assert!(!h.hold(bytes::Bytes::from(vec![0u8; super::PauseHold::MAX + 1])));
+    }
+
     #[test]
     fn test_copy_within_simulates_short_write_retry() {
-        // forward_direction のショートライト処理（copy_within）を単体でテスト
+        // forward_direction のショートライト処理を単体でテスト
         let mut buf: Vec<u8> = vec![1, 2, 3, 4, 5, 6];
-        let n = 6;
-        let written = 2; // 2 バイトだけ書けた
-
-        buf.copy_within(written..n, 0);
-        unsafe { buf.set_len(n - written) };
-
-        // [3, 4, 5, 6] が先頭に詰められているはず
+        // 2 バイトだけ書けた → [3, 4, 5, 6] が先頭に詰められているはず
+        assert_eq!(super::shift_unsent(&mut buf, 2), 4);
         assert_eq!(&buf[..], &[3u8, 4, 5, 6]);
+        // B-319: 2 回目のショートライトでも範囲外を指さない（以前は元の長さで切って panic）
+        assert_eq!(super::shift_unsent(&mut buf, 1), 3);
+        assert_eq!(&buf[..], &[4u8, 5, 6]);
+        assert_eq!(super::shift_unsent(&mut buf, 3), 0);
+        assert_eq!(super::shift_unsent(&mut buf, 9), 0);
     }
 
     // ====================

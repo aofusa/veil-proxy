@@ -2461,8 +2461,11 @@ impl FilterEngine {
             match self.execute_on_new_connection(module, config).await {
                 Ok(NetworkAction::Close) => return NetworkAction::Close,
                 Ok(NetworkAction::Continue) => {}
+                // B-319: 失敗は `failure_policy` に従う（以前は記録するだけで接続を通していた。F10）
                 Err(e) => {
-                    ftlog::error!("[wasm:{}] on_new_connection error: {}", module.name, e);
+                    if self.on_failure(module, "new_connection", &e).is_some() {
+                        return NetworkAction::Close;
+                    }
                 }
             }
         }
@@ -2557,13 +2560,11 @@ impl FilterEngine {
                 Ok(NetworkDataModuleResult::Continue { data }) => current = data,
                 Ok(NetworkDataModuleResult::Pause) => return NetworkFilterResult::Pause,
                 Ok(NetworkDataModuleResult::Close) => return NetworkFilterResult::Close,
+                // B-319: 失敗は `failure_policy` に従う（fail_closed なら閉じる。F10）
                 Err(e) => {
-                    ftlog::error!(
-                        "[wasm:{}] on_{}_data error: {}",
-                        module.name,
-                        direction.label(),
-                        e
-                    );
+                    if self.on_failure(module, direction.phase(), &e).is_some() {
+                        return NetworkFilterResult::Close;
+                    }
                 }
             }
         }
@@ -2732,10 +2733,11 @@ impl NetworkDataDirection {
             NetworkDataDirection::Upstream => "proxy_on_upstream_data",
         }
     }
-    fn label(self) -> &'static str {
+    /// 失敗の記録（`failure_policy`・メトリクス）の段の名前
+    fn phase(self) -> &'static str {
         match self {
-            NetworkDataDirection::Downstream => "downstream",
-            NetworkDataDirection::Upstream => "upstream",
+            NetworkDataDirection::Downstream => "downstream_data",
+            NetworkDataDirection::Upstream => "upstream_data",
         }
     }
 }
@@ -2758,8 +2760,7 @@ enum NetworkDataModuleResult {
 pub enum NetworkFilterResult {
     /// 転送を継続する（`data` は書き換え後、または未変更の場合はそのまま）。
     Continue { data: bytes::Bytes },
-    /// 処理を一時停止する（現状 L4 では非同期再開経路が無いため、呼び出し側は
-    /// 警告ログを出して Continue 相当に倒す想定）。
+    /// 判断にもっとデータが要る（呼び出し側はデータを転送せずに持ち、次に読んだ分と合わせて渡し直す）。
     Pause,
     /// 接続をクローズする（`proxy_close_stream` が呼ばれた）。
     Close,

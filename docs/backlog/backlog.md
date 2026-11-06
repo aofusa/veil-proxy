@@ -664,6 +664,7 @@
 | B-316 | P1 | 修正済み（v0.11.0） | [bugs/B-316-mesh-network-rbac-only-last-filter.md](bugs/B-316-mesh-network-rbac-only-last-filter.md) | メッシュの network RBAC がチェーンの最後の 1 つしか効かず、Istio の TCP の DENY が ALLOW と併用すると無視される |
 | B-317 | P1 | 修正済み（v0.11.0） | [bugs/B-317-http-frontend-handler-bypass-leading-crlf-connect.md](bugs/B-317-http-frontend-handler-bypass-leading-crlf-connect.md) | HTTP/2・HTTP/3 のハンドラのストリーミング経路・拡張 CONNECT が route.security・Proxy-Wasm を飛ばす、HTTP/1.1 の先頭の空行でヘッダの上限をすり抜ける、CONNECT の authority 形式を上流へ送る |
 | B-318 | P1 | 修正済み（v0.11.0） | [bugs/B-318-header-and-log-injection.md](bugs/B-318-header-and-log-injection.md) | 上流の HTTP/2・ハンドラ・Proxy-Wasm のヘッダの CR/LF を HTTP/1.1 へそのまま書く、HTTP/2 の擬似ヘッダの数え溢れ、GOAWAY・SNI・メトリクスのラベルのエスケープ漏れ |
+| B-319 | P1 | 修正済み（v0.11.0） | [bugs/B-319-l4-wasm-fail-open-pause-short-write.md](bugs/B-319-l4-wasm-fail-open-pause-short-write.md) | L4 の Proxy-Wasm が失敗・Pause でデータを素通しし、ショートライトの再送が 2 回目で panic する |
 
 ---
 

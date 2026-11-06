@@ -262,6 +262,13 @@ when `on_http_request_headers` returns `Pause` before the body (`end_of_stream =
 (`allow_request_body_read`); the same for the response. A `Pause` that waits for a `proxy_grpc_call`/`proxy_grpc_stream`,
 or that has nothing to wait for, is an `unsupported_pause` failure.
 
+L4 network filters (`[[l4]] wasm_modules`) follow the same `failure_policy`: under `fail_closed` (the default) a failing
+`proxy_on_new_connection`, `proxy_on_downstream_data` or `proxy_on_upstream_data` closes the connection (`phase` is
+`new_connection`, `downstream_data` or `upstream_data`); under `fail_open` the module is skipped. When
+`proxy_on_downstream_data`/`proxy_on_upstream_data` returns `Pause`, veil does not forward the bytes: it holds them and
+passes them again, followed by the next bytes read, on the next call. If more than 1 MiB is held, the connection is
+closed. Before 0.11.0, L4 filters always continued after a failure and forwarded the bytes on `Pause`.
+
 At startup and on reload veil runs each module's `_start`, `proxy_on_vm_start` and `proxy_on_configure` once. If one
 traps or returns `false` (for example the plugin rejects its configuration), the configuration is rejected: startup
 fails, and a reload keeps the previous configuration.
