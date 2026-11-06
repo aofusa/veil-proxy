@@ -178,7 +178,14 @@ async fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -
         .or_else(|| caller.get_export("malloc"))?;
     let func = func.into_func()?;
     let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
-    typed.call_async(&mut *caller, size as i32).await.ok()
+    let size = i32::try_from(size).ok()?;
+    // B-320: 0 はゲストのアロケータの失敗（以前は有効な場所として先頭からクライアントのバイトを
+    // 書き込んでいた。F49）
+    typed
+        .call_async(&mut *caller, size)
+        .await
+        .ok()
+        .filter(|&p| p != 0 || size == 0)
 }
 
 /// Helper to write to WASM memory

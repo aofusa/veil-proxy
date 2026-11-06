@@ -119,7 +119,14 @@ async fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -
         .or_else(|| caller.get_export("malloc"))?;
     let func = func.into_func()?;
     let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
-    typed.call_async(&mut *caller, size as i32).await.ok()
+    let size = i32::try_from(size).ok()?;
+    // B-320: 0 はゲストのアロケータの失敗（以前は有効な場所として先頭からクライアントのバイトを
+    // 書き込んでいた。F49）
+    typed
+        .call_async(&mut *caller, size)
+        .await
+        .ok()
+        .filter(|&p| p != 0 || size == 0)
 }
 
 /// Helper to write to WASM memory
@@ -292,17 +299,17 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             let start_pos = start as u32 as usize;
-            let end_pos = start_pos + size as u32 as usize;
 
             // Handle replacement
             if start_pos > buffer.len() {
                 return PROXY_RESULT_BAD_ARGUMENT;
             }
-
-            if end_pos > buffer.len() {
-                // Extend buffer if needed
-                buffer.resize(end_pos, 0);
-            }
+            // B-320: 置き換える範囲はバッファの終わりで切る（Envoy と同じ）。以前はゲストの `size`
+            // （最大 4GiB）までバッファを 0 で埋めて伸ばしてから捨てていて、ゲストのメモリの上限と
+            // 関係なくホストのヒープを確保できた（F21）
+            let end_pos = start_pos
+                .saturating_add(size as u32 as usize)
+                .min(buffer.len());
 
             // Replace range with new value
             let mut new_buffer =

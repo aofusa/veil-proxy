@@ -976,7 +976,9 @@ pub(super) async fn handle_requests(
                                     Arc::from(method_str),
                                     headers_vec,
                                     Arc::from(client_ip),
-                                    content_length == 0 && !is_chunked, // end_of_stream
+                                    // end_of_stream。B-320: WebSocket は本文の段を走らせないので、本文を待つ
+                                    // Pause を決めずに通さないよう、本文が無いものとして渡す（F57）
+                                    (content_length == 0 && !is_chunked) || is_websocket,
                                 )
                                 .await;
 

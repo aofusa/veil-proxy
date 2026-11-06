@@ -247,7 +247,11 @@ Envoy の `FAIL_CLOSED` と違い、1 つの要求の失敗で後の要求は失
 `Pause` は、フィルタが待つものを veil が待てるときに守る: どのフェーズの `dispatch_http_call` でもその場で解決する
 （[外部サービス連携](#外部サービス連携http呼び出し)）。`on_http_request_headers` が本文の前（`end_of_stream = false`）に `Pause` を返し、
 モジュールが本文を読む（`allow_request_body_read`）なら本文のフェーズで続きを決める（応答も同じ）。`proxy_grpc_call`・`proxy_grpc_stream` を
-待つ `Pause` や、待つものの無い `Pause` は `unsupported_pause` の失敗になる。
+待つ `Pause` や、待つものの無い `Pause` は `unsupported_pause` の失敗になる。`dispatch_http_call` の後は、
+`proxy_on_http_call_response` が要求を再開する（`resume_http_request`、つまり `proxy_continue_stream`）かローカル応答を返したときだけ
+要求を続ける。どちらもしないフィルタや、`max_http_calls` 回を過ぎてもコールが残るフィルタは Pause のままで、上と同じに扱う
+（0.11.0 より前は続けていた）。WebSocket のアップグレード（HTTP/1.1 と HTTP/2・HTTP/3 の拡張 CONNECT）は本文の段を走らせないので、
+`on_http_request_headers` には `end_of_stream = true` を渡す。
 
 L4 のネットワークフィルタ（`[[l4]] wasm_modules`）も同じ `failure_policy` に従う: `fail_closed`（既定）では
 `proxy_on_new_connection`・`proxy_on_downstream_data`・`proxy_on_upstream_data` が失敗すると接続を閉じる（`phase` は

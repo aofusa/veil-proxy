@@ -617,6 +617,7 @@ impl FilterEngine {
                 FilterAction::Continue => Ok(false),
                 FilterAction::Pause => {
                     let (instance, ctx_id) = (sess.instance, sess.context_id);
+                    sess.store.data_mut().http_ctx.stream_resumed = false;
                     match self
                         .resolve_pending_http_calls_inline(
                             module,
@@ -626,8 +627,16 @@ impl FilterEngine {
                         )
                         .await
                     {
-                        // 再開した（応答を受けたモジュールが続きを決めた）
-                        Ok(true) => Ok(false),
+                        // 応答を受けたモジュールが再開した（`proxy_continue_stream`）か、ローカル応答を決めた。
+                        // B-320: どちらでもない（再開も拒否もしない・`max_http_calls` 回を超えてコールが
+                        // 残った）なら Pause のまま（以前は続けていて、決めていない Pause が許可になった。F20）
+                        Ok(true)
+                            if sess.store.data().http_ctx.stream_resumed
+                                || sess.store.data().http_ctx.local_response.is_some() =>
+                        {
+                            Ok(false)
+                        }
+                        Ok(true) => Ok(true),
                         // インラインで待てるものが無い Pause
                         Ok(false) => Ok(true),
                         Err(e) => Err(e.context(FailKind("http_call_resume"))),

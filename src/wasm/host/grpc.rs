@@ -486,8 +486,7 @@ fn proxy_grpc_stream_impl(
 
     // Allocate stream ID
     let state = caller.data_mut();
-    let stream_id = state.http_ctx.next_grpc_stream_id;
-    state.http_ctx.next_grpc_stream_id += 1;
+    let stream_id = state.http_ctx.next_grpc_stream_id();
 
     // Create the stream
     let stream = GrpcStream {

@@ -259,9 +259,9 @@ mod context_tests {
         let token2 = ctx.allocate_http_call_token();
         let token3 = ctx.allocate_http_call_token();
 
-        assert_eq!(token1, 1);
-        assert_eq!(token2, 2);
-        assert_eq!(token3, 3);
+        // B-320: トークンはプロセスで一意（並行する試験とも重ならない）
+        assert!(token1 > 0 && token2 > 0 && token3 > 0);
+        assert!(token1 != token2 && token2 != token3 && token1 != token3);
     }
 
     #[test]
@@ -933,9 +933,9 @@ mod host_function_tests {
         let token2 = ctx.allocate_http_call_token();
         let token3 = ctx.allocate_http_call_token();
 
-        assert_eq!(token1, 1);
-        assert_eq!(token2, 2);
-        assert_eq!(token3, 3);
+        // B-320: トークンはプロセスで一意（並行する試験とも重ならない）
+        assert!(token1 > 0 && token2 > 0 && token3 > 0);
+        assert!(token1 != token2 && token2 != token3 && token1 != token3);
     }
 
     #[test]
@@ -1128,7 +1128,7 @@ mod lifecycle_callback_tests {
 
         // Create some pending state
         let token = ctx.allocate_http_call_token();
-        assert_eq!(token, 1);
+        assert!(token > 0);
 
         // Verify modifications tracked
         assert!(ctx.has_request_modifications());
@@ -1311,9 +1311,14 @@ mod p3_grpc_callback_tests {
         let call_id_2 = ctx.next_grpc_call_id();
         let call_id_3 = ctx.next_grpc_call_id();
 
-        assert_eq!(call_id_1, 1);
-        assert_eq!(call_id_2, 2);
-        assert_eq!(call_id_3, 3);
+        // B-320: ID はプロセスで一意（別のコンテキストとも重ならない）
+        let other =
+            HttpContext::new(1, CapabilityPreset::Extended.to_capabilities()).next_grpc_call_id();
+        let ids = [call_id_1, call_id_2, call_id_3, other];
+        for (i, a) in ids.iter().enumerate() {
+            assert!(*a > 0 && *a <= i32::MAX as u32);
+            assert!(ids[i + 1..].iter().all(|b| b != a), "{ids:?}");
+        }
     }
 
     /// Test gRPC stream state

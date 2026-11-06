@@ -260,7 +260,11 @@ Each failure counts in `veil_wasm_failures_total{filter, phase, reason, action}`
 (resolved inline, see [External Service Integration](#external-service-integration-http-calls)), or the request body
 when `on_http_request_headers` returns `Pause` before the body (`end_of_stream = false`) and the module reads the body
 (`allow_request_body_read`); the same for the response. A `Pause` that waits for a `proxy_grpc_call`/`proxy_grpc_stream`,
-or that has nothing to wait for, is an `unsupported_pause` failure.
+or that has nothing to wait for, is an `unsupported_pause` failure. After a `dispatch_http_call`, the request goes on
+only when `proxy_on_http_call_response` resumes it (`resume_http_request`, i.e. `proxy_continue_stream`) or sends a
+local response; a filter that does neither, or that still has calls pending after `max_http_calls` rounds, stays paused
+and is handled as above (before 0.11.0 such a request went on). WebSocket upgrades (HTTP/1.1 and the extended CONNECT of
+HTTP/2 and HTTP/3) run no body phase, so `on_http_request_headers` sees `end_of_stream = true` there.
 
 L4 network filters (`[[l4]] wasm_modules`) follow the same `failure_policy`: under `fail_closed` (the default) a failing
 `proxy_on_new_connection`, `proxy_on_downstream_data` or `proxy_on_upstream_data` closes the connection (`phase` is

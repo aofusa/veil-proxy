@@ -174,12 +174,13 @@ pub struct HttpContext {
     /// `proxy_close_stream` が呼ばれ、接続クローズが要求されたか（network filter 専用。
     /// Proxy-Wasm ABI の Action には Close が無いため、host 関数呼び出しで検知する）。
     pub close_requested: bool,
+    /// `proxy_continue_stream` が呼ばれたか（B-320: Pause したフィルタが `http_call` の応答で再開を
+    /// 決めたかを見る。`settle` が呼ぶ前に倒す）
+    pub stream_resumed: bool,
 
     // === HTTP Calls ===
     /// Pending HTTP calls
     pub pending_http_calls: HashMap<u32, PendingHttpCall>,
-    /// Next HTTP call token
-    pub next_http_call_token: u32,
     /// HTTP call responses (token -> response)
     pub http_call_responses: HashMap<u32, HttpCallResponse>,
     /// Current HTTP call token being processed
@@ -213,9 +214,6 @@ pub struct HttpContext {
     /// ものを保持し、ここへ入れる際の `clone()` は参照カウントのみで完結する。
     #[cfg(feature = "grpc")]
     pub pending_grpc_calls: HashMap<u32, (String, Bytes, u32)>,
-    /// Next gRPC call ID
-    #[cfg(feature = "grpc")]
-    pub next_grpc_call_id: u32,
     /// Cancelled gRPC call IDs
     #[cfg(feature = "grpc")]
     pub cancelled_grpc_calls: std::collections::HashSet<u32>,
@@ -224,9 +222,6 @@ pub struct HttpContext {
     /// Active gRPC streams (stream_id -> GrpcStream)
     #[cfg(feature = "grpc")]
     pub pending_grpc_streams: HashMap<u32, GrpcStream>,
-    /// Next gRPC stream ID
-    #[cfg(feature = "grpc")]
-    pub next_grpc_stream_id: u32,
 
     // === gRPC Receive State (feature = "grpc", F-134) ===
     // `MapType::GrpcReceiveInitialMetadata`(4) / `GrpcReceiveTrailingMetadata`(5) /
@@ -275,6 +270,16 @@ pub enum GrpcStreamState {
     HalfClosed,
     /// Stream is fully closed
     Closed,
+}
+
+/// HTTP の呼び出しのトークン・gRPC の呼び出しとストリームの ID（1..=i32::MAX）。
+///
+/// B-320: プロセスで一意にする。以前はコンテキストごとに 1 から数えていて、コールバックごとに作るコンテキストの
+/// 間で同じ ID になり、gRPC の実行器の表（モジュール名・ID で引く）で同じモジュールの別の要求の呼び出しへ
+/// 送ったり、取り消したり、置き換えたりできた（F48）
+fn next_unique_id() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % (i32::MAX as u32) + 1
 }
 
 impl HttpContext {
@@ -332,8 +337,8 @@ impl HttpContext {
             upstream_data: BodyBuffer::empty(),
             upstream_data_modified: false,
             close_requested: false,
+            stream_resumed: false,
             pending_http_calls: HashMap::new(),
-            next_http_call_token: 1,
             http_call_responses: HashMap::new(),
             current_http_call_token: None,
             metrics: HashMap::new(),
@@ -345,13 +350,9 @@ impl HttpContext {
             #[cfg(feature = "grpc")]
             pending_grpc_calls: HashMap::new(),
             #[cfg(feature = "grpc")]
-            next_grpc_call_id: 1,
-            #[cfg(feature = "grpc")]
             cancelled_grpc_calls: std::collections::HashSet::new(),
             #[cfg(feature = "grpc")]
             pending_grpc_streams: HashMap::new(),
-            #[cfg(feature = "grpc")]
-            next_grpc_stream_id: 1,
             #[cfg(feature = "grpc")]
             grpc_receive_initial_metadata: Vec::new(),
             #[cfg(feature = "grpc")]
@@ -402,9 +403,7 @@ impl HttpContext {
 
     /// Get next HTTP call token
     pub fn allocate_http_call_token(&mut self) -> u32 {
-        let token = self.next_http_call_token;
-        self.next_http_call_token += 1;
-        token
+        next_unique_id()
     }
 
     /// Get next metric ID
@@ -432,9 +431,13 @@ impl HttpContext {
     /// Get next gRPC call ID
     #[cfg(feature = "grpc")]
     pub fn next_grpc_call_id(&mut self) -> u32 {
-        let id = self.next_grpc_call_id;
-        self.next_grpc_call_id += 1;
-        id
+        next_unique_id()
+    }
+
+    /// Get next gRPC stream ID
+    #[cfg(feature = "grpc")]
+    pub fn next_grpc_stream_id(&mut self) -> u32 {
+        next_unique_id()
     }
 
     /// Register a pending gRPC call

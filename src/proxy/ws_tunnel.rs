@@ -390,7 +390,9 @@ async fn wasm_request_headers(
             Arc::from("GET"),
             headers_vec,
             Arc::from(&*req.client_ip),
-            false,
+            // B-320: 拡張 CONNECT のトンネルは本文の段を走らせないので、本文を待つ Pause を決めずに
+            // 通さないよう、本文が無いものとして渡す（F57）
+            true,
         )
         .await;
     match result {
