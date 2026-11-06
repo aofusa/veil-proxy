@@ -284,18 +284,15 @@ mod tests {
 
     #[test]
     fn forms_errors_and_json() {
-        let req = request(
-            &[],
-            "grant_type=password&username=al+ice&password=p%40ss&x=%zz&flag",
-        );
+        let req = request(&[], "kind=form&name=al+ice&code=p%40ss&x=%zz&flag");
         let (_, r) = with_handles(req, |rq, rs| unsafe {
             let mut len = 0;
             assert_eq!(
-                take(veil_kit_form_get(rq, c("username").as_ptr(), &mut len), len),
+                take(veil_kit_form_get(rq, c("name").as_ptr(), &mut len), len),
                 "al ice"
             );
             assert_eq!(
-                take(veil_kit_form_get(rq, c("password").as_ptr(), &mut len), len),
+                take(veil_kit_form_get(rq, c("code").as_ptr(), &mut len), len),
                 "p@ss"
             );
             assert_eq!(

@@ -672,6 +672,7 @@
 | B-324 | P1 | 修正済み（v0.11.0） | [bugs/B-324-api-client-pool-errors-unix-host.md](bugs/B-324-api-client-pool-errors-unix-host.md) | API クライアント: プールの鍵に方式が無く https の要求が平文の接続を使う、エラーの詳細（URL のクエリ・内部のアドレス）を利用者へ返す、`http://unix/` が UDS になる |
 | B-325 | P2 | 修正済み（v0.11.0） | [bugs/B-325-acme-windows-key-permissions.md](bugs/B-325-acme-windows-key-permissions.md) | Windows で ACME の秘密鍵・アカウント鍵が親ディレクトリの DACL を継承する |
 | B-326 | P2 | 修正済み（v0.11.0） | [bugs/B-326-mesh-linkerd-build-h2-stream-plan.md](bugs/B-326-mesh-linkerd-build-h2-stream-plan.md) | `mesh-linkerd` のビルドが通らない（tap の H2Service が H2StreamPlan に追従していない。v0.10.1 から） |
+| B-327 | P2 | 修正済み（v0.11.0） | [bugs/B-327-ci-macos14-runner-pyi-precompressed.md](bugs/B-327-ci-macos14-runner-pyi-precompressed.md) | CI: macOS arm64 のランナー（macos-14）の廃止、Python の型スタブに `precompressed` が無い、試験の値が秘密の検出に掛かる |
 
 ---
 

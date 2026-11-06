@@ -52,7 +52,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macos-arm64, runner: macos-14, modes: "c c-kit python" }
+          - { name: macos-arm64, runner: macos-15, modes: "c c-kit python" }
           - { name: windows-x86_64, runner: windows-2022, modes: "c c-kit python" }
           # Linux の wheel は ci.yml の python-docs（stubtest）が作る。ここでは C のライブラリと例だけ
           # （c-kit は Windows では MSVC のビルド手順が無いので library_e2e.sh が飛ばす。F-291）
