@@ -86,6 +86,10 @@ enum Settled {
 /// インスタンス枠が尽きたときに待つ上限（1+2+…+64 ≒ 127ms。B-299）
 const INSTANTIATE_RETRY_MAX_MS: u64 = 64;
 
+/// 起動時の検査（[`FilterEngine::validate`]）の実時間の締切（エポックのティック数。`EPOCH_TICK` ごとに進むので約 60 秒）。
+/// 1 回のコールバックの締切と違い、データプレーンの外で 1 度だけ走る（暴走は燃料が止める）。
+const VALIDATE_EPOCH_DEADLINE: u64 = 600;
+
 /// Filter engine for executing WASM modules
 pub struct FilterEngine {
     /// Module registry
@@ -258,11 +262,7 @@ impl FilterEngine {
     /// （データプレーンの外。リロードで失敗したら前の設定のまま）。
     pub fn validate(&self) -> anyhow::Result<()> {
         for module in self.registry.modules() {
-            let mut store = Store::new(
-                self.registry.engine(),
-                HostState::new(HttpContext::for_module(1, module)),
-            );
-            self.arm_store(&mut store)?;
+            let mut store = self.validation_store(module)?;
             // 起動・リロードのスレッドで 1 回だけ（ワーカーのランタイムの外）
             futures::executor::block_on(async {
                 let instance = module.instance_pre.instantiate_async(&mut store).await?;
@@ -274,6 +274,21 @@ impl FilterEngine {
             })?;
         }
         Ok(())
+    }
+
+    /// 起動時の検査に使う Store。CPU の上限は要求のときと同じ燃料で、実時間の締切だけを長くする（B-336）。
+    ///
+    /// キャッシュから読んだモジュールの機械語は mmap なので、最初の実行はページフォールトでディスクを待つ。
+    /// ページキャッシュが冷えていて遅いディスクが混んでいると、ゲストが何も悪くなくても 1 秒の締切に届いて
+    /// `interrupt` でトラップし、正しい設定なのにサーバが起動しない（リロードなら拒否される）。
+    fn validation_store(&self, module: &LoadedModule) -> anyhow::Result<Store<HostState>> {
+        let mut store = Store::new(
+            self.registry.engine(),
+            HostState::new(HttpContext::for_module(1, module)),
+        );
+        self.arm_store(&mut store)?;
+        store.set_epoch_deadline(VALIDATE_EPOCH_DEADLINE);
+        Ok(store)
     }
 
     /// Store に 1 回のコールバックの燃料と締切を入れる
@@ -2952,6 +2967,51 @@ mod exec_smoke_tests {
         match result {
             FilterResult::Continue { .. } | FilterResult::LocalResponse(_) => {}
         }
+    }
+
+    /// B-336 回帰テスト: 検査の Store を用意してから最初の実行までに 1 回のコールバックの締切を超える時間が
+    /// 過ぎても（ページフォールトでディスクを待つ間）、起動時の検査はトラップしない。エポックは時間の経過の
+    /// 代わりに直接進める（修正前の締切ではトラップする）。
+    #[test]
+    fn b336_validation_survives_a_stall_longer_than_the_callback_deadline() {
+        let path = "tests/fixtures/wasm/header_filter.wasm";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        }
+        let config = WasmConfig {
+            enabled: true,
+            defaults: WasmDefaults::default(),
+            modules: vec![ModuleConfig {
+                name: "header_filter".to_string(),
+                path: path.to_string(),
+                configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
+                capabilities: ModuleCapabilities {
+                    allow_logging: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+        };
+        let engine = FilterEngine::new(&config).expect("engine");
+        let module = engine
+            .get_module("header_filter")
+            .expect("module must be loaded");
+        let mut store = engine.validation_store(&module).expect("store");
+        for _ in 0..engine.epoch_deadline * 2 {
+            engine.registry.engine().increment_epoch();
+        }
+        let r = futures::executor::block_on(async {
+            let instance = module.instance_pre.instantiate_async(&mut store).await?;
+            engine
+                .run_lifecycle(&mut store, instance, &module.configuration)
+                .await
+        });
+        assert!(r.is_ok(), "validation must not trap on a stall: {:?}", r);
     }
 
     /// B-173 回帰テスト: 他の要求の WASM 呼び出しは、すでに締切を入れた store の締切を減らさない。

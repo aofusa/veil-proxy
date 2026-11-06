@@ -686,6 +686,7 @@
 | B-333 | P1 | 進行中 | [bugs/B-333-h2-trailers-flush-per-stream.md](bugs/B-333-h2-trailers-flush-per-stream.md) | HTTP/2 のトレーラの送出が 1 ストリームごとに `send(2)` を 2 回呼ぶ |
 | B-334 | P1 | 進行中 | [bugs/B-334-python-thread-state-per-call.md](bugs/B-334-python-thread-state-per-call.md) | Python の呼び出しごとに thread state を作って壊す（要求ごとの mmap/munmap/gettid） |
 | B-335 | P2 | 進行中 | [bugs/B-335-access-log-writer-wake-per-request.md](bugs/B-335-access-log-writer-wake-per-request.md) | アクセスログのスレッドを要求ごとに起こす（要求ごとの futex 2 本） |
+| B-336 | P1 | 修正済み | [bugs/B-336-wasm-validate-cold-page-cache-interrupt.md](bugs/B-336-wasm-validate-cold-page-cache-interrupt.md) | 起動時の Proxy-Wasm の検査が、冷えたページキャッシュと遅いディスクで `interrupt` になって起動できない |
 
 ---
 

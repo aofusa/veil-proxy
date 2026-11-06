@@ -2651,6 +2651,13 @@ wait_for_proxy_ready() {
             || curl -ks "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" > /dev/null 2>&1; then
             return 0
         fi
+        # プロキシが落ちていたら待たない（B-336: 起動失敗を 180 秒待った上に「AOT のせい」と報告していた）
+        if [ "${RUN_MODE}" = "host" ] && [ -f "${FIXTURES_DIR}/proxy.pid" ] \
+            && ! kill -0 "$(cat "${FIXTURES_DIR}/proxy.pid")" 2>/dev/null; then
+            log_error "Proxy exited during startup; last lines of /tmp/proxy.log:"
+            tail -5 /tmp/proxy.log >&2
+            return 1
+        fi
         if [ $(( $(date +%s) - start_ts )) -ge "$deadline_secs" ]; then
             log_error "Proxy failed to become ready within ${deadline_secs}s (WASM AOT compile?)"
             return 1
