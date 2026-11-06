@@ -377,6 +377,8 @@ mod tests {
     use super::*;
 
     // B-325: 秘密は所有者だけ（unix は 0600、Windows は継承を切った DACL）で書く
+    // 理由付き allow: 試験でファイルのモードを読む（データプレーン外）
+    #[allow(clippy::disallowed_methods)]
     #[test]
     fn secret_files_are_owner_only() {
         let dir = std::env::temp_dir().join(format!("veil-acme-b325-{}", std::process::id()));
