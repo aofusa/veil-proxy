@@ -325,6 +325,11 @@
 | F-292 | P2 | 実装済み | [features/F-292-ktls-h1-zero-copy-same-as-plain.md](features/F-292-ktls-h1-zero-copy-same-as-plain.md) | HTTP/1.1 の kTLS の本文のゼロコピーを平文（B-286）と同じ経路にそろえる: 静的配信は `sendfile_plain` を一般化（時間切れ・譲る・短い本文で閉じる・非対応のファイルは読み書きへ）、プロキシはその場の非ブロッキング `splice`。kTLS の `MSG_MORE` は既定オフで各カーネルを確かめてから。採否は交互 A/B |
 | F-293 | P1 | 完了（v0.11.0） | [features/F-293-wasm-failure-policy.md](features/F-293-wasm-failure-policy.md) | Proxy-Wasm のフィルタの失敗（trap・fuel・時間切れ）の扱い `failure_policy`（fail_closed・fail_open・fail_reload）をメッシュ外でも選べるようにし、既定を fail_closed（503）にする（今はメッシュ外では素通し）。失敗のメトリクス、要求ごとのログを抑える、文書の食い違いも直す |
 | F-294 | P2 | 実装済み | [features/F-294-precompressed-static-siblings.md](features/F-294-precompressed-static-siblings.md) | 静的配信で事前圧縮の兄弟（`.br`・`.gz`・`.zst`）を返す（`[route.action] precompressed`）。圧縮した表現を sendfile・kTLS のゼロコピーのまま返す。兄弟の有無は `open_file_cache` のエントリに持たせ、ルートの dirfd 相対で開く。Range・方式ごとの強い ETag・`Vary`。ライブラリの `ServeOptions` も |
+| F-295 | P1 | 進行中 | [features/F-295-v0120-perf-harness.md](features/F-295-v0120-perf-harness.md) | v0.12.0 の性能改善の親チケットと計測基盤（`tools/perf/veil-load`・`api-app`・`api_ab.py`） |
+| F-296 | P1 | 進行中 | [features/F-296-json-comp-throughput.md](features/F-296-json-comp-throughput.md) | JSON + 圧縮のスループット（json-comp 36.7k の解消） |
+| F-297 | P1 | 進行中 | [features/F-297-core-limited-latency.md](features/F-297-core-limited-latency.md) | コア制限下の遅延（1 要求あたりの CPU を減らす。epoll の登録を要求ごとに触らない） |
+| F-298 | P1 | 進行中 | [features/F-298-grpc-unary-fast-path.md](features/F-298-grpc-unary-fast-path.md) | unary gRPC の高速経路（本文が揃ってから起動、全量 + トレーラの応答） |
+| F-299 | P1 | 進行中 | [features/F-299-python-gil-lane.md](features/F-299-python-gil-lane.md) | Python ハンドラの経路（GIL のレーン・境界の削減。目標 50k〜70k） |
 | F-170 | P2 | 完了 | [features/F-170-unix-domain-socket-backend.md](features/F-170-unix-domain-socket-backend.md) | **Unix ドメインソケット（UDS）バックエンド接続対応**（F-164 の残件）。HTTP 上流を `http://unix:/run/app.sock[:/prefix]` / `https://unix:...`（nginx 互換表記）、L4 TCP 上流を `unix:/run/db.sock` で指定できるようにする。`TcpStream::connect_str` の `unix:` 分岐と `ProxyTarget::conn_addr()` を単一チョークポイントにして HTTP/1.1・HTTP/2・h2c・HTTPS・HTTP/3→上流の全経路を一度に対応。ヘルスチェック（同期プローブ）・L4 TCP 上流・OpenBSD pledge/unveil・Landlock・macOS Seatbelt も追随。**実装中に既存バグ 2 件（B-83 / B-84）を発見**し、自傷バグも 2 件踏んだ: `ProbeStream` がベクタード I/O を委譲せず rustls の書き込みが停止（E2E 1 件だけが検出）、`connect_target` の `cfg(unix)` 付け忘れで Windows クロスビルドが破壊（B-69 クラス 4 件目、クロスビルドのみが検出）。いずれも修正済み |
 | F-73 | P1 | 完了 | [features/F-73-http2-send-zerocopy-writeall.md](features/F-73-http2-send-zerocopy-writeall.md) | HTTP/2 送信ホットパスの write_all ゼロコピー化（per-frame の 2 度目の to_vec 確保+コピーを排除）。A/B で **HTTP/2 +11.6%**（1577→1761 req/s、nginx 比 75%→84%）、HTTP/1.1 不変・応答ボディ sha256 一致。レポート `docs/artifacts/performance_report_veil_vs_nginx_v3.md` |
 | F-74 | P1 | 完了 | [features/F-74-http2-send-frame-coalescing.md](features/F-74-http2-send-frame-coalescing.md) | HTTP/2 送信ホットパスのフレーム連結（HEADERS/DATA コアレッシング）。1 レスポンス分のフレームを接続再利用連結バッファ `write_buf`（スレッドローカルプール）へ積み **1 回の書き込み** で送出。`encode_*_into` 追記 API・`send_headers_buffered`・128KB 途中フラッシュ閾値を追加。per-frame 送信システムコールを削減。単体 660 / http2 E2E 11 / gRPC E2E 35 グリーン。F-73 続き |
@@ -676,6 +681,11 @@
 | B-328 | P2 | 修正済み（v0.11.0） | [bugs/B-328-macos-cpu-pin-warn-bsd-paste.md](bugs/B-328-macos-cpu-pin-warn-bsd-paste.md) | macOS で起動のたびに CPU のピン留めの失敗を WARN、ライブラリ E2E の `paste` が BSD で動かない |
 | B-329 | P1 | 修正済み（v0.11.0） | [bugs/B-329-bsd-vm-sync-back-target.md](bugs/B-329-bsd-vm-sync-back-target.md) | リリースの BSD の VM のビルドが target をランナーへ同期し戻して失敗する（権限・容量） |
 | B-330 | P1 | 修正済み（v0.11.0） | [bugs/B-330-release-rc2-image-windows-port-checks.md](bugs/B-330-release-rc2-image-windows-port-checks.md) | v0.11.0-rc.2 の release: glibc のイメージの照合（直す版の無い CVE）・Windows の試験（Docker 無し・MSI のアイコンの見る場所）・OpenBSD の port の依存 |
+| B-331 | P1 | 進行中 | [bugs/B-331-brotli-huge-mapping-per-request.md](bugs/B-331-brotli-huge-mapping-per-request.md) | brotli の圧縮が要求ごとに 8 MiB の領域を mmap/munmap する（json-comp が 36.7k の原因） |
+| B-332 | P1 | 進行中 | [bugs/B-332-reactor-hot-connection-starves-others.md](bugs/B-332-reactor-hot-connection-starves-others.md) | reactor で応答の速い接続がワーカーを占有し、他の接続が秒単位で待たされる（gRPC のテール遅延の主因） |
+| B-333 | P1 | 進行中 | [bugs/B-333-h2-trailers-flush-per-stream.md](bugs/B-333-h2-trailers-flush-per-stream.md) | HTTP/2 のトレーラの送出が 1 ストリームごとに `send(2)` を 2 回呼ぶ |
+| B-334 | P1 | 進行中 | [bugs/B-334-python-thread-state-per-call.md](bugs/B-334-python-thread-state-per-call.md) | Python の呼び出しごとに thread state を作って壊す（要求ごとの mmap/munmap/gettid） |
+| B-335 | P2 | 進行中 | [bugs/B-335-access-log-writer-wake-per-request.md](bugs/B-335-access-log-writer-wake-per-request.md) | アクセスログのスレッドを要求ごとに起こす（要求ごとの futex 2 本） |
 
 ---
 

@@ -1,0 +1,23 @@
+# F-295: 計測用の負荷ツール。本体のワークスペースへ入れない（空の [workspace] で独立させる。
+# 本体の Cargo.toml に [[bin]]・[[bench]] を足すとコンテナのビルドが壊れる）。
+[package]
+name = "veil-load"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "veil-load"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[workspace]
