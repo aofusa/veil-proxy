@@ -660,6 +660,8 @@
 | B-312 | P1 | 修正済み（v0.11.0） | [bugs/B-312-windows-http3-tls-upstream-crt-fastfail.md](bugs/B-312-windows-http3-tls-upstream-crt-fastfail.md) | Windows で HTTP/3 の要求を TLS の上流へ中継すると、`http3_stream` が CRT の `read`/`write` にソケットを渡してプロセスが `__fastfail` で落ちる。Winsock の `recv`/`send` にした |
 | B-313 | P1 | 修正済み（v0.11.0） | [bugs/B-313-ktls-tls12-tx-nonce-reuse.md](bugs/B-313-ktls-tls12-tx-nonce-reuse.md) | Linux の kTLS で TLS 1.2（AES-GCM）の送信の最初のレコードが rustls の Finished と同じ nonce を使い、GCM の認証鍵が漏れる。送信の explicit nonce を乱数から始める |
 | B-314 | P1 | 修正済み（v0.11.0） | [bugs/B-314-mesh-jwt-panic-cookies-claim-crlf.md](bugs/B-314-mesh-jwt-panic-cookies-claim-crlf.md) | メッシュの JWT 認証: 接頭辞の境界の多バイト文字で panic してワーカーごと落ちる・`from_cookies` を読まず偽造トークンが通る・クレームの CR/LF を上流のヘッダに書く |
+| B-315 | P1 | 修正済み（v0.11.0） | [bugs/B-315-mesh-h1-absolute-form-framing-chunk-overflow.md](bugs/B-315-mesh-h1-absolute-form-framing-chunk-overflow.md) | メッシュの HTTP/1.1: 絶対形式の要求先でパスの認可（DENY・notPaths）を素通り・曖昧な本文の区切り（CL+TE・複数 CL）を上流へ送る・chunked の長さの溢れで panic |
+| B-316 | P1 | 修正済み（v0.11.0） | [bugs/B-316-mesh-network-rbac-only-last-filter.md](bugs/B-316-mesh-network-rbac-only-last-filter.md) | メッシュの network RBAC がチェーンの最後の 1 つしか効かず、Istio の TCP の DENY が ALLOW と併用すると無視される |
 
 ---
 

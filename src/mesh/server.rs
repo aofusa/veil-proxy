@@ -188,7 +188,7 @@ async fn accept_loop<F, Fut>(
         }
         match crate::runtime::timeout(Duration::from_secs(1), l.accept()).await {
             Ok(Ok((stream, peer))) => {
-                // B-315: 接続タスクの panic をタスクの中で止める（データプレーンの accept と同じ）。
+                // B-314: 接続タスクの panic をタスクの中で止める（データプレーンの accept と同じ）。
                 // 止めないと 1 つの要求の panic でワーカーと、その上の全接続が落ちる
                 crate::system::spawn_pooled_with_panic_catch(&pool, h(stream, peer, addr));
             }
@@ -730,7 +730,7 @@ async fn serve_tcp(
         Some(i) => i.principal,
         None => principal_of(&peer_cert).0,
     };
-    if let Some(r) = &tp.rbac {
+    for r in &tp.rbac {
         let header = |_: &str| None;
         let md = |_: &str, _: &[String]| None;
         let input = super::xds::rbac::RbacInput {

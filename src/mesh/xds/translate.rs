@@ -668,7 +668,9 @@ fn filter_chain(fc: &p::FilterChain, reg: &mut Registry, direction: Direction) -
     };
     let mut action = None;
     let mut stats = false;
-    let mut tcp_rbac: Option<Arc<RbacCfg>> = None;
+    // B-316: network RBAC はチェーンに複数並び得る（Istio は DENY・AUDIT・ALLOW を別のフィルタにする）。
+    // すべてを順に適用する（以前は最後の 1 つだけを残し、ALLOW と併用した DENY が効いていなかった。F3）
+    let mut tcp_rbac: Vec<Arc<RbacCfg>> = Vec::new();
     for f in &fc.filters {
         let ty = f.typed_config.as_ref().map(inner_type).unwrap_or_default();
         if f.name == "istio.stats" || ty.ends_with("stats.PluginConfig") {
@@ -696,7 +698,7 @@ fn filter_chain(fc: &p::FilterChain, reg: &mut Registry, direction: Direction) -
                 &hcm,
                 reg,
                 direction,
-                tcp_rbac.take(),
+                std::mem::take(&mut tcp_rbac),
             )?)));
             continue;
         }
@@ -706,13 +708,13 @@ fn filter_chain(fc: &p::FilterChain, reg: &mut Registry, direction: Direction) -
             action = Some(ChainAction::Tcp(Arc::new(tcp_proxy(
                 &tp,
                 reg,
-                tcp_rbac.take(),
+                std::mem::take(&mut tcp_rbac),
             )?)));
             continue;
         }
         if ty.contains("network.rbac") || f.name == "envoy.filters.network.rbac" {
             let any = f.typed_config.as_ref().ok_or("rbac without config")?;
-            tcp_rbac = Some(Arc::new(super::rbac::network_rbac(any)?));
+            tcp_rbac.push(Arc::new(super::rbac::network_rbac(any)?));
             continue;
         }
         return Err(format!("unsupported network filter {} ({})", f.name, ty));
@@ -726,7 +728,7 @@ fn filter_chain(fc: &p::FilterChain, reg: &mut Registry, direction: Direction) -
     })
 }
 
-fn tcp_proxy(tp: &p::TcpProxy, reg: &mut Registry, rbac: Option<Arc<RbacCfg>>) -> R<TcpProxyCfg> {
+fn tcp_proxy(tp: &p::TcpProxy, reg: &mut Registry, rbac: Vec<Arc<RbacCfg>>) -> R<TcpProxyCfg> {
     let mut clusters = Vec::new();
     match &tp.cluster_specifier {
         Some(p::tcp_proxy::ClusterSpecifier::Cluster(c)) => clusters.push((reg.cluster_slot(c), 1)),
@@ -757,7 +759,7 @@ fn http_cm(
     hcm: &p::HttpConnectionManager,
     reg: &mut Registry,
     direction: Direction,
-    tcp_rbac: Option<Arc<RbacCfg>>,
+    tcp_rbac: Vec<Arc<RbacCfg>>,
 ) -> R<HttpCm> {
     let routes = match &hcm.route_specifier {
         Some(p::hcm::RouteSpecifier::Rds(r)) => RouteRef::Rds(reg.route_slot(&r.route_config_name)),
@@ -769,7 +771,7 @@ fn http_cm(
     let mut filters = Vec::new();
     let mut peer_metadata = false;
     let mut istio_alpn = false;
-    if let Some(r) = tcp_rbac {
+    for r in tcp_rbac {
         filters.push(HttpFilterCfg::Rbac(r));
     }
     for f in &hcm.http_filters {
@@ -1549,6 +1551,60 @@ fn resolve(host: &str, port: u16) -> Vec<SocketAddr> {
 mod tests {
     use super::*;
     use crate::mesh::state::Registry;
+
+    /// B-316: 1 つのチェーンの network RBAC（Istio は DENY と ALLOW を別のフィルタにする）をすべて残す
+    #[test]
+    fn filter_chain_keeps_every_network_rbac() {
+        use crate::mesh::xds::rbac::{Rbac, RbacFilterNetwork};
+        use prost::Message;
+        let rbac = |action: i32| p::Filter {
+            name: "envoy.filters.network.rbac".into(),
+            typed_config: Some(p::Any {
+                type_url: "type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC"
+                    .into(),
+                value: RbacFilterNetwork {
+                    rules: Some(Rbac {
+                        action,
+                        policies: Default::default(),
+                    }),
+                    shadow_rules: None,
+                    matcher: None,
+                }
+                .encode_to_vec(),
+            }),
+        };
+        let tcp = p::Filter {
+            name: "envoy.filters.network.tcp_proxy".into(),
+            typed_config: Some(p::Any {
+                type_url: p::T_TCP_PROXY.into(),
+                value: p::TcpProxy {
+                    stat_prefix: "t".into(),
+                    cluster_specifier: Some(p::tcp_proxy::ClusterSpecifier::Cluster("c".into())),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            }),
+        };
+        let fc = p::FilterChain {
+            name: "tcp".into(),
+            filters: vec![rbac(1), rbac(0), tcp],
+            ..Default::default()
+        };
+        let mut reg = Registry::default();
+        let chain = filter_chain(&fc, &mut reg, Direction::Inbound).unwrap();
+        let ChainAction::Tcp(tp) = &chain.action else {
+            panic!("expected a TCP chain");
+        };
+        assert_eq!(tp.rbac.len(), 2);
+        assert!(matches!(
+            tp.rbac[0].action,
+            crate::mesh::model::RbacAction::Deny
+        ));
+        assert!(matches!(
+            tp.rbac[1].action,
+            crate::mesh::model::RbacAction::Allow
+        ));
+    }
 
     /// waypoint の `main_internal` と同じ形の `filter_chain_matcher`（宛先 IP → 宛先ポート → チェーン名）。
     #[test]

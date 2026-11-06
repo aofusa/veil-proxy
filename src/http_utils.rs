@@ -853,8 +853,10 @@ pub(crate) fn decode_chunked_body(chunked_data: &[u8]) -> Vec<u8> {
         // チャンク拡張（;以降）を除去
         let size_str = size_str.split(';').next().unwrap_or(size_str);
 
+        // B-315: 長さは飽和させる（`ffffffffffffffff` で `pos + chunk_size` が折り返し、`end < pos` の切り出しで
+        // panic していた。F55）
         let chunk_size = match u64::from_str_radix(size_str, 16) {
-            Ok(s) => s as usize,
+            Ok(s) => usize::try_from(s).unwrap_or(usize::MAX),
             Err(_) => break,
         };
 
@@ -870,7 +872,7 @@ pub(crate) fn decode_chunked_body(chunked_data: &[u8]) -> Vec<u8> {
         }
 
         // チャンクデータをコピー
-        let end = std::cmp::min(pos + chunk_size, chunked_data.len());
+        let end = std::cmp::min(pos.saturating_add(chunk_size), chunked_data.len());
         result.extend_from_slice(&chunked_data[pos..end]);
         pos = end;
 
@@ -968,6 +970,25 @@ pub(crate) fn is_valid_h2_field_value(value: &[u8]) -> bool {
 #[inline]
 pub(crate) fn is_valid_method(method: &[u8]) -> bool {
     is_valid_header_name(method)
+}
+
+/// Content-Length の値を厳密に読む（RFC 9110 §8.6: `1*DIGIT`。前後の SP・HTAB だけ許す）。
+///
+/// B-315: `str::parse` は `+5` を受け付け（`trim` は Unicode の空白も外す）、上流（`+5` を拒否する実装）と本文の
+/// 長さの解釈が食い違って要求の密輸の足がかりになっていた（F17）。数字以外・空・桁あふれは `None`。
+pub(crate) fn parse_content_length(value: &[u8]) -> Option<u64> {
+    let v = trim_ascii_whitespace(value);
+    if v.is_empty() || v.len() > 20 {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &b in v {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+    }
+    Some(n)
 }
 
 /// HTTP/1.1 の要求先を origin 形式の範囲にする（RFC 9112 §3.2）。
@@ -2264,6 +2285,39 @@ mod chunked_span_tests {
         let (_body, complete, limit) = drive(&mut d, &[b"5\r\nhello\r\n0\r\n\r\n"]);
         assert!(!complete);
         assert!(limit);
+    }
+
+    /// B-315: 巨大なチャンク長で panic しない（`pos + chunk_size` の折り返し）
+    #[cfg(feature = "http2")]
+    #[test]
+    fn decode_chunked_body_huge_size_does_not_panic() {
+        assert_eq!(decode_chunked_body(b"ffffffffffffffff\r\nabc"), b"abc");
+        assert_eq!(decode_chunked_body(b"fffffffffffffffff\r\nabc"), b"");
+    }
+
+    /// B-315: Content-Length は数字だけ（`+5`・`-1`・空・空白だけ・桁あふれ・Unicode の空白は不正）
+    #[test]
+    fn parse_content_length_is_strict() {
+        assert_eq!(parse_content_length(b"5"), Some(5));
+        assert_eq!(parse_content_length(b" 12\t"), Some(12));
+        assert_eq!(parse_content_length(b"0"), Some(0));
+        assert_eq!(
+            parse_content_length(b"18446744073709551615"),
+            Some(u64::MAX)
+        );
+        for bad in [
+            &b"+5"[..],
+            b"-1",
+            b"",
+            b"  ",
+            b"5 5",
+            b"0x10",
+            b"18446744073709551616",
+            "\u{3000}5".as_bytes(),
+            b"5,5",
+        ] {
+            assert_eq!(parse_content_length(bad), None, "{:?}", bad);
+        }
     }
 
     // decode_chunked_body は http2 feature でのみ提供されるため、比較テストも同 feature で gate する

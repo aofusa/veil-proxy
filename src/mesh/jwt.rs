@@ -144,7 +144,7 @@ pub struct Provider {
     /// (小文字のヘッダ名, 接頭辞)
     pub from_headers: Vec<(String, String)>,
     pub from_params: Vec<String>,
-    /// B-315: Cookie から取る名前（Envoy の `from_cookies`）
+    /// B-314: Cookie から取る名前（Envoy の `from_cookies`）
     pub from_cookies: Vec<String>,
     pub payload_in_metadata: String,
     pub space_delimited: Vec<String>,
@@ -327,7 +327,7 @@ fn token_from(
 ) -> Option<(String, Option<Bytes>)> {
     for (name, prefix) in &prov.from_headers {
         if let Some(v) = header(name) {
-            // B-315: 接頭辞はバイト列で比べる。文字列にしてから `s[..prefix.len()]` で切ると、その位置に
+            // B-314: 接頭辞はバイト列で比べる。文字列にしてから `s[..prefix.len()]` で切ると、その位置に
             // 多バイト文字がまたがる値（`Bearer` の途中に UTF-8 を置いた Authorization）で panic し、
             // ワーカーごと落ちていた
             let p = prefix.as_bytes();
@@ -353,7 +353,7 @@ fn token_from(
             }
         }
     }
-    // B-315: `from_cookies` を読んでいなかった（Cookie だけのプロバイダではトークンが「無い」扱いになり、
+    // B-314: `from_cookies` を読んでいなかった（Cookie だけのプロバイダではトークンが「無い」扱いになり、
     // `allow_missing` と組むと偽造・期限切れのトークンでも検証されずに通っていた）
     if !prov.from_cookies.is_empty() {
         if let Some(c) = header("cookie") {
@@ -516,7 +516,7 @@ fn eval(
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    // B-315: クレームの文字列は JSON のエスケープで CR・LF・NUL を含み得る。そのまま上流の
+                    // B-314: クレームの文字列は JSON のエスケープで CR・LF・NUL を含み得る。そのまま上流の
                     // HTTP/1.1 のヘッダに書くとヘッダ・要求の注入になるので、フィールド値として正しくない値は付けない
                     if crate::http_utils::is_valid_h2_field_value(s.as_bytes()) {
                         out.add_headers.push((h.clone(), Bytes::from(s)));
@@ -661,7 +661,7 @@ mod tests {
         );
     }
 
-    /// B-315: 接頭辞の長さの位置に多バイト文字がまたがる Authorization で panic しない
+    /// B-314: 接頭辞の長さの位置に多バイト文字がまたがる Authorization で panic しない
     #[test]
     fn multibyte_at_prefix_boundary_does_not_panic() {
         let c = cfg();
@@ -676,7 +676,7 @@ mod tests {
         }
     }
 
-    /// B-315: from_cookies のトークンも検証する（読まずに「無し」として通していた）
+    /// B-314: from_cookies のトークンも検証する（読まずに「無し」として通していた）
     #[test]
     fn from_cookies_token_is_verified() {
         let c = cfg_with(|p| {
@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(cookie_value(b"", b"a"), None);
     }
 
-    /// B-315: CR・LF を含むクレームはヘッダにしない（上流の HTTP/1.1 への注入）
+    /// B-314: CR・LF を含むクレームはヘッダにしない（上流の HTTP/1.1 への注入）
     #[test]
     fn claim_with_crlf_is_not_copied_to_headers() {
         let c = cfg_with(|p| {

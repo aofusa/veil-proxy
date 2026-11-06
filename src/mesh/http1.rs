@@ -97,7 +97,35 @@ where
             return;
         }
         let mut method = sub(&head, req.method.unwrap_or("GET").as_bytes());
-        let mut path = sub(&head, req.path.unwrap_or("/").as_bytes());
+        let raw_target = sub(&head, req.path.unwrap_or("/").as_bytes());
+        // B-315: 要求先は origin 形式にしてから正規化・RBAC・JWT・ルートの照合と上流の要求行に使う
+        // （データプレーンの HTTP/1.1 と同じ。RFC 9112 §3.2）。絶対形式（`GET http://x/admin`）をそのまま
+        // 使うと `/admin` の DENY・notPaths に合わず、上流は `/admin` として処理していた（F1・F2）。
+        // authority は絶対形式のものを使う（RFC 9112 §3.2.2）
+        let (mut path, target_authority) =
+            match crate::http_utils::origin_form_target(&method, &raw_target) {
+                Some(r) if r.start == 0 => (raw_target, None),
+                Some(r) => {
+                    let scheme_len = if raw_target[..7].eq_ignore_ascii_case(b"http://") {
+                        7
+                    } else {
+                        8
+                    };
+                    let auth = raw_target.slice(scheme_len..r.start);
+                    (raw_target.slice(r), Some(auth))
+                }
+                None => {
+                    let _ = write_local(
+                        &mut io,
+                        &LocalReply::new(400, ResponseFlag::None),
+                        false,
+                        &ctx,
+                        true,
+                    )
+                    .await;
+                    return;
+                }
+            };
         let http10 = req.version == Some(0);
         let mut headers: Vec<(Bytes, Bytes)> = Vec::with_capacity(req.headers.len() + 8);
         let mut authority = Bytes::new();
@@ -106,19 +134,17 @@ where
         let mut keep_alive = !http10;
         let mut upgrade = false;
         let mut expect_continue = false;
+        let mut bad_framing = false;
         for h in req.headers.iter() {
             let name = Bytes::from(h.name.to_ascii_lowercase());
             let value = sub(&head, h.value);
             match name.as_ref() {
                 b"host" => authority = value.clone(),
-                b"content-length" => {
-                    if let Some(n) = std::str::from_utf8(&value)
-                        .ok()
-                        .and_then(|s| s.trim().parse().ok())
-                    {
-                        framing = Framing::Length(n);
-                    }
-                }
+                b"content-length" => match crate::http_utils::parse_content_length(&value) {
+                    // B-315: 数字だけを受ける（`+5` 等を上流と違う長さで読まない）
+                    Some(n) => framing = Framing::Length(n),
+                    None => bad_framing = true,
+                },
                 b"transfer-encoding" => {
                     if value.windows(7).any(|w| w.eq_ignore_ascii_case(b"chunked")) {
                         te_chunked = true;
@@ -144,8 +170,34 @@ where
             }
             headers.push((name, value));
         }
+        // B-315: 本文の区切りが曖昧な要求（CL と TE の両方・複数の CL・最後が chunked でない TE・不正な CL）は
+        // 400 にする。接続を使い回す上流へそのまま送ると、veil と上流で要求の切れ目が食い違う（F13）
+        if bad_framing
+            || crate::http_utils::classify_request_framing(
+                headers.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
+            )
+            .is_err()
+        {
+            let _ = write_local(
+                &mut io,
+                &LocalReply::new(400, ResponseFlag::None),
+                false,
+                &ctx,
+                true,
+            )
+            .await;
+            return;
+        }
         if te_chunked {
             framing = Framing::Chunked;
+        }
+        if let Some(a) = target_authority {
+            for (k, v) in headers.iter_mut() {
+                if k.as_ref() == b"host" {
+                    *v = a.clone();
+                }
+            }
+            authority = a;
         }
         let upgrade = upgrade
             && headers
@@ -717,12 +769,12 @@ async fn read_resp_head(up: &mut UpIo, buf: &mut BytesMut, head_req: bool) -> io
                 let value = sub(&head, h.value);
                 match name.as_ref() {
                     b"content-length" => {
-                        if let Some(n) = std::str::from_utf8(&value)
-                            .ok()
-                            .and_then(|s| s.trim().parse().ok())
-                        {
+                        // B-315: 要求と同じく数字だけを受ける（不正な値は接続を閉じるまでの本文として扱う）
+                        if let Some(n) = crate::http_utils::parse_content_length(&value) {
                             framing = Framing::Length(n);
                             has_len = true;
+                        } else {
+                            keep = false;
                         }
                     }
                     b"transfer-encoding" => {

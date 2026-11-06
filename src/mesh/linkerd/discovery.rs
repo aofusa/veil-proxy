@@ -584,7 +584,7 @@ fn tcp_cfg(clusters: Vec<(Arc<ClusterSlot>, u32)>) -> TcpProxyCfg {
         clusters,
         total_weight,
         idle_timeout: None,
-        rbac: None,
+        rbac: Vec::new(),
         access_logs: Vec::new(),
         tunnel: None,
     }
