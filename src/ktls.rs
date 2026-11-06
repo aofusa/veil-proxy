@@ -186,6 +186,8 @@ pub enum KtlsError {
     DrainError(String),
     /// バッファサイズ超過 (64KB 制限)
     BufferOverflow,
+    /// 乱数の生成に失敗（TLS 1.2 の送信の explicit nonce。B-313）
+    RandomFailed,
 }
 
 impl std::fmt::Display for KtlsError {
@@ -199,6 +201,9 @@ impl std::fmt::Display for KtlsError {
             KtlsError::SetsockoptFailed(errno) => write!(f, "setsockopt failed: errno={}", errno),
             KtlsError::DrainError(msg) => write!(f, "Buffer drain failed: {}", msg),
             KtlsError::BufferOverflow => write!(f, "Excessive buffered data in rustls (>64KB)"),
+            KtlsError::RandomFailed => {
+                write!(f, "Failed to generate a random TLS 1.2 explicit nonce")
+            }
         }
     }
 }
@@ -427,23 +432,45 @@ fn build_aes256_gcm_info(
 }
 
 /// 単一方向の CryptoInfo を抽出
+///
+/// B-313: `fresh_tx_explicit_iv` は送信方向で true にする。TLS 1.2 の AES-GCM では、rustls は
+/// レコードの nonce を `salt || (explicit_base XOR seq)` で作るのに対し、Linux の kTLS は渡された
+/// `iv` を最初のレコードの explicit nonce にそのまま使い、レコードごとに 1 ずつ増やす。rustls の
+/// `explicit_base` を渡すと、kTLS の最初のレコードが rustls が seq 0 で送った Finished と同じ
+/// （鍵, nonce）になり、GCM の認証鍵が漏れる（forbidden attack）。TLS 1.2 の explicit nonce は
+/// レコードに載って相手へ届くので、送信側は OpenSSL と同じく新しい乱数から始めてよい
+/// （受信側はレコードから読むので `iv` を使わない）。TLS 1.3 は nonce を `iv XOR rec_seq` で作るので
+/// rustls と一致し、変えない。
 fn extract_single(
     secrets: (u64, ConnectionTrafficSecrets),
     tls_version: u16,
+    fresh_tx_explicit_iv: bool,
 ) -> Result<CryptoInfo, KtlsError> {
     let (seq_num, traffic_secrets) = secrets;
+    let fresh = fresh_tx_explicit_iv && tls_version == TLS_1_2_VERSION;
 
     match traffic_secrets {
         ConnectionTrafficSecrets::Aes128Gcm { key, iv } => {
-            let info = build_aes128_gcm_info(seq_num, &key, &iv, tls_version)?;
+            let mut info = build_aes128_gcm_info(seq_num, &key, &iv, tls_version)?;
+            if fresh {
+                fill_explicit_iv(&mut info.iv)?;
+            }
             Ok(CryptoInfo::Aes128Gcm(info))
         }
         ConnectionTrafficSecrets::Aes256Gcm { key, iv } => {
-            let info = build_aes256_gcm_info(seq_num, &key, &iv, tls_version)?;
+            let mut info = build_aes256_gcm_info(seq_num, &key, &iv, tls_version)?;
+            if fresh {
+                fill_explicit_iv(&mut info.iv)?;
+            }
             Ok(CryptoInfo::Aes256Gcm(info))
         }
         _ => Err(KtlsError::UnsupportedCipher),
     }
+}
+
+/// TLS 1.2 の送信の explicit nonce の初期値を CSPRNG で埋める（B-313）
+fn fill_explicit_iv(iv: &mut [u8; 8]) -> Result<(), KtlsError> {
+    aws_lc_rs::rand::fill(iv).map_err(|_| KtlsError::RandomFailed)
 }
 
 /// TX/RX 両方の CryptoInfo をバッチ抽出
@@ -462,8 +489,8 @@ pub fn extract_tx_rx(
 ) -> Result<(CryptoInfo, CryptoInfo), KtlsError> {
     let tls_version = get_tls_version(protocol_version)?;
 
-    let tx = extract_single(secrets.tx, tls_version)?;
-    let rx = extract_single(secrets.rx, tls_version)?;
+    let tx = extract_single(secrets.tx, tls_version, true)?;
+    let rx = extract_single(secrets.rx, tls_version, false)?;
 
     Ok((tx, rx))
 }
@@ -835,6 +862,56 @@ mod tests {
             }
             _ => panic!("Unexpected variant"),
         }
+    }
+
+    /// B-313: TLS 1.2 の送信は rustls の explicit nonce の基点を kTLS に渡さない（rustls が seq 0 の
+    /// Finished に使った nonce をカーネルの最初のレコードが再利用する）。受信と TLS 1.3 は変えない。
+    #[test]
+    fn test_tls12_tx_explicit_iv_is_not_rustls_base() {
+        use rustls::crypto::cipher::{AeadKey, Iv};
+        let base = [0x11, 0x22, 0x33, 0x44, 1, 2, 3, 4, 5, 6, 7, 8];
+        let secrets = || {
+            (
+                1u64,
+                ConnectionTrafficSecrets::Aes256Gcm {
+                    key: AeadKey::from([7u8; 32]),
+                    iv: Iv::new(base),
+                },
+            )
+        };
+        let iv_of = |c: &CryptoInfo| match c {
+            CryptoInfo::Aes256Gcm(i) => (i.salt, i.iv, i.rec_seq),
+            _ => panic!("unexpected cipher"),
+        };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let tx = extract_single(secrets(), TLS_1_2_VERSION, true).unwrap();
+            let (salt, iv, rec_seq) = iv_of(&tx);
+            assert_eq!(
+                salt,
+                [0x11, 0x22, 0x33, 0x44],
+                "the salt (implicit part) stays"
+            );
+            assert_eq!(rec_seq, 1u64.to_be_bytes());
+            assert_ne!(
+                iv,
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                "the TX explicit nonce must not restart at rustls' base"
+            );
+            seen.insert(iv);
+        }
+        assert!(
+            seen.len() > 1,
+            "the TX explicit nonce must come from a CSPRNG"
+        );
+        let rx = extract_single(secrets(), TLS_1_2_VERSION, false).unwrap();
+        assert_eq!(iv_of(&rx).1, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let tx13 = extract_single(secrets(), TLS_1_3_VERSION, true).unwrap();
+        assert_eq!(
+            iv_of(&tx13).1,
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            "TLS 1.3 derives the nonce from iv XOR seq like rustls"
+        );
     }
 
     #[test]

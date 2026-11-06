@@ -658,6 +658,7 @@
 | B-310 | P2 | 修正済み（v0.11.0） | [bugs/B-310-windows-udp-connreset-breaks-http3-recv.md](bugs/B-310-windows-udp-connreset-breaks-http3-recv.md) | Windows の UDP ソケット（HTTP/3・L4）が閉じたクライアントへの送信の ICMP を次の受信の `WSAECONNRESET` として返し、HTTP/3 が受信の周回を捨てて ERROR をログする。`SIO_UDP_CONNRESET` を切る |
 | B-311 | P2 | 修正済み（v0.11.0） | [bugs/B-311-windows-e2e-suite-could-not-run.md](bugs/B-311-windows-e2e-suite-could-not-run.md) | E2E が Windows で走らない（UDS の上流で起動しない・試験のビルドが実行中の veil.exe を置き換えられない・SIGHUP の試験がプロキシを終了させる） |
 | B-312 | P1 | 修正済み（v0.11.0） | [bugs/B-312-windows-http3-tls-upstream-crt-fastfail.md](bugs/B-312-windows-http3-tls-upstream-crt-fastfail.md) | Windows で HTTP/3 の要求を TLS の上流へ中継すると、`http3_stream` が CRT の `read`/`write` にソケットを渡してプロセスが `__fastfail` で落ちる。Winsock の `recv`/`send` にした |
+| B-313 | P1 | 修正済み（v0.11.0） | [bugs/B-313-ktls-tls12-tx-nonce-reuse.md](bugs/B-313-ktls-tls12-tx-nonce-reuse.md) | Linux の kTLS で TLS 1.2（AES-GCM）の送信の最初のレコードが rustls の Finished と同じ nonce を使い、GCM の認証鍵が漏れる。送信の explicit nonce を乱数から始める |
 
 ---
 
