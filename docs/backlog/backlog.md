@@ -674,6 +674,8 @@
 | B-326 | P2 | 修正済み（v0.11.0） | [bugs/B-326-mesh-linkerd-build-h2-stream-plan.md](bugs/B-326-mesh-linkerd-build-h2-stream-plan.md) | `mesh-linkerd` のビルドが通らない（tap の H2Service が H2StreamPlan に追従していない。v0.10.1 から） |
 | B-327 | P2 | 修正済み（v0.11.0） | [bugs/B-327-ci-macos14-runner-pyi-precompressed.md](bugs/B-327-ci-macos14-runner-pyi-precompressed.md) | CI: macOS arm64 のランナー（macos-14）の廃止、Python の型スタブに `precompressed` が無い、試験の値が秘密の検出に掛かる |
 | B-328 | P2 | 修正済み（v0.11.0） | [bugs/B-328-macos-cpu-pin-warn-bsd-paste.md](bugs/B-328-macos-cpu-pin-warn-bsd-paste.md) | macOS で起動のたびに CPU のピン留めの失敗を WARN、ライブラリ E2E の `paste` が BSD で動かない |
+| B-329 | P1 | 修正済み（v0.11.0） | [bugs/B-329-bsd-vm-sync-back-target.md](bugs/B-329-bsd-vm-sync-back-target.md) | リリースの BSD の VM のビルドが target をランナーへ同期し戻して失敗する（権限・容量） |
+| B-330 | P1 | 修正済み（v0.11.0） | [bugs/B-330-release-rc2-image-windows-port-checks.md](bugs/B-330-release-rc2-image-windows-port-checks.md) | v0.11.0-rc.2 の release: glibc のイメージの照合（直す版の無い CVE）・Windows の試験（Docker 無し・MSI のアイコンの見る場所）・OpenBSD の port の依存 |
 
 ---
 

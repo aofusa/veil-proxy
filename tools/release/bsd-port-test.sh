@@ -123,7 +123,8 @@ openbsd)
     make package NO_DEPENDS=Yes >"$OUT/build.log" 2>&1 || { grep -E '^error|error(\[|:)|panicked|Could not|not found' "$OUT/build.log" | grep -v 'Running `' | tail -30; tail -30 "$OUT/build.log"; exit 1; }
     PKG="$(ls /usr/ports/packages/*/all/veil-*.tgz | head -1)"; cp "$PKG" "$OUT/"
     log "入れる・サービスの試験"
-    env TRUSTED_PKG_PATH=/usr/ports/packages/$(uname -p)/all pkg_add -D unsigned "$PKG"
+    # B-330: 実行時の依存（hicolor のアイコンのキャッシュを更新する x11/gtk+4,-guic）はミラーから取る
+    env TRUSTED_PKG_PATH=/usr/ports/packages/$(uname -p)/all PKG_PATH="$P" pkg_add -D unsigned "$PKG"
     check "config at /etc/veil/config.toml" test -f /etc/veil/config.toml
     check "rcctl enable veil" rcctl enable veil
     check "rcctl start veil" rcctl start veil

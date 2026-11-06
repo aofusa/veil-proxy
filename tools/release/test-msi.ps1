@@ -32,9 +32,10 @@ function Check-Serving($label) {
 # 1. 新しく入れる
 $rc = Install-Msi; if ($rc -eq 0) { Ok "install" } else { Bad "install exit $rc"; Get-Content "$env:RUNNER_TEMP\msi.log" -Tail 60 | Write-Host }
 foreach ($f in "$exe", "$data\config.toml", "$data\www\index.html", "$data\www\quickstart.html", "$data\www\favicon.ico") { if (Test-Path $f) { Ok "installed $f" } else { Bad "missing $f" } }
-# F-290: 「インストールされているアプリ」のアイコン（ARPPRODUCTICON は Uninstall の DisplayIcon になる）
-$arp = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' | Get-ItemProperty | Where-Object { $_.DisplayName -eq 'veil' } | Select-Object -First 1
-if ($arp -and $arp.DisplayIcon) { Ok "installed apps entry has the icon $($arp.DisplayIcon)" } else { Bad "installed apps entry has no icon (ARPPRODUCTICON)" }
+# F-290: 「インストールされているアプリ」のアイコン。Windows Installer は ARPPRODUCTICON を Uninstall の DisplayIcon には
+# 書かず、HKCR\Installer\Products\<製品>\ProductIcon に書く（B-330: DisplayIcon を見ていて必ず落ちた）
+$arp = Get-ChildItem 'Registry::HKEY_CLASSES_ROOT\Installer\Products' | Get-ItemProperty | Where-Object { $_.ProductName -eq 'veil' } | Select-Object -First 1
+if ($arp -and $arp.ProductIcon) { Ok "installed apps entry has the icon $($arp.ProductIcon)" } else { Bad "installed apps entry has no icon (ARPPRODUCTICON)" }
 $machinePath = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
 if ($machinePath -like "*$env:ProgramFiles\veil*") { Ok "PATH has the install dir" } else { Bad "PATH lacks the install dir" }
 $v = & $exe --version; if ($v -match [regex]::Escape($Version)) { Ok "--version $v" } else { Bad "--version $v (want $Version)" }

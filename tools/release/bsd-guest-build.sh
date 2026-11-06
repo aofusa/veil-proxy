@@ -138,4 +138,8 @@ if [ "${VEIL_BSD_UNIT_TESTS:-1}" = 1 ]; then
     fi
 fi
 
+# B-329: VM の作業ディレクトリは step の後に丸ごとランナーへ同期し戻される（cross-platform-actions）。root で作った
+# target（単体試験の debug のビルドと root 所有のロック）を残すと、同期が権限で失敗し、ランナーの容量も使い切る
+# （v0.11.0-rc.2 の FreeBSD）。配布物は $OUT にあるので target は消す。
+rm -rf "$ROOT/target"
 ls -l "$OUT"

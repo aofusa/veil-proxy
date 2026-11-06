@@ -332,6 +332,10 @@ jobs:
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           $d = (Resolve-Path "x/veil-$v-x86_64-pc-windows-msvc").Path
+          # B-330: runner のイメージ（windows-2022 の 20261101 以降）で Docker が動いていないことがある。C ランタイムを
+          # import していないことは cross の job の check-pe-imports.py が必ず確かめるので、ここは動くときだけの念押し
+          docker version 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Output "::notice title=Windows::no Docker on this runner; skipped the Nano Server run (check-pe-imports.py covers the C runtime)"; exit 0 }
           $out = docker run --rm -v "${d}:C:\veil" mcr.microsoft.com/windows/nanoserver:ltsc2022 C:\veil\veil.exe --version 2>&1
           "$out"
           if ($LASTEXITCODE -ne 0 -or "$out" -notmatch "veil $v") { Write-Output "::error title=Windows::veil.exe does not start without the Visual C++ runtime (exit $LASTEXITCODE)"; exit 1 }

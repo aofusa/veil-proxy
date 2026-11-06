@@ -1,0 +1,13 @@
+# grype の除外（B-158 の方針: 直す版の無いものも失敗にする。やむを得ず残すものだけを、理由付きでここに書く）。
+# grype は作業ディレクトリの .grype.yaml を読む（release.yml の image-test・nightly の照合）。直る版が出たら消す。
+ignore:
+  # B-330: glibc の gettext が LANGUAGE の "/"・".." を拒まない（任意の .mo を読ませる）。Wolfi の glibc-2.44 に
+  # 直した版が無い（2026-11-06 時点の 2.44-r13 も該当）。veil のイメージは届かない:
+  #   - veil は gettext を呼ばない（Rust。メッセージカタログを使わない）
+  #   - イメージのロケールは POSIX だけ（glibc-2.44-locale-posix）。LANGUAGE は LC_MESSAGES が C/POSIX 以外のときしか
+  #     使われず、ほかのロケールが入っていない
+  #   - シェルが無く、環境変数を外から渡す経路（sshd の AcceptEnv 等）も無い
+  - vulnerability: CVE-2026-84243
+    package:
+      name: glibc-2.44
+      type: apk
