@@ -129,7 +129,7 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   future の状態がキャッシュから落ちて、命令数は同じでサイクルが倍になる。F-158/F-300）。
 - io_uring の TCP・splice の Future は SQE を積むだけで、提出は実行器の park の `submit_and_wait` がまとめて行う（`submit_sqes()` を Future で呼ばない。
   操作ごとの提出は HTTP/1.1 で −40%）。カーネルは提出のときに fd を解決するので、未提出の SQE は生きている Future のものだけにする。実行中の
-  Future の drop は必ず `detach_op` を通す（`submit_cancel` が SQ を流すので fd が閉じられる前にカーネルへ渡る）。Future を stream より長く生かさない。
+  Future の drop は必ず `detach_op` を通す（`submit_cancel` が SQ を流すので fd が閉じられる前にカーネルへ渡る。流せなかった SQE は fd を -1 へ書き換える。B-337）。Future を stream より長く生かさない。
   周回の途中の提出（`SUBMIT_INTERVAL`）は保険で、小さくすると遅くなる。UDP は束にして即時に提出する。リングは `COOP_TASKRUN` で作る（古いカーネルは付けずに作り直す。F-300）。
 - io_uring で I/O ごとにカーネルタイマーを張らない。`runtime::uring::timer` はユーザ空間の最小ヒープで、
   カーネルの `IORING_OP_TIMEOUT` は park 直前に 1 本だけ（B-72）。キャンセル済みエントリは生存数に対して

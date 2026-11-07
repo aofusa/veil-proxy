@@ -1855,6 +1855,71 @@ mod tests {
         handle.join().expect("join");
     }
 
+    /// B-337: 取り消しの提出が一時的なエラーで通らなくても、閉じた fd の番号へ SQE を届けない。番号を別の接続が
+    /// 受け取ったところへ提出すると、前の接続の応答がその相手へ送られる。
+    #[test]
+    fn test_b337_a_failed_flush_never_reaches_a_reused_fd() {
+        if !io_uring_available() {
+            eprintln!(
+                "io_uring unavailable; skipping test_b337_a_failed_flush_never_reaches_a_reused_fd"
+            );
+            return;
+        }
+        for errno in [libc::EBUSY, libc::EAGAIN, libc::ENOMEM] {
+            let (addr, handle) = spawn_sink_server();
+            crate::runtime::block_on(async move {
+                let mut pair = [0i32; 2];
+                // SAFETY: `pair` は 2 要素の有効な配列
+                let made = unsafe {
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr())
+                };
+                assert_eq!(made, 0);
+
+                let stream = TcpStream::connect(addr).await.expect("connect");
+                let fd = stream.fd;
+                let mut write = Box::pin(stream.write(b"secret".to_vec()));
+                std::future::poll_fn(|cx| {
+                    assert!(write.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                crate::runtime::ring::inject_enter_errors(1, errno);
+                drop(write);
+                assert_eq!(
+                    with_ring(|r| r.sq_pending()),
+                    2,
+                    "the flush must have failed"
+                );
+                drop(stream);
+
+                // 別の接続が同じ番号を受け取る
+                // SAFETY: どちらも有効な fd で、`fd` は上の drop で閉じた
+                assert_eq!(unsafe { libc::dup2(pair[1], fd) }, fd);
+                // park が SQ を流す
+                crate::runtime::sleep(std::time::Duration::from_millis(5)).await;
+
+                let mut got = [0u8; 16];
+                // SAFETY: `got` は有効なバッファで、`pair[0]` は有効な fd
+                let n = unsafe {
+                    libc::recv(
+                        pair[0],
+                        got.as_mut_ptr().cast(),
+                        got.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                assert_eq!(n, -1, "the reused fd got the closed connection's data");
+                // SAFETY: このテストが開いた fd を 1 度だけ閉じる
+                unsafe {
+                    libc::close(fd);
+                    libc::close(pair[0]);
+                    libc::close(pair[1]);
+                }
+            });
+            assert!(handle.join().expect("join").is_empty());
+        }
+    }
+
     /// F-300: 自分を起こし続けるタスクがいても、積まれた SQE は周回の途中で提出される。
     #[test]
     fn test_f300_a_spinning_task_does_not_hold_back_sqes() {

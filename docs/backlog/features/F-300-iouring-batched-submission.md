@@ -45,6 +45,8 @@ c256 m100 では 1 接続で 100 個ぶんの future の状態（数 KB ずつ�
 - 未提出の SQE は生きている Future のものだけになる。Future が生きている間、その fd の所有者は閉じない。
 - 実行中の Future を drop する経路は必ず `detach_op` → `submit_cancel` を通り、`submit_cancel` は本物の `submit_sqes()` を呼ぶ。この提出は SQ の全部を流すので、
   所有者が fd を閉じる前に積まれた SQE はカーネルへ渡る。
+- この提出が通らなかったら（一時的なエラー・途中までの提出）、`detach_op` がその op の SQE の fd を -1 へ書き換える。カーネルは `EBADF` で完了させる
+  （[B-337](../bugs/B-337-iouring-queued-sqe-outlives-closed-fd.md)）。
 - キャンセルの `user_data` には世代が入っていて、再利用されたスロットの操作を取り消さない。
 - `TcpStream` の drop は同期の `close(2)` で、`ReadFuture` などは生の fd だけを持つ。Future を構造体に保存している箇所は無く（`.await` の一時値だけ）、
   状態機械は後で作った一時値から drop するので、Future が stream より長く生きることはない。Future と stream を同じ構造体に持たせるときは Future を先に drop する順で書く。

@@ -854,6 +854,29 @@ impl IoUring {
         self.enter(pending, n, if n > 0 { IORING_ENTER_GETEVENTS } else { 0 })
     }
 
+    /// まだカーネルへ渡していない SQE のうち `user_data` のものを、どの fd にも触らない形へ書き換える（B-337）。
+    ///
+    /// fd を -1 にするとカーネルは `EBADF` で完了させる。CQE は普段どおり届くので op の後始末の経路は変わらない。
+    /// 提出が通らないまま持ち主が fd を閉じる経路の安全弁で、普段は呼ばれない。
+    #[cold]
+    pub(crate) fn disarm_pending(&mut self, user_data: u64) {
+        // SAFETY: sq_head・sq_tail・sq_ring_mask は mmap した SQ リング内の有効な u32 で、`head` から `tail` までの
+        // 添字は `get_sqe` が埋めた SQE を指す。非 SQPOLL のリングはこのスレッドの `io_uring_enter` の中でしか
+        // 読まれない。SQPOLL ではカーネルが同時に読み得るので `write_volatile` で書く（読むのは新旧どちらかの値）。
+        unsafe {
+            let tail = (*self.sq_tail).load(Ordering::Relaxed);
+            let mask = *self.sq_ring_mask;
+            let mut pos = (*self.sq_head).load(Ordering::Acquire);
+            while pos != tail {
+                let sqe = self.sqes_ptr.add((pos & mask) as usize);
+                if (*sqe).user_data == user_data {
+                    std::ptr::write_volatile(std::ptr::addr_of_mut!((*sqe).fd), -1);
+                }
+                pos = pos.wrapping_add(1);
+            }
+        }
+    }
+
     /// 未提出の SQE 数を返す
     pub(crate) fn sq_pending(&self) -> u32 {
         unsafe {

@@ -888,6 +888,13 @@ pub fn detach_op(user_data: u64, guard: OpGuard) {
     }
     if should_cancel {
         submit_cancel(user_data);
+        // 持ち主はこの後で fd を閉じ、その番号は他のスレッドの接続が受け取り得る。提出が通らずに SQE が残っていたら
+        // （B-242 の一時的なエラー・途中までの提出）、閉じた番号へ届かないように無効にする（B-337）
+        with_ring(|ring| {
+            if ring.sq_pending() != 0 {
+                ring.disarm_pending(user_data);
+            }
+        });
     }
 }
 
@@ -1065,7 +1072,8 @@ fn take_armed_timer_result_if_fired() {
 ///
 /// **未提出の SQE を持ったまま fd を閉じさせない。** カーネルが fd を引くのは提出のときなので、閉じた後に
 /// 提出すると、別のスレッドが受け取った同じ番号の接続へ送ってしまう。op を持つ Future の drop は必ず
-/// `detach_op` を通り、そこの取り消しが SQ を全部流すので、fd の持ち主が閉じる前に流れている。
+/// `detach_op` を通り、そこの取り消しが SQ を全部流すので、fd の持ち主が閉じる前に流れている。流せなかった
+/// ときは `detach_op` がその SQE の fd を -1 へ書き換える（B-337）。
 pub fn submit_sqes() -> std::io::Result<()> {
     match with_ring(|ring| ring.submit()) {
         Ok(_) => Ok(()),
