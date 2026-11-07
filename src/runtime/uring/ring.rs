@@ -747,9 +747,9 @@ impl IoUring {
     /// SQE スロットを取得する。SQ が満杯の場合は **未提出の SQE をカーネルへ提出**して
     /// スロットを解放し、再取得を試みる。
     ///
-    /// 各 I/O Future は 1 スロットを取得したら直ちに提出するのが基本だが、瞬間的に
-    /// 提出前 SQE が `sq_ring_entries` 個溜まると SQ が満杯になり `get_sqe` が `None` を
-    /// 返す。旧実装はこの `None` を握り潰して SQE を埋めないまま `submitted=true` にして
+    /// I/O Future は SQE を積むだけで、提出は実行器が周回の終わりにまとめて行う（F-300）。
+    /// 1 周回で提出前の SQE が `sq_ring_entries` 個溜まると SQ が満杯になり `get_sqe` が
+    /// `None` を返す。旧実装はこの `None` を握り潰して SQE を埋めないまま `submitted=true` にして
     /// おり、対応する CQE が永久に来ず Future がハングしていた（[B-24]）。
     ///
     /// 非 SQPOLL リングでは `submit()`（`io_uring_enter(to_submit=pending)`）がカーネルに

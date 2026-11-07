@@ -27,7 +27,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from api_ab import cpu_ticks, port_open, wait_port  # noqa: E402
 
-COLUMNS = ["round", "target", "case", "rps", "p99_us", "errors", "cpu_us_per_req", "user_us_per_req", "sys_us_per_req"]
+COLUMNS = ["round", "target", "case", "rps", "p99_us", "errors", "wrk_timeouts", "cpu_us_per_req", "user_us_per_req",
+           "sys_us_per_req"]
 CLEAR, TLS, BACKEND = 18080, 18443, 18081
 BODY_54K = 54576
 
@@ -154,9 +155,12 @@ def parse_wrk(out):
     m = re.search(r"^\s*99%\s+([0-9.]+)(us|ms|s)\s*$", out, re.M)
     if m:
         p99 = float(m.group(1)) * {"us": 1, "ms": 1000, "s": 1000000}[m.group(2)]
-    errs = sum(int(x) for x in re.findall(r"(?:connect|read|write|timeout) (\d+)", out))
+    errs = sum(int(x) for x in re.findall(r"(?:connect|read|write) (\d+)", out))
+    # wrk の timeout は gettimeofday の差。時計が戻るとその瞬間に処理中の全接続を数える（WSL2 は 30 秒ごとに約 75 ms 戻る）
+    m = re.search(r"timeout (\d+)", out)
+    timeouts = int(m.group(1)) if m else 0
     m = re.search(r"Non-2xx or 3xx responses: (\d+)", out)
-    return rps, p99, errs + (int(m.group(1)) if m else 0)
+    return rps, p99, errs + (int(m.group(1)) if m else 0), timeouts
 
 
 def parse_h2load(out):
@@ -164,7 +168,7 @@ def parse_h2load(out):
     m = re.search(r"(\d+) failed, (\d+) errored, (\d+) timeout", out)
     errs = sum(int(x) for x in m.groups()) if m else 0
     m = re.search(r"status codes: \d+ 2xx, (\d+) 3xx, (\d+) 4xx, (\d+) 5xx", out)
-    return rps, 0.0, errs + (sum(int(x) for x in m.groups()) if m else 0)
+    return rps, 0.0, errs + (sum(int(x) for x in m.groups()) if m else 0), 0
 
 
 def load_cmd(args, tool, url, secs):
@@ -210,12 +214,12 @@ def measure(args, binary, config, target, rnd, case, writer):
         run_load(cmd, parse)  # 暖機（キャッシュと上流のプールを埋める）
         cmd, parse = load_cmd(args, tool, url, args.duration)
         u0, s0 = cpu_ticks(srv.pid)
-        rps, p99, errs = run_load(cmd, parse)
+        rps, p99, errs, timeouts = run_load(cmd, parse)
         u1, s1 = cpu_ticks(srv.pid)
     finally:
         stop(srv)
     n = max(rps * args.duration, 1.0)
-    row = [rnd, target, name, f"{rps:.0f}", f"{p99:.0f}", errs, f"{(u1 - u0 + s1 - s0) * 1e6 / n:.2f}",
+    row = [rnd, target, name, f"{rps:.0f}", f"{p99:.0f}", errs, timeouts, f"{(u1 - u0 + s1 - s0) * 1e6 / n:.2f}",
            f"{(u1 - u0) * 1e6 / n:.2f}", f"{(s1 - s0) * 1e6 / n:.2f}"]
     writer.writerow(row)
     print("\t".join(str(x) for x in row), flush=True)

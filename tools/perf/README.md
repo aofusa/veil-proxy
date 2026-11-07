@@ -431,6 +431,8 @@ python3 tools/perf/proxy_ab.py --summary r.tsv
   ほかの機械では `lscpu -e` を見て兄弟のスレッドが両側にまたがらないように変える。
 - kTLS は既定で切る。`--ktls` で両方を有効にする（`tls` モジュールが要る）。
 - 表の `wins` は同じラウンドで new が勝った回数。`errs` が 0 でない行はスループットより先に見る。
+- wrk の `timeout` は `errs` に入れず TSV の `wrk_timeouts` へ分ける。wrk は `gettimeofday` の差で判定するので、時計が戻るとその瞬間に処理中の全接続を
+  数える（WSL2 は 30 秒ごとに約 75 ms 戻り、1 回の実行で 100 件前後の偽の `timeout` になる。Max の遅延は動かない）。
 
 ## リーク試験（`leak_check.sh`、F-185）
 
