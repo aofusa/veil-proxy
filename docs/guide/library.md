@@ -279,7 +279,7 @@ for debugging.
 | `multipart_max_header_size` | `8192` | maximum size of the headers of one part |
 | `multipart_spool_threshold` | `1048576` | Python `UploadFile` and C `VEIL_ROUTE_FORM`: larger files are written to a temporary file instead of memory |
 | `upload_tmp_dir` | OS temp dir | directory of the anonymous temporary files for uploads (added to the Landlock / unveil write paths) |
-| `compression` | `false` | compress handler responses with br or gzip when the client accepts it: handler routes without their own `[route.compression]` get `{ preferred_encodings = ["br", "gzip"], min_size = 256, compressible_types = ["application/json", "text/", "application/javascript", "image/svg+xml"] }` (needs the `compression` feature; see [Response compression](#response-compression)) |
+| `compression` | `false` | compress handler responses with gzip or br when the client accepts it: handler routes without their own `[route.compression]` get `{ preferred_encodings = ["gzip", "br"], min_size = 256, compressible_types = ["application/json", "text/", "application/javascript", "image/svg+xml"] }` (needs the `compression` feature; see [Response compression](#response-compression)) |
 
 ## Routing macros
 
@@ -581,8 +581,10 @@ Handler responses are compressed with the same `[route.compression]` table as pr
 ([compression-cache.md](compression-cache.md)), on HTTP/1.1, HTTP/2 and HTTP/3, for buffered and streaming bodies
 (needs the `compression` feature, which `full` includes and `api` does not). `[api] compression = true` (builder
 `.compression(true)`, Python `veil.run(compression=True)`, C `veil_config_set(cfg, "api.compression", "true")`) gives
-every handler route without its own `[route.compression]` a default that suits JSON APIs: br, then gzip, from 256
-bytes, for `application/json`, `text/*`, `application/javascript` and `image/svg+xml`.
+every handler route without its own `[route.compression]` a default that suits JSON APIs: gzip, then br, from 256
+bytes, for `application/json`, `text/*`, `application/javascript` and `image/svg+xml`. gzip comes first because
+each response is compressed on the fly: on JSON, gzip 4 and brotli 4 give nearly the same size and gzip takes about
+30% less CPU.
 
 ```toml
 [api]

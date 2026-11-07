@@ -269,7 +269,7 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `multipart_max_header_size` | `8192` | 1 パートのヘッダの大きさの上限 |
 | `multipart_spool_threshold` | `1048576` | Python の `UploadFile`・C の `VEIL_ROUTE_FORM`: これより大きいファイルはメモリでなく一時ファイルに書く |
 | `upload_tmp_dir` | OS の一時ディレクトリ | アップロードの名前の無い一時ファイルを置くディレクトリ（Landlock・unveil の書き込み許可に足す） |
-| `compression` | `false` | クライアントが受け付けるときハンドラの応答を br・gzip で圧縮する。自前の `[route.compression]` の無いハンドラのルートに `{ preferred_encodings = ["br", "gzip"], min_size = 256, compressible_types = ["application/json", "text/", "application/javascript", "image/svg+xml"] }` を入れる（`compression` feature が必要。[応答の圧縮](#応答の圧縮)） |
+| `compression` | `false` | クライアントが受け付けるときハンドラの応答を gzip・br で圧縮する。自前の `[route.compression]` の無いハンドラのルートに `{ preferred_encodings = ["gzip", "br"], min_size = 256, compressible_types = ["application/json", "text/", "application/javascript", "image/svg+xml"] }` を入れる（`compression` feature が必要。[応答の圧縮](#応答の圧縮)） |
 
 ## ルーティングマクロ
 
@@ -549,7 +549,8 @@ async fn upload(mut form: Multipart) -> Result<Json<Value>, ApiError> {
 HTTP/1.1・HTTP/2・HTTP/3、バッファの本文・ストリーミングの本文のどちらも対象（`compression` feature が必要。`full` には入り、
 `api` には入らない）。`[api] compression = true`（ビルダの `.compression(true)`、Python の `veil.run(compression=True)`、C の
 `veil_config_set(cfg, "api.compression", "true")`）にすると、自前の `[route.compression]` の無いハンドラのルートに JSON の API 向けの
-既定（br、次に gzip、256 バイト以上、`application/json`・`text/*`・`application/javascript`・`image/svg+xml`）が入る。
+既定（gzip、次に br、256 バイト以上、`application/json`・`text/*`・`application/javascript`・`image/svg+xml`）が入る。
+応答ごとに圧縮するので gzip を先にしている。JSON では gzip 4 と brotli 4 の大きさがほぼ同じで、gzip の CPU が約 3 割少ない。
 
 ```toml
 [api]

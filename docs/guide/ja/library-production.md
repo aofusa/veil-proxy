@@ -35,7 +35,7 @@ enabled = false                      # the library default writes one line per r
 
 [api]
 openapi_enabled = false              # no /openapi.json and /docs on the public listener
-compression = true                   # br / gzip for JSON and text responses of 256 bytes or more
+compression = true                   # gzip / br for JSON and text responses of 256 bytes or more
 max_body_size = 1048576              # 1 MiB request bodies
 websocket_ping_interval_secs = 30    # keep idle WebSockets alive through proxies and NAT
 websocket_idle_timeout_secs = 120    # close WebSockets that sent nothing for 2 minutes
@@ -115,10 +115,11 @@ Python は `veil.run(openapi=False)`）、役に立つ場所だけで有効に�
 ## 圧縮
 
 `[api] compression = true` で、ハンドラの応答のうち 256 バイト以上の `application/json`・`text/*`・JavaScript・SVG を
-br か gzip で圧縮します（クライアントの `Accept-Encoding` で決まる）。[応答の圧縮](library.md#応答の圧縮) を見てください。
-既定のレベル（brotli 4・gzip 4）は API の応答に合っています。大きくてあまり変わらない文書を返すルートは、
-そのルートの `[route.compression]` で上げられます（`brotli_level`・`gzip_level`）。圧縮済みの応答（画像・アーカイブ）は
-型で除かれます。`compression` feature が必要です（`full` に含まれ、Python の wheel にも入っています）。
+gzip か br で圧縮します（クライアントの `Accept-Encoding` で決まる）。[応答の圧縮](library.md#応答の圧縮) を見てください。
+既定のレベル（gzip 4・brotli 4）は API の応答に合っています。大きくてあまり変わらない文書を返すルートは、
+そのルートの `[route.compression]` で上げられます（`gzip_level`・`brotli_level`）。応答ごとに圧縮するルートの
+`brotli_level` は 5 以下にしてください。6 以上は応答ごとに 2 MiB 以上のハッシュ表を確保し、大きさがほとんど
+変わらないままスループットが 1 桁落ちます。圧縮済みの応答（画像・アーカイブ）は型で除かれます。`compression` feature が必要です（`full` に含まれ、Python の wheel にも入っています）。
 
 ## 静的ファイル
 

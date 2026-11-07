@@ -14,9 +14,10 @@ use bytes::Bytes;
 pub(crate) fn library_default_table() -> toml::Value {
     let mut t = toml::map::Map::new();
     t.insert("enabled".into(), toml::Value::Boolean(true));
+    // F-296: 応答ごとに圧縮する JSON では gzip 4 と brotli 4 の大きさがほぼ同じで、gzip の CPU が 3 割少ない
     t.insert(
         "preferred_encodings".into(),
-        toml::Value::Array(vec!["br".into(), "gzip".into()]),
+        toml::Value::Array(vec!["gzip".into(), "br".into()]),
     );
     t.insert("min_size".into(), toml::Value::Integer(256));
     t.insert(
@@ -682,6 +683,6 @@ mod tests {
         assert!(r[2].get("compression").is_none());
         let c: CompressionConfig = r[0]["compression"].clone().try_into().unwrap();
         assert_eq!(c.min_size, 256);
-        assert_eq!(c.preferred_encodings, vec!["br", "gzip"]);
+        assert_eq!(c.preferred_encodings, vec!["gzip", "br"]);
     }
 }

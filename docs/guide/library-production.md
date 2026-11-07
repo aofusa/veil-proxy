@@ -33,7 +33,7 @@ enabled = false                      # the library default writes one line per r
 
 [api]
 openapi_enabled = false              # no /openapi.json and /docs on the public listener
-compression = true                   # br / gzip for JSON and text responses of 256 bytes or more
+compression = true                   # gzip / br for JSON and text responses of 256 bytes or more
 max_body_size = 1048576              # 1 MiB request bodies
 websocket_ping_interval_secs = 30    # keep idle WebSockets alive through proxies and NAT
 websocket_idle_timeout_secs = 120    # close WebSockets that sent nothing for 2 minutes
@@ -116,11 +116,13 @@ unpkg.com in the browser.
 
 ## Compression
 
-`[api] compression = true` compresses handler responses with br or gzip (the client's `Accept-Encoding` decides)
+`[api] compression = true` compresses handler responses with gzip or br (the client's `Accept-Encoding` decides)
 for `application/json`, `text/*`, JavaScript and SVG of 256 bytes or more; see
-[Response compression](library.md#response-compression). The default levels (brotli 4, gzip 4) suit API responses;
+[Response compression](library.md#response-compression). The default levels (gzip 4, brotli 4) suit API responses;
 a route that sends large, rarely changing documents can raise them in its own `[route.compression]`
-(`brotli_level`, `gzip_level`). Responses that are already compressed (images, archives) are skipped by type.
+(`gzip_level`, `brotli_level`). Keep `brotli_level` at 5 or below for responses compressed on the fly: from 6 on,
+every response allocates a hash table of 2 MiB or more, and throughput drops by an order of magnitude for little
+gain in size. Responses that are already compressed (images, archives) are skipped by type.
 Compression needs the `compression` feature (in `full`; the Python wheel has it).
 
 ## Static files

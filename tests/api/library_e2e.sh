@@ -146,7 +146,7 @@ comp_suite() {
   [ "$br" = 0 ] || expect "$L compression: br decodes to the original" "ce=br vary=1 sha=$want" comp_probe br "$B$J" "$@"
   expect "$L compression: gzip decodes to the original" "ce=gzip vary=1 sha=$want" comp_probe gzip "$B$J" "$@"
   expect "$L compression: q-values (gzip;q=1, br;q=0.5)" "ce=gzip" comp_probe "gzip;q=1, br;q=0.5" "$B$J" "$@"
-  expect "$L compression: configured order (gzip, deflate, br)" "ce=br" comp_probe "gzip, deflate, br" "$B$J" "$@"
+  expect "$L compression: configured order (br, deflate, gzip)" "ce=gzip" comp_probe "br, deflate, gzip" "$B$J" "$@"
   expect "$L compression: none without Accept-Encoding" "ce=none vary=0" comp_probe - "$B$J" "$@"
   expect "$L compression: identity only" "ce=none" comp_probe identity "$B$J" "$@"
   expect "$L compression: compress=false route" "ce=none vary=0 sha=$want" comp_probe br "$B$R" "$@"
