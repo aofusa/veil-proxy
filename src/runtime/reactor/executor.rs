@@ -1119,10 +1119,13 @@ fn spawn_body_and_poll(body: TaskBody) -> bool {
 
     let waker = make_waker(index, generation);
     let mut cx = Context::from_waker(&waker);
+    // 予算はタスクごと（B-332）。呼び元の接続と分け合うと、束の途中のストリームが要求を送る前に `Pending` へ落ちる
+    let outer = COOP.with(|c| c.replace(COOP_BUDGET));
     let poll = match &mut body {
         TaskBody::Boxed(f) => f.as_mut().poll(&mut cx),
         TaskBody::Pooled { pool, slot } => pool.poll_slot(*slot, &mut cx),
     };
+    COOP.with(|c| c.set(outer));
 
     EXEC_STATE.with(|s| {
         let mut st = s.borrow_mut();
@@ -1416,5 +1419,31 @@ mod tests {
             }
         });
         assert_eq!(got, 100);
+    }
+
+    /// B-332: インラインの poll は呼び元の接続と予算を分け合わない（束の途中のストリームが要求を送る前に落ちない）
+    #[test]
+    fn inline_poll_has_its_own_coop_budget() {
+        init_reactor().unwrap();
+        init_executor();
+        let exec = current_executor();
+        exec.block_on(async move {
+            std::future::poll_fn(|cx| {
+                while coop_proceed(cx) {}
+                let used = Rc::new(Cell::new(0u32));
+                let counted = used.clone();
+                let finished = TaskPool::new().spawn_inline(std::future::poll_fn(move |cx| {
+                    while coop_proceed(cx) {
+                        counted.set(counted.get() + 1);
+                    }
+                    Poll::Ready(())
+                }));
+                assert!(finished);
+                assert_eq!(used.get(), COOP_BUDGET);
+                assert!(!coop_proceed(cx), "the caller keeps its own budget");
+                Poll::Ready(())
+            })
+            .await
+        });
     }
 }

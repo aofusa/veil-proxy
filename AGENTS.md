@@ -154,7 +154,7 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 
 - epoll はレベルトリガで、待機のある方向だけを武装したまま使う（`EPOLLET` は使わない。B-75/F-297）。`ReadableFd` は起床後も確認用の
   `poll(2)` を省略しない（HTTP/2 の select で偽の Ready は読み取りの待ちに化ける）。fd は閉じる前に `unregister` し、番号の再利用は
-  `forget_stale_fd` で古い記録を消す。タスクは 1 回の poll で I/O を `COOP_BUDGET` までしか進めず、実行器は `EVENT_INTERVAL` ごとに
+  `forget_stale_fd` で古い記録を消す。タスクは 1 回の poll で I/O を `COOP_BUDGET` までしか進めず（インラインの初回 poll は別の予算。分け合うと束の途中のストリームが落ちる）、実行器は `EVENT_INTERVAL` ごとに
   poller を見る（速い相手の接続が他を飢えさせない。B-332）。kqueue の readiness ヒントは維持し、ヒントが無いときの `poll(2)` フォールバックを消さない（F-141）。
 - fd ごとの待機者は `WakerSlot`（F-166）。accept は `accept_batch` で 1 周回に複数（reactor のみ。F-155）。
 - `block_on` は poller を作り直し、タスクは `block_on` をまたいで残らない。fd 表も一緒に空にする（`reset_fd_table`。「武装済み」の
