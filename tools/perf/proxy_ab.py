@@ -8,7 +8,7 @@
 `suite_ab.sh` はイメージを 2 つ作って全構成を何時間も回す。こちらは手元の 2 つの `veil` を CPU に固定して、
 HTTP/1.1・HTTP/2・h2c・HTTP/3 × 静的配信・上流への転送 × 3B・54KB を 1 ケースごとに交互に測る（ケースごとに
 起動し直し、ラウンドごとに順番を入れ替える）。上流は nginx（`--nginx`）。負荷は wrk・h2load、HTTP/3 は
-`tools/perf/h3load`（`--h3load` を渡したときだけ）。
+`--h3load` に渡した QUIC 対応の h2load か `tools/perf/h3load`（渡したときだけ測る）。
 """
 
 import argparse
@@ -87,7 +87,7 @@ servers = ["http://127.0.0.1:{BACKEND}/"]
 
 [[route]]
 [route.conditions]
-path = "/p/"
+path = "/p/*"
 [route.action]
 type = "Proxy"
 upstream = "backend"
@@ -127,19 +127,20 @@ http {{
     uwsgi_temp_path {work}/nginx-tmp;
     scgi_temp_path {work}/nginx-tmp;
     server {{
-        listen 127.0.0.1:{BACKEND};
-        root {work}/www;
+        listen 127.0.0.1:{BACKEND} reuseport;
+        root {work}/up;
     }}
 }}
 """)
 
 
 def prepare(work):
-    www = work / "www"
-    (www / "p").mkdir(parents=True)
+    www, up = work / "www", work / "up"
+    www.mkdir()
+    (up / "p").mkdir(parents=True)
     (work / "nginx-tmp").mkdir()
-    # 上流が接頭辞を落としても残しても同じ本文が返るように両方に置く
-    for d in (www, www / "p"):
+    # 静的配信と上流で根を分ける（ルートを間違えると 404 で errs に出る）。上流は接頭辞の有無のどちらでも返す
+    for d in (www, up, up / "p"):
         (d / "3b.html").write_bytes(b"abc")
         (d / "index.html").write_bytes(b"x" * BODY_54K)
     subprocess.run(
@@ -171,13 +172,18 @@ def parse_h2load(out):
     return rps, 0.0, errs + (sum(int(x) for x in m.groups()) if m else 0), 0
 
 
-def load_cmd(args, tool, url, secs):
-    pin = ["taskset", "-c", args.load_cpus]
-    t = str(args.load_threads)
+def load_cmd(args, name, tool, url, secs):
+    # 転送の行は上流に CPU を渡すぶん負荷の CPU を減らす（静的配信の行は上流が眠っているので 12・13 も使える）
+    proxied = "_proxy_" in name
+    pin = ["taskset", "-c", args.proxy_load_cpus if proxied else args.load_cpus]
+    t = str(args.proxy_load_threads if proxied else args.load_threads)
     if tool == "wrk":
         return pin + ["wrk", "-t", t, "-c", str(args.conns), "-d", f"{secs}s", "--latency", url], parse_wrk
     if tool == "h2load":
         return pin + ["h2load", "-t", t, "-c", str(args.conns), "-m", str(args.streams), "-D", str(secs), url], parse_h2load
+    if Path(args.h3load).name.startswith("h2load"):
+        return pin + [args.h3load, "--alpn-list=h3", "-t", t, "-c", str(args.conns), "-m", str(args.streams), "-D", str(secs),
+                      url], parse_h2load
     return pin + [args.h3load, "-t", t, "-c", str(args.conns), "-m", str(args.streams), "-d", str(secs), url], parse_h2load
 
 
@@ -210,9 +216,9 @@ def measure(args, binary, config, target, rnd, case, writer):
     try:
         wait_port(addr, srv)
         time.sleep(0.3)
-        cmd, parse = load_cmd(args, tool, url, 1)
+        cmd, parse = load_cmd(args, name, tool, url, 1)
         run_load(cmd, parse)  # 暖機（キャッシュと上流のプールを埋める）
-        cmd, parse = load_cmd(args, tool, url, args.duration)
+        cmd, parse = load_cmd(args, name, tool, url, args.duration)
         u0, s0 = cpu_ticks(srv.pid)
         rps, p99, errs, timeouts = run_load(cmd, parse)
         u1, s1 = cpu_ticks(srv.pid)
@@ -260,10 +266,12 @@ def main():
     ap.add_argument("--server-cpus", default="0-7")
     ap.add_argument("--load-cpus", default="8-13")
     ap.add_argument("--load-threads", type=int, default=6)
-    ap.add_argument("--backend-cpus", default="14,15")
-    ap.add_argument("--backend-workers", type=int, default=2)
+    ap.add_argument("--proxy-load-cpus", default="8-11", help="load CPUs of the proxied cases")
+    ap.add_argument("--proxy-load-threads", type=int, default=4)
+    ap.add_argument("--backend-cpus", default="12-15")
+    ap.add_argument("--backend-workers", type=int, default=4)
     ap.add_argument("--nginx", default=shutil.which("nginx") or "/usr/sbin/nginx")
-    ap.add_argument("--h3load", help="tools/perf/h3load binary; without it the HTTP/3 cases are skipped")
+    ap.add_argument("--h3load", help="a QUIC h2load or the tools/perf/h3load binary; without it the HTTP/3 cases are skipped")
     ap.add_argument("--ktls", action="store_true", help="turn kTLS on for both sides")
     args = ap.parse_args()
     if args.summary:
@@ -273,6 +281,12 @@ def main():
         ap.error("--base and --new are required")
 
     selected = [c for c in cases() if re.search(args.cases, c[0]) and (c[1] != "h3load" or args.h3load)]
+    # 前の実行の nginx が残っていると、こちらの起動は bind で失敗しても wait_port は残りの応答で通り、`--backend-*` の効かない
+    # 別の上流を測る（B-218 のサーバと同じ）
+    if port_open(f"127.0.0.1:{BACKEND}"):
+        raise SystemExit(f"127.0.0.1:{BACKEND} is already in use")
+    # kill で止められたときも finally で上流を止める
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     with tempfile.TemporaryDirectory(prefix="veil-proxy-ab-") as tmp:
         work = Path(tmp)
         prepare(work)

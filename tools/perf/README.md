@@ -419,18 +419,31 @@ python3 tools/perf/api_ab.py --summary api_ab.tsv    # 表だけ作り直す
 ```bash
 cargo build --release --features full --target-dir target-uring            # io_uring
 cargo build --release --features full,epoll --target-dir target-epoll      # epoll
-(cd tools/perf/h3load && cargo build --release)                            # HTTP/3 も測るとき
 
-python3 tools/perf/proxy_ab.py --base <旧の veil> --new target-uring/release/veil \
-    --h3load tools/perf/h3load/target/release/h3load --rounds 3 --out r.tsv
+python3 tools/perf/proxy_ab.py --base <旧の veil> --new target-uring/release/veil --rounds 3 --out r.tsv
 python3 tools/perf/proxy_ab.py --base A --new B --cases '^h2c_file' --rounds 5   # 名前を正規表現で絞る
 python3 tools/perf/proxy_ab.py --summary r.tsv
+
+# サーバが律速になる条件（下の注意を参照）
+python3 tools/perf/proxy_ab.py --base A --new B --server-cpus 0-3 --threads 4 --load-cpus 4-13 --load-threads 10
+
+# HTTP/3 は QUIC 対応の h2load を渡す（名前が h2load で始まるものは h2load の引数で呼ぶ）
+docker build -t local/h2load-h3:latest tools/perf/h2load-http3
+id=$(docker create local/h2load-h3:latest)
+docker cp $id:/usr/local/bin/h2load ~/h2load-h3/h2load && docker cp $id:/usr/local/lib ~/h2load-h3/lib && docker rm $id
+LD_LIBRARY_PATH=~/h2load-h3/lib python3 tools/perf/proxy_ab.py --base A --new B --cases '^h3_' --h3load ~/h2load-h3/h2load
 ```
 
-- 既定の CPU はサーバ 0-7、負荷 8-13、上流の nginx 14,15（`--server-cpus` など）。8 コア 16 スレッドの機械の割り当てなので、
-  ほかの機械では `lscpu -e` を見て兄弟のスレッドが両側にまたがらないように変える。
+- 既定の CPU はサーバ 0-7、負荷 8-13（転送の行は 8-11）、上流の nginx 12-15 の 4 ワーカー（`--server-cpus` など）。8 コア 16 スレッドの機械の
+  割り当てなので、ほかの機械では `lscpu -e` を見て兄弟のスレッドが両側にまたがらないように変える。
 - kTLS は既定で切る。`--ktls` で両方を有効にする（`tls` モジュールが要る）。
 - 表の `wins` は同じラウンドで new が勝った回数。`errs` が 0 でない行はスループットより先に見る。
+- 差が小さい行は、同じバイナリを `--base` と `--new` に渡した A/A で計測器のぶれを先に見る。
+- 転送の行の上流は veil より速くないといけない。nginx が同じ物理コアの 2 スレッドだけだと、nginx 直でも 8 万 rps で飽和して、大きさにもプロトコルにも
+  関係なく 6〜7 万に揃う（veil は 6 割しか動かず、比べられない）。物理コア 2 つの 4 ワーカーなら nginx 直で 28 万、転送で 20 万を超える。
+  `listen` の `reuseport` を外すとワーカーの負荷が偏る。行が頭打ちに見えたら、上流へ直接 wrk を当てて確かめる。
+- TLS の行はサーバが飽和しない（8 ワーカーで約 6 コア）。`rps` は負荷ツールの TLS の費用と起床の間隔で決まるので、サーバの比較には CPU を絞った条件を使う。
+- `tools/perf/h3load`（quinn）はクライアントが律速で、同じ条件でも回ごとに 16k〜105k へ分かれる。版の比較には QUIC 対応の h2load を使う。
 - wrk の `timeout` は `errs` に入れず TSV の `wrk_timeouts` へ分ける。wrk は `gettimeofday` の差で判定するので、時計が戻るとその瞬間に処理中の全接続を
   数える（WSL2 は 30 秒ごとに約 75 ms 戻り、1 回の実行で 100 件前後の偽の `timeout` になる。Max の遅延は動かない）。
 

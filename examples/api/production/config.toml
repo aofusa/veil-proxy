@@ -16,7 +16,7 @@ enabled = false                      # the library default writes one line per r
 
 [api]
 openapi_enabled = false              # no /openapi.json and /docs on the public listener
-compression = true                   # br / gzip for JSON and text responses of 256 bytes or more
+compression = true                   # gzip / br for JSON and text responses of 256 bytes or more
 max_body_size = 1048576              # 1 MiB request bodies
 websocket_ping_interval_secs = 30    # keep idle WebSockets alive through proxies and NAT
 websocket_idle_timeout_secs = 120    # close WebSockets that sent nothing for 2 minutes
