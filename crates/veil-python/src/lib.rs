@@ -8,6 +8,7 @@
 mod aio;
 mod ext;
 mod grpc_client;
+mod lane;
 mod native;
 
 use bytes::Bytes;
@@ -446,7 +447,7 @@ fn call_python(
     parts: Option<Vec<veil::api::multipart::SpooledPart>>,
     ctx: Option<&mut HandlerContext>,
 ) -> Response {
-    Python::attach(|py| {
+    lane::attach(|py| {
         let r = (|| -> PyResult<Response> {
             let native_req = native::NativeRequest::with_parts(req, parts);
             let ctx_ptr = ctx.map(|c| c as *mut HandlerContext);
@@ -459,11 +460,11 @@ fn call_python(
                     .store(p as usize, std::sync::atomic::Ordering::Release);
             }
             let req = Py::new(py, native_req)?;
-            let out = route.call.call1(py, (req.clone_ref(py),));
+            let out = lane::call_in_new_context(py, &route.call, req.bind(py).as_any());
             let resp = out.and_then(|out| {
                 // SAFETY: ctx_ptr は call_blocking の閉包が持つ HandlerContext（この呼び出しの間有効）
                 let ctx = ctx_ptr.map(|p| unsafe { &mut *p });
-                native::to_response(py, out.into_bound(py), route.status, &route.fallback, ctx)
+                native::to_response(py, out, route.status, &route.fallback, ctx)
             });
             // 呼び出しの外で要求本文を読まれないように外す
             req.borrow(py)
@@ -507,10 +508,11 @@ fn make_loop_handler(route: PyRoute, handler_id: u64, form: bool) -> HandlerFn {
     })
 }
 
-fn make_handler(route: PyRoute, offload: bool, form: bool) -> HandlerFn {
+fn make_handler(route: PyRoute, offload: bool, form: bool, lane: Arc<lane::Lane>) -> HandlerFn {
     let route = Arc::new(route);
     Arc::new(move |req: Request| {
         let r = Arc::clone(&route);
+        let lane = Arc::clone(&lane);
         Box::pin(async move {
             // F-266: Form・File の引数があるルートは本文を先に読む（大きなファイルは一時ファイルへ）
             let (req, parts) = if form {
@@ -522,9 +524,9 @@ fn make_handler(route: PyRoute, offload: bool, form: bool) -> HandlerFn {
                 (req, None)
             };
             if offload {
-                // GIL を握る呼び出しはイベントループ（ワーカー）を止めないようハンドラ用プールへ退避する。
+                // GIL を握る呼び出しはイベントループ（ワーカー）を止めないよう GIL のスレッドへ退避する。
                 // 応答のストリーミング・要求本文の順次受信は call_blocking の文脈で（F-210）
-                veil::api::bridge::call_blocking(req, move |req, ctx| {
+                veil::api::bridge::call_blocking_via(lane::OnLane(lane), req, move |req, ctx| {
                     call_python(&r, req, parts, Some(ctx))
                 })
                 .await
@@ -542,6 +544,7 @@ fn make_handler(route: PyRoute, offload: bool, form: bool) -> HandlerFn {
 fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<()> {
     let routes = std::mem::take(&mut *PENDING.lock().unwrap());
     let mut app = App::new().config(config.inner).without_macro_routes();
+    let lane = lane::Lane::new();
     // F-268: WebSocket と同じパスの GET のルートは 1 本にまとめ、Upgrade の有無で振り分ける
     let mut ws_routes: Vec<Option<(PendingWs, HandlerFn)>> = Vec::new();
     for w in std::mem::take(&mut *PENDING_WS.lock().unwrap()) {
@@ -576,7 +579,7 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
         let mut func = if r.on_loop {
             make_loop_handler(py_route, r.handler_id, r.form)
         } else {
-            make_handler(py_route, r.offload, r.form)
+            make_handler(py_route, r.offload, r.form, Arc::clone(&lane))
         };
         if r.methods.iter().any(|m| m.eq_ignore_ascii_case("GET")) {
             if let Some(slot) = ws_routes
@@ -711,8 +714,12 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
         };
     }
     drop(handlers);
-    py.detach(move || app.run())
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    py.detach(move || {
+        let r = app.run();
+        lane.stop();
+        r
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 /// Stop the running server gracefully.

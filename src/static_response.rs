@@ -1146,8 +1146,17 @@ mod tests {
                 .collect()
         };
         for len in [0usize, 1, 100, 4096, 4097, 70_000, 300_000, 2_000_000] {
-            let repeated: Vec<u8> = b"{\"id\":1,\"name\":\"Alpha\"},".iter().copied().cycle().take(len).collect();
-            for (body, q) in [(repeated, 4), (noise(len, &mut x), 4), (noise(len.min(70_000), &mut x), 5)] {
+            let repeated: Vec<u8> = b"{\"id\":1,\"name\":\"Alpha\"},"
+                .iter()
+                .copied()
+                .cycle()
+                .take(len)
+                .collect();
+            for (body, q) in [
+                (repeated, 4),
+                (noise(len, &mut x), 4),
+                (noise(len.min(70_000), &mut x), 5),
+            ] {
                 let out = brotli_compress_all(&body, q).expect("compressed");
                 let mut back = Vec::new();
                 brotli::Decompressor::new(&out[..], 4096)

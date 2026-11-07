@@ -658,6 +658,8 @@ mod tests {
 
     /// B-335: まとめて書く周回をまたいでも、行を落とさず順序どおりに書き、送信端が閉じたら書き切って終わる
     #[test]
+    // 理由付き allow: 試験のスレッド（イベントループの外）で一時ファイルを読み書きする
+    #[allow(clippy::disallowed_methods)]
     fn writer_keeps_every_line_across_batches() {
         let path = std::env::temp_dir().join(format!(
             "veil-access-log-{}-{:?}.log",

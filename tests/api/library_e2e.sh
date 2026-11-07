@@ -587,6 +587,7 @@ run_python() {
   fi
   (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_binding.py) >/dev/null 2>&1 && ok "unit tests" || bad "unit tests"
   (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_native.py) >/dev/null 2>&1 && ok "native request / fast call (F-212)" || bad "native request / fast call"
+  (cd "$ROOT/crates/veil-python" && "$PY" -I tests/test_lane.py) > "$TMPD/lane.log" 2>&1 && ok "handler threads (test_lane.py)" || { bad "handler threads (test_lane.py)"; sed 's/^/   /' "$TMPD/lane.log"; }
   (cd "$ROOT/crates/veil-python" && PYTHON="$PY" bash tests/e2e.sh) > "$TMPD/py.log" 2>&1 && ok "e2e.sh (both examples)" || { bad "e2e.sh"; grep -E "FAIL|server" "$TMPD/py.log"; }
   run_python_f210 "$PY"
   run_python_ws "$PY"

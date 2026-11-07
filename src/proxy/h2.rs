@@ -1107,8 +1107,7 @@ where
                                     std::str::from_utf8(value).ok().map(|s| s.to_string());
                             }
                         }
-                        let _ =
-                            conn.queue_grpc_trailers(sid, grpc_status, grpc_message.as_deref());
+                        let _ = conn.queue_grpc_trailers(sid, grpc_status, grpc_message.as_deref());
                     }
                     st.head_sent = true;
                     st.end_sent = true;

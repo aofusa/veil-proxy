@@ -1203,8 +1203,8 @@ impl App {
                 };
                 let accepts = call.accepts;
                 let web = call.web.clone();
-                let body: Result<Bytes, Streaming<Req>> = single_message(&req, &call)
-                    .ok_or_else(|| request_parts(&req, &call, &decode));
+                let body: Result<Bytes, Streaming<Req>> =
+                    single_message(&req, &call).ok_or_else(|| request_parts(&req, &call, &decode));
                 let deadline = call.deadline;
                 let r = with_deadline(deadline, async move {
                     let m = match body {

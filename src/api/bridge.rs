@@ -16,12 +16,15 @@
 
 use crate::runtime::offload::WakeFlag;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 struct Shared<T> {
     q: Mutex<VecDeque<T>>,
     cv: Condvar,
+    // F-299: `cv` で眠っているスレッドの数（`q` のロックの中で増減する）。`Condvar` の通知は待ち手がいなくても
+    // futex を呼ぶので、数を見てから通知する（要求ごとにワーカーで 2 本走っていた）
+    blocked: AtomicUsize,
     cap: usize,
     /// The sending side is closed.
     tx_closed: AtomicBool,
@@ -34,13 +37,39 @@ struct Shared<T> {
 impl<T> Shared<T> {
     fn new(cap: usize) -> Arc<Shared<T>> {
         Arc::new(Shared {
-            q: Mutex::new(VecDeque::with_capacity(cap.min(64))),
+            // 要求ごとに作る（全量の応答は 1 件だけ通る）ので先に確保しない
+            q: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
+            blocked: AtomicUsize::new(0),
             cap: cap.max(1),
             tx_closed: AtomicBool::new(false),
             rx_closed: AtomicBool::new(false),
             wake: WakeFlag::new(),
         })
+    }
+
+    // プール側が眠る（`q` を手放して待つ）。
+    fn block<'a>(&self, q: MutexGuard<'a, VecDeque<T>>) -> MutexGuard<'a, VecDeque<T>> {
+        self.blocked.fetch_add(1, Ordering::Relaxed);
+        let q = self.cv.wait(q).unwrap();
+        self.blocked.fetch_sub(1, Ordering::Relaxed);
+        q
+    }
+
+    // キューを変えた後で（`q` を手放してから）呼ぶ。眠る側は `q` の中で数を増やしてから手放すので、ここで 0 に
+    // 見えた相手はキューの変化を見てから判断する（取りこぼさない）
+    fn wake_blocked(&self) {
+        if self.blocked.load(Ordering::Relaxed) > 0 {
+            self.cv.notify_one();
+        }
+    }
+
+    // 閉じた旗を立てた後で呼ぶ。`q` を通ると、旗を見ずに眠りかけている相手が数に現れる
+    fn wake_blocked_closed(&self) {
+        drop(self.q.lock().unwrap());
+        if self.blocked.load(Ordering::Relaxed) > 0 {
+            self.cv.notify_all();
+        }
     }
 }
 
@@ -62,7 +91,7 @@ impl<T> BlockingSender<T> {
     pub fn send(&self, v: T) -> Result<(), T> {
         let mut q = self.s.q.lock().unwrap();
         while q.len() >= self.s.cap && !self.s.rx_closed.load(Ordering::Acquire) {
-            q = self.s.cv.wait(q).unwrap();
+            q = self.s.block(q);
         }
         if self.s.rx_closed.load(Ordering::Acquire) {
             return Err(v);
@@ -73,6 +102,15 @@ impl<T> BlockingSender<T> {
         Ok(())
     }
 
+    // F-299: 全量の応答の 1 件で閉じる（閉じる通知を別に打たない。打つとワーカーを要求ごとに 2 回起こす）
+    fn send_last(&self, v: T) {
+        let mut q = self.s.q.lock().unwrap();
+        q.push_back(v);
+        self.s.tx_closed.store(true, Ordering::Release);
+        drop(q);
+        self.s.wake.notify();
+    }
+
     /// Whether the receiver is closed (for example because the client disconnected).
     pub fn is_closed(&self) -> bool {
         self.s.rx_closed.load(Ordering::Acquire)
@@ -81,8 +119,9 @@ impl<T> BlockingSender<T> {
 
 impl<T> Drop for BlockingSender<T> {
     fn drop(&mut self) {
-        self.s.tx_closed.store(true, Ordering::Release);
-        self.s.wake.notify();
+        if !self.s.tx_closed.swap(true, Ordering::AcqRel) {
+            self.s.wake.notify();
+        }
     }
 }
 
@@ -100,7 +139,7 @@ impl<T> AsyncReceiver<T> {
                 let mut q = self.s.q.lock().unwrap();
                 if let Some(v) = q.pop_front() {
                     drop(q);
-                    self.s.cv.notify_one();
+                    self.s.wake_blocked();
                     return Some(v);
                 }
                 if self.s.tx_closed.load(Ordering::Acquire) {
@@ -115,7 +154,7 @@ impl<T> AsyncReceiver<T> {
     pub fn try_recv(&self) -> Option<T> {
         let v = self.s.q.lock().unwrap().pop_front();
         if v.is_some() {
-            self.s.cv.notify_one();
+            self.s.wake_blocked();
         }
         v
     }
@@ -135,7 +174,7 @@ impl<T> AsyncReceiver<T> {
 impl<T> Drop for AsyncReceiver<T> {
     fn drop(&mut self) {
         self.s.rx_closed.store(true, Ordering::Release);
-        self.s.cv.notify_all();
+        self.s.wake_blocked_closed();
     }
 }
 
@@ -166,7 +205,7 @@ impl<T> AsyncSender<T> {
                 if q.len() < self.s.cap {
                     q.push_back(v.take().expect("value"));
                     drop(q);
-                    self.s.cv.notify_one();
+                    self.s.wake_blocked();
                     return Ok(());
                 }
             }
@@ -178,7 +217,7 @@ impl<T> AsyncSender<T> {
 impl<T> Drop for AsyncSender<T> {
     fn drop(&mut self) {
         self.s.tx_closed.store(true, Ordering::Release);
-        self.s.cv.notify_all();
+        self.s.wake_blocked_closed();
     }
 }
 
@@ -204,7 +243,7 @@ impl<T> BlockingReceiver<T> {
             if self.s.tx_closed.load(Ordering::Acquire) {
                 return None;
             }
-            q = self.s.cv.wait(q).unwrap();
+            q = self.s.block(q);
         }
     }
 }
@@ -351,6 +390,30 @@ pub async fn call_blocking<F>(req: Request, f: F) -> Response
 where
     F: FnOnce(Request, &mut HandlerContext) -> Response + Send + 'static,
 {
+    call_blocking_via(HandlerPool, req, f).await
+}
+
+// F-299: Python は GIL を握ったまま続けて仕事を取るので、ハンドラ用プールではなく自分のスレッドへ渡す。
+/// Where [`call_blocking_via`] runs a handler.
+pub trait BlockingExecutor {
+    /// Runs `job` once on another thread. If it is dropped instead, the request is answered with 500.
+    fn execute<J: FnOnce() + Send + 'static>(self, job: J);
+}
+
+struct HandlerPool;
+
+impl BlockingExecutor for HandlerPool {
+    fn execute<J: FnOnce() + Send + 'static>(self, job: J) {
+        crate::runtime::offload::spawn_handler(job);
+    }
+}
+
+/// [`call_blocking`] on threads of the caller's choosing (a binding that keeps its own threads).
+pub async fn call_blocking_via<E, F>(executor: E, req: Request, f: F) -> Response
+where
+    E: BlockingExecutor,
+    F: FnOnce(Request, &mut HandlerContext) -> Response + Send + 'static,
+{
     use futures::FutureExt;
     let (ev_tx, ev_rx) = to_worker::<Event>(16);
     let ev_tx = Arc::new(ev_tx);
@@ -373,7 +436,7 @@ where
     };
     {
         let ev_tx = ev_tx.clone();
-        crate::runtime::offload::spawn_handler(move || {
+        executor.execute(move || {
             let mut ctx = HandlerContext {
                 events: ev_tx.clone(),
                 started: false,
@@ -381,7 +444,7 @@ where
             };
             let resp = f(req, &mut ctx);
             if !ctx.started {
-                let _ = ev_tx.send(Event::Full(resp));
+                ev_tx.send_last(Event::Full(resp));
             }
         });
     }

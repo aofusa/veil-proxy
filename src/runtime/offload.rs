@@ -115,56 +115,58 @@ fn current_thread_notify_fds() -> Option<(RawFd, RawFd)> {
         if r >= 0 {
             return Some((r, w));
         }
-        #[cfg(target_os = "linux")]
-        {
-            // EFD_NONBLOCK: ドレイン read が即時に返る。EFD_CLOEXEC: exec で漏らさない。
-            let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-            if fd < 0 {
-                return None;
-            }
-            cell.set((fd, fd));
-            Some((fd, fd))
-        }
-        // macOS には `pipe2(2)` が無いため `pipe(2)` + `fcntl(F_SETFL, O_NONBLOCK)` +
-        // `fcntl(F_SETFD, FD_CLOEXEC)` の 2 段構えへフォールバックする（F-125、設計
-        // docs/artifacts/f125_windows_macos_design.md の macOS 節 7）。他 BSD
-        // （FreeBSD/OpenBSD）は pipe2 のまま。
-        #[cfg(target_os = "macos")]
-        {
-            let mut fds = [0 as RawFd; 2];
-            let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
-            if ret < 0 {
-                return None;
-            }
-            for fd in fds {
-                unsafe {
-                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                }
-            }
-            cell.set((fds[0], fds[1]));
-            Some((fds[0], fds[1]))
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-        {
-            let mut fds = [0 as RawFd; 2];
-            let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
-            if ret < 0 {
-                return None;
-            }
-            cell.set((fds[0], fds[1]));
-            Some((fds[0], fds[1]))
-        }
-        // Windows には eventfd/pipe2 相当が無いため、ループバック TCP ソケットペアで
-        // 自己パイプ相当を実装する（F-125 設計ドキュメント参照）。読み取り fd/書き込み fd
-        // は別ソケット（accept 側/connect 側）になる。
-        #[cfg(windows)]
-        {
-            let (r, w) = windows_notify_pair()?;
-            cell.set((r, w));
-            Some((r, w))
-        }
+        let fds = create_notify_fds()?;
+        cell.set(fds);
+        Some(fds)
     })
+}
+
+/// 通知 fd のペア（読み取り fd, 書き込み fd）を作る。Linux では両者は同一の eventfd。
+fn create_notify_fds() -> Option<(RawFd, RawFd)> {
+    #[cfg(target_os = "linux")]
+    {
+        // EFD_NONBLOCK: ドレイン read が即時に返る。EFD_CLOEXEC: exec で漏らさない。
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        Some((fd, fd))
+    }
+    // macOS には `pipe2(2)` が無いため `pipe(2)` + `fcntl(F_SETFL, O_NONBLOCK)` +
+    // `fcntl(F_SETFD, FD_CLOEXEC)` の 2 段構えへフォールバックする（F-125、設計
+    // docs/artifacts/f125_windows_macos_design.md の macOS 節 7）。他 BSD
+    // （FreeBSD/OpenBSD）は pipe2 のまま。
+    #[cfg(target_os = "macos")]
+    {
+        let mut fds = [0 as RawFd; 2];
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if ret < 0 {
+            return None;
+        }
+        for fd in fds {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        Some((fds[0], fds[1]))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let mut fds = [0 as RawFd; 2];
+        let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if ret < 0 {
+            return None;
+        }
+        Some((fds[0], fds[1]))
+    }
+    // Windows には eventfd/pipe2 相当が無いため、ループバック TCP ソケットペアで
+    // 自己パイプ相当を実装する（F-125 設計ドキュメント参照）。読み取り fd/書き込み fd
+    // は別ソケット（accept 側/connect 側）になる。
+    #[cfg(windows)]
+    {
+        windows_notify_pair()
+    }
 }
 
 /// Windows 版の自己パイプ相当（ループバック TCP ソケットペア）を生成する。
@@ -480,15 +482,246 @@ async fn wait_until_done(read_fd: RawFd, done: &Arc<AtomicBool>) {
 
 // ===== API ライブラリ用（`handler` feature のみ）: 外部スレッドの完了待ち・ハンドラ専用プール =====
 
+/// 別スレッドの完了をワーカーへ届ける受け口（F-299）。ワーカーごとに 1 つ。
+///
+/// 完了側は [`WaitCell`] を積み、通知 fd を叩くのは前回の取り出しの後の最初の 1 件だけ。ワーカーの受け取りの
+/// タスク（[`drain_inbox`]）が積まれた分の Waker をまとめて呼ぶ。以前はハンドラの完了ごとに通知 fd へ `write(2)` し、
+/// 同じ fd で待つ全タスクが起きて `poll(2)` を打っていた（1 件の完了で待ちの数だけ起床と syscall が走る）。
+///
+/// 通知 fd は [`offload`] のものと分ける（`offload` の待機は fd のシグナルを読み捨てる）。
+#[cfg(feature = "handler-pool")]
+struct Inbox {
+    done: Mutex<Vec<Arc<WaitCell>>>,
+    /// 通知 fd を叩いた後、受け取りのタスクがまだ取り出していない。
+    signaled: AtomicBool,
+    read_fd: RawFd,
+    write_fd: RawFd,
+}
+
+#[cfg(feature = "handler-pool")]
+impl Inbox {
+    fn push(&self, cell: Arc<WaitCell>) {
+        self.done
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(cell);
+        // 積んでから旗を見る。受け取り側は旗を下ろしてから取り出すので、旗が立っていれば（叩かなくても）この分は
+        // 次の取り出しに入る
+        if !self.signaled.swap(true, Ordering::SeqCst) {
+            // SAFETY: write_fd は `Inbox` が持っていて、`Inbox` の生存中は閉じられない。
+            unsafe { signal_notify(self.write_fd) };
+        }
+    }
+}
+
+// fd を閉じるのは Unix だけ（Windows はスレッドの通知のソケットを閉じない。ワーカーはプロセスと同じ長さ生きる）
+#[cfg(all(feature = "handler-pool", unix))]
+impl Drop for Inbox {
+    fn drop(&mut self) {
+        // SAFETY: fd はこの `Inbox` だけが持つ。完了側は `Arc` を持つので、これより後に叩く者はいない。
+        unsafe {
+            libc::close(self.read_fd);
+            if self.write_fd != self.read_fd {
+                libc::close(self.write_fd);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "handler-pool")]
+thread_local! {
+    static INBOX: std::cell::RefCell<Option<Arc<Inbox>>> = const { std::cell::RefCell::new(None) };
+    /// このスレッドの受け取りのタスクが動いている（実行器が作り直されるとタスクごと捨てられるので見張る）。
+    static INBOX_DRAIN_RUNNING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// このスレッド（ワーカー）の受け口。ドライバが無い（単体テスト等）ときは `None`。
+#[cfg(feature = "handler-pool")]
+fn current_inbox() -> Option<Arc<Inbox>> {
+    if !has_driver() {
+        return None;
+    }
+    // スレッドの終了処理の中（破棄の順は決まらない）では作らない
+    let inbox = INBOX
+        .try_with(|cell| {
+            let mut cell = cell.borrow_mut();
+            if cell.is_none() {
+                let (read_fd, write_fd) = create_notify_fds()?;
+                *cell = Some(Arc::new(Inbox {
+                    done: Mutex::new(Vec::new()),
+                    signaled: AtomicBool::new(false),
+                    read_fd,
+                    write_fd,
+                }));
+            }
+            cell.clone()
+        })
+        .ok()??;
+    if !INBOX_DRAIN_RUNNING.with(|r| r.replace(true)) {
+        crate::runtime::spawn(drain_inbox(Arc::clone(&inbox)));
+    }
+    Some(inbox)
+}
+
+/// 受け口の通知を待つ（シグナルを読み捨てて返る）。
+#[cfg(all(feature = "handler-pool", veil_rt_uring))]
+async fn inbox_signal(inbox: &Inbox) {
+    if wait_readable_fd(inbox.read_fd).await.is_err() {
+        // 待てなくてもタスクを独占しない（次の周回で積まれた分は見る）
+        crate::runtime::yield_now().await;
+    }
+    drain_notify(inbox.read_fd);
+}
+
+/// 受け口の通知を待つ（シグナルを読み捨てて返る）。fd はこのタスクだけが読むので確認の `poll(2)` は要らず、
+/// 旗が倒れていれば読まずに待つ（積まれていないときの `read(2)` を打たない）。
+#[cfg(all(feature = "handler-pool", veil_rt_reactor))]
+async fn inbox_signal(inbox: &Inbox) {
+    let mut woken = false;
+    std::future::poll_fn(|cx| {
+        if (woken || inbox.signaled.load(Ordering::SeqCst)) && drain_notify(inbox.read_fd) {
+            return std::task::Poll::Ready(());
+        }
+        woken = true;
+        crate::runtime::executor::register_read(inbox.read_fd, cx.waker().clone());
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+/// 受け口に積まれた完了の Waker を呼ぶタスク（ワーカーごとに 1 本）。
+///
+/// 旗の後始末はタスクと一緒に持たせる（一度も poll されずに捨てられても下ろす）。
+#[cfg(feature = "handler-pool")]
+fn drain_inbox(inbox: Arc<Inbox>) -> impl std::future::Future<Output = ()> {
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = INBOX_DRAIN_RUNNING.try_with(|r| r.set(false));
+        }
+    }
+    let running = Running;
+    async move {
+        let _running = running;
+        let mut batch: Vec<Arc<WaitCell>> = Vec::new();
+        loop {
+            inbox_signal(&inbox).await;
+            // 旗を下ろしてから取り出す（`Inbox::push` の順と対）
+            inbox.signaled.store(false, Ordering::SeqCst);
+            std::mem::swap(
+                &mut batch,
+                &mut *inbox.done.lock().unwrap_or_else(|e| e.into_inner()),
+            );
+            for cell in batch.drain(..) {
+                // 読み書き一体で下ろす。`notify` が積まずに帰った（`queued` が立っていた）なら、その `flag` が
+                // この後の poll に見える（`store` だと下ろす前に `flag` を先読みして起床を取りこぼし得る）
+                cell.queued.swap(false, Ordering::AcqRel);
+                // SAFETY: このタスクは起点のスレッドで動く（`waker` は起点のスレッドだけが触れる）
+                if let Some(w) = unsafe { (*cell.waker.get()).take() } {
+                    w.wake();
+                }
+            }
+        }
+    }
+}
+
+/// 別スレッドから立てる旗と、それを待つタスクの Waker（待つのは 1 タスクだけ）。
+#[cfg(feature = "handler-pool")]
+struct WaitCell {
+    flag: AtomicBool,
+    /// 受け口に積み済み（同じ待ちを 2 回積まない）。
+    queued: AtomicBool,
+    /// 待っているタスクの Waker。**起点のスレッドだけが読み書きする**（ランタイムのタスクは `Send` でない）。
+    waker: std::cell::UnsafeCell<Option<std::task::Waker>>,
+    /// `None` はドライバ無し（単体テスト等。待機側はポーリングする）。
+    inbox: Option<Arc<Inbox>>,
+}
+
+// SAFETY: `waker` は起点のスレッドだけが触れる（`WaitFuture` と `drain_inbox`）。起点のスレッド以外で最後の参照が
+// 落ちても Waker は残らない（`WaitFuture` が完了・破棄のときに取り除き、`drain_inbox` は取り出す）。
+#[cfg(feature = "handler-pool")]
+unsafe impl Send for WaitCell {}
+#[cfg(feature = "handler-pool")]
+unsafe impl Sync for WaitCell {}
+
+#[cfg(feature = "handler-pool")]
+impl WaitCell {
+    /// 起点のスレッド（現在のスレッド）で待つ旗。
+    fn new() -> Arc<WaitCell> {
+        Arc::new(WaitCell {
+            flag: AtomicBool::new(false),
+            queued: AtomicBool::new(false),
+            waker: std::cell::UnsafeCell::new(None),
+            inbox: current_inbox(),
+        })
+    }
+
+    /// 旗を立てて起点のスレッドへ知らせる（どのスレッドからでも）。
+    fn notify(self: &Arc<Self>) {
+        self.flag.store(true, Ordering::Release);
+        if let Some(inbox) = &self.inbox {
+            if !self.queued.swap(true, Ordering::AcqRel) {
+                inbox.push(Arc::clone(self));
+            }
+        }
+    }
+
+    /// 旗が立つまで待つ（起点のスレッドで）。
+    async fn wait(&self) {
+        if self.inbox.is_some() {
+            WaitFuture { cell: self }.await;
+        } else {
+            poll_wait_done(&self.flag);
+        }
+    }
+}
+
+/// [`WaitCell::wait`] の Future。破棄されたら Waker を残さない。
+#[cfg(feature = "handler-pool")]
+struct WaitFuture<'a> {
+    cell: &'a WaitCell,
+}
+
+#[cfg(feature = "handler-pool")]
+impl std::future::Future for WaitFuture<'_> {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.cell.flag.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(());
+        }
+        // SAFETY: 起点のスレッドで poll される（`drain_inbox` と同じスレッド）
+        let slot = unsafe { &mut *self.cell.waker.get() };
+        match slot {
+            Some(w) if w.will_wake(cx.waker()) => {}
+            _ => *slot = Some(cx.waker().clone()),
+        }
+        // 受け口の取り出しは同じスレッドなので、ここで旗が倒れていれば Waker は次の取り出しで呼ばれる
+        if self.cell.flag.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(());
+        }
+        std::task::Poll::Pending
+    }
+}
+
+#[cfg(feature = "handler-pool")]
+impl Drop for WaitFuture<'_> {
+    fn drop(&mut self) {
+        // SAFETY: 起点のスレッドで破棄される（タスクは `Send` でない）
+        unsafe { *self.cell.waker.get() = None };
+    }
+}
+
 /// 別スレッドで完了する処理の結果を、起点スレッドへ届ける送り手（`await_completion` が渡す）。
 ///
 /// `complete` を呼ばずに drop された場合（完了側の panic 等）も待機側は起きて `None` を受け取る。
 #[cfg(feature = "handler-pool")]
 pub struct Completer<R> {
     slot: Arc<Mutex<Option<R>>>,
-    done: Arc<AtomicBool>,
-    /// 起点スレッドの通知 fd。負値はドライバ無し（単体テスト等。待機側はポーリングする）。
-    write_fd: RawFd,
+    cell: Arc<WaitCell>,
     sent: bool,
 }
 
@@ -505,15 +738,7 @@ impl<R> Completer<R> {
             return;
         }
         self.sent = true;
-        // 結果格納を Release で公開してから通知 fd を叩く（起点スレッドは Acquire で読む）。
-        self.done.store(true, Ordering::Release);
-        if self.write_fd >= 0 {
-            // SAFETY: write_fd は起点スレッドのスレッドローカルな通知 fd で、スレッドの生存中は
-            // 閉じられない（`offload()` と同じ前提）。
-            unsafe {
-                signal_notify(self.write_fd);
-            }
-        }
+        self.cell.notify();
     }
 }
 
@@ -527,9 +752,8 @@ impl<R> Drop for Completer<R> {
 /// `submit` に [`Completer`] を渡し、別スレッド（tokio ランタイム・専用プール等）で
 /// `complete` されるのを、イベントループをブロックせずに待つ。
 ///
-/// スレッド越しに Waker を呼ぶ代わりに `offload()` と同じ「結果スロット + 通知 fd」で
-/// 起点スレッドへ戻る（executor のタスクは `!Send`）。ランタイムドライバが無い場合
-/// （単体テスト等）は完了までポーリングして待つ。`Completer` が `complete` されずに
+/// スレッド越しに Waker を呼ぶ代わりに受け口（[`Inbox`]）で起点スレッドへ戻る（executor のタスクは `!Send`）。
+/// ランタイムドライバが無い場合（単体テスト等）は完了までポーリングして待つ。`Completer` が `complete` されずに
 /// drop されたら `None`。
 #[cfg(feature = "handler-pool")]
 pub async fn await_completion<R, S>(submit: S) -> Option<R>
@@ -538,24 +762,19 @@ where
     S: FnOnce(Completer<R>),
 {
     let slot: Arc<Mutex<Option<R>>> = Arc::new(Mutex::new(None));
-    let done = Arc::new(AtomicBool::new(false));
-    let fds = current_thread_notify_fds();
+    let cell = WaitCell::new();
     submit(Completer {
         slot: Arc::clone(&slot),
-        done: Arc::clone(&done),
-        write_fd: fds.map(|(_, w)| w).unwrap_or(-1),
+        cell: Arc::clone(&cell),
         sent: false,
     });
-    match fds {
-        Some((read_fd, _)) => wait_until_done(read_fd, &done).await,
-        None => poll_wait_done(&done),
-    }
+    cell.wait().await;
     let value = slot.lock().unwrap().take();
     value
 }
 
 /// ドライバ無し（単体テスト等）のスレッドで完了を待つ。
-// 理由付き allow: ランタイムドライバが無いスレッド（イベントループ外の単体テスト）でだけ通る待機。
+// 理由付き allow: ランタイムドライバが無いスレッド（イベントループ外の単体テスト）でだけ呼ぶ
 #[cfg(feature = "handler-pool")]
 #[allow(clippy::disallowed_methods)]
 fn poll_wait_done(done: &AtomicBool) {
@@ -566,51 +785,38 @@ fn poll_wait_done(done: &AtomicBool) {
 
 /// 別スレッドから起点スレッド（ワーカー）を起こすための旗（F-210 の C・Python の橋渡し）。
 ///
-/// 起点スレッドで作り（そのスレッドの通知 fd を覚える）、`Arc` で別スレッドへ渡す。別スレッドは
-/// [`WakeFlag::notify`] で旗を立てて通知 fd を叩き、起点スレッドは [`WakeFlag::wait`] で旗が立つまで待つ
-/// （`await_completion` と同じ「旗 + 通知 fd」。スレッド越しに Waker を呼ばない）。
+/// 起点スレッドで作り（そのスレッドの受け口を覚える）、`Arc` で別スレッドへ渡す。別スレッドは
+/// [`WakeFlag::notify`] で旗を立て、起点スレッドは [`WakeFlag::wait`] で旗が立つまで待つ
+/// （`await_completion` と同じ受け口。スレッド越しに Waker を呼ばない）。待つのは 1 つのタスクだけ。
 /// 取りこぼさない使い方: 待つ側は `reset()` → 条件を確かめる → 満たされなければ `wait()`。
 #[cfg(feature = "handler-pool")]
 pub struct WakeFlag {
-    flag: Arc<AtomicBool>,
-    read_fd: RawFd,
-    write_fd: RawFd,
+    cell: Arc<WaitCell>,
 }
 
 #[cfg(feature = "handler-pool")]
 impl WakeFlag {
     /// 現在のスレッド（ワーカー）を起こす旗。ドライバが無い（単体テスト等）ときはポーリングで待つ。
     pub fn new() -> WakeFlag {
-        let fds = current_thread_notify_fds();
         WakeFlag {
-            flag: Arc::new(AtomicBool::new(false)),
-            read_fd: fds.map(|(r, _)| r).unwrap_or(-1),
-            write_fd: fds.map(|(_, w)| w).unwrap_or(-1),
+            cell: WaitCell::new(),
         }
     }
 
     /// 旗を立てて起点スレッドを起こす（どのスレッドからでも）。
     pub fn notify(&self) {
-        self.flag.store(true, Ordering::Release);
-        if self.write_fd >= 0 {
-            // SAFETY: write_fd は起点スレッドのスレッドローカルな通知 fd で、スレッドの生存中は
-            // 閉じられない（`Completer` と同じ前提）。
-            unsafe { signal_notify(self.write_fd) };
-        }
+        self.cell.notify();
     }
 
     /// 旗を下ろす（起点スレッドが条件を確かめる前に）。
     pub fn reset(&self) {
-        self.flag.store(false, Ordering::Release);
+        // 読み書き一体で下ろす（`store` だと、この後の条件の読み取りが先に走ったときに `notify` を消し得る）
+        self.cell.flag.swap(false, Ordering::AcqRel);
     }
 
     /// 旗が立つまで待つ（起点スレッドで）。
     pub async fn wait(&self) {
-        if self.read_fd >= 0 {
-            wait_until_done(self.read_fd, &self.flag).await;
-        } else {
-            poll_wait_done(&self.flag);
-        }
+        self.cell.wait().await;
     }
 }
 
@@ -635,18 +841,23 @@ static HANDLER_POOL_THREADS: std::sync::atomic::AtomicUsize =
 /// API ライブラリのブロッキングなハンドラ（Python・C・`offload = true` の Rust）を実行する専用プール。
 /// FS 用プール（2〜8 本）と分けるのは、重いハンドラで静的配信のオフロードを枯渇させないため。
 #[cfg(feature = "handler-pool")]
-static HANDLER_POOL: Lazy<Arc<OffloadPool>> = Lazy::new(|| {
-    let n = match HANDLER_POOL_THREADS.load(Ordering::Relaxed) {
-        0 => default_handler_threads(),
-        n => n,
-    };
-    OffloadPool::spawn("veil-handler", n)
-});
+static HANDLER_POOL: Lazy<Arc<OffloadPool>> =
+    Lazy::new(|| OffloadPool::spawn("veil-handler", handler_pool_threads()));
 
 /// ハンドラ用プールのスレッド数を設定する（最初のハンドラ実行より前に呼ぶこと。以後は無効）。
 #[cfg(feature = "handler-pool")]
 pub fn set_handler_pool_threads(n: usize) {
     HANDLER_POOL_THREADS.store(n, Ordering::Relaxed);
+}
+
+/// ブロッキングなハンドラを同時に動かすスレッド数（`[api] handler_threads`。バインディングが自分の実行線を
+/// 同じ本数で持つときに読む）。
+#[cfg(feature = "handler-pool")]
+pub fn handler_pool_threads() -> usize {
+    match HANDLER_POOL_THREADS.load(Ordering::Relaxed) {
+        0 => default_handler_threads(),
+        n => n,
+    }
 }
 
 /// ブロッキングな処理 `f` をハンドラ用プールで実行し、完了を待たない（結果は呼び出し側が
@@ -701,5 +912,112 @@ mod b226_tests {
             }
             assert_eq!(super::offload(|| 7u32).await, 7);
         });
+    }
+}
+
+// F-299: 別スレッドの完了を受け口で受け取る（通知はまとめられるので、1 件も落とさないことを見る）
+#[cfg(all(test, feature = "handler-pool"))]
+mod inbox_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    fn on_worker<F: std::future::Future<Output = ()> + 'static>(f: F) {
+        #[cfg(all(veil_rt_uring, target_os = "linux"))]
+        if crate::runtime::ring::IoUring::new(8, 0).is_err() {
+            eprintln!("io_uring unavailable; skipping");
+            return;
+        }
+        crate::runtime::block_on(f);
+    }
+
+    #[test]
+    fn every_completion_of_many_waiters_arrives() {
+        on_worker(async {
+            let left = Rc::new(Cell::new(2000u32));
+            let done = Arc::new(WakeFlag::new());
+            for i in 0..2000u32 {
+                let left = Rc::clone(&left);
+                let done = Arc::clone(&done);
+                crate::runtime::spawn(async move {
+                    let got = await_completion(|c| spawn_handler(move || c.complete(i))).await;
+                    assert_eq!(got, Some(i));
+                    left.set(left.get() - 1);
+                    if left.get() == 0 {
+                        done.notify();
+                    }
+                });
+            }
+            done.wait().await;
+        });
+    }
+
+    #[test]
+    fn a_dropped_completer_wakes_the_waiter() {
+        on_worker(async {
+            let got: Option<u32> = await_completion(|c| spawn_handler(move || drop(c))).await;
+            assert_eq!(got, None);
+        });
+    }
+
+    // 待ちの直前の `notify` を取りこぼさない（行き来の毎回が `reset`・確認・`wait` の窓を通る）
+    #[test]
+    fn ping_pong_loses_no_wakeup() {
+        on_worker(async {
+            const ROUNDS: u32 = 20_000;
+            let flag = Arc::new(WakeFlag::new());
+            let seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let sent = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let h = {
+                let (flag, seen, sent) = (Arc::clone(&flag), Arc::clone(&seen), Arc::clone(&sent));
+                std::thread::spawn(move || {
+                    for i in 1..=ROUNDS {
+                        sent.store(i, Ordering::Release);
+                        flag.notify();
+                        while seen.load(Ordering::Acquire) < i {
+                            std::hint::spin_loop();
+                        }
+                    }
+                })
+            };
+            let mut i = 0;
+            while i < ROUNDS {
+                flag.reset();
+                let now = sent.load(Ordering::Acquire);
+                if now > i {
+                    i = now;
+                    seen.store(i, Ordering::Release);
+                    continue;
+                }
+                flag.wait().await;
+            }
+            h.join().unwrap();
+        });
+    }
+
+    // 待ちを捨てた後の通知は、次の待ちを起こす（古い Waker を残さない）
+    #[test]
+    fn notify_after_an_abandoned_wait_reaches_the_next_wait() {
+        on_worker(async {
+            let flag = Arc::new(WakeFlag::new());
+            let abandoned =
+                crate::runtime::time::timeout(Duration::from_millis(5), flag.wait()).await;
+            assert!(abandoned.is_err());
+            let f = Arc::clone(&flag);
+            spawn_handler(move || f.notify());
+            flag.wait().await;
+        });
+    }
+
+    // 同じスレッドで `block_on` を繰り返す（タスクも poller も作り直される）
+    #[test]
+    fn the_inbox_works_again_in_the_next_block_on() {
+        for _ in 0..3 {
+            on_worker(async {
+                let got = await_completion(|c| spawn_handler(move || c.complete(1u8))).await;
+                assert_eq!(got, Some(1));
+            });
+        }
     }
 }

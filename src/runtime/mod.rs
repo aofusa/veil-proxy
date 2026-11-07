@@ -195,6 +195,17 @@ where
     // スレッドローカルエグゼキュータを初期化
     executor::init_executor();
 
+    // 残ったタスクはスレッドローカルが生きているうちに片付ける（B-118。受け口の受け取りのタスクはカーネルに
+    // POLL_ADD を出したまま常駐するので、`shutdown_thread` を呼ばないスレッドでも残る。次の `block_on` の
+    // `init_executor` でどのみち捨てられる）
+    struct DropTasks;
+    impl Drop for DropTasks {
+        fn drop(&mut self) {
+            shutdown_thread();
+        }
+    }
+    let _drop_tasks = DropTasks;
+
     // spawn() と同じスレッドローカルエグゼキュータ（同一キュー）上で実行する。
     // 別途 Executor::new() で作ったエグゼキュータを使うと、spawn() されたタスクが
     // スレッドローカル側のキューに積まれて永遠にポーリングされない（接続を accept

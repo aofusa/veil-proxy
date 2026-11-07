@@ -47,11 +47,21 @@ thread_local! {
     static FD_TABLE: RefCell<FdTable> = RefCell::new(FdTable::new());
 }
 
+/// fd 表を空にする。新しい poller は古い登録を知らないのに、「武装済み」の記録が残ると `epoll_ctl` を飛ばして
+/// 永久に待つ（同じスレッドで `block_on` を繰り返すとき。F-297）。
+#[cfg(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll))]
+fn reset_fd_table() {
+    // 残っている Waker は借用の外で落とす
+    let old = FD_TABLE.with(|t| std::mem::replace(&mut *t.borrow_mut(), FdTable::new()));
+    drop(old);
+}
+
 /// このスレッドの poller（epoll インスタンス）を初期化する。
 #[cfg(veil_poller_epoll)]
 pub fn init_reactor() -> std::io::Result<()> {
     let poller = EpollPoller::new()?;
     POLLER.with(|p| *p.borrow_mut() = Some(poller));
+    reset_fd_table();
     Ok(())
 }
 
@@ -60,6 +70,7 @@ pub fn init_reactor() -> std::io::Result<()> {
 pub fn init_reactor() -> std::io::Result<()> {
     let poller = KqueuePoller::new()?;
     POLLER.with(|p| *p.borrow_mut() = Some(poller));
+    reset_fd_table();
     Ok(())
 }
 
@@ -68,6 +79,7 @@ pub fn init_reactor() -> std::io::Result<()> {
 pub fn init_reactor() -> std::io::Result<()> {
     let poller = WsaPollPoller::new()?;
     POLLER.with(|p| *p.borrow_mut() = Some(poller));
+    reset_fd_table();
     Ok(())
 }
 

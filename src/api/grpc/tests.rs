@@ -190,7 +190,11 @@ fn unary_with_a_whole_body_keeps_the_stream_errors() {
         (two, b"13", "more than one message"),
         (m.slice(..m.len() - 1), b"13", "cut short"),
         (m.slice(..3), b"13", "cut inside the frame header"),
-        (Bytes::from(compressed), b"13", "compressed, no grpc-encoding"),
+        (
+            Bytes::from(compressed),
+            b"13",
+            "compressed, no grpc-encoding",
+        ),
     ] {
         let resp = futures::executor::block_on(f(buffered_request(body, &[])));
         let h = resp.headers().to_vec();

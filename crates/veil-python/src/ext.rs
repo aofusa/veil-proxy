@@ -127,7 +127,7 @@ fn meta_value(v: &Bound<'_, PyAny>) -> PyResult<Bytes> {
 
 /// Run one call through the Python handler (`handle(call) -> (code, message)`).
 pub fn run_grpc(handle: &Py<PyAny>, call: &mut GrpcCall) -> Status {
-    Python::attach(|py| {
+    crate::lane::attach(|py| {
         let native = match Py::new(
             py,
             NativeGrpcCall {
@@ -140,9 +140,9 @@ pub fn run_grpc(handle: &Py<PyAny>, call: &mut GrpcCall) -> Status {
                 return Status::internal("internal error");
             }
         };
-        let r = handle.call1(py, (native.clone_ref(py),));
+        let r = crate::lane::call_in_new_context(py, handle, native.bind(py).as_any());
         native.borrow(py).ptr.store(0, Ordering::Release);
-        match r.and_then(|o| o.extract::<(u8, String)>(py)) {
+        match r.and_then(|o| o.extract::<(u8, String)>()) {
             Ok((code, msg)) => Status::new(Code::from_u8(code).unwrap_or(Code::Unknown), msg),
             Err(e) => {
                 e.print(py);
