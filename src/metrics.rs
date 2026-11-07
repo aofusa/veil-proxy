@@ -351,6 +351,19 @@ impl ActiveConnectionMetric {
         }
     }
 
+    /// `set_host` がまだラベルを必要としているか（接続の最初の要求だけ。呼び出し側が毎回ホスト名を検査しないように）
+    #[inline]
+    pub(crate) fn wants_host(&self) -> bool {
+        #[cfg(feature = "metrics")]
+        {
+            self.enabled && self.host_name.is_none()
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn set_host(&mut self, _host: &str) {
         #[cfg(feature = "metrics")]
         if self.enabled && self.host_name.is_none() {

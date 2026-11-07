@@ -577,11 +577,20 @@ pub(crate) fn access_outputs_active() -> bool {
     #[cfg(not(feature = "access-log"))]
     let text_log = ftlog::log_enabled!(target: "access", Level::Info);
     #[cfg(feature = "access-log")]
-    let text_log = crate::config::CURRENT_CONFIG
-        .load()
-        .access_log_config
-        .enabled;
+    let text_log = ACCESS_LOG_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
     text_log || (cfg!(feature = "metrics") && crate::metrics::metrics_runtime_enabled())
+}
+
+// `[access_log] enabled` の写し（要求ごとに読むので `CURRENT_CONFIG` を経由しない）。
+// 既定は `AccessLogConfig::default()` と同じ
+#[cfg(feature = "access-log")]
+static ACCESS_LOG_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 設定のロード・リロードで `[access_log] enabled` を反映する（`CURRENT_CONFIG` の更新と並べて呼ぶ）
+#[cfg(feature = "access-log")]
+pub(crate) fn set_access_log_enabled(enabled: bool) {
+    ACCESS_LOG_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `log_access` に渡すリクエスト開始時刻。

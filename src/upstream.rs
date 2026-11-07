@@ -812,8 +812,10 @@ pub(crate) fn matches_conditions(
 
     // method条件のチェック
     if let Some(ref methods) = conditions.method {
-        let method_str = std::str::from_utf8(method).unwrap_or("");
-        if !methods.iter().any(|m| m.eq_ignore_ascii_case(method_str)) {
+        if !methods
+            .iter()
+            .any(|m| m.as_bytes().eq_ignore_ascii_case(method))
+        {
             return false;
         }
     }
@@ -847,6 +849,8 @@ pub(crate) fn matches_conditions(
 /// - Phase 4: LRU キャッシュ
 ///
 /// 候補ルートのみを評価することで、線形O(n)から大幅に削減
+///
+/// `config` は呼び出し側が読んだ設定（ルートの表とその索引が同じ世代になるように、ここで読み直さない）。
 pub fn find_backend_unified(
     host: &[u8],
     path: &[u8],
@@ -854,25 +858,24 @@ pub fn find_backend_unified(
     headers: &[(&[u8], &[u8])],
     raw_query: &[u8],
     source_ip: &SocketAddr,
-    routes: &[Route],
-    upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
+    config: &RuntimeConfig,
 ) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
-    find_backend_inner(
+    select_route(
+        &config.optimized_router,
         host,
         path,
         method,
         headers,
         raw_query,
         source_ip,
-        routes,
-        upstream_groups,
+        config.route.as_slice(),
+        &config.upstream_groups,
         true,
     )
 }
 
 /// ストリーミングにするかの下見用（HTTP/2 の `h2_route_streaming_plan`・HTTP/3 の `classify`）。
 /// ルートのトラフィック制御（F-219）の乱数を引かない（下見と本番で 2 回引かない）。
-#[allow(clippy::too_many_arguments)]
 pub fn find_backend_preview(
     host: &[u8],
     path: &[u8],
@@ -880,18 +883,18 @@ pub fn find_backend_preview(
     headers: &[(&[u8], &[u8])],
     raw_query: &[u8],
     source_ip: &SocketAddr,
-    routes: &[Route],
-    upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
+    config: &RuntimeConfig,
 ) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
-    find_backend_inner(
+    select_route(
+        &config.optimized_router,
         host,
         path,
         method,
         headers,
         raw_query,
         source_ip,
-        routes,
-        upstream_groups,
+        config.route.as_slice(),
+        &config.upstream_groups,
         false,
     )
 }
@@ -911,34 +914,6 @@ fn route_backend(
         }
     }
     load_backend(route, upstream_groups)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn find_backend_inner(
-    host: &[u8],
-    path: &[u8],
-    method: &[u8],
-    headers: &[(&[u8], &[u8])],
-    raw_query: &[u8],
-    source_ip: &SocketAddr,
-    routes: &[Route],
-    upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
-    draw: bool,
-) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
-    // CURRENT_CONFIG から OptimizedRouter を取得
-    let config = CURRENT_CONFIG.load();
-    select_route(
-        &config.optimized_router,
-        host,
-        path,
-        method,
-        headers,
-        raw_query,
-        source_ip,
-        routes,
-        upstream_groups,
-        draw,
-    )
 }
 
 /// ルートの照合（`optimized_router` は `routes` から作ったもの）。
@@ -1146,8 +1121,10 @@ pub(crate) fn matches_remaining_conditions(
 
     // method条件のチェック
     if let Some(ref methods) = conditions.method {
-        let method_str = std::str::from_utf8(method).unwrap_or("");
-        if !methods.iter().any(|m| m.eq_ignore_ascii_case(method_str)) {
+        if !methods
+            .iter()
+            .any(|m| m.as_bytes().eq_ignore_ascii_case(method))
+        {
             return false;
         }
     }

@@ -254,7 +254,11 @@ pub fn route_pattern_matches(pattern: &str, path: &[u8]) -> bool {
 /// Decodes percent-encoding (`+` is not turned into a space, as befits paths). Malformed sequences are left as is.
 pub fn percent_decode(input: &[u8]) -> std::borrow::Cow<'_, str> {
     if !input.contains(&b'%') {
-        return String::from_utf8_lossy(input);
+        // `from_utf8_lossy` は短い入力でも検査を反復子で回すので 1 回 150 命令ほどかかる（有効な UTF-8 の分は同じ結果）
+        return match std::str::from_utf8(input) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(_) => String::from_utf8_lossy(input),
+        };
     }
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;

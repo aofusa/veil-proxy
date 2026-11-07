@@ -75,7 +75,32 @@ pub fn resolve_route(
     client_addr: &SocketAddr,
     draw: bool,
 ) -> Option<RouteMatch> {
-    let config = CURRENT_CONFIG.load();
+    resolve_route_in(
+        &CURRENT_CONFIG.load(),
+        authority,
+        path,
+        method,
+        headers,
+        raw_query,
+        client_addr,
+        draw,
+    )
+}
+
+/// [`resolve_route`] と同じだが、呼び出し側が読んだ設定で引く（`CURRENT_CONFIG` の読み取りは 1 回 100 命令ほど
+/// かかるので、要求の中で読み直さない）。
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn resolve_route_in(
+    config: &crate::config::RuntimeConfig,
+    authority: &[u8],
+    path: &[u8],
+    method: &[u8],
+    headers: &[(&[u8], &[u8])],
+    raw_query: &[u8],
+    client_addr: &SocketAddr,
+    draw: bool,
+) -> Option<RouteMatch> {
     if draw {
         crate::upstream::find_backend_unified(
             authority,
@@ -84,8 +109,7 @@ pub fn resolve_route(
             headers,
             raw_query,
             client_addr,
-            config.route.as_slice(),
-            &config.upstream_groups,
+            config,
         )
     } else {
         crate::upstream::find_backend_preview(
@@ -95,8 +119,7 @@ pub fn resolve_route(
             headers,
             raw_query,
             client_addr,
-            config.route.as_slice(),
-            &config.upstream_groups,
+            config,
         )
     }
 }

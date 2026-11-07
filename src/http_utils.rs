@@ -901,20 +901,44 @@ pub(crate) fn decode_chunked_body(chunked_data: &[u8]) -> Vec<u8> {
 ///         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
 #[inline]
 pub(crate) fn is_valid_header_name(name: &[u8]) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    for &b in name {
-        let is_tchar = matches!(b,
+    !name.is_empty() && name.iter().all(|&b| TCHAR[b as usize])
+}
+
+// 応答の 1 ヘッダごとに全バイトを見るので、1 バイトの判定は表引きにする
+static TCHAR: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut b = 0;
+    while b < 256 {
+        table[b] = matches!(b as u8,
             b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' |
             b'^' | b'_' | b'`' | b'|' | b'~' |
             b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z'
         );
-        if !is_tchar {
-            return false;
-        }
+        b += 1;
     }
-    true
+    table
+};
+
+#[cfg(test)]
+mod header_name_tests {
+    use super::*;
+
+    /// 表が RFC 9110 の tchar と全バイトで一致すること。
+    #[test]
+    fn header_name_table_is_exactly_tchar() {
+        let tchar: &[u8] =
+            b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        for b in 0..=255u8 {
+            assert_eq!(
+                is_valid_header_name(&[b]),
+                tchar.contains(&b),
+                "byte {b:#x}"
+            );
+        }
+        assert!(!is_valid_header_name(b""));
+        assert!(is_valid_header_name(b"x-a"));
+        assert!(!is_valid_header_name(b"x a"));
+    }
 }
 
 /// ヘッダー値が有効か検証（Header Injection防止）

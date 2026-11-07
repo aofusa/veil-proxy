@@ -252,9 +252,13 @@ pub(super) async fn handle_requests(
         // ヘッダー終端 \r\n\r\n が見つかった場合はヘッダー部分のみをチェック。
         // まだヘッダーが完全でない場合は蓄積サイズで判定する。
         // URIが長すぎる場合は414 URI Too Long、それ以外のヘッダー超過は431
-        let header_section_end = accumulated.windows(4).position(|w| w == b"\r\n\r\n");
-        let header_check_size = header_section_end.map_or(accumulated.len(), |end| end + 4);
-        if header_check_size > MAX_HEADER_SIZE {
+        // ヘッダの大きさは蓄積の長さを超えないので、蓄積が上限以下なら終端を探さなくても通る
+        // （普通の要求はここで終わる。1 バイトずつの走査はパーサの読む範囲を丸ごともう 1 回なめていた）
+        let header_too_large = accumulated.len() > MAX_HEADER_SIZE && {
+            let header_section_end = accumulated.windows(4).position(|w| w == b"\r\n\r\n");
+            header_section_end.map_or(accumulated.len(), |end| end + 4) > MAX_HEADER_SIZE
+        };
+        if header_too_large {
             // リクエストラインの終端を探してURIサイズを確認
             let response_code =
                 if let Some(line_end) = accumulated.windows(2).position(|w| w == b"\r\n") {
@@ -288,12 +292,9 @@ pub(super) async fn handle_requests(
         }
 
         // HTTPリクエストをパース
-        let mut headers_storage = [httparse::EMPTY_HEADER; 64];
-        let mut req = Request::new(&mut headers_storage);
-
-        match req.parse(&accumulated) {
+        match parse_request_head(&mut accumulated) {
             // B-317: httparse が読んだヘッダの長さでも上限を確かめる（下でヘッダの位置を u16 に詰める前提）
-            Ok(Status::Complete(header_len)) if header_len > MAX_HEADER_SIZE => {
+            RequestHeadParse::TooLarge => {
                 let _ = timeout(
                     WRITE_TIMEOUT,
                     tls_stream.write_all(ERR_MSG_REQUEST_HEADER_TOO_LARGE.to_vec()),
@@ -302,57 +303,16 @@ pub(super) async fn handle_requests(
                 lingering_drain_before_close(&mut tls_stream).await;
                 return;
             }
-            Ok(Status::Complete(header_len)) => {
+            RequestHeadParse::Complete(RequestHead {
+                header_bytes,
+                headers: headers_for_proxy,
+                method_range,
+                host_range,
+                path_range,
+                user_agent_range,
+                http10,
+            }) => {
                 skipped_empty_lines = 0;
-                // 各フィールドの (offset, len) を req の借用中（accumulated への参照が
-                // 生きている間）に確定する。以後は accumulated を可変利用するため、
-                // ここでオフセットをすべて集め終えたら直ちに req をドロップする。
-                let method_range = req.method.map(|m| slice_range(&accumulated, m.as_bytes()));
-                let host_range = req
-                    .headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("host"))
-                    .map(|h| slice_range(&accumulated, h.value));
-                let path_range = req.path.map(|p| slice_range(&accumulated, p.as_bytes()));
-                let user_agent_range = req
-                    .headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("user-agent"))
-                    .map(|h| slice_range(&accumulated, h.value));
-                // F-261・B-307: HTTP/1.0 の要求はアップグレードできない
-                let http10 = req.version == Some(0);
-                // ヘッダの位置はスタックの配列に控える（要求ごとに Vec を確保しない。F-202）。
-                // httparse の格納先と同じ 64 個が上限。ヘッダ部は上の検査で MAX_HEADER_SIZE（8KB）以下なので
-                // 位置は u16 に収まる（配列を 512 バイトに抑え、要求ごとの初期化を小さくする）。
-                // await をまたがないので Future は大きくならない。
-                let mut header_ranges = [[0u16; 4]; 64];
-                let mut header_count = 0;
-                for h in req.headers.iter().filter(|h| !h.name.is_empty()) {
-                    let (no, nl) = slice_range(&accumulated, h.name.as_bytes());
-                    let (vo, vl) = slice_range(&accumulated, h.value);
-                    header_ranges[header_count] = [no as u16, nl as u16, vo as u16, vl as u16];
-                    header_count += 1;
-                }
-
-                // req（accumulated への借用）はここで使い終わる（以後 accumulated を可変で使う）。
-
-                // ヘッダー領域を Bytes として切り出す（参照カウント共有・memcpy なし）。
-                // split_to 後は accumulated にボディの続きだけが残り、読み込みバッファとして
-                // 再利用できる。
-                let header_bytes: Bytes = accumulated.split_to(header_len).freeze();
-
-                // ヘッダー一覧を Bytes ペアとして構築（`Bytes::slice` は参照カウント +1 の
-                // みでコピーを伴わない）。
-                let headers_for_proxy: Vec<(Bytes, Bytes)> = header_ranges[..header_count]
-                    .iter()
-                    .map(|&[no, nl, vo, vl]| {
-                        let (no, nl, vo, vl) = (no as usize, nl as usize, vo as usize, vl as usize);
-                        (
-                            header_bytes.slice(no..no + nl),
-                            header_bytes.slice(vo..vo + vl),
-                        )
-                    })
-                    .collect();
 
                 // HTTPメソッド取得
                 let method_bytes: Bytes = method_range
@@ -379,10 +339,12 @@ pub(super) async fn handle_requests(
                     .unwrap_or_else(Bytes::new);
 
                 // メトリクス: 最初のリクエストでホスト名を取得し、インクリメント
-                if let Ok(host_str) = std::str::from_utf8(&host_bytes) {
-                    connection_metric.set_host(host_str);
-                } else {
-                    connection_metric.set_host("unknown");
+                if connection_metric.wants_host() {
+                    if let Ok(host_str) = std::str::from_utf8(&host_bytes) {
+                        connection_metric.set_host(host_str);
+                    } else {
+                        connection_metric.set_host("unknown");
+                    }
                 }
 
                 let path_bytes: Bytes = path_range
@@ -511,7 +473,16 @@ pub(super) async fn handle_requests(
                     return;
                 }
 
-                let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
+                // 設定はここから経路の解決まで 1 回読んだものを使う（読み取りは 1 回 100 命令ほどかかる）
+                let config = CURRENT_CONFIG.load();
+
+                // 管理 API の照合にしか使わない（有効なときだけ検査する。無効なら下の分岐に入らない）
+                #[cfg(feature = "admin")]
+                let path_str = if config.admin_config.enabled {
+                    std::str::from_utf8(&path_bytes).unwrap_or("/")
+                } else {
+                    "/"
+                };
 
                 // Expect: 100-continue ヘッダーがある場合、ボディ送信前に 100 Continue を返す。
                 // B-210: 返すのはルートの検査（`[route.security]` の本文の上限・IP・メソッド・レート制限）を通った後
@@ -523,12 +494,11 @@ pub(super) async fn handle_requests(
                 // メトリクスエンドポイントの処理（設定可能なパス）
                 // Prometheusスクレイピング用の特別なパス
                 {
-                    let config = CURRENT_CONFIG.load();
                     let prom_config = &config.prometheus_config;
 
                     // パスとメソッドをチェック
                     if prom_config.enabled
-                        && path_str == prom_config.path
+                        && path_bytes.as_ref() == prom_config.path.as_bytes()
                         && method_bytes.as_ref() == b"GET"
                     {
                         let start_instant = Instant::now();
@@ -583,7 +553,6 @@ pub(super) async fn handle_requests(
                 // PURGE メソッド、または admin.path_prefix 配下の /cache/purge を処理する
                 #[cfg(feature = "admin")]
                 {
-                    let config = CURRENT_CONFIG.load();
                     let admin_config = &config.admin_config;
                     let is_purge_method = method_bytes.as_ref() == b"PURGE";
                     // パフォーマンス最適化: 事前計算済みプレフィックスを使用（format! 排除）
@@ -644,7 +613,6 @@ pub(super) async fn handle_requests(
                 // 管理 API エンドポイントの処理（F-21: /config, /stats, /reload, /tls/reload）
                 #[cfg(feature = "admin")]
                 {
-                    let config = CURRENT_CONFIG.load();
                     let admin_config = &config.admin_config;
 
                     if admin_config.enabled
@@ -802,7 +770,8 @@ pub(super) async fn handle_requests(
                     let raw_query: &[u8] =
                         query_start_pos.map(|i| &path_bytes[i + 1..]).unwrap_or(b"");
 
-                    crate::l7::resolve_route(
+                    crate::l7::resolve_route_in(
+                        &config,
                         &host_bytes,
                         path_without_query,
                         &method_bytes,
@@ -812,6 +781,8 @@ pub(super) async fn handle_requests(
                         true,
                     )
                 };
+                // ここから先の await へ持ち越さない
+                drop(config);
 
                 let (prefix, backend, route_compression) = match backend_result {
                     Some(b) => b,
@@ -954,7 +925,9 @@ pub(super) async fn handle_requests(
                     };
 
                 #[cfg(feature = "wasm")]
-                let headers_for_proxy = {
+                let headers_for_proxy = if modules_to_apply.is_empty() {
+                    headers_for_proxy
+                } else {
                     let config = CURRENT_CONFIG.load();
                     if let Some(ref wasm_engine) = config.wasm_filter_engine {
                         // routes内で指定されたmodulesを優先
@@ -1400,17 +1373,121 @@ pub(super) async fn handle_requests(
                     }
                 }
             }
-            Ok(Status::Partial) => {
+            RequestHeadParse::Partial => {
                 // データ不足、次の読み込みを待つ
                 continue;
             }
-            Err(_) => {
+            RequestHeadParse::Invalid => {
                 let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
                 let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                 return;
             }
         }
     }
+}
+
+/// 読み取ったヘッダ部（[`parse_request_head`] の結果）。
+struct RequestHead {
+    /// ヘッダ部全体（各フィールドはここを指す `Bytes`）
+    header_bytes: Bytes,
+    headers: Vec<(Bytes, Bytes)>,
+    method_range: Option<(usize, usize)>,
+    host_range: Option<(usize, usize)>,
+    path_range: Option<(usize, usize)>,
+    user_agent_range: Option<(usize, usize)>,
+    http10: bool,
+}
+
+enum RequestHeadParse {
+    Complete(RequestHead),
+    /// ヘッダが `MAX_HEADER_SIZE` を超えた
+    TooLarge,
+    /// まだ揃っていない
+    Partial,
+    Invalid,
+}
+
+/// 蓄積の先頭のヘッダ部を読み、揃っていれば切り出す。
+///
+/// 同期の関数に分けているのは、作業用の配列（2.5KB）を接続ごとのフューチャの状態へ載せないため。`handle_requests`
+/// の中に置くと `await` をまたぐ扱いになり、要求ごとに冷たいメモリへ書くことになる（ここならスタックで済む）。
+#[inline]
+fn parse_request_head(accumulated: &mut BytesMut) -> RequestHeadParse {
+    // 格納先は要求ごとに初期化しない（埋まった分だけ `req.headers` に見える）
+    let mut headers_storage = [const { std::mem::MaybeUninit::<httparse::Header>::uninit() }; 64];
+    let mut req = Request::new(&mut []);
+
+    let header_len = match req.parse_with_uninit_headers(accumulated, &mut headers_storage) {
+        Ok(Status::Complete(header_len)) => header_len,
+        Ok(Status::Partial) => return RequestHeadParse::Partial,
+        Err(_) => return RequestHeadParse::Invalid,
+    };
+    if header_len > MAX_HEADER_SIZE {
+        return RequestHeadParse::TooLarge;
+    }
+
+    // 各フィールドの (offset, len) を req の借用中（accumulated への参照が
+    // 生きている間）に確定する。以後は accumulated を可変利用するため、
+    // ここでオフセットをすべて集め終えたら直ちに req をドロップする。
+    let method_range = req.method.map(|m| slice_range(accumulated, m.as_bytes()));
+    let host_range = req
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("host"))
+        .map(|h| slice_range(accumulated, h.value));
+    let path_range = req.path.map(|p| slice_range(accumulated, p.as_bytes()));
+    // アクセスログにしか使わない（出力先が無ければ探さない。切り出しの参照カウントの増減も省ける）
+    let user_agent_range = crate::logging::access_outputs_active()
+        .then(|| {
+            req.headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("user-agent"))
+                .map(|h| slice_range(accumulated, h.value))
+        })
+        .flatten();
+    // F-261・B-307: HTTP/1.0 の要求はアップグレードできない
+    let http10 = req.version == Some(0);
+    // ヘッダの位置はスタックの配列に控える（要求ごとに Vec を確保しない。F-202）。
+    // httparse の格納先と同じ 64 個が上限。ヘッダ部は上の検査で MAX_HEADER_SIZE（8KB）以下なので
+    // 位置は u16 に収まる。
+    let mut header_ranges = [[0u16; 4]; 64];
+    let mut header_count = 0;
+    for h in req.headers.iter().filter(|h| !h.name.is_empty()) {
+        let (no, nl) = slice_range(accumulated, h.name.as_bytes());
+        let (vo, vl) = slice_range(accumulated, h.value);
+        header_ranges[header_count] = [no as u16, nl as u16, vo as u16, vl as u16];
+        header_count += 1;
+    }
+
+    // req（accumulated への借用）はここで使い終わる（以後 accumulated を可変で使う）。
+
+    // ヘッダー領域を Bytes として切り出す（参照カウント共有・memcpy なし）。
+    // split_to 後は accumulated にボディの続きだけが残り、読み込みバッファとして
+    // 再利用できる。
+    let header_bytes: Bytes = accumulated.split_to(header_len).freeze();
+
+    // ヘッダー一覧を Bytes ペアとして構築（`Bytes::slice` は参照カウント +1 の
+    // みでコピーを伴わない）。
+    let headers: Vec<(Bytes, Bytes)> = header_ranges[..header_count]
+        .iter()
+        .map(|&[no, nl, vo, vl]| {
+            let (no, nl, vo, vl) = (no as usize, nl as usize, vo as usize, vl as usize);
+            (
+                header_bytes.slice(no..no + nl),
+                header_bytes.slice(vo..vo + vl),
+            )
+        })
+        .collect();
+
+    RequestHeadParse::Complete(RequestHead {
+        header_bytes,
+        headers,
+        method_range,
+        host_range,
+        path_range,
+        user_agent_range,
+        http10,
+    })
 }
 
 // Backend処理
@@ -1727,6 +1804,8 @@ pub(super) async fn handle_backend(
         }
         #[cfg(feature = "handler")]
         Backend::Handler(entry, security, _, comp) => {
+            // Box のまま（外すと確保とコピーは消えるが、要求の状態が接続ごとの冷たいメモリに載る。Box なら
+            // ワーカーの中で同じ温かいブロックを回せる。外した版は命令数 −10%・サイクル +12%・スループット −8%）
             Box::pin(handle_api_handler(
                 tls_stream,
                 &entry,
@@ -1781,8 +1860,9 @@ pub(super) async fn handle_api_handler(
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // F-266: ストリーミング受信のハンドラ（`Multipart` 等）は本文を待たずに呼び、届いた順に渡す。
     // chunked は従来どおり全部を読んでから 1 つの断片で渡す（`take_body_stream` の既定）
+    // Box に逃がす（このフューチャは要求ごとに Box へコピーされるので、まれな経路の分で大きくしない）
     if entry.streaming_request && !is_chunked && content_length > 0 {
-        return handle_api_streaming(
+        return Box::pin(handle_api_streaming(
             tls_stream,
             entry,
             comp,
@@ -1796,45 +1876,50 @@ pub(super) async fn handle_api_handler(
             client_ip,
             api_cache,
             overflow,
-        )
+        ))
         .await;
     }
-    let limit = crate::api::app::max_body_size();
-    let body = match read_full_request_body(
-        &mut tls_stream,
-        content_length,
-        is_chunked,
-        initial_body,
-        limit,
-        overflow,
-    )
-    .await
-    {
-        Ok(b) => b,
-        Err(status) => {
-            let resp = crate::api::response::Response::error(
-                status,
-                if status == 413 {
-                    "Payload Too Large"
-                } else {
-                    "Bad Request"
-                },
-            );
-            let mut out = crate::api::dispatch::http1_head(&resp, false);
-            out.extend_from_slice(&resp.body);
-            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(out)).await;
-            // 本文の途中で打ち切った（chunked の上限超過等）: 読み捨ててから閉じる（B-102・B-211）
-            lingering_drain_before_close(&mut tls_stream).await;
-            return Some((tls_stream, status, resp.body.len() as u64, true));
+    // 本文の無い要求は読みにいかない。読み取りのフューチャ（約 3KB）も Box に逃がして、ここの大きさに入れない
+    let body = if content_length == 0 && !is_chunked {
+        Bytes::new()
+    } else {
+        let limit = crate::api::app::max_body_size();
+        match Box::pin(read_full_request_body(
+            &mut tls_stream,
+            content_length,
+            is_chunked,
+            initial_body,
+            limit,
+            overflow,
+        ))
+        .await
+        {
+            Ok(b) => b,
+            Err(status) => {
+                let resp = crate::api::response::Response::error(
+                    status,
+                    if status == 413 {
+                        "Payload Too Large"
+                    } else {
+                        "Bad Request"
+                    },
+                );
+                let mut out = crate::api::dispatch::http1_head(&resp, false);
+                out.extend_from_slice(&resp.body);
+                let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(out)).await;
+                // 本文の途中で打ち切った（chunked の上限超過等）: 読み捨ててから閉じる（B-102・B-211）
+                lingering_drain_before_close(&mut tls_stream).await;
+                return Some((tls_stream, status, resp.body.len() as u64, true));
+            }
         }
     };
     // メソッド・パスは要求ヘッダの領域を指す Bytes（参照カウントだけ。F-202）
-    let mut req = crate::api::dispatch::build_request(
+    let mut req = crate::api::dispatch::build_request_from(
         method.clone(),
         req_path.clone(),
         headers,
         body,
-        client_ip,
+        api_cache.client_ip(client_ip),
         crate::api::request::HttpVersion::Http11,
     );
     req.tls = !tls_stream.is_plain();
@@ -1881,7 +1966,7 @@ async fn write_api_response(
         _ => return None,
     }
     if let Some(stream) = streaming {
-        let (tls_stream, sent) = write_api_chunked(tls_stream, stream).await?;
+        let (tls_stream, sent) = Box::pin(write_api_chunked(tls_stream, stream)).await?;
         return Some((tls_stream, status, sent, client_wants_close));
     }
     let len = body.len() as u64;
@@ -1927,12 +2012,12 @@ async fn handle_api_streaming(
         Held,
     }
     let (tx, slot) = crate::api::stream::request_body_channel(8);
-    let mut req = crate::api::dispatch::build_request(
+    let mut req = crate::api::dispatch::build_request_from(
         method.clone(),
         req_path.clone(),
         headers,
         Bytes::new(),
-        client_ip,
+        api_cache.client_ip(client_ip),
         crate::api::request::HttpVersion::Http11,
     );
     req.tls = !tls_stream.is_plain();

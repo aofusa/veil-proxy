@@ -340,7 +340,9 @@ pub(crate) fn form_lookup<'a>(data: &'a [u8], name: &str) -> Option<Cow<'a, str>
             Some(i) => (&pair[..i], &pair[i + 1..]),
             None => (pair, &b""[..]),
         };
-        if form_decode(k) == name {
+        // ほとんどのキーはエンコードの無い ASCII なので、デコードせずにバイト列のまま比べる
+        let plain = k.iter().all(|&b| b.is_ascii() && b != b'%' && b != b'+');
+        if (plain && k == name.as_bytes()) || (!plain && form_decode(k) == name) {
             return Some(form_decode(v));
         }
     }
@@ -362,6 +364,28 @@ pub(crate) fn form_decode(input: &[u8]) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// デコードせずに比べる近道と、デコードして比べる経路で結果が変わらないこと。
+    #[test]
+    fn form_lookup_compares_keys_as_decoded() {
+        assert_eq!(form_lookup(b"a=1&b=2", "b").as_deref(), Some("2"));
+        assert_eq!(form_lookup(b"a=1&b=2", "c"), None);
+        // エンコードされたキーはデコードして比べる
+        assert_eq!(form_lookup(b"%61=1", "a").as_deref(), Some("1"));
+        assert_eq!(form_lookup(b"a+b=1", "a b").as_deref(), Some("1"));
+        assert_eq!(form_lookup(b"a%20b=1", "a b").as_deref(), Some("1"));
+        // 生の `%`・`+` は名前そのものとは一致しない
+        assert_eq!(form_lookup(b"a+b=1", "a+b"), None);
+        // ASCII でないキーも同じ（無効な UTF-8 は置換文字になる）
+        assert_eq!(
+            form_lookup("名前=1".as_bytes(), "名前").as_deref(),
+            Some("1")
+        );
+        assert_eq!(form_lookup(b"\xff=1", "\u{fffd}").as_deref(), Some("1"));
+        // 値の無いキー・無効な UTF-8 の値
+        assert_eq!(form_lookup(b"flag", "flag").as_deref(), Some(""));
+        assert_eq!(form_lookup(b"a=\xff", "a").as_deref(), Some("\u{fffd}"));
+    }
 
     #[test]
     fn accessors() {

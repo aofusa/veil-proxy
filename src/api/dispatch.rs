@@ -8,6 +8,12 @@ use bytes::Bytes;
 use futures::FutureExt;
 use std::net::IpAddr;
 
+fn parse_client_ip(client_ip: &str) -> IpAddr {
+    client_ip
+        .parse::<IpAddr>()
+        .unwrap_or(IpAddr::from([0, 0, 0, 0]))
+}
+
 /// Builds a request (`target` is the `:path` or request line, including the query).
 pub(crate) fn build_request(
     method: Bytes,
@@ -15,6 +21,25 @@ pub(crate) fn build_request(
     headers: Vec<(Bytes, Bytes)>,
     body: Bytes,
     client_ip: &str,
+    version: HttpVersion,
+) -> Request {
+    build_request_from(
+        method,
+        target,
+        headers,
+        body,
+        parse_client_ip(client_ip),
+        version,
+    )
+}
+
+/// Like [`build_request`], for a caller that already has the parsed client address.
+pub(crate) fn build_request_from(
+    method: Bytes,
+    target: Bytes,
+    headers: Vec<(Bytes, Bytes)>,
+    body: Bytes,
+    client_ip: IpAddr,
     version: HttpVersion,
 ) -> Request {
     let (path, query) = split_target(&target);
@@ -25,9 +50,7 @@ pub(crate) fn build_request(
         headers,
         body,
         params: Vec::new(),
-        client_ip: client_ip
-            .parse::<IpAddr>()
-            .unwrap_or(IpAddr::from([0, 0, 0, 0])),
+        client_ip,
         version,
         // HTTP/3 は常に TLS。HTTP/1.1・HTTP/2 は呼び出し側が接続を見て立てる（B-204）
         tls: version == HttpVersion::Http3,
@@ -48,9 +71,18 @@ pub(crate) struct CallCache {
     pub(crate) upgrade_allowed: bool,
     // F-261: 101 を書いた後に接続を渡す関数（HTTP/1.1 の接続のループが受け取る）。
     pub(crate) pending_upgrade: Option<super::upgrade::UpgradeFn>,
+    // 文字列から読んだクライアントのアドレス（接続の間変わらないので最初の要求で 1 回だけ読む）
+    client_ip: Option<IpAddr>,
 }
 
 impl CallCache {
+    /// The connection's client address (`client_ip` must be the same string for the whole connection).
+    pub(crate) fn client_ip(&mut self, client_ip: &str) -> IpAddr {
+        *self
+            .client_ip
+            .get_or_insert_with(|| parse_client_ip(client_ip))
+    }
+
     #[cfg(feature = "tokio-compat")]
     pub(crate) fn waker_cache(&mut self) -> &mut crate::tokio::waker::SafeWakerCache {
         &mut self.waker
