@@ -752,7 +752,7 @@ impl<R> Drop for Completer<R> {
 /// `submit` に [`Completer`] を渡し、別スレッド（tokio ランタイム・専用プール等）で
 /// `complete` されるのを、イベントループをブロックせずに待つ。
 ///
-/// スレッド越しに Waker を呼ぶ代わりに受け口（[`Inbox`]）で起点スレッドへ戻る（executor のタスクは `!Send`）。
+/// スレッド越しに Waker を呼ぶ代わりに受け口（`Inbox`）で起点スレッドへ戻る（executor のタスクは `!Send`）。
 /// ランタイムドライバが無い場合（単体テスト等）は完了までポーリングして待つ。`Completer` が `complete` されずに
 /// drop されたら `None`。
 #[cfg(feature = "handler-pool")]

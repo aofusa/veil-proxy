@@ -1061,7 +1061,7 @@ fn take_armed_timer_result_if_fired() {
 /// SQE を今すぐ提出する。
 ///
 /// TCP の I/O Future はこれを呼ばない（F-300）。SQE を積むだけにして、park（`submit_and_wait`）と
-/// [`SUBMIT_INTERVAL`] ごとの提出でまとめる。呼ぶのは取り消しと、自分で束ねて積む UDP。
+/// `SUBMIT_INTERVAL` ごとの提出でまとめる。呼ぶのは取り消しと、自分で束ねて積む UDP。
 ///
 /// **未提出の SQE を持ったまま fd を閉じさせない。** カーネルが fd を引くのは提出のときなので、閉じた後に
 /// 提出すると、別のスレッドが受け取った同じ番号の接続へ送ってしまう。op を持つ Future の drop は必ず
