@@ -1128,8 +1128,8 @@ impl FilterEngine {
         self.registry.set_root_id(module, root_id)
     }
 
-    /// 試験用: wasmtime のエンジン（枠を外から握る試験。F-293）
-    #[cfg(test)]
+    /// 試験用: wasmtime のエンジン（枠を外から握る試験。F-293。その試験は OpenBSD では動かない）
+    #[cfg(all(test, not(target_os = "openbsd")))]
     pub(crate) fn registry_engine(&self) -> &wasmtime::Engine {
         self.registry.engine()
     }

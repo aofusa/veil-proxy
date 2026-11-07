@@ -1564,25 +1564,26 @@ pub struct ReadableFd {
 impl Future for ReadableFd {
     type Output = io::Result<()>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
         // epoll（F-297）: まず待ちに入る（レベルトリガなので、もう読めるなら次の `epoll_wait` が報告する）。
         // 確認の `poll(2)` は起きた後の 1 本だけ。必ず一度 executor へ戻るので、すぐ次を送ってくる接続が同じ
         // ワーカーの他の接続を飢えさせない（B-332）。起きた後の確認は省かない: HTTP/2 の接続のループは
         // 可読を見てから読み取りを待つので、外れると応答の通知を待てなくなる（B-75）。
         #[cfg(veil_poller_epoll)]
-        if !std::mem::replace(&mut self.registered, true) {
-            register_read(self.fd, cx.waker().clone());
+        if !std::mem::replace(&mut this.registered, true) {
+            register_read(this.fd, cx.waker().clone());
             return Poll::Pending;
         }
         // F-141: `Readable::poll` と同じ理由で、kqueue の直近ヒントがあれば
         // 確認用 `poll(2)` syscall を省略する（UDP の `wait_readable_fd` 経路で使われる
         // ため、`QuicUdpSocket` の recv 系ループがこの恩恵を受ける）。
         #[cfg(veil_poller_kqueue)]
-        if crate::runtime::executor::take_read_hint(self.fd) > 0 {
+        if crate::runtime::executor::take_read_hint(this.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
         let mut pfd = libc::pollfd {
-            fd: self.fd,
+            fd: this.fd,
             events: libc::POLLIN,
             revents: 0,
         };
@@ -1591,7 +1592,7 @@ impl Future for ReadableFd {
         if ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
             return Poll::Ready(Ok(()));
         }
-        register_read(self.fd, cx.waker().clone());
+        register_read(this.fd, cx.waker().clone());
         Poll::Pending
     }
 }
