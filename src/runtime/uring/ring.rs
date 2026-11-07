@@ -46,6 +46,8 @@ pub const IORING_SETUP_CLAMP: u32 = 1 << 4;
 pub const IORING_SETUP_ATTACH_WQ: u32 = 1 << 5;
 /// R_DISABLED: 制限適用まで無効状態で作成
 pub const IORING_SETUP_R_DISABLED: u32 = 1 << 6;
+/// 完了のたびに実行中のスレッドへ割り込まない（次のカーネル呼び出しで処理する。5.19 以降）
+pub const IORING_SETUP_COOP_TASKRUN: u32 = 1 << 8;
 
 // ====================
 // io_uring_enter フラグ
@@ -835,6 +837,14 @@ impl IoUring {
         self.enter(self.sq_pending(), 0, 0)
     }
 
+    /// 保留中の SQE があれば提出する（無ければシステムコールを呼ばない）
+    pub fn submit_pending(&self) -> io::Result<i32> {
+        match self.sq_pending() {
+            0 => Ok(0),
+            pending => self.enter(pending, 0, 0),
+        }
+    }
+
     /// 提出して最低 `n` 件の完了を待つ
     pub fn submit_and_wait(&self, n: u32) -> io::Result<i32> {
         let pending = self.sq_pending();
@@ -845,7 +855,7 @@ impl IoUring {
     }
 
     /// 未提出の SQE 数を返す
-    fn sq_pending(&self) -> u32 {
+    pub(crate) fn sq_pending(&self) -> u32 {
         unsafe {
             let head = (*self.sq_head).load(Ordering::Acquire);
             let tail = (*self.sq_tail).load(Ordering::Relaxed);

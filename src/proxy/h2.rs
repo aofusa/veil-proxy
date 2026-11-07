@@ -601,50 +601,29 @@ pub(super) type H2TaskSpawner = std::rc::Rc<
 
 /// HTTP/2 ワーカースレッド用の per-stream タスクスポーナを作成する。
 ///
-/// F-158（A-1'）: **readiness reactor バックエンドに限り** `pool.spawn()` ではなく
-/// `pool.spawn_inline()` を使う。タスク本体（`h2_request_task`）が実際に pend する
-/// await を 1 つも持たない場合（静的キャッシュヒット等）、その場でタスク自身の実 Waker で
-/// 1 回 poll し、`Poll::Ready` まで進めばエグゼキュータへ一切登録しない。これにより
-/// 「spawn → メインループへ戻る → 1 周回後にエグゼキュータがタスクを実行する」という
-/// 強制往復が 1 リクエストにつき 1 回消える。`Poll::Pending` の場合は `spawn()` と全く
-/// 同じ状態でエグゼキュータに残るため、戻り値（完了したか）はここでは無視してよい。
+/// F-158（A-1'）: `pool.spawn()` ではなく `pool.spawn_inline_with()` を使う。タスク本体
+/// （`h2_request_task`）が実際に pend する await を 1 つも持たない場合（静的キャッシュヒット等）、
+/// その場でタスク自身の実 Waker で 1 回 poll し、`Poll::Ready` まで進めばエグゼキュータへ
+/// 一切登録しない。これにより「spawn → メインループへ戻る → 1 周回後にエグゼキュータがタスクを
+/// 実行する」という強制往復が 1 リクエストにつき 1 回消える。`Poll::Pending` の場合は `spawn()` と
+/// 全く同じ状態でエグゼキュータに残るため、戻り値（完了したか）はここでは無視してよい。
 ///
-/// ## なぜ io_uring では使わないのか（実測に基づく）
+/// 効くのは往復の費用だけではない。フレームの束を読んでから全ストリームを spawn して後で実行すると、
+/// future の状態（数 KB）を全部書き終えてからもう一度読むので、多重度が高いとキャッシュから落ちる。
+/// その場で poll すれば書いた直後に走る。交互 A/B の実測:
 ///
-/// **この最適化は readiness reactor 固有のコストを消すものであり、io_uring では
-/// 逆に退行する。** 交互 A/B の実測:
+/// - FreeBSD 14.3 aarch64（kqueue）: 3B レスポンスで中央値 **+27.3%**、54KB は +0.8%（F-158）。
+/// - Linux x86_64（io_uring）: gRPC c256 m100 で 2 倍、h2 GET で 2.3 倍。命令数は変わらずサイクルが
+///   半分以下になる（F-300）。
 ///
-/// - FreeBSD 14.3 aarch64（kqueue）: 3B レスポンスで中央値 **+27.3%**
-///   （10/10 ラウンド勝ち・分布は完全分離）。54KB は +0.8% で退行なし。
-/// - Linux x86_64（io_uring）: `h2c_file` で中央値 **−4.6%**（12 ラウンド中 11 で
-///   ベースラインが勝ち）。`h2c_proxy` も −3.8%。
-///
-/// 理由は待機の実装差にある。reactor では `h2_select_readable_or_notify` が
-/// `Readable::poll` を通り、**kqueue ヒントが無いときは同期 `poll(2)` を 1 回発行する**
-/// （この `poll(2)` フォールバック自体は F-141/F-155 の実測により削除禁止。
-/// AGENTS.md 参照）。インライン初回 poll はこの往復ごと消せるため大きく効く。
-/// 一方 io_uring では同じ待機が `IORING_OP_POLL_ADD` の SQE 1 本であり、他の SQE と
-/// まとめて submit されるため**消せる往復コストがそもそも小さい**。残るのは
-/// インライン poll 側の固定費（スロット確保・Waker 構築・`EXEC_STATE` の追加借用）と
-/// SQE バッチングの乱れだけになり、差し引きで退行する。
-///
-/// **したがって io_uring 側にはこの機構を実装せず**（`runtime::uring::executor` は
-/// F-158 以前と 1 バイトも変わらない）、`veil_rt_reactor` のときだけ `spawn_inline` を
-/// 呼ぶ。AGENTS.md の「io_uring パスのロジックは変えない」「Linux io_uring 経路の
-/// 非劣化保証」の両方を満たす。
+/// io_uring では F-158 の時点では −4.6% だったので reactor 専用にしていたが、それは SQE を操作ごとに
+/// 提出していた頃の値で、提出を park へまとめた F-300 で前提が変わった。
 #[cfg(feature = "http2")]
 pub(super) fn h2_task_spawner() -> H2TaskSpawner {
     let pool = crate::runtime::TaskPool::new();
     std::rc::Rc::new(move |ctx, req_rx, resp_tx, notify| {
-        // reactor: future をプールのスロットの中で作る（値で受け渡すと要求ごとに数 KB の memcpy。B-240）
-        #[cfg(veil_rt_reactor)]
-        {
-            let _ = pool.spawn_inline_with(|| h2_request_task(ctx, req_rx, resp_tx, notify));
-        }
-        #[cfg(not(veil_rt_reactor))]
-        {
-            pool.spawn(h2_request_task(ctx, req_rx, resp_tx, notify));
-        }
+        // future をプールのスロットの中で作る（値で受け渡すと要求ごとに数 KB の memcpy。B-240）
+        let _ = pool.spawn_inline_with(|| h2_request_task(ctx, req_rx, resp_tx, notify));
     })
 }
 
@@ -765,7 +744,7 @@ pub(super) fn h2_spawn_for_request<S, V>(
         (None, None)
     };
 
-    // A-1': spawner はタスクを `spawn_inline` するため、この呼び出し自体が
+    // A-1': spawner はタスクをその場で 1 回 poll するため、この呼び出し自体が
     // `h2_request_task` を完了まで（ペンドせずに済む限り）その場で実行する可能性がある。
     // つまりタスクが Head/Body を `resp_tx` へ送出し終えるのが、`streams.insert` より
     // **前**になり得る。これは安全: `resp_rx`（受信端）はこの関数のローカル変数として

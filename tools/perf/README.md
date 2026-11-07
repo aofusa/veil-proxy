@@ -18,6 +18,7 @@
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力。**Linux ハーネスの 11 列形式専用**で、FreeBSD ネイティブ計測（8/10 列）を渡すと列位置がずれるため**明示エラーで停止する**（黙って全行 0.0 を出さない）。`#` 始まりの節見出し・列凡例・ヘッダ行は集計対象外 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能）。**`*_compression_cached` は F-169 で追加した「静的キャッシュ有効」版**で、`static_file_cache` + `open_file_cache` を有効にしないと F-169 の圧縮結果キャッシュは有効化条件を満たさず一切効かない（既存の `*_compression` はキャッシュ無効時のコストを測るため据え置き） |
 | `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化。平文 8080 で `listen 8080; http2 on;` により h2c も有効化し、veil の `listen_cleartext` と条件を揃える）。v0.8.0 で同じ仕事の相手を足した: `base`（443、TLS 静的、HTTP/3 も）・`base_proxy`（8443、TLS で受けて perf-backend へ中継、HTTP/3 も）・`base_compression`（8444、毎回 gzip）・`base_proxy_compression`（8445、中継 + gzip） |
+| `proxy_ab.py` | 2 つの `veil` を Docker なしで交互に比べる退行確認（[下の節](#プロキシ本体の交互-abproxy_abpyf-300)） |
 | `api_ab.py`・`veil-load/`・`api-app/`・`syscall_count/` | API 経路の交互 A/B（[下の節](#api-経路の交互-abapi_abpyf-295)。Docker を使わない） |
 | `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象）。公開する生データは [docs/perf/linux_suite_ab_raw.tsv](../../docs/perf/linux_suite_ab_raw.tsv) へコピーしてコミットする（サマリは [docs/perf/README.md](../../docs/perf/README.md)） |
 
@@ -408,6 +409,28 @@ python3 tools/perf/api_ab.py --summary api_ab.tsv    # 表だけ作り直す
 - 飽和に近い固定レートの p99 は回ごとに大きく揺れる（`docs/perf/` の表は 5 回の中央値）。
 - 速度の判定は **サイクル** で。命令数は下がったのにサイクルが上がることがある（フューチャの状態が接続ごとの冷たいメモリに
   載るなど。`perf stat -e instructions:u,cycles:u` を閉ループの飽和で採る）。
+
+## プロキシ本体の交互 A/B（`proxy_ab.py`、F-300）
+
+`suite_ab.sh` は 2 つのイメージで全構成を何時間も回す。ランタイムや転送の経路に手を入れたときの退行確認は、手元の 2 つの
+`veil` を直接比べる `proxy_ab.py` で足りる（Docker を使わない）。HTTP/1.1・TLS の HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3 ×
+静的配信（`/`）・上流への転送（`/p/`、上流は nginx）× 3B・54KB を、1 ケースごとに起動し直して交互に測る。
+
+```bash
+cargo build --release --features full --target-dir target-uring            # io_uring
+cargo build --release --features full,epoll --target-dir target-epoll      # epoll
+(cd tools/perf/h3load && cargo build --release)                            # HTTP/3 も測るとき
+
+python3 tools/perf/proxy_ab.py --base <旧の veil> --new target-uring/release/veil \
+    --h3load tools/perf/h3load/target/release/h3load --rounds 3 --out r.tsv
+python3 tools/perf/proxy_ab.py --base A --new B --cases '^h2c_file' --rounds 5   # 名前を正規表現で絞る
+python3 tools/perf/proxy_ab.py --summary r.tsv
+```
+
+- 既定の CPU はサーバ 0-7、負荷 8-13、上流の nginx 14,15（`--server-cpus` など）。8 コア 16 スレッドの機械の割り当てなので、
+  ほかの機械では `lscpu -e` を見て兄弟のスレッドが両側にまたがらないように変える。
+- kTLS は既定で切る。`--ktls` で両方を有効にする（`tls` モジュールが要る）。
+- 表の `wins` は同じラウンドで new が勝った回数。`errs` が 0 でない行はスループットより先に見る。
 
 ## リーク試験（`leak_check.sh`、F-185）
 

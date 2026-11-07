@@ -1227,7 +1227,7 @@ impl<F: Future<Output = ()> + 'static> TaskPool<F> {
     }
 
     /// future をプールのスロットへ格納し、その場で 1 回だけ poll する（A-1'）。
-    /// uring 版 `TaskPool::spawn_inline` と等価。健全性の根拠はそちらの doc コメント参照。
+    /// uring 版 `TaskPool::spawn_inline_with` と同じ動き（Waker と借用の規律も同じ）。
     pub fn spawn_inline(&self, future: F) -> bool {
         let slot = self.store(future);
         let pool: Rc<dyn PoolPoll> = self.inner.clone();

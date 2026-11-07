@@ -9,6 +9,9 @@
 //!   完了時に返却する（io_uring のゼロコピーモデルに合わせた設計）
 //! - `readable()` / `writable()` は POLL_ADD を使用して準備完了を待つ
 //! - ノンブロッキングソケットを使用し、libc::read/write と組み合わせて使用可能
+//! - Future は SQE を積むだけで、提出は実行器がまとめて行う（F-300）。op を持ったまま drop された
+//!   Future は `detach_op` が SQ を流すので、fd が閉じられるときに未提出の SQE は残らない
+//!   （`executor::submit_sqes` の説明を参照）。この `detach_op` を通らない drop を足さない
 
 #![warn(clippy::undocumented_unsafe_blocks)]
 
@@ -21,8 +24,8 @@ use std::task::{Context, Poll};
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::executor::{
-    alloc_op, cancel_op, detach_op, peek_op_result, remove_op, set_op_waker, submit_sqes,
-    take_op_result, with_ring, OpGuard,
+    alloc_op, cancel_op, detach_op, peek_op_result, remove_op, set_op_waker, take_op_result,
+    with_ring, OpGuard,
 };
 use crate::runtime::ring::{
     IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_POLL_ADD, IORING_OP_RECV, IORING_OP_SEND,
@@ -347,11 +350,6 @@ impl<'a> Future for Accept<'a> {
                 // 次イテレーションで再試行する）。
                 remove_op(user_data);
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
-            }
-
-            if let Err(e) = submit_sqes() {
-                remove_op(user_data);
-                return Poll::Ready(Err(e));
             }
 
             self.submitted = true;
@@ -790,13 +788,6 @@ impl Future for Connect {
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
             }
 
-            if let Err(e) = submit_sqes() {
-                // SAFETY: fd は本 Future が作った自分の所有するソケットで、submit に失敗したためここで 1 度だけ閉じる。
-                unsafe { libc::close(fd) };
-                remove_op(user_data);
-                return Poll::Ready(Err(e));
-            }
-
             self.submitted = true;
         }
 
@@ -946,13 +937,6 @@ impl Future for ConnectUnix {
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
             }
 
-            if let Err(e) = submit_sqes() {
-                // SAFETY: fd は本 Future が作った自分の所有するソケットで、submit に失敗したためここで 1 度だけ閉じる。
-                unsafe { libc::close(fd) };
-                remove_op(user_data);
-                return Poll::Ready(Err(e));
-            }
-
             self.submitted = true;
         }
 
@@ -1066,12 +1050,6 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buf));
             }
 
-            if let Err(e) = submit_sqes() {
-                remove_op(user_data);
-                let buf = this.buf.take().expect("buffer present on submit error");
-                return Poll::Ready((Err(e), buf));
-            }
-
             this.submitted = true;
         }
 
@@ -1155,11 +1133,6 @@ impl<T: IoBufMut> Future for ReadWithin<T> {
                 remove_op(user_data);
                 let buf = this.buf.take().expect("buffer present on SQ-full");
                 return Poll::Ready((Some(Err(io::Error::from(io::ErrorKind::WouldBlock))), buf));
-            }
-            if let Err(e) = submit_sqes() {
-                remove_op(user_data);
-                let buf = this.buf.take().expect("buffer present on submit error");
-                return Poll::Ready((Some(Err(e)), buf));
             }
             this.user_data = user_data;
             this.submitted = true;
@@ -1254,12 +1227,6 @@ impl<T: IoBuf> Future for WriteFuture<T> {
                 remove_op(user_data);
                 let buf = this.buf.take().expect("buffer present on SQ-full");
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buf));
-            }
-
-            if let Err(e) = submit_sqes() {
-                remove_op(user_data);
-                let buf = this.buf.take().expect("buffer present on submit error");
-                return Poll::Ready((Err(e), buf));
             }
 
             this.submitted = true;
@@ -1453,13 +1420,6 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), a, b));
             }
 
-            if let Err(e) = submit_sqes() {
-                remove_op(user_data);
-                release_sendmsg_state(this.state.take().expect("state present on submit error"));
-                let (a, b) = this.bufs.take().expect("buffers present on submit error");
-                return Poll::Ready((Err(e), a, b));
-            }
-
             this.submitted = true;
         }
 
@@ -1539,11 +1499,6 @@ impl<'a> Future for Readable<'a> {
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
             }
 
-            if let Err(e) = submit_sqes() {
-                remove_op(user_data);
-                return Poll::Ready(Err(e));
-            }
-
             self.submitted = true;
         }
 
@@ -1609,11 +1564,6 @@ impl<'a> Future for Writable<'a> {
                 // 失敗する（submitted を立てないためハングしない）。
                 remove_op(user_data);
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
-            }
-
-            if let Err(e) = submit_sqes() {
-                remove_op(user_data);
-                return Poll::Ready(Err(e));
             }
 
             self.submitted = true;
@@ -1684,11 +1634,6 @@ impl Future for ReadableFd {
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
             }
 
-            if let Err(e) = submit_sqes() {
-                remove_op(user_data);
-                return Poll::Ready(Err(e));
-            }
-
             self.submitted = true;
         }
 
@@ -1751,11 +1696,6 @@ impl Future for WritableFd {
                 // 失敗する（submitted を立てないためハングしない）。
                 remove_op(user_data);
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
-            }
-
-            if let Err(e) = submit_sqes() {
-                remove_op(user_data);
-                return Poll::Ready(Err(e));
             }
 
             self.submitted = true;
@@ -1889,6 +1829,56 @@ mod tests {
 
             assert_eq!(handle.join().expect("join"), expected);
         }
+    }
+
+    /// F-300: 積んだだけの SQE を持つ Future を drop すると、その場で SQ が流れる（この後に fd を閉じても、
+    /// 閉じた番号へ提出しない）。
+    #[test]
+    fn test_f300_dropping_an_op_flushes_the_queue() {
+        if !io_uring_available() {
+            eprintln!("io_uring unavailable; skipping test_f300_dropping_an_op_flushes_the_queue");
+            return;
+        }
+        let (addr, handle) = spawn_sink_server();
+        crate::runtime::block_on(async move {
+            let stream = TcpStream::connect(addr).await.expect("connect");
+            let mut read = Box::pin(stream.read(vec![0u8; 16]));
+            std::future::poll_fn(|cx| {
+                assert!(read.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(with_ring(|r| r.sq_pending()), 1, "the op is only queued");
+            drop(read);
+            assert_eq!(with_ring(|r| r.sq_pending()), 0, "dropping it flushes");
+        });
+        handle.join().expect("join");
+    }
+
+    /// F-300: 自分を起こし続けるタスクがいても、積まれた SQE は周回の途中で提出される。
+    #[test]
+    fn test_f300_a_spinning_task_does_not_hold_back_sqes() {
+        if !io_uring_available() {
+            eprintln!(
+                "io_uring unavailable; skipping test_f300_a_spinning_task_does_not_hold_back_sqes"
+            );
+            return;
+        }
+        let (addr, handle) = spawn_sink_server();
+        crate::runtime::block_on(async move {
+            let stream = TcpStream::connect(addr).await.expect("connect");
+            let mut read = Box::pin(stream.read(vec![0u8; 16]));
+            std::future::poll_fn(|cx| {
+                assert!(read.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            for _ in 0..crate::runtime::executor::SUBMIT_INTERVAL {
+                crate::runtime::executor::yield_now().await;
+            }
+            assert_eq!(with_ring(|r| r.sq_pending()), 0);
+        });
+        handle.join().expect("join");
     }
 
     /// F-59: ボディが空でも SENDMSG（iovec 1 本）で送出できること。

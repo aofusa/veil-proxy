@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::runtime::executor::{
-    alloc_op, detach_op, remove_op, set_op_waker, submit_sqes, take_op_result, with_ring, OpGuard,
+    alloc_op, detach_op, remove_op, set_op_waker, take_op_result, with_ring, OpGuard,
 };
 use crate::runtime::ring::IORING_OP_SPLICE;
 
@@ -139,10 +139,6 @@ impl Future for SpliceFuture {
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
             }
 
-            if let Err(e) = submit_sqes() {
-                remove_op(user_data);
-                return Poll::Ready(Err(e));
-            }
             self.submitted = true;
         }
 

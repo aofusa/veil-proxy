@@ -22,7 +22,7 @@ use crate::runtime::ring::{
     IoUring, IoUringCqe, KernelTimespec, IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL, IORING_OP_CLOSE,
     IORING_OP_CONNECT, IORING_OP_NOP, IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE, IORING_OP_RECV,
     IORING_OP_RECVMSG, IORING_OP_SEND, IORING_OP_SENDMSG, IORING_OP_SPLICE, IORING_OP_TIMEOUT,
-    IORING_SETUP_R_DISABLED,
+    IORING_SETUP_COOP_TASKRUN, IORING_SETUP_R_DISABLED,
 };
 
 // ====================
@@ -125,6 +125,11 @@ const CANCEL_SENTINEL_USER_DATA: u64 = u64::MAX;
 
 /// 事前確保する in-flight op スロット数（典型的な同時 in-flight op 数を見込む）。
 const OP_TABLE_PREALLOC: usize = 256;
+
+/// 実行器が SQE を提出する間隔（タスクの poll の回数）。提出の本体は park の `submit_and_wait` で、これは
+/// タスクが自分を起こし続けて park へ戻らないときの保険（F-300）。周回の途中の提出は費用になる（束ねるほど
+/// 相手の起床がまとまる。8 回ごとだと 30% 遅い）ので、普段の周回の長さより十分大きくする。
+pub(crate) const SUBMIT_INTERVAL: u32 = 1024;
 
 /// Multishot op の完了キュー（F-124: `IORING_RECV_MULTISHOT`）。
 ///
@@ -726,7 +731,15 @@ pub fn init_ring(entries: u32, flags: u32) -> std::io::Result<()> {
     // リングにのみ適用できる。「生成（R_DISABLED）→ 制限登録 → ENABLE_RINGS で有効化」の
     // 順で行う。R_DISABLED 自体が未対応の古いカーネル（<5.10）では制限なしの通常リングへ
     // フォールバックする。
-    let ring = match IoUring::new(entries, flags | IORING_SETUP_R_DISABLED) {
+    //
+    // F-300: リングはスレッドごとで、完了は park の `io_uring_enter` で受け取るので、完了のたびに割り込ませる
+    // （IPI）必要が無い。未対応のカーネル（<5.19）と SQPOLL では EINVAL になるので付けずに作り直す。
+    let ring = match IoUring::new(
+        entries,
+        flags | IORING_SETUP_R_DISABLED | IORING_SETUP_COOP_TASKRUN,
+    )
+    .or_else(|_| IoUring::new(entries, flags | IORING_SETUP_R_DISABLED))
+    {
         Ok(ring) => {
             match ring.apply_restrictions(PROXY_ALLOWED_OPCODES) {
                 Ok(()) => {
@@ -1045,11 +1058,27 @@ fn take_armed_timer_result_if_fired() {
     }
 }
 
-/// SQE を提出する
+/// SQE を今すぐ提出する。
+///
+/// TCP の I/O Future はこれを呼ばない（F-300）。SQE を積むだけにして、park（`submit_and_wait`）と
+/// [`SUBMIT_INTERVAL`] ごとの提出でまとめる。呼ぶのは取り消しと、自分で束ねて積む UDP。
+///
+/// **未提出の SQE を持ったまま fd を閉じさせない。** カーネルが fd を引くのは提出のときなので、閉じた後に
+/// 提出すると、別のスレッドが受け取った同じ番号の接続へ送ってしまう。op を持つ Future の drop は必ず
+/// `detach_op` を通り、そこの取り消しが SQ を全部流すので、fd の持ち主が閉じる前に流れている。
 pub fn submit_sqes() -> std::io::Result<()> {
     match with_ring(|ring| ring.submit()) {
         Ok(_) => Ok(()),
         Err(e) => submit_enter_error(e),
+    }
+}
+
+/// 未提出の SQE があれば提出する。実行器の周回の途中から呼ぶ（失敗は次の park が受け取る）。
+fn flush_sqes() {
+    // リングが無い（実行器だけの単体テスト）ときは積まれた SQE も無い
+    let res = RING.with(|r| r.borrow().as_ref().map(|ring| ring.submit_pending()));
+    if let Some(Err(e)) = res {
+        let _ = submit_enter_error(e);
     }
 }
 
@@ -1200,6 +1229,27 @@ impl ExecutorState {
         self.ready.push_back((index, generation));
     }
 
+    /// タスク本体を新しいスロットへ格納するが、ready キューへは積まない。
+    ///
+    /// 呼び出し側（`spawn_body_and_poll`）がこの直後に自前で 1 回 poll する。
+    fn reserve_slot(&mut self, body: TaskBody) -> (usize, u32) {
+        let index = if let Some(i) = self.free.pop() {
+            let slot = &mut self.slots[i];
+            slot.body = Some(body);
+            slot.scheduled = false;
+            i
+        } else {
+            let i = self.slots.len();
+            self.slots.push(TaskSlot {
+                body: Some(body),
+                generation: 0,
+                scheduled: false,
+            });
+            i
+        };
+        (index, self.slots[index].generation)
+    }
+
     /// index/generation のタスクを ready キューへ積む（既に積まれていれば何もしない）。
     fn schedule(&mut self, index: usize, generation: u32) {
         if let Some(slot) = self.slots.get_mut(index) {
@@ -1267,6 +1317,46 @@ fn make_waker(index: usize, generation: u32) -> Waker {
     unsafe { Waker::from_raw(raw) }
 }
 
+/// タスクをスラブへ登録し、その場でタスク自身の Waker を使って 1 回だけ poll する。
+///
+/// `Poll::Ready` まで進めば `true`（ready キューに一度も積まれない）、`Poll::Pending` なら `false`
+/// （通常の `spawn` と同じ状態でエグゼキュータに残る）を返す。ポーリングの間は `EXEC_STATE` を借用しない
+/// （タスクの中で別のタスクを起こしたり spawn したりできる）。タスクの poll の中から呼んでよい
+/// （スラブの本体は `run_ready_tasks` と同じく take してあり、再入しない）。
+fn spawn_body_and_poll(body: TaskBody) -> bool {
+    let (index, generation) = EXEC_STATE.with(|s| s.borrow_mut().reserve_slot(body));
+    let mut body = EXEC_STATE
+        .with(|s| s.borrow_mut().slots[index].body.take())
+        .expect("slot has no body right after reserve_slot");
+
+    let waker = make_waker(index, generation);
+    let mut cx = Context::from_waker(&waker);
+    let poll = match &mut body {
+        TaskBody::Boxed(f) => f.as_mut().poll(&mut cx),
+        TaskBody::Pooled { pool, slot } => pool.poll_slot(*slot, &mut cx),
+    };
+
+    EXEC_STATE.with(|s| {
+        let mut st = s.borrow_mut();
+        match st.slots.get_mut(index) {
+            Some(slot) if slot.generation == generation => match poll {
+                Poll::Pending => {
+                    slot.body = Some(body);
+                    false
+                }
+                Poll::Ready(()) => {
+                    slot.generation = slot.generation.wrapping_add(1);
+                    slot.scheduled = false;
+                    st.free.push(index);
+                    true
+                }
+            },
+            // 単一スレッド・直列 poll のため通常起き得ない（run_ready_tasks と同じ前提）。
+            _ => true,
+        }
+    })
+}
+
 /// シングルスレッドエグゼキュータのハンドル（状態はスレッドローカル `EXEC_STATE`）。
 ///
 /// 旧実装の `Arc<Mutex<TaskQueue>>` 共有は不要になり、ハンドルは ZST。`spawn()` も
@@ -1296,7 +1386,15 @@ impl Executor {
     /// future 内からの `spawn()` や自身の `wake()`（いずれも `EXEC_STATE` を再 borrow）が
     /// 安全に行える。
     fn run_ready_tasks(&self) {
+        let mut polled = 0u32;
         loop {
+            // 積まれた SQE を待たせすぎない（タスクが自分を起こし続けると park へ戻らない）
+            polled += 1;
+            if polled == SUBMIT_INTERVAL {
+                polled = 0;
+                flush_sqes();
+            }
+
             // 次の (index, generation) を取り出す（borrow は最小限）。
             let next = EXEC_STATE.with(|s| s.borrow_mut().ready.pop_front());
             let (index, generation) = match next {
@@ -1544,39 +1642,79 @@ impl<F: Future<Output = ()> + 'static> TaskPool<F> {
         }
     }
 
-    /// future をプールのスロットへ格納し、エグゼキュータのタスクとして起動する。
-    pub fn spawn(&self, future: F) {
-        let slot = {
-            let mut free = self.inner.free.borrow_mut();
-            match free.pop() {
-                Some(s) => s,
-                None => {
-                    // 新チャンクを確保し、先頭以外を free-list へ積む。
-                    // 注意: 巨大な async fn Future ではチャンク（POOL_CHUNK × size_of::<F>()）が
-                    // 数 MB になり得るため、スタック経由の配列構築（Box::new([..; N])）は
-                    // スタックオーバーフローを起こす。Vec 経由でヒープ上に直接構築する。
-                    let mut chunks = self.inner.chunks.borrow_mut();
-                    let base = (chunks.len() * POOL_CHUNK) as u32;
-                    let chunk: Box<[RefCell<Option<F>>]> = (0..POOL_CHUNK)
-                        .map(|_| RefCell::new(None))
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice();
-                    chunks.push(chunk);
-                    for i in (1..POOL_CHUNK as u32).rev() {
-                        free.push(base + i);
-                    }
-                    base
+    /// 空きスロットを 1 つ取り出す（足りなければチャンクを足す）。
+    fn alloc_slot(&self) -> u32 {
+        let mut free = self.inner.free.borrow_mut();
+        match free.pop() {
+            Some(s) => s,
+            None => {
+                // 新チャンクを確保し、先頭以外を free-list へ積む。
+                // 注意: 巨大な async fn Future ではチャンク（POOL_CHUNK × size_of::<F>()）が
+                // 数 MB になり得るため、スタック経由の配列構築（Box::new([..; N])）は
+                // スタックオーバーフローを起こす。Vec 経由でヒープ上に直接構築する。
+                let mut chunks = self.inner.chunks.borrow_mut();
+                let base = (chunks.len() * POOL_CHUNK) as u32;
+                let chunk: Box<[RefCell<Option<F>>]> = (0..POOL_CHUNK)
+                    .map(|_| RefCell::new(None))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                chunks.push(chunk);
+                for i in (1..POOL_CHUNK as u32).rev() {
+                    free.push(base + i);
                 }
+                base
             }
-        };
+        }
+    }
+
+    /// `make` が作る future を空きスロットへ直接書き込み、スロット index を返す。
+    ///
+    /// 要求ごとの future は数 KB〜十数 KB あり、値で受け渡すと `memcpy` が要求ごとに何回も走る。
+    /// 作る関数を呼び出しとして残し、戻り値の領域をスロットそのものにする（reactor の `store_with` と同じ）。
+    fn store_with(&self, make: impl FnOnce() -> F) -> u32 {
+        let slot = self.alloc_slot();
         {
             let chunks = self.inner.chunks.borrow();
             let cell = &chunks[slot as usize / POOL_CHUNK][slot as usize % POOL_CHUNK];
-            *cell.borrow_mut() = Some(future);
+            write_empty_slot(&mut cell.borrow_mut(), make);
         }
+        slot
+    }
+
+    /// future をプールのスロットへ格納し、エグゼキュータのタスクとして起動する。
+    pub fn spawn(&self, future: F) {
+        let slot = self.store_with(move || future);
         let pool: Rc<dyn PoolPoll> = self.inner.clone();
         EXEC_STATE.with(|s| s.borrow_mut().spawn_body(TaskBody::Pooled { pool, slot }));
     }
+
+    /// `make` が作る future をスロットの中に作り、その場で 1 回だけ poll する。
+    ///
+    /// `Poll::Ready` まで進めば `true`、`Poll::Pending` なら `false`（`spawn` と同じ状態で残る）を返す。
+    /// タスクの poll の中から呼べる。
+    pub fn spawn_inline_with(&self, make: impl FnOnce() -> F) -> bool {
+        let slot = self.store_with(make);
+        let pool: Rc<dyn PoolPoll> = self.inner.clone();
+        spawn_body_and_poll(TaskBody::Pooled { pool, slot })
+    }
+}
+
+/// 空きスロット（常に `None`）へ `make()` の結果を書く。
+///
+/// `construct` を呼び出しのまま残すと、その戻り値の一時領域から `dst` への `memcpy` を LLVM が消し、
+/// `dst` へ直接作らせる（call slot optimization）。`dst` は `&mut` の引数なので書ける大きさと
+/// 別名が無いことが分かる。古い値の drop を挟むと消えないので `ptr::write` で書く。
+#[inline(never)]
+fn write_empty_slot<F, M: FnOnce() -> F>(dst: &mut Option<F>, make: M) {
+    debug_assert!(dst.is_none(), "pool slot reused before release");
+    // SAFETY: 空きスロットは解放時（`poll_slot`・`drop_slot`）と作成時に `None` にしてあり、
+    // 上書きで drop し損なう値は無い。`dst` は有効な `&mut`。
+    unsafe { std::ptr::write(dst, Some(construct(make))) }
+}
+
+#[inline(never)]
+fn construct<F, M: FnOnce() -> F>(make: M) -> F {
+    make()
 }
 
 impl<F: Future<Output = ()> + 'static> Default for TaskPool<F> {
@@ -1992,6 +2130,78 @@ mod executor_tests {
                 let need = 100usize.div_ceil(POOL_CHUNK);
                 assert_eq!(pool.inner.chunks.borrow().len(), need);
                 assert_eq!(pool.inner.free.borrow().len(), need * POOL_CHUNK);
+            }
+        });
+    }
+
+    #[test]
+    fn task_pool_inline_finishes_without_being_queued() {
+        // 一度も pend しないタスクはその場で完了し、実行キューにもスロットにも残らない
+        init_executor();
+        let exec = current_executor();
+        exec.block_on(async move {
+            let pool = TaskPool::new();
+            for _ in 0..100 {
+                let done = Rc::new(Cell::new(false));
+                let d = done.clone();
+                let finished = pool.spawn_inline_with(move || async move { d.set(true) });
+                assert!(finished);
+                assert!(done.get());
+                assert!(EXEC_STATE.with(|s| s.borrow().ready.is_empty()));
+            }
+            assert_eq!(pool.inner.chunks.borrow().len(), 1);
+            assert_eq!(pool.inner.free.borrow().len(), POOL_CHUNK);
+        });
+    }
+
+    #[test]
+    fn task_pool_inline_pending_continues_on_the_executor() {
+        // pend したタスクは `spawn` と同じ状態で残り、自分の Waker で続きが動く
+        init_executor();
+        let exec = current_executor();
+        exec.block_on(async move {
+            let pool = TaskPool::new();
+            let steps = Rc::new(Cell::new(0usize));
+            let s = steps.clone();
+            let finished = pool.spawn_inline_with(move || async move {
+                s.set(1);
+                yield_once().await;
+                s.set(2);
+            });
+            assert!(!finished);
+            assert_eq!(steps.get(), 1);
+            while steps.get() < 2 {
+                yield_once().await;
+            }
+        });
+    }
+
+    #[test]
+    fn task_pool_inline_can_spawn_from_inside_a_task() {
+        // 接続のタスクの poll の中から呼ぶのが本来の使い方。入れ子でスロットが増えても壊れない
+        init_executor();
+        let exec = current_executor();
+        exec.block_on(async move {
+            type Task = Pin<Box<dyn Future<Output = ()>>>;
+            let pool: TaskPool<Task> = TaskPool::new();
+            let count = Rc::new(Cell::new(0usize));
+            let (inner_pool, c) = (pool.clone(), count.clone());
+            let finished = pool.spawn_inline_with(move || {
+                Box::pin(async move {
+                    // 最初のチャンクを超えるだけ入れ子で起動する
+                    for _ in 0..POOL_CHUNK * 2 {
+                        let c2 = c.clone();
+                        let task: Task = Box::pin(async move {
+                            yield_once().await;
+                            c2.set(c2.get() + 1);
+                        });
+                        assert!(!inner_pool.spawn_inline_with(move || task));
+                    }
+                })
+            });
+            assert!(finished);
+            while count.get() < POOL_CHUNK * 2 {
+                yield_once().await;
             }
         });
     }

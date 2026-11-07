@@ -125,7 +125,12 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - HTTP/2 の要求は、HEADERS の直後に END_STREAM 付き DATA の全量が読み取りバッファに見えていれば溜める経路で起動する（本文の
   チャネル・中継のタスクが消える。見るだけで読み進めない。分割して届いたら従来のストリーミング。F-298）。トレーラは `write_buf` に積む
   （別に `write_all` すると応答ごとに `send(2)` が 2 本になる。B-333）。
-- HTTP/2 のインライン初回 poll（`spawn_inline`）は reactor 専用。io_uring 側の executor は変えない（F-158）。
+- HTTP/2 のストリームはプールのスロットの中で作ってその場で 1 回 poll する（`spawn_inline_with`。両バックエンド。全部 spawn してから実行すると
+  future の状態がキャッシュから落ちて、命令数は同じでサイクルが倍になる。F-158/F-300）。
+- io_uring の TCP・splice の Future は SQE を積むだけで、提出は実行器の park の `submit_and_wait` がまとめて行う（`submit_sqes()` を Future で呼ばない。
+  操作ごとの提出は HTTP/1.1 で −40%）。カーネルは提出のときに fd を解決するので、未提出の SQE は生きている Future のものだけにする。実行中の
+  Future の drop は必ず `detach_op` を通す（`submit_cancel` が SQ を流すので fd が閉じられる前にカーネルへ渡る）。Future を stream より長く生かさない。
+  周回の途中の提出（`SUBMIT_INTERVAL`）は保険で、小さくすると遅くなる。UDP は束にして即時に提出する。リングは `COOP_TASKRUN` で作る（古いカーネルは付けずに作り直す。F-300）。
 - io_uring で I/O ごとにカーネルタイマーを張らない。`runtime::uring::timer` はユーザ空間の最小ヒープで、
   カーネルの `IORING_OP_TIMEOUT` は park 直前に 1 本だけ（B-72）。キャンセル済みエントリは生存数に対して
   増えすぎたら圧縮する（遅延パージだけだとヒープが「要求レート × タイムアウト」まで膨らむ。reactor も同じ。B-117）。
