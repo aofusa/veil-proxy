@@ -4,7 +4,7 @@
 //! same bytes. Responses are not HPACK-decoded: a stream finishes on `END_STREAM` and `:status: 200` is recognized
 //! from the indexed form the server sends; correctness is what the E2E tests are for.
 
-use crate::{connect_nb, now_ns, Args, Mode, Report, Schedule, Shared};
+use crate::{connect_nb, now_ns, wait_events, Args, Mode, Report, Schedule, Shared, IDLE_WAIT_NS};
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -206,6 +206,7 @@ pub fn run(
     let mut rr = 0usize;
     let mut events: Vec<libc::epoll_event> = vec![libc::epoll_event { events: 0, u64: 0 }; 1024];
     while !s.stop.load(Ordering::Relaxed) {
+        let mut wait_ns = IDLE_WAIT_NS;
         if fixed && !conns.is_empty() {
             let now = now_ns(sched_base);
             while sched.due_ns() <= now {
@@ -225,10 +226,12 @@ pub fn run(
                 start_stream(&mut conns[i], &blocks, &body, due, slots);
                 flush(&mut conns[i]);
             }
+            let now = now_ns(sched_base);
+            if sched.due_ns() > now {
+                wait_ns = sched.due_ns() - now;
+            }
         }
-        let wait = if fixed { 0 } else { 100 };
-        // SAFETY: events は有効な領域
-        let n = unsafe { libc::epoll_wait(ep, events.as_mut_ptr(), events.len() as i32, wait) };
+        let n = wait_events(ep, &mut events, wait_ns);
         if n < 0 {
             continue;
         }

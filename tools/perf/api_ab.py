@@ -175,6 +175,10 @@ def scenario_grpc(args, trees, rnd, writer):
                 run_row(args, srv, name, rnd, "grpc-c256-m100", grpc + ["-c", "256", "-m", "100"], writer)
                 run_row(args, srv, name, rnd, "grpc-c64-m10", grpc + ["-c", "64", "-m", "10"], writer)
                 run_row(args, srv, name, rnd, "grpc-c256-m1", grpc + ["-c", "256", "-m", "1"], writer)
+                # 固定レート: 閉ループでは遅延がスループットの裏返しになるので、到着を固定して分布を見る
+                for r in args.grpc_rates:
+                    run_row(args, srv, name, rnd, f"grpc-rate-{r // 1000}k",
+                            grpc + ["-c", "256", "-m", "100", "--rate", str(r)], writer)
                 run_row(args, srv, name, rnd, "h2-c256-m100",
                         ["--mode", "h2", "--path", "/baseline11?a=1&b=2", "-c", "256", "-m", "100"], writer)
             finally:
@@ -249,6 +253,7 @@ def main():
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--rates", default="200000,300000,400000", help="fixed rates of the latency scenario")
+    p.add_argument("--grpc-rates", default="100000,200000,300000", help="fixed rates of the grpc scenario")
     p.add_argument("--py-variants", default="offload,inline,async")
     p.add_argument("--py-threads", default="2,4")
     p.add_argument("--no-access-log", action="store_true", help="python scenario: turn the access log off")
@@ -260,6 +265,7 @@ def main():
         summarize(args.summary)
         return
     args.rates = [int(x) for x in args.rates.split(",") if x]
+    args.grpc_rates = [int(x) for x in args.grpc_rates.split(",") if x]
     args.py_variants = [x for x in args.py_variants.split(",") if x]
     args.py_threads = [int(x) for x in args.py_threads.split(",") if x]
     args.load = args.load or str(Path(args.new) / "tools/perf/veil-load/target/release/veil-load")

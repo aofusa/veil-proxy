@@ -1,6 +1,6 @@
 //! HTTP/1.1 client loop (closed-loop, pipelined or fixed rate).
 
-use crate::{connect_nb, now_ns, Args, Report, Schedule, Shared};
+use crate::{connect_nb, now_ns, wait_events, Args, Report, Schedule, Shared, IDLE_WAIT_NS};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
@@ -187,7 +187,9 @@ pub fn run(
     let per_thread = a.rate / a.threads as f64;
     let mut sched = Schedule::new(per_thread.max(1.0), Instant::now());
     let sched_base = sched.start;
-    let mut free: Vec<usize> = Vec::with_capacity(conns.len());
+    // 空き接続は FIFO で回す。LIFO だと同じ数本だけが温まり続けて、残りの接続に要求が届かない
+    // （接続数を増やしても負荷の形が変わらず、外部の計測で見える頭打ちを再現できなかった）
+    let mut free: VecDeque<usize> = VecDeque::with_capacity(conns.len());
     if fixed {
         free.extend(0..conns.len());
     } else {
@@ -210,7 +212,7 @@ pub fn run(
         if fixed {
             let now = now_ns(sched_base);
             while sched.due_ns() <= now {
-                let Some(i) = free.pop() else { break };
+                let Some(i) = free.pop_front() else { break };
                 let due = sched.due_ns();
                 sched.next += 1;
                 let lag = now - due;
@@ -226,9 +228,12 @@ pub fn run(
                 }
             }
         }
-        let wait = if fixed { 0 } else { 100 };
-        // SAFETY: events は有効な領域
-        let n = unsafe { libc::epoll_wait(ep, events.as_mut_ptr(), events.len() as i32, wait) };
+        let wait_ns = if fixed && !free.is_empty() {
+            sched.due_ns().saturating_sub(now_ns(sched_base))
+        } else {
+            IDLE_WAIT_NS
+        };
+        let n = wait_events(ep, &mut events, wait_ns);
         if n < 0 {
             continue;
         }
@@ -302,7 +307,7 @@ pub fn run(
                 }
                 if fixed {
                     if c.inflight.is_empty() {
-                        free.push(idx);
+                        free.push_back(idx);
                     }
                 } else {
                     let r = &reqs[c.next];

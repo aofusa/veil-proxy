@@ -202,6 +202,33 @@ pub fn now_ns(base: Instant) -> u64 {
     base.elapsed().as_nanos() as u64
 }
 
+/// How long a closed-loop thread (or a fixed-rate thread with nothing left to send) waits for events.
+pub const IDLE_WAIT_NS: u64 = 100_000_000;
+
+/// Waits for events for at most `timeout_ns` (`epoll_wait` has only millisecond resolution, and two requests of
+/// one thread are microseconds apart).
+///
+/// 固定レートも次の予定まで眠る。回し続けると、ループバックで相手のスレッドを起こす費用がサーバの `send` から
+/// 消えて（システム時間が半分になる）、眠る普通のクライアントを相手にした計測より大幅に軽く見える
+pub fn wait_events(ep: RawFd, events: &mut [libc::epoll_event], timeout_ns: u64) -> i32 {
+    let ts = libc::timespec {
+        tv_sec: (timeout_ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (timeout_ns % 1_000_000_000) as _,
+    };
+    // SAFETY: events と ts は呼び出しの間有効な領域で、シグナルマスクは渡さない
+    unsafe {
+        libc::syscall(
+            libc::SYS_epoll_pwait2,
+            ep,
+            events.as_mut_ptr(),
+            events.len() as libc::c_int,
+            &ts as *const libc::timespec,
+            std::ptr::null::<libc::sigset_t>(),
+            0usize,
+        ) as i32
+    }
+}
+
 fn main() {
     let args = parse_args();
     let addr: std::net::SocketAddr = {
