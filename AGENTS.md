@@ -122,6 +122,9 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - HTTP/2・HTTP/3 の静的配信は `static_file_cache` と `open_file_cache` をセットで有効にして初めて offload ゼロになる（F-157）。
 - FreeBSD の平文 h2c は、静的コンテンツキャッシュの本体（共有メモリ。`cache::shm`）の DATA を `sendfile(2)` + `sf_hdtr`
   で送る（`Http2Connection::enable_zero_copy` は平文の h2c のリスナーだけで呼ぶ。TLS で呼ぶと平文漏洩。F-240）。
+- HTTP/2 の要求は、HEADERS の直後に END_STREAM 付き DATA の全量が読み取りバッファに見えていれば溜める経路で起動する（本文の
+  チャネル・中継のタスクが消える。見るだけで読み進めない。分割して届いたら従来のストリーミング。F-298）。トレーラは `write_buf` に積む
+  （別に `write_all` すると応答ごとに `send(2)` が 2 本になる。B-333）。
 - HTTP/2 のインライン初回 poll（`spawn_inline`）は reactor 専用。io_uring 側の executor は変えない（F-158）。
 - io_uring で I/O ごとにカーネルタイマーを張らない。`runtime::uring::timer` はユーザ空間の最小ヒープで、
   カーネルの `IORING_OP_TIMEOUT` は park 直前に 1 本だけ（B-72）。キャンセル済みエントリは生存数に対して
@@ -130,6 +133,11 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - HTTP/2 レスポンスヘッダは `Vec<(Bytes, Bytes)>`（F-165）。per-stream 固定費は接続あたり 1 回で済まないか先に考える（F-162）。
 - `config::load_backend` はリクエストごとに呼ばれる。ルート単位の派生値は設定ロード時に `Route` の
   `#[serde(skip)]` フィールドへ解決し、ホットパスは `Arc` clone のみ（F-148/F-159、B-64）。
+- `CURRENT_CONFIG.load()` は 1 回で 100 命令を超える。HTTP/1.1 の要求処理では 1 回だけ読み、`resolve_route_in` へ渡す。
+  「機能が有効か」だけを見る値は、設定を保存する箇所の隣で静的な値へ写す（`set_access_log_enabled` 等。F-297）。
+- 要求ごとの `async fn` で `await` をまたぐ局所変数はフューチャの状態になり、接続ごとの冷たいメモリに載る。ヘッダ解析の作業用配列の
+  ような大きなものは同期関数へ切り出す（`proxy::h1::parse_request_head`）。`handle_api_handler` の `Box::pin` は外さない
+  （ワーカーの中で温かいブロックを回せる。外すと命令数は減るがサイクルが増える。F-297）。
 - UDS バックエンドの接続先表記は `ProxyTarget::conn_addr()` が唯一の入口（TCP では従来の `host:port` と 1 バイトも
   変えない）。同期プローブは `upstream::connect_probe`（F-170）。
 - 上流のプール接続が応答の前に切れていたら、本文受信済みの冪等な要求だけ新しい接続で 1 回再送する（F-177）。
@@ -144,6 +152,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   `forget_stale_fd` で古い記録を消す。タスクは 1 回の poll で I/O を `COOP_BUDGET` までしか進めず、実行器は `EVENT_INTERVAL` ごとに
   poller を見る（速い相手の接続が他を飢えさせない。B-332）。kqueue の readiness ヒントは維持し、ヒントが無いときの `poll(2)` フォールバックを消さない（F-141）。
 - fd ごとの待機者は `WakerSlot`（F-166）。accept は `accept_batch` で 1 周回に複数（reactor のみ。F-155）。
+- `block_on` は poller を作り直し、タスクは `block_on` をまたいで残らない。fd 表も一緒に空にする（`reset_fd_table`。「武装済み」の
+  記録が残ると `epoll_ctl` を呼ばずに永久に待つ。F-297）。
 - 実行器の poller の待ち時間はタイマーまでの時間を切り捨てない（kqueue はナノ秒、epoll・WSAPoll はミリ秒へ切り上げ。
   切り捨てると 1ms 未満の先のタイマーで空回りする。B-152）。
 - Windows の WSAPoll はローカル `shutdown` を通知しないので、`shutdown` 時に読み取り待機者を起こす（B-88）。
@@ -200,6 +210,14 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   ルート注入・具体性ソート・衝突検査）。リクエスト時にレジストリを引かない（`Backend::Handler` に解決済みの `Arc`）。
 - ハンドラ・tokio の完了は `runtime::offload::await_completion`（結果スロット + 通知 fd）で受ける。スレッド越しに Waker を呼ばない。
   ブロッキングなハンドラ（同期 fn・C・Python）はハンドラ専用プール（`offload_handler`）で動かし、FS 用プールを使わない。
+- 完了の受け口はワーカーごとに 1 つ（`offload::Inbox`）。通知 fd を叩くのは前回の取り出しの後の最初の 1 件だけで、常駐の 1 タスクが
+  積まれた分の Waker を呼ぶ。`offload` の通知 fd と分ける（`offload` の待機はシグナルを読み捨てる）。`WakeFlag` を待てるのは 1 タスクだけ。
+  常駐タスクの「動いている」印を下ろす guard は `async` の外で作る（一度も poll されずに捨てられると中の guard は作られない。F-299）。
+- Python のハンドラは `crates/veil-python/src/lane.rs` のスレッドで動かす。走者 1 本が GIL を握ったまま続けて処理し、控え 1 本が GIL を
+  待ち、残りは眠る（全スレッドに GIL を奪い合わせない）。状態のロックを握ったまま GIL を待たない。スレッド状態は残したままにして
+  （要求ごとの作り直しは `mmap`・`munmap` を伴う。B-334）、要求は毎回新しい `contextvars.Context` で呼ぶ（F-299）。
+- 応答の br は本文の全量を 1 回で渡す（`compress_stream`）。`BrotliCompress` は 8 MiB のリングバッファを `mmap` する（B-331）。
+  ライブラリの既定の順は gzip → br（既定の品質で gzip の方が速くて同じ大きさ。F-296）。
 - VDS・ACME の通信は専用スレッドの `ctrl_http`（ブロッキング）で行い、データプレーンに触れない。ACME の HTTP-01 は専用リスナー。
 - crates/（veil-macros・veil-capi・veil-python）はワークスペースメンバー。Dockerfile の cacher 段と `.dockerignore` に `crates/`・`benches/` が要る。
 - Kubernetes の Service に `appProtocol` を付けない（Linkerd は `http` を HTTP/1.1 固定と解釈し h2c が壊れる。F-196）。
@@ -241,6 +259,10 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - 蓄積するコストは定常状態で測る（`READ_TIMEOUT` を超える持続負荷の後）。allocs/req の削減とスループット改善は別の主張。
 - ベースラインは `git worktree` で対象コミットを取り出してビルドする（`docker build` は作業ツリーをコピーする）。
 - errors 列が跳ねている行はスループットより先に見る（0 rps は「測れていない」可能性）。
+- 速さの判定はサイクルと rps で行う。命令数は下がっても速くなるとは限らない（F-297）。フューチャの大きさを出す一時的なパッチを入れた
+  ビルドは計測に使わない（要求ごとに +3,900 サイクルになった）。
+- ループバックではサーバの `send(2)` が相手の受信と起床の費用を払う。負荷ツールが回り続ける（`epoll_wait(0)`）とこの費用が消えて
+  サーバのシステム時間が半分になるので、固定レートは次の予定まで眠り、全接続を順に使う（`tools/perf/veil-load`。F-295）。
 - `[profile.release]` は cargo 既定のまま。配布は `[profile.dist]`（fat LTO）。`panic = "abort"` は禁止（F-147）。
 
 ---
@@ -329,6 +351,6 @@ VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の
 | `third_party/quinn-udp/` | テスト用 HTTP/3 クライアントの quinn-udp 0.5.14 の vendoring（NetBSD/aarch64 の CMSG アラインメント。B-62/F-176） |
 | `docker/` | コンテナイメージ・Windows/macOS クロスビルド用 Dockerfile・共有アセット |
 | `packaging/` | 配布物のビルド（[packaging/README.md](packaging/README.md)） |
-| `tools/perf/` | nginx 比較の性能計測ハーネス |
+| `tools/perf/` | nginx 比較の性能計測ハーネス、API 経路の交互 A/B（`api_ab.py`・`veil-load/`・`api-app/`） |
 | `tools/container_security/` | ファジング・カオス・h2spec/h3spec・セキュリティスキャン |
 | `tools/qemu/` | BSD / Linux aarch64 の VM でのビルド・E2E（[tools/qemu/README.md](tools/qemu/README.md)） |

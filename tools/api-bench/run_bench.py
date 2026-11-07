@@ -74,6 +74,7 @@ TARGETS = {
         "FastAPI def, uvicorn 2 workers": ([UV, "fastapi_app:app", "--workers", "2"] + UVARGS, {"BENCH_SYNC": "1"}, PYDIR),
         "veil (offload=True)": ([PY, "veil_app.py"], {"BENCH_OFFLOAD": "1", "BENCH_THREADS": str(THREADS)}, PYDIR),
         "veil (offload=False)": ([PY, "veil_app.py"], {"BENCH_OFFLOAD": "0", "BENCH_THREADS": str(THREADS)}, PYDIR),
+        "veil (async def)": ([PY, "veil_app.py"], {"BENCH_ASYNC": "1", "BENCH_THREADS": str(THREADS)}, PYDIR),
     },
 }
 
@@ -95,6 +96,12 @@ if BASE_VENV:
         [bpy, "veil_app.py"], {"BENCH_OFFLOAD": "1", "BENCH_THREADS": str(THREADS)}, PYDIR)
     TARGETS["python"]["veil (offload=False) [base]"] = (
         [bpy, "veil_app.py"], {"BENCH_OFFLOAD": "0", "BENCH_THREADS": str(THREADS)}, PYDIR)
+    TARGETS["python"]["veil (async def) [base]"] = (
+        [bpy, "veil_app.py"], {"BENCH_ASYNC": "1", "BENCH_THREADS": str(THREADS)}, PYDIR)
+
+# F-299: Python の目標（1 プロセス、2〜数スレッド）。veil の行に比を出す
+PY_TARGET_MIN = float(os.environ.get("BENCH_PY_TARGET_MIN", "50000"))
+PY_TARGET_GOAL = float(os.environ.get("BENCH_PY_TARGET_GOAL", "70000"))
 
 
 def tree_pids(pid):
@@ -284,6 +291,13 @@ def summary(path):
             errs = sorted({r["errors"] for r in rs if r["errors"]})
             print(f"| {n} | {med('rps'):,.0f} | {med('p50_ms'):.2f} | {med('p99_ms'):.2f} | {med('cpu_pct'):.0f} | "
                   f"{med('cores_pct'):.0f} | {med('us_per_req'):.1f} | {med('rss_mb'):.1f} | {len(ok)} | {'; '.join(errs)} |")
+        veil_py = [n for n in names if n.startswith("veil (") and "[base]" not in n]
+        for n in veil_py:
+            ok = [float(r["rps"]) for r in rows if r["target"] == n and r["endpoint"] == ep and r["rps"] != "NA"]
+            if ok:
+                m = statistics.median(ok)
+                print(f"\n{n}: {m / PY_TARGET_MIN:.2f}x of the minimum target ({PY_TARGET_MIN:,.0f}), "
+                      f"{m / PY_TARGET_GOAL:.2f}x of the goal ({PY_TARGET_GOAL:,.0f})")
 
 
 TLS = (os.path.join(ROOT, "target", "api-bench-cert.pem"), os.path.join(ROOT, "target", "api-bench-key.pem"))

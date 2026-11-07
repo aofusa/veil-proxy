@@ -2,7 +2,7 @@
 """F-295: API 経路の交互 A/B（json-comp・コア制限の遅延・gRPC・Python）。手順は tools/perf/README.md「API 経路の交互 A/B」。
 
     python3 tools/perf/api_ab.py --scenario json --new . --base ~/base --rounds 5 --out r.tsv
-    python3 tools/perf/api_ab.py --scenario latency --new . --rates 200000,300000,400000
+    python3 tools/perf/api_ab.py --scenario latency --new . --rates 300000,400000,475000,500000
     python3 tools/perf/api_ab.py --scenario python --new . --new-venv v1 --base ~/base --base-venv v0
     python3 tools/perf/api_ab.py --summary r.tsv
 
@@ -252,7 +252,7 @@ def main():
     p.add_argument("--duration", type=int, default=6)
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--rounds", type=int, default=3)
-    p.add_argument("--rates", default="200000,300000,400000", help="fixed rates of the latency scenario")
+    p.add_argument("--rates", default="300000,400000,475000,500000", help="fixed rates of the latency scenario")
     p.add_argument("--grpc-rates", default="100000,200000,300000", help="fixed rates of the grpc scenario")
     p.add_argument("--py-variants", default="offload,inline,async")
     p.add_argument("--py-threads", default="2,4")

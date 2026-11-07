@@ -18,6 +18,7 @@
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力。**Linux ハーネスの 11 列形式専用**で、FreeBSD ネイティブ計測（8/10 列）を渡すと列位置がずれるため**明示エラーで停止する**（黙って全行 0.0 を出さない）。`#` 始まりの節見出し・列凡例・ヘッダ行は集計対象外 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能）。**`*_compression_cached` は F-169 で追加した「静的キャッシュ有効」版**で、`static_file_cache` + `open_file_cache` を有効にしないと F-169 の圧縮結果キャッシュは有効化条件を満たさず一切効かない（既存の `*_compression` はキャッシュ無効時のコストを測るため据え置き） |
 | `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化。平文 8080 で `listen 8080; http2 on;` により h2c も有効化し、veil の `listen_cleartext` と条件を揃える）。v0.8.0 で同じ仕事の相手を足した: `base`（443、TLS 静的、HTTP/3 も）・`base_proxy`（8443、TLS で受けて perf-backend へ中継、HTTP/3 も）・`base_compression`（8444、毎回 gzip）・`base_proxy_compression`（8445、中継 + gzip） |
+| `api_ab.py`・`veil-load/`・`api-app/`・`syscall_count/` | API 経路の交互 A/B（[下の節](#api-経路の交互-abapi_abpyf-295)。Docker を使わない） |
 | `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象）。公開する生データは [docs/perf/linux_suite_ab_raw.tsv](../../docs/perf/linux_suite_ab_raw.tsv) へコピーしてコミットする（サマリは [docs/perf/README.md](../../docs/perf/README.md)） |
 
 計測に必要な静的アセットは **`docker/assets/`** を参照します（このディレクトリには複製しません）。
@@ -365,6 +366,48 @@ python3 tools/perf/suite_ab_summary.py tools/perf/results/suite_ab/<日時>.tsv 
 
 集計は (構成, プロトコル) ごとの rps 中央値の比（new / base）の分布と、0.95 未満の組・errors のある行の一覧。
 0.95 未満の組は単独で再計測して戻るかを見る（`CONFIG_GLOB` で絞って `suite_ab.sh` を再実行）。
+
+## API 経路の交互 A/B（`api_ab.py`、F-295）
+
+API ライブラリの経路（ハンドラ・圧縮・gRPC・Python）を、Docker を使わず 1 台で測る。v0.12.0 の性能改善の 4 領域を 1 コマンドずつ回せる。
+
+| 部品 | 役割 |
+|---|---|
+| `veil-load/` | 負荷ツール。HTTP/1.1・h2c・gRPC、閉ループと固定レート（予定時刻から測るので Coordinated Omission を含む）、CPU の固定、1 行の `key=value` か `--tsv` |
+| `api-app/` | HttpArena の `veil-api` と同じ形のハンドラ（`/baseline11`・`/json/{count}`・unary gRPC）の API サーバ |
+| `api_ab.py` | シナリオを交互に回して TSV と中央値の表を出すドライバ |
+| `syscall_count/` | 1 要求あたりのシステムコール数を数える LD_PRELOAD の小片（`--syscalls`。futex は数えない） |
+
+```bash
+# 改修前の作業ツリーを用意する（api-app・veil-load は同じソースを改修前の木へ置いてビルドする）
+git worktree add ../veil-base <基準のコミット>
+cp -r tools/perf/api-app tools/perf/api_ab.py ../veil-base/tools/perf/
+(cd tools/perf/api-app && cargo build --release --features epoll)
+(cd ../veil-base/tools/perf/api-app && cargo build --release --features epoll)
+(cd tools/perf/veil-load && cargo build --release)
+
+# サーバは CPU 0-7、負荷は CPU 8-15（lscpu -e の CORE 列で兄弟を両側にまたがせない）
+python3 tools/perf/api_ab.py --new . --base ../veil-base --scenario latency --rates 300000,400000,475000,500000 --rounds 5
+python3 tools/perf/api_ab.py --new . --base ../veil-base --scenario json
+python3 tools/perf/api_ab.py --new . --base ../veil-base --scenario grpc
+python3 tools/perf/api_ab.py --new . --base ../veil-base --new-venv <新の venv> --base-venv <旧の venv> --scenario python
+python3 tools/perf/api_ab.py --summary api_ab.tsv    # 表だけ作り直す
+```
+
+| シナリオ | 行 | 見るもの |
+|---|---|---|
+| `json` | `identity`・`gzip`・`br`（`Accept-Encoding: gzip, br`） | 差が圧縮のコスト。`identity` が直列化と送信 |
+| `latency` | `saturation` と `rate-<N>k` | 固定レートの達成率（`rate_ratio`）と p50/p99/p99.9。サーバの CPU は `--server-cpus` で固定する |
+| `grpc` | `grpc-c256-m100` など閉ループの行、`grpc-rate-<N>k`、比較用の `h2-c256-m100` | 遅延の分布。固定レート（`--grpc-rates`）の行は到着を固定するので、スループットの裏返しでない遅延が出る |
+| `python` | `<offload\|inline\|async>-t<スレッド>-<plaintext\|json>` | `--py-variants`・`--py-threads`・`--conns`。コア制限は `--server-cpus 0,1` |
+
+- 固定レートの veil-load は **全接続を FIFO で回し、次の予定まで眠る**。同じ接続だけを使うと負荷が軽くなり、回し続ける
+  （`epoll_wait(0)`）と、ループバックで相手のスレッドを起こす費用がサーバの `send(2)` から消えてシステム時間が半分になる。
+  どちらも直す前は基準の版が外部の結果（rate 0.7455）を再現せず 500k を維持してしまった。
+- `--syscalls` は LD_PRELOAD の分だけ遅くなるので、飽和に近い固定レートの遅延を見る回では付けない（p99 が 1 桁変わる）。
+- 飽和に近い固定レートの p99 は回ごとに大きく揺れる（`docs/perf/` の表は 5 回の中央値）。
+- 速度の判定は **サイクル** で。命令数は下がったのにサイクルが上がることがある（フューチャの状態が接続ごとの冷たいメモリに
+  載るなど。`perf stat -e instructions:u,cycles:u` を閉ループの飽和で採る）。
 
 ## リーク試験（`leak_check.sh`、F-185）
 

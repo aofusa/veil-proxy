@@ -90,9 +90,11 @@ secure_redirect = true               # 301 to the https listener
   follows the CPU affinity (`taskset`, `docker --cpuset-cpus`) and the cgroup CPU quota (`docker --cpus`,
   Kubernetes CPU limits), so a container limited to 2 CPUs starts 2 workers. Set it only to leave CPUs to other
   processes on the same host.
-- `[api] handler_threads` sizes the pool that runs blocking Rust functions (`route_blocking`), C callbacks and
-  Python handlers. The default is twice the CPU count (at least 4). Raise it when blocking handlers wait on I/O
-  (a synchronous database driver), not for CPU-bound work.
+- `[api] handler_threads` sizes the pool that runs blocking Rust functions (`route_blocking`) and C callbacks, and
+  sets the number of Python handler threads. The default is twice the CPU count (at least 4). Raise it when blocking
+  handlers wait on I/O (a synchronous database driver), not for CPU-bound work. Python handler threads take turns on
+  the GIL: one runs requests back to back and another takes over whenever a handler releases the GIL, so the count
+  bounds how many handlers can be blocked at once, not how much Python runs in parallel.
 
 ## Logging
 

@@ -52,8 +52,8 @@ shutdown, metrics), see [library-production.md](library-production.md).
   plane has no tokio or monoio. tokio-based libraries (hyper, reqwest, sqlx, ...) run on the same workers through
   veil's tokio-free tokio compatibility layer ([tokio compatibility](#tokio-compatibility)).
 - Blocking work must not run on a worker. A **synchronous** `fn` handler (Rust), a C callback and a Python
-  handler are executed on a separate handler thread pool (`[api] handler_threads`) through veil's `offload`,
-  so a slow database call does not stall other connections.
+  handler are executed off the workers, on separate handler threads (`[api] handler_threads`), so a slow database
+  call does not stall other connections.
 - **The release binary contains no library code.** The `handler`, `macro`, `openapi`, `tokio-compat`,
   `tokio-compat-bridge`, `l4-handler`, `grpc-handler`, `api-core` and `api` features are in neither `default` nor `full*`. `cargo build --features full`
   produces exactly the same proxy as before.
@@ -252,7 +252,7 @@ for debugging.
 | `openapi_version` | `"0.1.0"` | `info.version` (your API's version) |
 | `openapi_description` | none | `info.description` |
 | `max_body_size` | `10485760` | maximum request body handed to a handler, in bytes |
-| `handler_threads` | `0` | threads of the handler pool used for synchronous Rust fns, C callbacks and Python handlers (`0` = built-in default) |
+| `handler_threads` | `0` | threads of the handler pool used for synchronous Rust fns and C callbacks, and the number of Python handler threads (`0` = built-in default) |
 | `tokio_threads` | `2` | worker threads of the bundled tokio runtime (`tokio-compat-bridge` only) |
 | `grpc_max_message_size` | `4194304` | maximum size of one received gRPC message (`grpc-handler`) |
 | `grpc_max_send_message_size` | `0` | maximum size of one sent gRPC message (0 = no limit) |

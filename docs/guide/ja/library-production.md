@@ -91,9 +91,11 @@ secure_redirect = true               # https のリスナーへ 301
 - `[server] threads` は既定のままにします: プロセスが動ける CPU 1 個につきネットワークのワーカー 1 本。この数は CPU の
   affinity（`taskset`・`docker --cpuset-cpus`）と cgroup の CPU のクォータ（`docker --cpus`・Kubernetes の CPU の limits）に
   従うので、2 CPU に絞ったコンテナではワーカーは 2 本です。同じホストの他のプロセスに CPU を残すときだけ設定します。
-- `[api] handler_threads` は、ブロッキングする Rust の関数（`route_blocking`）・C のコールバック・Python のハンドラを動かす
-  プールの大きさです。既定は CPU 数の 2 倍（最低 4）。ブロッキングするハンドラが I/O を待つ（同期のデータベースの
-  ドライバ等）ときに増やします。CPU を使う処理のために増やしても速くなりません。
+- `[api] handler_threads` は、ブロッキングする Rust の関数（`route_blocking`）・C のコールバックを動かすプールの大きさで、
+  Python のハンドラのスレッド数でもあります。既定は CPU 数の 2 倍（最低 4）。ブロッキングするハンドラが I/O を待つ（同期の
+  データベースのドライバ等）ときに増やします。CPU を使う処理のために増やしても速くなりません。Python のハンドラのスレッドは
+  GIL を順番に使います。1 本が要求を続けて処理し、ハンドラが GIL を手放すと別の 1 本がすぐ引き継ぐので、この数は同時に
+  ブロッキングできるハンドラの数の上限で、Python が並列に動く数ではありません。
 
 ## ログ
 

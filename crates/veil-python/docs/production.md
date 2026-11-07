@@ -40,11 +40,18 @@ static files, file descriptors, shutdown, metrics) is `docs/guide/library-produc
 
 | Handler | Runs on | Use it for |
 |---|---|---|
-| `def f()` (default `offload=True`) | the handler pool (`[api] handler_threads`, default twice the CPUs, at least 4) | ordinary handlers, blocking libraries |
+| `def f()` (default `offload=True`) | the handler threads (`[api] handler_threads`, default twice the CPUs, at least 4) | ordinary handlers, blocking libraries |
 | `def f()` with `offload=False` | the network worker, directly | tiny handlers that never block (a health check, a constant) |
 | `async def f()` | the persistent event loop (`[api] python_event_loops`, default 1) | handlers that wait for I/O with async libraries |
 | `await veil.run_in_threadpool(g, ...)` inside `async def` | the thread pool | blocking or CPU-heavy calls from `async def` handlers |
 
+- The handler threads take turns on the GIL instead of competing for it: one thread runs requests back to back, and
+  when a handler releases the GIL (`time.sleep`, a socket, a database driver) the next thread takes over at once. So up
+  to `handler_threads` blocking handlers still wait at the same time, and raising `handler_threads` only helps handlers
+  that block.
+- The handler threads live as long as the server, so `threading.local` values stay on a thread between requests (a
+  connection or a client kept there is reused). Each request runs in a new `contextvars.Context`, so a context variable
+  set by one request is not visible to the next.
 - Never block inside `async def`: a blocking call stops every coroutine of the loop.
 - Install `uvloop` for a faster event loop (`python_event_loop = "auto"` uses it when present).
 - CPU-bound Python code is limited by the GIL. Run one process per host (or container) with the default threads,

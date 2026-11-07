@@ -51,7 +51,7 @@ GraphQL・依存性注入・バックグラウンドタスクを足します。
   tokio・monoio はありません。tokio 前提のライブラリ（hyper・reqwest・sqlx など）は、veil の tokio 無しの tokio 互換
   レイヤーを通じて同じワーカーで動きます（[tokio 互換](#tokio-互換)）。
 - ワーカー上でブロッキング処理をしてはいけません。Rust の **同期** `fn` ハンドラ・C のコールバック・Python のハンドラは、
-  veil の `offload` を通じて別のハンドラ用スレッドプール（`[api] handler_threads`）で実行されるので、遅い DB 呼び出しが
+  ワーカーの外の別のハンドラ用スレッド（`[api] handler_threads`）で実行されるので、遅い DB 呼び出しが
   他の接続を止めることはありません。
 - **リリースバイナリにライブラリのコードは入りません。** `handler`・`macro`・`openapi`・`tokio-compat`・
   `tokio-compat-bridge`・`l4-handler`・`grpc-handler`・`api-core`・`api` の各 feature は `default` にも `full*` にも含まれません。`cargo build --features full` で作るプロキシは
@@ -242,7 +242,7 @@ let config = Config::load()?            // または Config::new()（既定設�
 | `openapi_version` | `"0.1.0"` | `info.version`（API 自体のバージョン） |
 | `openapi_description` | なし | `info.description` |
 | `max_body_size` | `10485760` | ハンドラへ渡すリクエスト本文の上限（バイト） |
-| `handler_threads` | `0` | 同期 Rust 関数・C コールバック・Python ハンドラを実行するハンドラ用プールのスレッド数（`0` = 組み込みの既定） |
+| `handler_threads` | `0` | 同期 Rust 関数・C コールバックを実行するハンドラ用プールのスレッド数と、Python のハンドラのスレッド数（`0` = 組み込みの既定） |
 | `tokio_threads` | `2` | 同梱の tokio ランタイムのワーカー数（`tokio-compat-bridge` のみ） |
 | `grpc_max_message_size` | `4194304` | 受信する gRPC メッセージ 1 つの上限（`grpc-handler`） |
 | `grpc_max_send_message_size` | `0` | 送信する gRPC メッセージ 1 つの上限（0 = 無制限） |
