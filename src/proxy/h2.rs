@@ -206,11 +206,10 @@ where
     // 接続あたり 1 回だけ行い、以降は `Rc::clone`（参照カウント +1）と値渡し（Copy）で使い回す。
     let client_ip_rc: std::rc::Rc<str> = std::rc::Rc::from(client_ip);
     let client_socket_addr = h2_client_socket_addr(client_ip);
-    let mut streams: std::collections::HashMap<u32, H2ActiveStream> =
-        std::collections::HashMap::new();
+    let mut streams: http2::stream::StreamIdMap<H2ActiveStream> = Default::default();
     // `drive_h2_streams` のストリーム ID 走査用バッファ（F-157）。コネクションごとに
     // 1 本持ち回して毎イテレーションのヒープ確保を避ける。
-    let mut stream_ids: Vec<u32> = Vec::new();
+    let mut drive_scratch = H2DriveScratch::default();
     // B-274・B-276: 要求の受信（本文・ヘッダの続き）が止まったストリームを打ち切る見回り。受信中の
     // ストリームがあって待つときだけ 1 秒のタイマーを 1 本張って使い回す（I/O・要求ごとにタイマーを張らない）。
     let mut recv_sweep = std::pin::pin!(None::<crate::runtime::time::Sleep>);
@@ -218,7 +217,7 @@ where
 
     loop {
         // 1. 各ストリームのレスポンスを送出（HPACK エンコードは送信順にここでのみ行う）。
-        drive_h2_streams(conn, &mut streams, &mut stream_ids).await?;
+        drive_h2_streams(conn, &mut streams, &mut drive_scratch).await?;
         // 2. 1 イテレーション 1 回のフラッシュ（複数ストリームの write_buf 合流を 1 回で送出）。
         conn.flush_write_buf().await?;
 
@@ -669,7 +668,7 @@ pub(super) fn h2_spawn_for_request<S, V>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
     body_pending: bool,
-    streams: &mut std::collections::HashMap<u32, H2ActiveStream>,
+    streams: &mut http2::stream::StreamIdMap<H2ActiveStream>,
     notify: &crate::stream_channel::Notify,
     svc: &V,
     client_ip: &std::rc::Rc<str>,
@@ -881,7 +880,7 @@ pub(super) async fn h2_select_readable_notify_or_sweep(
 #[cfg(feature = "http2")]
 async fn h2_reset_stalled_streams<S>(
     conn: &mut http2::Http2Connection<S>,
-    streams: &mut std::collections::HashMap<u32, H2ActiveStream>,
+    streams: &mut http2::stream::StreamIdMap<H2ActiveStream>,
     stalled: &mut Vec<u32>,
 ) -> Result<(), http2::Http2Error>
 where
@@ -915,6 +914,14 @@ where
     Ok(())
 }
 
+/// `drive_h2_streams` の走査用バッファ（コネクションごと）。
+#[cfg(feature = "http2")]
+#[derive(Default)]
+pub(super) struct H2DriveScratch {
+    ids: Vec<u32>,
+    done: Vec<u32>,
+}
+
 /// 全ストリームのレスポンスを 1 回駆動する（F-116）。
 ///
 /// 各ストリームで pending_body 再送 → resp_rx を try_recv して
@@ -923,15 +930,13 @@ where
 #[cfg(feature = "http2")]
 pub(super) async fn drive_h2_streams<S>(
     conn: &mut http2::Http2Connection<S>,
-    streams: &mut std::collections::HashMap<u32, H2ActiveStream>,
-    stream_ids: &mut Vec<u32>,
+    streams: &mut http2::stream::StreamIdMap<H2ActiveStream>,
+    scratch: &mut H2DriveScratch,
 ) -> Result<(), http2::Http2Error>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
     use crate::stream_channel::{TryRecv, TrySendError};
-
-    let mut done: Vec<u32> = Vec::new();
 
     // ストリーム ID の走査用バッファ（F-157）。毎イテレーションの
     // `collect::<Vec<u32>>()` によるヒープ確保を消すため、呼び出し元
@@ -940,6 +945,11 @@ where
     // スレッドローカルにしてはならない: このループは `.await` をまたぐため、
     // 同一スレッド上の別コネクションの `drive_h2_streams` が割り込んで
     // 同じバッファを `clear()` し、走査中の ID 列を壊す。
+    let H2DriveScratch {
+        ids: stream_ids,
+        done,
+    } = scratch;
+    done.clear();
     stream_ids.clear();
     stream_ids.extend(streams.keys().copied());
 
@@ -1131,7 +1141,7 @@ where
         }
     }
 
-    for sid in done {
+    for &sid in done.iter() {
         if let Some(st) = streams.remove(&sid) {
             // タスクが早期終了したストリーミングストリームは req_pending が未転送のまま
             // 残り得る。そのクレジットが conn レベルに滞留しないよう補充する。
@@ -1614,13 +1624,16 @@ pub(super) async fn h2_dispatch(
         .map(|h| (h.name.as_ref(), h.value.as_ref()))
         .collect();
 
+    // 設定は要求の入口で 1 回だけ読み、経路の解決の後で手放す（読むたびに費用がかかる。await をまたいで持たない）
+    let config = CURRENT_CONFIG.load();
+
     // メトリクスエンドポイント。
     {
-        let config = CURRENT_CONFIG.load();
         let prom = &config.prometheus_config;
-        let path_str = std::str::from_utf8(path).unwrap_or("/");
-        if prom.enabled && path_str == prom.path && method == b"GET" {
-            if !prom.is_ip_allowed(client_ip) {
+        if prom.enabled && path == prom.path.as_bytes() && method == b"GET" {
+            let allowed = prom.is_ip_allowed(client_ip);
+            drop(config);
+            if !allowed {
                 return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
             }
             let body = encode_prometheus_metrics();
@@ -1635,9 +1648,13 @@ pub(super) async fn h2_dispatch(
 
     // 管理 API（B-29）。
     #[cfg(feature = "admin")]
-    if let Some((status, headers, body)) = h2_admin_response(method, path, client_ip, &headers_raw)
-    {
-        return h2_emit_full(resp_tx, notify, status, headers, Bytes::from(body)).await;
+    if config.admin_config.enabled {
+        if let Some((status, headers, body)) =
+            h2_admin_response(method, path, client_ip, &headers_raw)
+        {
+            drop(config);
+            return h2_emit_full(resp_tx, notify, status, headers, Bytes::from(body)).await;
+        }
     }
 
     let query_start = path.iter().position(|&b| b == b'?');
@@ -1645,7 +1662,8 @@ pub(super) async fn h2_dispatch(
     let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
     let authority = &ctx.authority[..];
 
-    let backend_result = crate::l7::resolve_route(
+    let backend_result = crate::l7::resolve_route_in(
+        &config,
         authority,
         path_wo_query,
         method,
@@ -1654,6 +1672,7 @@ pub(super) async fn h2_dispatch(
         &ctx.client_socket_addr,
         true,
     );
+    drop(config);
 
     let (prefix, backend, route_compression) = match backend_result {
         Some(b) => b,
@@ -1690,7 +1709,11 @@ pub(super) async fn h2_dispatch(
     #[cfg(feature = "wasm")]
     let mut wasm_request_headers_override: Option<Vec<crate::http2::hpack::HeaderField>> = None;
     #[cfg(feature = "wasm")]
-    let wasm_modules_to_apply: crate::wasm_plugin_config::WasmModules = {
+    let wasm_modules_to_apply: crate::wasm_plugin_config::WasmModules = 'modules: {
+        // フィルタの無いルートは設定を読まない
+        if backend.modules_arc().is_none() {
+            break 'modules crate::wasm::empty_wasm_modules();
+        }
         let config = CURRENT_CONFIG.load();
         if let Some(ref wasm_engine) = config.wasm_filter_engine {
             let path_str = std::str::from_utf8(path).unwrap_or("/");

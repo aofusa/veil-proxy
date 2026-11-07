@@ -502,10 +502,40 @@ impl Stream {
     }
 }
 
+/// ストリーム ID 用の軽いハッシャ。
+///
+/// 要求ごとに表を何度も引くので SipHash では重い（F-298）。ID はクライアントが選べる値だが、1 接続の表は
+/// `max_concurrent_streams` までなので、偏っても探索の長さは接続の中で頭打ちになる。
+#[derive(Default, Clone, Copy)]
+pub(crate) struct StreamIdHasher(u64);
+
+impl std::hash::Hasher for StreamIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8) | b as u64;
+        }
+    }
+    #[inline]
+    fn write_u32(&mut self, n: u32) {
+        let h = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        // 表の添字は下位ビット。積の下位ビットは ID の下位ビットだけで決まるので、上位を畳み込む
+        // （下位ビットのそろった ID で同じ位置を狙われないように）
+        self.0 = h ^ (h >> 32);
+    }
+}
+
+/// ストリーム ID をキーにする表。
+pub(crate) type StreamIdMap<V> = HashMap<u32, V, std::hash::BuildHasherDefault<StreamIdHasher>>;
+
 /// ストリームマネージャー
 pub struct StreamManager {
     /// ストリーム (ID -> Stream)
-    streams: HashMap<u32, Stream>,
+    streams: StreamIdMap<Stream>,
     /// 次のサーバー発行ストリーム ID (偶数)
     next_server_stream_id: u32,
     /// クライアントから受信した最大ストリーム ID
@@ -526,7 +556,7 @@ impl StreamManager {
     /// 新しいストリームマネージャーを作成
     pub fn new(max_concurrent: u32, local_initial_window: i32) -> Self {
         Self {
-            streams: HashMap::new(),
+            streams: StreamIdMap::default(),
             next_server_stream_id: 2,
             max_client_stream_id: 0,
             max_concurrent_streams: max_concurrent,
@@ -578,9 +608,10 @@ impl StreamManager {
             ));
         }
 
-        // 同時ストリーム数チェック
-        let active_count = self.active_stream_count();
-        if active_count >= self.max_concurrent_streams as usize {
+        // 同時ストリーム数チェック。数えると表の全走査になるので、新しいストリームごとには数えない
+        // （閉じたストリームも `cleanup_closed` まで表に残る。表の長さが上限未満なら生きている数も上限未満。F-298）
+        let limit = self.max_concurrent_streams as usize;
+        if self.streams.len() >= limit && self.active_stream_count() >= limit {
             return Err(Http2Error::stream_error(
                 id,
                 Http2ErrorCode::RefusedStream,
@@ -589,18 +620,12 @@ impl StreamManager {
         }
 
         self.max_client_stream_id = id;
-        self.streams.insert(
+        let stream = Stream::new(
             id,
-            Stream::new(
-                id,
-                self.peer_initial_window_size,
-                self.local_initial_window_size,
-            ),
+            self.peer_initial_window_size,
+            self.local_initial_window_size,
         );
-
-        self.streams.get_mut(&id).ok_or_else(|| {
-            Http2Error::stream_error(id, Http2ErrorCode::StreamClosed, "Stream not found")
-        })
+        Ok(self.streams.entry(id).or_insert(stream))
     }
 
     /// ストリームを取得
@@ -875,6 +900,36 @@ mod tests {
             .unwrap()
             .append_header_fragment(b"", true);
         assert!(!manager.has_receiving());
+    }
+
+    #[test]
+    fn concurrent_limit_counts_only_live_streams() {
+        let mut manager = StreamManager::new(2, 65535);
+        for id in [1, 3] {
+            manager
+                .get_or_create_client_stream(id)
+                .unwrap()
+                .recv_headers(false)
+                .unwrap();
+        }
+        // 2 本が生きていれば 3 本目は拒否する
+        assert!(manager.get_or_create_client_stream(5).is_err());
+        // 閉じたストリームは `cleanup_closed` の前でも数えない
+        manager.get(1).unwrap().state = StreamState::Closed;
+        assert!(manager.get_or_create_client_stream(7).is_ok());
+    }
+
+    #[test]
+    fn stream_id_hash_spreads_ids_with_equal_low_bits() {
+        use std::hash::Hasher;
+        // 下位ビットのそろった ID が表の同じ位置に集まらない
+        let mut slots = std::collections::HashSet::new();
+        for i in 0..256u32 {
+            let mut h = StreamIdHasher::default();
+            h.write_u32((i << 16) | 1);
+            slots.insert(h.finish() & 0xff);
+        }
+        assert!(slots.len() > 128, "{} slots", slots.len());
     }
 
     #[test]

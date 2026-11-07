@@ -47,7 +47,7 @@ python3 tools/api-bench/run_bench.py --summary docs/artifacts/api_bench_rust.tsv
 - サーバのスレッド数は `BENCH_THREADS`（既定 2）。uvicorn は `--workers` がプロセス数、veil の Python はスレッド数。
 - 表の後に veil の Python の各行と目標（F-299: `BENCH_PY_TARGET_MIN` 既定 50,000・`BENCH_PY_TARGET_GOAL` 既定 70,000）の比を出す。
   改修前後の交互 A/B・コア数の制限・Python の版を変えた測定は `tools/perf/api_ab.py --scenario python`
-  （[tools/perf/README.md](../perf/README.md)「API 経路の交互 A/B」）。
+  （[tools/perf/README.md](../perf/README.md)「API 経路の交互 A/B」）。こちらは Docker を使わない。
 - ラウンドごとに対象の順番を回転・反転して交互に測る。`--only` で対象名の部分一致に絞れる。
 - 列: `rps`・`p50_ms`・`p99_ms`（wrk）、`cpu_pct`（サーバのプロセスツリーの utime + stime）、`cores_pct`（サーバに割り当てた
   コアの busy。ループバックのソフト割り込みを含む）、`us_per_req`（`cores_pct` から求めた 1 要求あたりの CPU 時間）、`rss_mb`。

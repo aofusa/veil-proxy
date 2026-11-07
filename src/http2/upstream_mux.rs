@@ -110,28 +110,7 @@ impl Drop for UpStream {
 // 接続の共有状態
 // ============================================================================
 
-/// ストリーム ID 用の軽量ハッシャ（クライアント ID は奇数の単調増加で衝突しない）。
-#[derive(Default, Clone, Copy)]
-struct IdHasher(u64);
-
-impl std::hash::Hasher for IdHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0 << 8) | b as u64;
-        }
-    }
-    #[inline]
-    fn write_u32(&mut self, n: u32) {
-        self.0 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-}
-
-type StreamMap = HashMap<u32, StreamSlot, std::hash::BuildHasherDefault<IdHasher>>;
+type StreamMap = super::stream::StreamIdMap<StreamSlot>;
 
 /// アクター側のストリーム状態。
 struct StreamSlot {
