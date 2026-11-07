@@ -1,5 +1,7 @@
 # F-298: unary gRPC の高速経路
 
+**状態: 完了（feat/v0120-perf、2026-11-07）**
+
 親: [F-295](F-295-v0120-perf-harness.md)。送信は [B-333](../bugs/B-333-h2-trailers-flush-per-stream.md)、テールは [B-332](../bugs/B-332-reactor-hot-connection-starves-others.md)。
 
 ## 現状
@@ -32,6 +34,18 @@ HEADERS と END_STREAM 付きの DATA はほぼ常に同じ読み取りで届く
    HEADERS・DATA・トレーラを `write_buf` に積む。HTTP/3・gRPC-Web・圧縮はこれまでの経路に落とす（または同じ形を読む）。
 4. **ストリーム表**: `HashMap<u32, _>` の SipHash をストリーム ID 用の軽いハッシュへ。
 5. その他、プロファイルの上位から要求ごとの確保を減らす。
+
+## 実装と判断
+
+- 1・2・4 は入れた。1 は「読み取りバッファの次のフレームが同じストリームの END_STREAM 付き DATA で全量が見えている」ときだけ溜める
+  経路で起動し、ルートの解決・チャネル 2 本・本文の中継のタスク切り替えが消える（メッシュの経路は従来のまま）。
+- **4 の調査で別の無駄が見つかった。** `get_or_create_client_stream` は新しいストリームごとに `active_stream_count()`（表の全走査）を呼び、
+  1 要求で SipHash を 3 回走らせていた。100 多重で 1 要求あたり 100 件の走査（O(n²)）。「閉じたストリームも `cleanup_closed` まで
+  表に残る」ので、表の長さが上限未満なら数えなくても判定は同じ。ハッシャは `upstream_mux` のものを `http2::stream::StreamIdHasher` へ
+  移して共有し、ID はクライアントが選べるので積の上位ビットを下位へ畳み込む（下位ビットのそろった ID で同じ位置を狙わせない）。
+- 5 は `h2_dispatch` の設定の読み取りを 1 回に（4 回読んでいた）、`drive_h2_streams` の `done` を接続ごとのバッファに。
+- **3（応答を 1 通のメッセージに）は採らない。** 残りのプロファイルは平坦で（`memmove` 12% は呼び元が分散、最大でも 14%）、チャネルの
+  `Head`/`Body`/`HandlerTrailers` の 3 通は合わせて数 %。`Response` の公開の形を増やす変更に見合わない。
 
 ## 計測
 

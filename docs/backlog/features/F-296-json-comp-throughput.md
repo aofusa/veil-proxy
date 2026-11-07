@@ -1,5 +1,7 @@
 # F-296: JSON + 圧縮のスループット（json-comp）
 
+**状態: 完了（feat/v0120-perf、2026-11-07）**
+
 親: [F-295](F-295-v0120-perf-harness.md)。原因の本体は [B-331](../bugs/B-331-brotli-huge-mapping-per-request.md)。
 
 ## 現状

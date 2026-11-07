@@ -425,7 +425,8 @@ python3 tools/perf/proxy_ab.py --base A --new B --cases '^h2c_file' --rounds 5  
 python3 tools/perf/proxy_ab.py --summary r.tsv
 
 # サーバが律速になる条件（下の注意を参照）
-python3 tools/perf/proxy_ab.py --base A --new B --server-cpus 0-3 --threads 4 --load-cpus 4-13 --load-threads 10
+python3 tools/perf/proxy_ab.py --base A --new B --server-cpus 0-3 --threads 4 --load-cpus 4-13 --load-threads 10 \
+    --proxy-load-cpus 4-11 --proxy-load-threads 8
 
 # HTTP/3 は QUIC 対応の h2load を渡す（名前が h2load で始まるものは h2load の引数で呼ぶ）
 docker build -t local/h2load-h3:latest tools/perf/h2load-http3
@@ -442,7 +443,8 @@ LD_LIBRARY_PATH=~/h2load-h3/lib python3 tools/perf/proxy_ab.py --base A --new B 
 - 転送の行の上流は veil より速くないといけない。nginx が同じ物理コアの 2 スレッドだけだと、nginx 直でも 8 万 rps で飽和して、大きさにもプロトコルにも
   関係なく 6〜7 万に揃う（veil は 6 割しか動かず、比べられない）。物理コア 2 つの 4 ワーカーなら nginx 直で 28 万、転送で 20 万を超える。
   `listen` の `reuseport` を外すとワーカーの負荷が偏る。行が頭打ちに見えたら、上流へ直接 wrk を当てて確かめる。
-- TLS の行はサーバが飽和しない（8 ワーカーで約 6 コア）。`rps` は負荷ツールの TLS の費用と起床の間隔で決まるので、サーバの比較には CPU を絞った条件を使う。
+- 静的配信の 54KB と TLS の行はサーバが飽和しない（8 ワーカーで約 6 コア）。`rps` はサーバの費用を映さず、`cpu` が同じでも数 % 動くので、サーバの比較には
+  CPU を絞った条件を使う。
 - `tools/perf/h3load`（quinn）はクライアントが律速で、同じ条件でも回ごとに 16k〜105k へ分かれる。版の比較には QUIC 対応の h2load を使う。
 - wrk の `timeout` は `errs` に入れず TSV の `wrk_timeouts` へ分ける。wrk は `gettimeofday` の差で判定するので、時計が戻るとその瞬間に処理中の全接続を
   数える（WSL2 は 30 秒ごとに約 75 ms 戻り、1 回の実行で 100 件前後の偽の `timeout` になる。Max の遅延は動かない）。
