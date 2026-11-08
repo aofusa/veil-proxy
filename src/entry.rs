@@ -1457,6 +1457,10 @@ pub fn run_server(opts: ServerOptions) {
         crate::server::unlink_unix_socket(path);
     }
 
+    // B-341: アクセスログの溜まった行を書き切ってから終わる（全ワーカーが抜けた後なので、もう行は足されない）
+    #[cfg(feature = "access-log")]
+    crate::access_log::shutdown_access_log_writer();
+
     // F-10: OpenTelemetry エクスポータをクリーンに停止（最終 flush 込み）
     #[cfg(feature = "opentelemetry")]
     crate::otel::shutdown_global();

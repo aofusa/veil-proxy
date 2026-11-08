@@ -31,7 +31,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use std::cell::RefCell;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
@@ -162,6 +162,9 @@ struct Sink {
     /// 同じパスで開き直す（F-178）
     reopen: AtomicBool,
     writer: OnceLock<std::thread::Thread>,
+    /// ライターが溜まった分を書き切って抜けた（終了時に待ち合わせる。B-341）
+    finished: Mutex<bool>,
+    finished_cv: Condvar,
 }
 
 /// 今の送り先。ワーカーはスレッドごとに控え、`generation` が変わったときだけ引き直す
@@ -201,17 +204,18 @@ impl Current {
         }
     }
 
-    /// 送り先を差し替える。前の送り先のライターには溜まった分を書いて終わるよう指示する
-    fn replace(&self, sink: Option<Arc<Sink>>) {
+    /// 送り先を差し替える。前の送り先のライターには溜まった分を書いて終わるよう指示し、前の送り先を返す
+    fn replace(&self, sink: Option<Arc<Sink>>) -> Option<Arc<Sink>> {
         let old = self.sink.swap(sink);
         self.generation.store(
             NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
             Ordering::Release,
         );
         // 世代を進めた後に閉じる（閉じた溜めを見たワーカーが世代を読み直すと新しい送り先が見える）
-        if let Some(old) = old {
+        if let Some(old) = &old {
             old.retire();
         }
+        old
     }
 }
 
@@ -265,6 +269,8 @@ impl Sink {
             stop: AtomicBool::new(false),
             reopen: AtomicBool::new(false),
             writer: OnceLock::new(),
+            finished: Mutex::new(false),
+            finished_cv: Condvar::new(),
         }
     }
 
@@ -312,6 +318,16 @@ impl Sink {
     fn retire(&self) {
         self.stop.store(true, Ordering::Release);
         self.wake();
+    }
+
+    /// ライターが書き切って抜けるのを `timeout` まで待つ。抜けたら true
+    fn wait_finished(&self, timeout: Duration) -> bool {
+        let done = lock(&self.finished);
+        let (done, _) = self
+            .finished_cv
+            .wait_timeout_while(done, timeout, |d| !*d)
+            .unwrap_or_else(PoisonError::into_inner);
+        *done
     }
 
     /// 各溜めの中身を空のバッファと取り替えて `batch` へ移す（錠の中は取り替えだけ。整形・書き込みは錠の外）。
@@ -438,6 +454,23 @@ pub(crate) fn reload_access_log_writer(config: &Arc<AccessLogConfig>) {
     CURRENT.replace(config.enabled.then(|| Sink::start(config)));
 }
 
+/// 終了時に書き切るのを待つ上限（書き込み先が詰まっている＝標準出力のパイプを誰も読まない等でも終了を止めない）
+const SHUTDOWN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 終了の直前に、溜まった行を書き切らせて待つ（全ワーカーが抜けた後に呼ぶ。B-341）。
+/// 呼ばないと、ライターの `BufWriter`（8KiB）と溜めに残った直前の行が書かれずにプロセスが終わる
+pub(crate) fn shutdown_access_log_writer() {
+    shutdown_on(&CURRENT, SHUTDOWN_WRITE_TIMEOUT);
+}
+
+/// `current` の送り先を外し、そのライターが書き切って抜けるのを待つ。抜けた（または送り先が無い）なら true
+fn shutdown_on(current: &Current, timeout: Duration) -> bool {
+    match current.replace(None) {
+        Some(old) => old.wait_finished(timeout),
+        None => true,
+    }
+}
+
 /// アクセスログを追記用に開く（無ければ作る）。
 ///
 /// FreeBSD の capability mode では絶対パスの `open` ができないため、`cap_enter` 前に登録した
@@ -551,6 +584,8 @@ fn run_writer(sink: &Sink, file_path: Option<&str>, flush_interval: Duration) {
         }
     }
     let _ = out.flush();
+    *lock(&sink.finished) = true;
+    sink.finished_cv.notify_all();
 }
 
 // ====================
@@ -1191,6 +1226,32 @@ mod tests {
             }
         }
         assert_eq!(next.to_vec(), counts);
+    }
+
+    /// B-341: 終了の待ち合わせから戻った時点で、溜めとライターの `BufWriter` に残っていた行がファイルにある
+    #[test]
+    // 理由付き allow: 試験のスレッド（イベントループの外）で一時ファイルを読んで消す
+    #[allow(clippy::disallowed_methods)]
+    fn shutdown_writes_buffered_lines_before_returning() {
+        let path = temp_log("shutdown");
+        let cell = Current::new();
+        // 定期のフラッシュは試験の間に来ない（ファイルに届くのは終了の待ち合わせの書き切りだけ）
+        let config = Arc::new(AccessLogConfig {
+            flush_interval_ms: 600_000,
+            ..(*file_config(&path)).clone()
+        });
+        start_on(&cell, &config);
+        for i in 0..100 {
+            append_line(&cell, |buf| {
+                buf.extend_from_slice(format!("0 {}\n", i).as_bytes())
+            });
+        }
+        assert!(shutdown_on(&cell, Duration::from_secs(10)));
+        let got = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got.lines().count(), 100);
+        // 送り先が無ければ何もしない
+        assert!(shutdown_on(&cell, Duration::from_millis(1)));
     }
 
     /// F-302: ライターが取り出さない間は 1 つの溜めに limit 行までで、超えた行は落とす。取り出せばまた足せる

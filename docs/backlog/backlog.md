@@ -694,6 +694,7 @@
 | B-338 | P2 | **取り下げ（仮説を実測で否定）** | [bugs/B-338-epoll-unclaimed-read-rearm-churn.md](bugs/B-338-epoll-unclaimed-read-rearm-churn.md) | epoll で待機者のいない読み取りイベントのたびに武装を上げ下げしている、という仮説（h2c 54KB の退行の原因の候補）。`epoll_ctl` は main の 100 分の 1 で、往復は起きていなかった |
 | B-339 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-339-epoll-level-trigger-sticky-wake-order.md](bugs/B-339-epoll-level-trigger-sticky-wake-order.md) | epoll のレベルトリガで起こす順が届いた順にならず、CPU を使い切る負荷で一部の要求が 2 周分待つ（JSON の gzip の p99 が main の 1.4 倍）。読み取りの待ちを待ち始めた順に起こす |
 | B-340 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-340-python-async-response-lost-on-close-race.md](bugs/B-340-python-async-response-lost-on-close-race.md) | Python の `async def` のハンドラの応答を、ワーカーがまれに取りこぼして 500 にする（ストリーミングは最後を落として打ち切る。100 万要求に 1 件ほど、v0.11.0 から）。閉じた旗をキューの錠の中で読む |
+| B-341 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-341-access-log-tail-lost-at-shutdown.md](bugs/B-341-access-log-tail-lost-at-shutdown.md) | SIGTERM で止めると、直前に処理した要求のアクセスログの行（ライターの `BufWriter` の 8KiB まで）が書かれずに消える（F-302 の前から）。全ワーカーの join の後にライターを止めて書き切るのを待つ（2 秒まで） |
 
 ---
 

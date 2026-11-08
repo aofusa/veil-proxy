@@ -100,7 +100,7 @@ secure_redirect = true               # 301 to the https listener
 
 - The access log is on by default in library mode and writes one line per request to standard output. The worker
   only copies the values of the request into a buffer of its own; a background thread formats the lines, writes them
-  and flushes them. At high request rates turn it off
+  and flushes them, and writes the remaining lines before the process exits. At high request rates turn it off
   (`[access_log] enabled = false`), or keep it and send it somewhere cheaper than a terminal: `format = "json"` and
   `file_path = "/var/log/app/access.log"`, or standard output collected by the container runtime. The fields are
   listed in [observability.md](observability.md).

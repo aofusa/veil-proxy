@@ -324,6 +324,21 @@ PY
   curl -s -o /dev/null "http://127.0.0.1:$P3/hello"; sleep 1.5
   if grep -a -q 'type=access' "$W2/log3"; then bad "access_log.enabled = false stops the access log"; else ok "access_log.enabled = false stops the access log"; fi
   kill "$!" 2>/dev/null
+  # B-341: SIGTERM の直前に処理した要求の行も書き切ってから終わる（以前はライターの BufWriter に残った 8KiB までが消えた）。
+  # 定期のフラッシュが終了より先に来ないよう flush_interval_ms を長くする
+  if [ "$OS" != Windows ]; then  # Windows の kill は TerminateProcess（終了処理が走らない）
+    local P4; P4=$(free_port)
+    (cd "$W2" && VEIL_LISTEN="127.0.0.1:$P4" VEIL_OVERRIDE_1="access_log.flush_interval_ms = 60000" exec "$T/debug/veil-example-showcase$EXE") > "$W2/log4" 2>&1 &
+    local PID4=$!; PIDS+=("$PID4")
+    if wait_port "$P4" "$PID4"; then
+      curl -s "http://127.0.0.1:$P4/hello?n=[1-300]" > /dev/null
+      kill "$PID4"; for _ in $(seq 1 50); do kill -0 "$PID4" 2>/dev/null || break; sleep 0.2; done
+      local n4; n4=$(grep -a -c 'type=access' "$W2/log4")
+      [ "$n4" = 300 ] && ok "access log written up to SIGTERM" || bad "access log written up to SIGTERM ($n4 of 300 lines)"
+    else
+      bad "access log shutdown: server did not start"
+    fi
+  fi
 }
 
 run_rust_multipart() { # F-266: multipart/form-data（examples/api/rust-showcase の /profile・/files-upload・/upload-stream）
