@@ -317,7 +317,11 @@ cargo build --features full                                        # フル機�
 cargo test --lib --bins --test integration_tests --features full   # 単体 + 統合（--lib を忘れると単体 0 件）
 ./tests/e2e_setup.sh test                                          # E2E（自動セットアップ・クリーンアップ）
 VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の E2E
+cargo test --test standalone_e2e --features full                   # 自己完結型 E2E（プロセス単位。full,epoll でも回す）
 ```
+
+- CI（`ci.yml`）は E2E の類を回さない。E2E・自己完結型 E2E・ライブラリの E2E（`tests/api/library_e2e.sh all`）はリリース前に
+  手元で回す（自己完結型 E2E を回しておらず、v0.11.0 から 1 件失敗していた。B-347）。
 
 - `http2` / `grpc` 系 feature が無いとコンパイルできない箇所がある。テストは十分な feature（`full`）で行う。
 - **Linux の既定ビルドは `src/runtime/reactor/` を 1 行もコンパイルしない。** reactor に触れたら epoll の E2E を必ず回す（F-145）。

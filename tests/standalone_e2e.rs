@@ -3067,15 +3067,11 @@ url = "http://127.0.0.1:{echo}"
     assert_eq!((c1, c2), (1, 1), "{}", veil.log());
     assert!(s2 > s1 && s1 > 1, "{s1} {s2}\n{}", veil.log());
 
-    // トラップしたら固定応答に落ち、次の要求は新しいインスタンス（http context の数が振り出しに戻る。
+    // トラップしたら既定の failure_policy（fail_closed）で本文の無い 503 になり（F-293 からルートの固定応答の
+    // "fallback" には落ちない。B-347）、次の要求は新しいインスタンス（http context の数が振り出しに戻る。
     // トラップした要求の on_log が新しいインスタンスで 1 つ作るので 2 以下）
     let r = http1_request(port, "GET", "/trap", &[], b"").unwrap();
-    assert_eq!(
-        (r.status, r.text()),
-        (503, "fallback".into()),
-        "{}",
-        veil.log()
-    );
+    assert_eq!((r.status, r.text()), (503, String::new()), "{}", veil.log());
     let r = http1_request(port, "GET", "/baseline11", &[], b"").unwrap();
     let (c3, s3) = seq(&r);
     assert!(

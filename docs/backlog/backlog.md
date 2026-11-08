@@ -700,6 +700,7 @@
 | B-344 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-344-capsicum-daily-log-file.md](bugs/B-344-capsicum-daily-log-file.md) | FreeBSD の capability mode で `[logging]` のファイルを使うと、地方時の 0 時に次のファイルをパスで開けずに panic して abort する（v0.11.0 から）。cap_enter の前にログのディレクトリの fd を登録し、そこから `openat` で作る |
 | B-345 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-345-logging-removed-keys-in-docs.md](bugs/B-345-logging-removed-keys-in-docs.md) | ガイドに無いキー `[logging] max_log_size`・`[logging] file_path` が載っている（黙って無視される）。ガイドを `app_file_path`・`error_file_path` に直し、ログファイルは日ごとで大きさの上限が無いことを書く |
 | B-346 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-346-bsd-security-e2e-stale-binary.md](bugs/B-346-bsd-security-e2e-stale-binary.md) | BSD の VM の `security-e2e` が、ソースを同期せず前に `build` した release のバイナリのまま走るので、古いコミットのバイナリでも PASS する。`build` してから走らせる |
+| B-347 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-347-standalone-e2e-f271-stale-after-f293.md](bugs/B-347-standalone-e2e-f271-stale-after-f293.md) | 自己完結型 E2E の f271 が、F-293 の既定（Proxy-Wasm の失敗は本文の無い 503）より前のルートの固定応答を期待したままで、v0.11.0 から失敗していた（自己完結型 E2E は CI でもリリース前の試験でも走っていなかった）。期待値を直し、AGENTS.md の試験の手順に足す |
 
 ---
 
