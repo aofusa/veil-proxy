@@ -1,0 +1,56 @@
+# tools/api-bench/run_bench.py --group python --rounds 3（aofish WSL2、サーバ CPU 0-1、wrk 4.1 -t2 -c64 -d10s を CPU 2-3）。Python 3.12、FastAPI 0.162 / uvicorn 0.54（uvloop・httptools）。veil は v0.12.0 の候補（03cb80d0）、[base] は v0.11.0（43c8045a）
+round	target	endpoint	rps	p50_ms	p99_ms	cpu_pct	cores_pct	us_per_req	rss_mb	errors
+1	FastAPI async, uvicorn 1 worker	plaintext	9086.70	7.030	9.570	96	102	112.5	49.0	
+1	FastAPI async, uvicorn 2 workers	plaintext	21366.84	3.130	6.660	193	200	93.6	133.8	
+1	FastAPI def, uvicorn 2 workers	plaintext	14118.91	3.910	30.210	192	198	140.9	138.3	
+1	veil (offload=True)	plaintext	187254.27	0.297	0.757	182	183	9.8	37.3	
+1	veil (offload=False)	plaintext	245655.63	0.215	0.737	181	177	7.2	35.2	
+1	veil (async def)	plaintext	143928.14	0.391	1.000	173	172	12.0	36.4	
+1	veil (offload=True) [base]	plaintext	70260.27	0.772	3.140	182	187	26.6	33.9	
+1	veil (offload=False) [base]	plaintext	23431.43	2.820	5.190	168	171	73.0	32.4	
+1	veil (async def) [base]	plaintext	88827.42	0.635	2.410	174	174	19.7	33.9	 non2xx=1
+1	FastAPI async, uvicorn 1 worker	json	7494.01	8.440	10.450	96	100	133.7	48.8	
+1	FastAPI async, uvicorn 2 workers	json	16978.53	3.930	7.920	193	200	117.9	134.3	
+1	FastAPI def, uvicorn 2 workers	json	12418.64	5.130	32.250	189	194	156.5	138.8	
+1	veil (offload=True)	json	212353.47	0.294	0.723	206	206	8.8	36.2	connect 0, read 0, write 0, timeout 69
+1	veil (offload=False)	json	153990.32	0.372	1.160	174	171	11.1	35.0	
+1	veil (async def)	json	145874.11	0.437	1.160	195	193	11.9	36.1	connect 0, read 0, write 0, timeout 116
+1	veil (offload=True) [base]	json	70802.40	0.782	2.440	185	190	26.9	33.9	
+1	veil (offload=False) [base]	json	24878.20	2.960	5.250	187	190	69.2	32.6	connect 0, read 0, write 0, timeout 128
+1	veil (async def) [base]	json	87397.51	0.646	2.080	174	173	20.0	33.6	
+2	FastAPI async, uvicorn 1 worker	plaintext	9915.66	7.120	14.210	108	113	102.8	49.0	connect 0, read 0, write 0, timeout 128
+2	veil (async def) [base]	plaintext	88730.51	0.635	2.370	177	174	19.8	34.0	
+2	veil (offload=False) [base]	plaintext	26160.62	2.830	5.230	187	189	65.2	32.5	connect 0, read 0, write 0, timeout 128
+2	veil (offload=True) [base]	plaintext	69245.46	0.800	2.690	183	188	27.1	33.9	
+2	veil (async def)	plaintext	158493.13	0.399	1.020	194	193	10.9	36.6	connect 0, read 0, write 0, timeout 128
+2	veil (offload=False)	plaintext	236838.36	0.226	0.726	182	178	7.5	35.1	
+2	veil (offload=True)	plaintext	221533.60	0.284	0.707	209	210	8.6	36.6	connect 0, read 0, write 0, timeout 122
+2	FastAPI def, uvicorn 2 workers	plaintext	14561.40	3.680	29.980	191	198	136.6	138.3	
+2	FastAPI async, uvicorn 2 workers	plaintext	22588.45	2.940	6.020	216	224	89.3	133.8	connect 0, read 0, write 0, timeout 127
+2	FastAPI async, uvicorn 1 worker	json	7387.12	8.560	14.360	96	101	136.9	49.2	
+2	veil (async def) [base]	json	92417.56	0.654	2.320	185	183	18.7	33.6	connect 0, read 0, write 0, timeout 59 non2xx=2
+2	veil (offload=False) [base]	json	19970.15	3.140	6.550	165	168	84.3	32.6	
+2	veil (offload=True) [base]	json	66599.50	0.821	2.930	181	186	28.0	34.0	
+2	veil (async def)	json	132653.29	0.430	1.010	174	175	13.2	36.2	
+2	veil (offload=False)	json	161223.16	0.356	1.050	175	170	10.6	35.0	
+2	veil (offload=True)	json	168779.06	0.333	0.860	183	185	11.0	36.1	
+2	FastAPI def, uvicorn 2 workers	json	13085.06	4.270	30.390	192	198	151.9	138.8	
+2	FastAPI async, uvicorn 2 workers	json	17200.56	3.590	7.150	193	200	116.6	134.0	
+3	FastAPI def, uvicorn 2 workers	plaintext	13946.42	3.840	30.430	191	196	141.1	138.4	
+3	veil (offload=True)	plaintext	206598.93	0.300	0.771	205	205	9.5	36.2	connect 0, read 0, write 0, timeout 123
+3	veil (offload=False)	plaintext	228867.91	0.235	0.880	181	178	7.8	35.1	
+3	veil (async def)	plaintext	153451.04	0.414	1.030	193	192	11.2	36.5	connect 0, read 0, write 0, timeout 112
+3	veil (offload=True) [base]	plaintext	68964.45	0.791	2.710	182	187	27.1	33.6	
+3	veil (offload=False) [base]	plaintext	26156.73	2.840	5.090	188	189	65.1	32.4	connect 0, read 0, write 0, timeout 128
+3	veil (async def) [base]	plaintext	86159.18	0.650	2.830	174	170	19.8	33.8	 non2xx=1
+3	FastAPI async, uvicorn 1 worker	plaintext	9964.78	7.130	14.160	108	112	101.1	48.9	connect 0, read 0, write 0, timeout 128
+3	FastAPI async, uvicorn 2 workers	plaintext	21872.93	2.800	5.840	193	200	92.3	134.0	
+3	FastAPI def, uvicorn 2 workers	json	14609.12	4.250	30.100	212	219	135.1	138.8	connect 0, read 0, write 0, timeout 127
+3	veil (offload=True)	json	168852.12	0.330	0.950	185	185	11.0	35.9	
+3	veil (offload=False)	json	176141.41	0.371	1.080	194	190	9.8	35.0	connect 0, read 0, write 0, timeout 122
+3	veil (async def)	json	131290.97	0.433	1.010	172	171	13.2	36.5	
+3	veil (offload=True) [base]	json	75376.42	0.837	3.000	202	207	24.8	33.6	connect 0, read 0, write 0, timeout 121
+3	veil (offload=False) [base]	json	21047.48	3.070	5.930	166	169	80.4	32.4	
+3	veil (async def) [base]	json	95067.59	0.672	2.760	194	192	18.2	33.8	connect 0, read 0, write 0, timeout 128 non2xx=2
+3	FastAPI async, uvicorn 1 worker	json	7474.30	8.490	11.800	96	100	134.5	49.1	
+3	FastAPI async, uvicorn 2 workers	json	19302.84	3.630	7.140	215	223	104.4	134.1	connect 0, read 0, write 0, timeout 128

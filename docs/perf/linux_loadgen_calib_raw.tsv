@@ -1,0 +1,26 @@
+# aofish の WSL2（Ryzen AI Z2 Extreme）。負荷生成の道具（wrk と veil-load）と置き場所の較正（2026-11-08）。サーバは v0.12.0 の候補（c9689c23）の wheel の tools/api-bench/python/veil_app.py（offload=True、2 スレッド、アクセスログ無し、Python 3.12）を CPU 0-1 に固定。負荷は 64 接続・10 秒・パイプライン無しで、wrk2 = wrk -t2（CPU 2-3、run_bench.py と同じ）、vl2 = veil-load -t 2（CPU 2-3）、wrk8 = wrk -t8（CPU 8-15）、vl8 = veil-load -t 8（CPU 8-15、api_ab.py と同じ）。1 回の起動で 4 通りを順に測り（偶数ラウンドは逆順）、3 ラウンド。
+round	path	load	rps	p99
+1	/plaintext	wrk2	249759.11	642.00us
+1	/plaintext	vl2	182115	790.5us
+1	/plaintext	wrk8	69654.15	2.16ms
+1	/plaintext	vl8	63584	1695.7us
+1	/json/abc	wrk2	201324.52	674.00us
+1	/json/abc	vl2	183056	741.4us
+1	/json/abc	wrk8	64438.92	1.79ms
+1	/json/abc	vl8	63527	1564.7us
+2	/plaintext	vl8	62502	1892.4us
+2	/plaintext	wrk8	62641.68	1.77ms
+2	/plaintext	vl2	187898	741.4us
+2	/plaintext	wrk2	210516.42	781.00us
+2	/json/abc	vl8	61948	1695.7us
+2	/json/abc	wrk8	73454.34	1.84ms
+2	/json/abc	vl2	169667	888.8us
+2	/json/abc	wrk2	176671.59	746.00us
+3	/plaintext	wrk2	235950.82	676.00us
+3	/plaintext	vl2	177920	790.5us
+3	/plaintext	wrk8	57130.20	2.31ms
+3	/plaintext	vl8	58486	1876.0us
+3	/json/abc	wrk2	179178.73	834.00us
+3	/json/abc	vl2	164002	856.1us
+3	/json/abc	wrk8	56904.46	2.32ms
+3	/json/abc	vl8	56376	2113.5us
