@@ -22,7 +22,7 @@ use super::*;
 #[derive(Deserialize, Clone, Debug)]
 pub struct PrometheusConfig {
     /// メトリクスエンドポイントを有効化するかどうか
-    /// デフォルト: true
+    /// デフォルト: false
     #[serde(default = "default_prometheus_enabled")]
     pub enabled: bool,
 
