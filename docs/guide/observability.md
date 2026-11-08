@@ -295,7 +295,7 @@ file_path = "/var/log/veil.json"
 
 ## Structured Access Log
 
-Write per-request access logs in JSON or text format, independent of the application log. Uses thread-local buffers to minimize heap allocation.
+Write per-request access logs in JSON or text format, independent of the application log. The request path only copies values into a per-thread buffer; a dedicated thread formats and writes the lines (see below).
 
 ### Configuration
 
@@ -306,11 +306,11 @@ format = "json"                         # "json" or "text"
 file_path = "/var/log/veil/access.log"  # omit for stdout; parent dir auto-added to landlock_write_paths
 # Limit output fields (omit for all fields)
 fields = ["timestamp", "method", "host", "path", "status", "duration_ms", "client_ip", "upstream"]
-channel_size = 10000      # async channel capacity to the writer thread (default: 10000)
+channel_size = 10000      # lines each request-serving thread can hold for the writer thread (default: 10000)
 flush_interval_ms = 1000  # BufWriter flush interval in ms (default: 1000)
 ```
 
-Access logs are written asynchronously by a dedicated writer thread. The hot path (worker thread) only pushes bytes into a bounded channel (`channel_size`). The writer thread holds the file/stderr handle exclusively, eliminating global lock contention. Log lines dropped when the channel is full are silently discarded without blocking request processing.
+Access logs are written asynchronously by a dedicated writer thread. Each worker thread only copies the values of a request (method, host, path, status, sizes, duration, time, client address, upstream) into a buffer of its own. The writer thread swaps those buffers for empty ones, turns the values into JSON or text lines and writes them (every millisecond while requests keep coming), so a request costs no formatting, no allocation, no channel push and no lock contention between workers. The timestamp is still the time the request finished. The writer thread holds the file/stdout handle exclusively. If the writer falls behind (for example, stdout is a pipe nobody reads), each worker thread holds up to `channel_size` lines and silently drops further lines without blocking request processing. Lines from one worker thread stay in order; lines from different worker threads can be interleaved out of order within about a millisecond. A reload (SIGHUP) starts a new writer thread, and the old one writes the lines it still holds before it exits.
 
 ### Available Fields
 

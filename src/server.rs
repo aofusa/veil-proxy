@@ -158,7 +158,7 @@ pub fn spawn_reload_thread() {
                 match reload_config(&config_path) {
                     Ok(()) => {
                         // アクセスログライタースレッドをホットリロード
-                        // ファイルパスやフォーマットが変わった場合、旧スレッドを終了して新スレッドを起動する
+                        // 新しいライタースレッドを起動し、旧スレッドは溜まった行を書き切って終わる（F-302）
                         #[cfg(feature = "access-log")]
                         {
                             let cfg = crate::config::CURRENT_CONFIG.load();

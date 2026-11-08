@@ -314,7 +314,7 @@ level = "info"
 #   "duration_ms", "client_ip", "upstream",
 #   "req_body_size", "resp_body_size", "user_agent"
 # ]
-# channel_size = 10000        # 非同期チャネルキャパシティ（デフォルト: 10000）
+# channel_size = 10000        # ログスレッドが書くのを待てる行数（要求を処理するスレッドごと。デフォルト: 10000）
 # flush_interval_ms = 1000    # BufWriter フラッシュ間隔ミリ秒（デフォルト: 1000）
 
 

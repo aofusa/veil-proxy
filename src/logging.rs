@@ -39,9 +39,14 @@ thread_local! {
 /// システムコールの呼び出しを大幅に削減。
 #[inline]
 pub(crate) fn coarse_now() -> OffsetDateTime {
+    coarse_now_at(Instant::now())
+}
+
+/// 呼び出し側が読んだ時刻（`now_instant`）で更新を判断する [`coarse_now`]（時刻を 2 回読まない。F-302）
+#[inline]
+pub(crate) fn coarse_now_at(now_instant: Instant) -> OffsetDateTime {
     CACHED_TIME.with(|cached| {
         LAST_UPDATE.with(|last| {
-            let now_instant = Instant::now();
             let elapsed = now_instant.duration_since(last.get()).as_millis();
 
             if elapsed >= COARSE_TIMER_UPDATE_INTERVAL_MS {
@@ -640,18 +645,14 @@ pub(crate) fn log_access(
         return;
     }
 
-    // 処理時間は Instant で高精度計測
-    let duration = start_instant.elapsed();
+    // 処理時間は Instant で高精度計測（読んだ時刻はタイムスタンプの更新の判断にも使う。F-302）
+    let now = Instant::now();
+    let duration = now.saturating_duration_since(start_instant);
     let duration_ms = duration.as_millis();
-    let duration_secs = duration.as_secs_f64();
 
     // タイムスタンプは Coarse Timer を使用（システムコール削減）
     // access-log feature が有効な場合はこの値を log_access_structured() にも渡す（二重 syscall 排除）
-    let log_time = coarse_now();
-    let path_str = std::str::from_utf8(path).unwrap_or("-");
-    let ua_str = std::str::from_utf8(ua).unwrap_or("-");
-    let method_str = std::str::from_utf8(method).unwrap_or("GET");
-    let host_str = std::str::from_utf8(host).unwrap_or("-");
+    let log_time = coarse_now_at(now);
 
     // access-log が無効な場合のみ ftlog 経由のテキストアクセスログを出力
     // （access-log 有効時は構造化ログと二重出力しない）
@@ -661,26 +662,32 @@ pub(crate) fn log_access(
     // `type` フィールドでアプリ本体ログと判別できる。
     #[cfg(not(feature = "access-log"))]
     info!(target: "access", "Access: time={} duration={}ms method={} host={} path={} ua={} req_body_size={} status={} resp_body_size={}",
-        log_time, duration_ms, method_str, host_str, path_str, ua_str, req_body_size, status, resp_body_size);
+        log_time, duration_ms,
+        std::str::from_utf8(method).unwrap_or("GET"), std::str::from_utf8(host).unwrap_or("-"),
+        std::str::from_utf8(path).unwrap_or("-"), std::str::from_utf8(ua).unwrap_or("-"),
+        req_body_size, status, resp_body_size);
 
-    // Prometheusメトリクスを記録
-    record_request_metrics(
-        method_str,
-        host_str,
-        status,
-        req_body_size,
-        resp_body_size,
-        duration_secs,
-    );
+    // Prometheusメトリクスを記録（無効なら文字列にもしない。構造化アクセスログはバイト列のまま渡し、
+    // UTF-8 の検査はライタースレッドが行う。F-302）
+    if cfg!(feature = "metrics") && crate::metrics::metrics_runtime_enabled() {
+        record_request_metrics(
+            std::str::from_utf8(method).unwrap_or("GET"),
+            std::str::from_utf8(host).unwrap_or("-"),
+            status,
+            req_body_size,
+            resp_body_size,
+            duration.as_secs_f64(),
+        );
+    }
 
     // 構造化アクセスログ出力（F-21）
     // log_time と duration_ms を渡すことで syscall 二重発行と clone を排除
     #[cfg(feature = "access-log")]
     crate::access_log::log_access_structured(
-        method_str,
-        host_str,
-        path_str,
-        ua_str,
+        method,
+        host,
+        path,
+        ua,
         req_body_size,
         status,
         resp_body_size,

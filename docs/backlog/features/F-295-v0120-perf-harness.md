@@ -12,7 +12,7 @@
 | JSON + 圧縮 | [F-296](F-296-json-comp-throughput.md)・[B-331](../bugs/B-331-brotli-huge-mapping-per-request.md) | json-comp 36.7k req/s（CPU 約 900%） | 最低でも数倍、理想は数十万 req/s |
 | コア制限下の遅延 | [F-297](F-297-core-limited-latency.md)・[B-332](../bugs/B-332-reactor-hot-connection-starves-others.md) | latency-500k-8cpu rate 0.7455、p99 数百万 µs | 8 CPU 固定で rate を維持し p99 を大きく下げる |
 | gRPC | [F-298](F-298-grpc-unary-fast-path.md)・[B-333](../bugs/B-333-h2-trailers-flush-per-stream.md) | unary の p99 が悪い | スループットを落とさず p99/p99.9 を改善 |
-| Python | [F-299](F-299-python-gil-lane.md)・[B-334](../bugs/B-334-python-thread-state-per-call.md)・[B-335](../bugs/B-335-access-log-writer-wake-per-request.md) | 25.5k plaintext / 22.6k json（2 スレッド、offload=True） | 50k 以上、できれば 70k（1 プロセス、2〜数スレッド） |
+| Python | [F-299](F-299-python-gil-lane.md)・[B-334](../bugs/B-334-python-thread-state-per-call.md)・[B-335](../bugs/B-335-access-log-writer-wake-per-request.md)・[F-302](F-302-access-log-hot-path.md) | 25.5k plaintext / 22.6k json（2 スレッド、offload=True） | 50k 以上、できれば 70k（1 プロセス、2〜数スレッド） |
 | io_uring（途中で発見） | [F-300](F-300-iouring-batched-submission.md) | 既定の Linux ビルドの 1 要求あたりの CPU が epoll 版より 4 割多い | 全シナリオで epoll 版と同等以上 |
 
 守ること: データプレーンは Rust のまま（io_uring / epoll / kTLS / rustls）。Python は `offload=True` を既定に保つ。

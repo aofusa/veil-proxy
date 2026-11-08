@@ -98,14 +98,16 @@ secure_redirect = true               # 301 to the https listener
 
 ## Logging
 
-- The access log is on by default in library mode and writes one line per request to standard output. Each line is
-  formatted and written by the worker and flushed by a background thread. At high request rates turn it off
+- The access log is on by default in library mode and writes one line per request to standard output. The worker
+  only copies the values of the request into a buffer of its own; a background thread formats the lines, writes them
+  and flushes them. At high request rates turn it off
   (`[access_log] enabled = false`), or keep it and send it somewhere cheaper than a terminal: `format = "json"` and
   `file_path = "/var/log/app/access.log"`, or standard output collected by the container runtime. The fields are
   listed in [observability.md](observability.md).
-  In a measurement of the Rust example (release build, 2 workers, `GET /api/items/7`, 64 connections) the
-  access log cost 15% of the throughput (44,543 against 52,277 requests/s). For Python handlers the difference was
-  within noise, because the handler itself takes most of the time.
+  On a 2-core machine (release build, 2 workers, 64 connections) the access log cost 7% of the throughput of the Rust
+  example (`GET /api/items/7`, 72,988 against 78,572 requests/s, written to a file) and 5% for Python handlers
+  (`offload=True`, 2 threads, 45,770 against 48,187 requests/s). Most of what remains is the background thread's
+  work, which runs on other cores when the process has them.
 - `[logging] format = "json"` makes the application log machine-readable. Keep `level = "info"`: veil logs nothing
   per request at `info`.
 
