@@ -11,7 +11,7 @@
     python3 tools/api-bench/run_bench.py --group rust --proto h3 --only "native" --out ...           # HTTP/3（h2load-h3）
 
 前提: tools/api-bench/README.md のビルド手順（axum-tokio・axum-veil の release ビルド、Python の venv）と
-docker イメージ local/wrk-openssl（wrk）。待ち受けは BENCH_PORT（既定 3000）。始める前にそのポートが空いているかを確かめる
+docker イメージ local/wrk-openssl（wrk。Docker を使わないときは WRK_BIN に wrk のパス）。待ち受けは BENCH_PORT（既定 3000）。始める前にそのポートが空いているかを確かめる
 （他のサーバが使っていると、そちらを測ってしまう）。
 """
 
@@ -35,6 +35,8 @@ SERVER_CPUS = os.environ.get("BENCH_SERVER_CPUS", "0,1")
 CLIENT_CPUS = os.environ.get("BENCH_CLIENT_CPUS", "2,3")
 THREADS = int(os.environ.get("BENCH_THREADS", "2"))
 WRK_IMG = os.environ.get("WRK_IMG", "local/wrk-openssl:latest")
+# Docker を使わずに、入っている wrk を taskset で BENCH_CLIENT_CPUS に固定して直接起動する（WRK_BIN=/usr/bin/wrk など）
+WRK_BIN = os.environ.get("WRK_BIN")
 # HTTP/2（h2c）・HTTP/3 の負荷ツール（F-206）。h2load の -m（1 接続あたりの同時ストリーム）は H2LOAD_STREAMS
 H2LOAD_IMG = os.environ.get("H2LOAD_IMG", "local/h2load:latest")
 H2LOAD_H3_IMG = os.environ.get("H2LOAD_H3_IMG", "local/h2load-h3:latest")
@@ -172,8 +174,11 @@ def wait_port(proc, timeout=20):
 
 
 def wrk(path, duration, conns):
-    cmd = ["docker", "run", "--rm", "--network", "host", "--cpuset-cpus", CLIENT_CPUS, WRK_IMG,
-           f"-t{len(CLIENT_CPUS.split(','))}", f"-c{conns}", f"-d{duration}s", "--latency", f"http://{ADDR}{path}"]
+    args = [f"-t{len(CLIENT_CPUS.split(','))}", f"-c{conns}", f"-d{duration}s", "--latency", f"http://{ADDR}{path}"]
+    if WRK_BIN:
+        cmd = ["taskset", "-c", CLIENT_CPUS, WRK_BIN] + args
+    else:
+        cmd = ["docker", "run", "--rm", "--network", "host", "--cpuset-cpus", CLIENT_CPUS, WRK_IMG] + args
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + 60)
     o = r.stdout
     rps = re.search(r"Requests/sec:\s+([\d.]+)", o)

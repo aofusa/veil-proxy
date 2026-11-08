@@ -31,7 +31,8 @@ python3 -m venv $V && $V/bin/pip install -r tools/api-bench/python/requirements.
 (cd crates/veil-python && VIRTUAL_ENV=$PWD/../../$V PATH=$PWD/../../$V/bin:$PATH maturin develop --release)
 ```
 
-負荷ツールは docker イメージ `local/wrk-openssl`（`WRK_IMG` で変更可）。
+負荷ツールは docker イメージ `local/wrk-openssl`（`WRK_IMG` で変更可）。Docker を使わない端末では `WRK_BIN=/usr/bin/wrk` のように
+入っている wrk を渡すと、`taskset` で `BENCH_CLIENT_CPUS` に固定して直接起動する（HTTP/1.1 のみ。h2load は docker のまま）。
 
 ## 実行
 
