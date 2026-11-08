@@ -212,6 +212,11 @@ fn register(fd: RawFd, interest: Interest, waker: Waker) {
         let bit = match interest {
             Interest::Read => {
                 rec.read_waker.push(waker);
+                rec.read_wait_seq = READ_WAIT_SEQ.with(|s| {
+                    let v = s.get().wrapping_add(1);
+                    s.set(v);
+                    v
+                });
                 READ
             }
             Interest::Write => {
@@ -491,15 +496,59 @@ fn park(timeout: Option<Duration>) {
             }
         }
     });
-    if n > 0 {
+    if n == 1 {
+        let ev = EVENT_BUF.with(|buf| buf.borrow()[0]);
+        dispatch_event(ev.u64 as RawFd, ev.events);
+    } else if n > 1 {
         EVENT_BUF.with(|buf| {
             let buf = buf.borrow();
-            for ev in buf.iter().take(n) {
+            let mut order = [0u64; EVENT_BATCH];
+            let order = &mut order[..n];
+            wake_order(&buf[..n], order);
+            for &key in order.iter() {
+                let ev = buf[(key & 0xffff) as usize];
                 dispatch_event(ev.u64 as RawFd, ev.events);
             }
         });
     }
     super::timer::fire_expired(super::timer::refresh_now());
+}
+
+#[cfg(veil_poller_epoll)]
+thread_local! {
+    /// 読み取りの待機者を置いた回数（ワーカーごと。`FdRecord::read_wait_seq` の元。B-339）。
+    static READ_WAIT_SEQ: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+// `wake_order` はイベントの添字を下位 16 ビットに持つ
+#[cfg(veil_poller_epoll)]
+const _: () = assert!(EVENT_BATCH <= 1 << 16);
+
+/// 起こす順番を決める（B-339）。読み取りの待機者のいるイベントは、待ち始めたのが古い順に並べる。
+///
+/// レベルトリガのカーネルは、報告した fd を準備済みリストの末尾へ戻して次の走査まで置いておく。その間に次のデータが
+/// 届いてもつなぎ直さないので、次の回は前の回に報告した fd を前の回の報告の順で返し、その後に新しくつながった fd を
+/// 返す。CPU を使い切っているワーカーでこの順のまま起こすと、束の最後に応答した接続は次の要求が走査に間に合わず、
+/// 次の束では全部の後ろに回って 2 周分待つ。`EPOLLONESHOT` のときは届いた順だった。閉ループの相手では、待ち始めた順は
+/// 届いた順とほぼ同じになる。待機者のいない読み取り（武装を下げるだけ）と書き込みのイベントは先に回す。
+///
+/// `order` には `(!経過) << 32 | 添字` を書いて昇順に並べる（経過 = 今の通し番号 − 待ち始めた番号。大きいほど古い）。
+#[cfg(veil_poller_epoll)]
+fn wake_order(events: &[libc::epoll_event], order: &mut [u64]) {
+    let now = READ_WAIT_SEQ.with(|s| s.get());
+    FD_TABLE.with(|t| {
+        let mut t = t.borrow_mut();
+        for (i, (ev, key)) in events.iter().zip(order.iter_mut()).enumerate() {
+            let age = match t.get_mut(ev.u64 as RawFd) {
+                Some(rec) if ev.events & READ != 0 && !rec.read_waker.is_empty() => {
+                    now.wrapping_sub(rec.read_wait_seq)
+                }
+                _ => u32::MAX,
+            };
+            *key = (u64::from(!age) << 32) | i as u64;
+        }
+    });
+    order.sort_unstable();
 }
 
 /// epoll 版イベント配送（F-297）。
@@ -1419,6 +1468,62 @@ mod tests {
             }
         });
         assert_eq!(got, 100);
+    }
+
+    /// B-339: 読み取りの待ちは待ち始めた順に起こす。レベルトリガのカーネルは、前の回に報告した fd を次のデータが
+    /// 届いた順ではなく前の回の報告の順で返す。
+    #[cfg(veil_poller_epoll)]
+    #[test]
+    fn read_waits_are_woken_oldest_first() {
+        use std::sync::{Arc, Mutex};
+        struct Log(Arc<Mutex<Vec<u8>>>, u8);
+        impl std::task::Wake for Log {
+            fn wake(self: Arc<Self>) {
+                self.0.lock().unwrap().push(self.1);
+            }
+        }
+        init_reactor().unwrap();
+        init_executor();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let waker = |label| Waker::from(Arc::new(Log(order.clone(), label)));
+        let pipe = || {
+            let mut fds = [0i32; 2];
+            // SAFETY: fds は 2 要素の配列で、pipe2(2) はその 2 要素に fd を書き込む
+            assert_eq!(
+                unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) },
+                0
+            );
+            (fds[0], fds[1])
+        };
+        // SAFETY: fd は有効な pipe の書き込み端で、1 バイトを渡す
+        let put = |fd: RawFd| assert_eq!(unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) }, 1);
+        let take = |fd: RawFd| {
+            let mut b = [0u8; 1];
+            // SAFETY: fd は有効な pipe の読み取り端で、b は 1 バイトの書き込み先
+            assert_eq!(unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) }, 1);
+        };
+        let ((a, aw), (b, bw)) = (pipe(), pipe());
+        register_read(a, waker(1));
+        register_read(b, waker(2));
+        put(aw);
+        put(bw);
+        park(Some(Duration::ZERO)); // a、b の順。どちらもカーネルの準備済みリストにこの順で残る
+        take(a);
+        take(b);
+        register_read(b, waker(2)); // 今度は b が先に待ち、データも b が先に届く
+        register_read(a, waker(1));
+        put(bw);
+        put(aw);
+        park(Some(Duration::ZERO)); // カーネルは前の回の順（a、b）で返す
+        assert_eq!(*order.lock().unwrap(), [1, 2, 2, 1]);
+        unregister(a);
+        unregister(b);
+        // SAFETY: このテストが作った fd を 1 度だけ閉じる
+        unsafe {
+            for fd in [a, aw, b, bw] {
+                libc::close(fd);
+            }
+        }
     }
 
     /// B-332: インラインの poll は呼び元の接続と予算を分け合わない（束の途中のストリームが要求を送る前に落ちない）

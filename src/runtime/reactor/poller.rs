@@ -149,6 +149,9 @@ pub(crate) struct FdRecord {
     /// [`ReadableLazy`](super::tcp::ReadableLazy) の待ちの状態（epoll 専用。F-297）。
     #[cfg(veil_poller_epoll)]
     pub lazy_read: LazyRead,
+    /// 読み取りの待機者を最後に置いた順番（ワーカーごとの通し番号。epoll 専用。起こす順番を決める。B-339）。
+    #[cfg(veil_poller_epoll)]
+    pub read_wait_seq: u32,
     /// 直近に届いた読み取り可能イベントのヒント（consume-once、F-141/F-166 A-1）。
     ///
     /// - kqueue: `EVFILT_READ` の `data`（読み取り可能バイト数、カーネルが kevent 発火

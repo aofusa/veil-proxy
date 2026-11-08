@@ -410,6 +410,19 @@ python3 tools/perf/api_ab.py --summary api_ab.tsv    # 表だけ作り直す
 - 速度の判定は **サイクル** で。命令数は下がったのにサイクルが上がることがある（フューチャの状態が接続ごとの冷たいメモリに
   載るなど。`perf stat -e instructions:u,cycles:u` を閉ループの飽和で採る）。
 
+### 同じバイナリの中で比べる（`--new-env`・`--base-env`、B-339）
+
+`json` の `identity` の行は、ビルドごとのコードの配置だけで 15% 動く（同じ意味のコードで 144k〜171k rps。命令数は同じで、
+フロントエンドの停止と分岐予測ミスが増える。`perf stat -e cycles:u,instructions:u,branch-misses:u,stalled-cycles-frontend:u`）。
+小さな変更の効果を 2 つのビルドの A/B で判定すると、配置の当たり外れを変更の効果と取り違える。
+
+変更を環境変数で切れるようにした一時的なビルドを 1 つ作り、同じ木を `--new`・`--base` に渡して片側だけ切る
+（切り替えはコミットしない）。
+
+```bash
+python3 tools/perf/api_ab.py --new . --base . --base-env VEIL_EXP_NOSORT=1 --scenario json --rounds 5
+```
+
 ## プロキシ本体の交互 A/B（`proxy_ab.py`、F-300）
 
 `suite_ab.sh` は 2 つのイメージで全構成を何時間も回す。ランタイムや転送の経路に手を入れたときの退行確認は、手元の 2 つの
@@ -448,6 +461,20 @@ LD_LIBRARY_PATH=~/h2load-h3/lib python3 tools/perf/proxy_ab.py --base A --new B 
 - `tools/perf/h3load`（quinn）はクライアントが律速で、同じ条件でも回ごとに 16k〜105k へ分かれる。版の比較には QUIC 対応の h2load を使う。
 - wrk の `timeout` は `errs` に入れず TSV の `wrk_timeouts` へ分ける。wrk は `gettimeofday` の差で判定するので、時計が戻るとその瞬間に処理中の全接続を
   数える（WSL2 は 30 秒ごとに約 75 ms 戻り、1 回の実行で 100 件前後の偽の `timeout` になる。Max の遅延は動かない）。
+
+## kTLS + HTTP/2 の回帰の手順（`ktls_h2_repro.sh`、B-75・F-297）
+
+reactor の待ち方（武装・確認の `poll(2)`・起こす順番）や kTLS の読み取りに手を入れたら、epoll と io_uring の両方のバイナリで回す。
+kTLS + CBPF の同じサーバへ wrk を 3 回流してから h2load を 3 回流す。[B-75](../../docs/backlog/bugs/B-75-epoll-et-ktls-hang.md) は
+この順で h2load が止まり、単体・統合・E2E は全部通っていた。
+
+```bash
+sudo modprobe tls
+bash tools/perf/ktls_h2_repro.sh target-epoll/release/veil      # 最後に OK / FAILED。失敗なら 0 以外で終わる
+SERVER_CPUS=0-3 LOAD_CPUS=4-7 bash tools/perf/ktls_h2_repro.sh target-uring/release/veil
+```
+
+h2load が 30 秒で終わらない・失敗が出る・kTLS が有効にならない、のどれかで FAILED になる。
 
 ## リーク試験（`leak_check.sh`、F-185）
 

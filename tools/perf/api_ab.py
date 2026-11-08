@@ -138,11 +138,17 @@ def app_cmd(tree, args):
     return [str(Path(tree) / args.app_subpath), args.addr, str(args.threads)]
 
 
+def side_env(args, target, env):
+    """`--new-env`・`--base-env` の分を足す（同じ木の実行時の切り替えを比べる。B-339）。"""
+    return dict(env, **args.side_env.get(target, {}))
+
+
 def scenario_json(args, trees, rnd, writer):
     paths = sum((["--path", p] for p in JSON_PATHS), [])
     for name, tree in trees:
         # 識別（直列化 + 送信）は圧縮を切った構成と同じ。増分が圧縮のコスト
-        srv = Server(app_cmd(tree, args), {"BENCH_COMPRESSION": "1"}, args.server_cpus, args.addr, args.sc_so)
+        srv = Server(app_cmd(tree, args), side_env(args, name, {"BENCH_COMPRESSION": "1"}), args.server_cpus, args.addr,
+                     args.sc_so)
         try:
             run_row(args, srv, name, rnd, "identity", ["-c", str(args.conns)] + paths, writer)
             run_row(args, srv, name, rnd, "gzip", ["-c", str(args.conns), "-H", "Accept-Encoding: gzip"] + paths, writer)
@@ -154,7 +160,7 @@ def scenario_json(args, trees, rnd, writer):
 def scenario_latency(args, trees, rnd, writer):
     path = ["--path", "/baseline11?a=1&b=2", "-c", str(args.conns)]
     for name, tree in trees:
-        srv = Server(app_cmd(tree, args), {}, args.server_cpus, args.addr, args.sc_so)
+        srv = Server(app_cmd(tree, args), side_env(args, name, {}), args.server_cpus, args.addr, args.sc_so)
         try:
             run_row(args, srv, name, rnd, "saturation", path, writer)
             for r in args.rates:
@@ -170,7 +176,7 @@ def scenario_grpc(args, trees, rnd, writer):
     grpc = ["--mode", "grpc", "--path", GRPC_PATH, "--body-file", body.name]
     try:
         for name, tree in trees:
-            srv = Server(app_cmd(tree, args), {}, args.server_cpus, args.addr, args.sc_so)
+            srv = Server(app_cmd(tree, args), side_env(args, name, {}), args.server_cpus, args.addr, args.sc_so)
             try:
                 run_row(args, srv, name, rnd, "grpc-c256-m100", grpc + ["-c", "256", "-m", "100"], writer)
                 run_row(args, srv, name, rnd, "grpc-c64-m10", grpc + ["-c", "64", "-m", "10"], writer)
@@ -200,7 +206,8 @@ def scenario_python(args, trees, rnd, writer):
                 env = dict(variants[v], BENCH_THREADS=str(threads), BENCH_LISTEN=args.addr)
                 if args.no_access_log:
                     env["BENCH_ACCESS_LOG"] = "0"
-                srv = Server([str(Path(venv) / "bin/python"), str(app)], env, args.server_cpus, args.addr, args.sc_so)
+                srv = Server([str(Path(venv) / "bin/python"), str(app)], side_env(args, name, env), args.server_cpus,
+                             args.addr, args.sc_so)
                 try:
                     c = ["-c", str(args.conns)]
                     run_row(args, srv, name, rnd, f"{v}-t{threads}-plaintext", c + ["--path", "/plaintext"], writer)
@@ -241,6 +248,10 @@ def main():
     p.add_argument("--base", help="baseline tree (omit to measure one tree)")
     p.add_argument("--new-venv", help="venv with the wheel of --new (python scenario)")
     p.add_argument("--base-venv", help="venv with the wheel of --base (python scenario)")
+    p.add_argument("--new-env", action="append", default=[], metavar="KEY=VALUE",
+                   help="extra environment variable for the --new server (repeatable)")
+    p.add_argument("--base-env", action="append", default=[], metavar="KEY=VALUE",
+                   help="extra environment variable for the --base server (repeatable)")
     p.add_argument("--app-subpath", default="tools/perf/api-app/target/release/veil-api-app")
     p.add_argument("--load", help="veil-load binary (default: the one in --new)")
     p.add_argument("--addr", default="127.0.0.1:3000")
@@ -269,6 +280,11 @@ def main():
     args.py_variants = [x for x in args.py_variants.split(",") if x]
     args.py_threads = [int(x) for x in args.py_threads.split(",") if x]
     args.load = args.load or str(Path(args.new) / "tools/perf/veil-load/target/release/veil-load")
+    try:
+        args.side_env = {"new": dict(kv.split("=", 1) for kv in args.new_env),
+                         "base": dict(kv.split("=", 1) for kv in args.base_env)}
+    except ValueError:
+        raise SystemExit("--new-env/--base-env take KEY=VALUE")
     args.sc_so = None
     if args.syscalls:
         cc = shutil.which("cc")
