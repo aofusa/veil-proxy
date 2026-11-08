@@ -1224,9 +1224,14 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
   引数は名前と注釈で束縛され、戻り値は変換されます（dict/list → JSON、`str` → テキスト、`veil.Response`、`(body, status)`、`None` → 204）。
   `veil.HTTPException(404, "...")` は `{"detail": ...}` になります。**pydantic** があれば `BaseModel` の本文を検証して OpenAPI に反映し、
   無ければ `body_constraints` で dict の本文を検証します。OpenAPI は `/openapi.json` と `/docs` で公開されます。
-- **offload と GIL。** ハンドラは GIL を握って実行されます。既定（`offload=True`）ではハンドラ用プールで実行されるので、
-  イベントループが GIL を待つことはありません。`offload=False` はネットワークワーカー上で直接実行する指定で、自明に軽いハンドラ専用です。
-  純 Python のハンドラの並列度は GIL に制限されるので、CPU バウンドな処理は複数プロセス構成にしてください。
+- **offload と GIL。** ハンドラは GIL を握って実行されます。既定（`offload=True`）では veil の Python 用のハンドラスレッド
+  （`[api] handler_threads`）で実行されるので、ネットワークワーカーが GIL を待つことはありません。スレッドは交代で動きます。1 本が
+  GIL を握ったまま要求を続けて処理し、もう 1 本が GIL を待っていて、ハンドラが GIL を手放すと（`time.sleep`・ブロッキングな I/O・
+  GIL を手放す C 拡張）すぐに引き継ぎ、残りは眠っています。そのためブロッキングなハンドラはスレッド数まで重なって動きます。
+  `offload=False` はネットワークワーカー上で直接実行する指定で、自明に軽いハンドラ専用です。純 Python のハンドラの並列度は GIL に
+  制限されるので、CPU バウンドな処理は複数プロセス構成にしてください。要求は毎回新しい `contextvars.Context` で呼ばれるので、
+  ある要求で設定したコンテキスト変数は次の要求から見えません。`threading.local` の値はハンドラのスレッドに残り、同じスレッドの後の
+  要求から見えます（0.12 より前は要求ごとに空になっていました）。
 - **サーバの中では**、ハンドラに Rust 側の要求（`veil._veil.NativeRequest`。`isinstance` では `veil.Request`）が渡ります。属性・メソッドは同じで、ハンドラが読んだ属性だけを作ります。よくある戻り値（`str`・`bytes`・`dict`/`list`・`None`・`veil.Response`）は Rust で本文を複製せずに応答にします（F-212）。Python 3.9 以上が必要です。
 - **async def とイベントループ（F-263）。** `async def` のハンドラは **常駐の asyncio のイベントループ**（uvicorn と同じく専用のスレッド。
   uvloop が入っていれば uvloop）で動きます。`await` の間はスレッドを握らないので、数千の要求が同時に待て、`asyncio.create_task` の

@@ -1289,10 +1289,15 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
   (dict/list → JSON, `str` → text, `veil.Response`, `(body, status)`, `None` → 204), `veil.HTTPException(404, "...")`
   gives `{"detail": ...}`. With **pydantic** installed, `BaseModel` bodies are validated and described in OpenAPI;
   without it, `body_constraints` validates dict bodies. OpenAPI is served at `/openapi.json` and `/docs`.
-- **offload and the GIL.** Handlers hold the GIL while they run. By default (`offload=True`) they run on the
-  handler pool, so the event loop never waits for the GIL. `offload=False` runs on the network worker and is for
+- **offload and the GIL.** Handlers hold the GIL while they run. By default (`offload=True`) they run on veil's
+  Python handler threads (`[api] handler_threads`), so a network worker never waits for the GIL. The threads take
+  turns: one runs requests back to back while it holds the GIL, a second waits for the GIL and takes over as soon as
+  a handler releases it (`time.sleep`, blocking I/O, C extensions that drop the GIL), and the rest sleep, so blocking
+  handlers still overlap up to the number of threads. `offload=False` runs on the network worker and is for
   trivially cheap handlers only. Pure-Python handlers are limited to the GIL's parallelism; for CPU-bound work use
-  several processes.
+  several processes. Each request runs in a new `contextvars.Context`, so a context variable set by one request is
+  not seen by the next; `threading.local` values stay with the handler thread and are seen by later requests on it
+  (before 0.12 they were cleared on every request).
 - **Inside the server** a handler receives a Rust-backed request (`veil._veil.NativeRequest`, an instance of
   `veil.Request` for `isinstance`) with the same attributes and methods; attributes are created only when the
   handler reads them, and common return values (`str`, `bytes`, `dict`/`list`, `None`, `veil.Response`) are turned
