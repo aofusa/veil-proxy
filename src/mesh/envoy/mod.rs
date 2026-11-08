@@ -102,7 +102,15 @@ pub fn main(args: Vec<String>) -> i32 {
     let mut lc = crate::logging::LoggingConfigSection::default();
     let lvl = std::env::var("VEIL_MESH_LOG").ok();
     lc.level = log_level(lvl.as_deref().or(cli.log_level.as_deref())).to_string();
-    let _guard = crate::logging::init_logging(&lc);
+    // 出力先は標準出力・標準エラーだけ（ファイルを開かないので失敗しない。B-343）
+    let _guard = match crate::logging::init_logging(&lc) {
+        Ok(g) => g,
+        Err(e) => {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "veil: {}", e);
+            return 1;
+        }
+    };
 
     // 既存のコンポーネント（TLS・HTTP/2）が読む実行時設定。kTLS は VEIL_MESH_KTLS=1 のときだけ
     // （ノードに tls モジュールが無いと接続ごとにフォールバックの警告が出るため既定は無効）

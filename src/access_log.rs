@@ -517,7 +517,8 @@ fn open_output(file_path: Option<&str>) -> Output {
         Some(path) => match open_log_file(path) {
             Ok(f) => Output::File(io::BufWriter::new(f)),
             Err(e) => {
-                eprintln!("access-log: failed to open '{}': {}", path, e);
+                // B-343: 標準エラーが書けなくても panic しない（`eprintln!` は書けないと panic する）
+                let _ = writeln!(io::stderr(), "access-log: failed to open '{}': {}", path, e);
                 Output::Stdout(io::BufWriter::new(io::stdout()))
             }
         },
@@ -533,10 +534,14 @@ fn reopen_output(out: &mut Output, file_path: Option<&str>) {
     let _ = out.flush();
     match open_log_file(path) {
         Ok(f) => *out = Output::File(io::BufWriter::new(f)),
-        Err(e) => eprintln!(
-            "access-log: failed to reopen '{}' (keeping the previous file): {}",
-            path, e
-        ),
+        Err(e) => {
+            let _ = writeln!(
+                io::stderr(),
+                "access-log: failed to reopen '{}' (keeping the previous file): {}",
+                path,
+                e
+            );
+        }
     }
 }
 

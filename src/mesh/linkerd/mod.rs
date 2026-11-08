@@ -67,7 +67,15 @@ pub fn main() -> i32 {
             .unwrap_or_else(|| cfg.log_level().to_string()),
         ..Default::default()
     };
-    let _guard = crate::logging::init_logging(&lc);
+    // 出力先は標準出力・標準エラーだけ（ファイルを開かないので失敗しない。B-343）
+    let _guard = match crate::logging::init_logging(&lc) {
+        Ok(g) => g,
+        Err(e) => {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "veil: {}", e);
+            return 1;
+        }
+    };
     {
         // 既存のコンポーネント（TLS・HTTP/2）が読む実行時設定（kTLS は使わない）
         let mut rc = crate::config::RuntimeConfig::default();

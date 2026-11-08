@@ -232,7 +232,6 @@ ftlogを使用した高性能非同期ログを提供します。ftlogは内部�
 | `format` | ログ出力形式（text/json） | text |
 | `channel_size` | 内部チャネルバッファサイズ（起動時に確保、1 件 約 88 バイト） | 16384 |
 | `flush_interval_ms` | ディスクフラッシュ間隔（ミリ秒） | 1000 |
-| `max_log_size` | 最大ログファイルサイズ（バイト、0=無制限） | 104857600 |
 | `app_file_path` | アプリ本体ログ（INFO/WARN/DEBUG/TRACE）の出力先 | なし（**標準出力**） |
 | `error_file_path` | エラーログ（ERROR）の出力先 | なし（**標準エラー出力**） |
 
@@ -247,6 +246,15 @@ ftlogを使用した高性能非同期ログを提供します。ftlogは内部�
 | アクセスログ | （リクエストごと） | `[access_log].file_path` | **標準出力 (stdout)** | `access` |
 
 いずれかの系統にファイルパスを指定した場合、その **親ディレクトリ** が `[security].landlock_write_paths` に自動追加され、Landlock 有効時にログ書き込みが拒否されるのを防ぎます（日次ローテーション生成ファイルも同ディレクトリ配下のため）。
+
+### ログファイル
+
+`app_file_path`・`error_file_path` は地方時の 0 時ごとに新しいファイルへ切り替わり、ファイル名に日付が入ります。`app_file_path = "/var/log/veil/veil.log"` なら 2026 年 11 月 8 日は `/var/log/veil/veil-20261108.log` に書きます（拡張子の無いパスには `-YYYYMMDD` を付けます）。書いているのはその日のファイルで、日付の無いファイルは作らず、大きさの上限もありません。古いファイルは cron や `find -mtime` で消してください。UTC からのずれは起動時に 1 回だけ読みます。
+
+- 起動時にログファイルを開けない（ディレクトリが無い・権限が無い）と、標準エラー出力に `veil: cannot open the log file <パス>: <理由>` を出して終了コード 1 で止まります。
+- 次の日のファイルを開けないときは、今のファイルへ書き続けて 60 秒ごとに開き直します。
+- ログの出力先へ書けない（ディスクが満杯・読み手のいないパイプ・書けない標準出力や標準エラー出力）ときは、その行を捨てて処理を続けます。書けるようになると、最初に捨てた行の数を知らせる 1 行（`N log lines were dropped because the log output could not be written`。アプリ本体ログは WARN、エラーログは ERROR。設定した形式）を出します。
+- FreeBSD の capsicum の capability mode では、`cap_enter` の前にログのディレクトリを開いておき、日付ごとのファイルはそこから作ります（[運用: 設定のリロード](running.md)）。
 
 ### ログ出力形式
 
@@ -283,7 +291,7 @@ error_file_path = "/var/log/veil/veil.error.log"  # 任意
 [logging]
 level = "info"
 format = "json"
-file_path = "/var/log/veil.json"
+app_file_path = "/var/log/veil/veil.json"  # 任意。既定は標準出力
 ```
 
 ## 構造化アクセスログ

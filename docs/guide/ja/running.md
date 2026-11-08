@@ -343,7 +343,7 @@ SIGHUPを受信すると、サーバーは設定ファイルを再読み込み�
 
 > **FreeBSD capsicum の capability mode でのプロキシ（接続ブローカー）**（F-182）: capability mode のままでも `Proxy` ルートと `[upstreams]` を使えます。`cap_enter` の前（特権降格の後）に、veil はサンドボックスの外で動く **接続ブローカー** を起動します。これは veil 自身を再実行した子プロセスで、本体と同じ利用者で動きます。ブローカーが受け付けるのは **起動時に確定した許可リスト** の添字だけです。許可リストは `[upstreams]` の全サーバ、`Proxy` ルートの URL、OpenTelemetry のエンドポイントです。ブローカーは非ブロッキングの `connect(2)` を始め、そのソケットを `SCM_RIGHTS` で本体へ渡します。TLS と HTTP はサンドボックス内の本体が処理します。そのため、ワーカーが乗っ取られても、ブローカーを使って設定された上流以外へは接続できません。ホスト名はブローカーが解決します（30 秒ごとに再解決）。追加のコストがかかるのは新しい上流接続を開くときだけです（上流の接続はプール・多重化で再利用します）。ブローカー自身も防御を固めています（ptrace とコアダンプの禁止、fork 不可、ファイル書き込み不可、veil と一緒に終了）。ブローカーが終了した場合、veil は終了コード 1 で終わり、サービスマネージャによる両方の再起動に任せます。
 
-> **FreeBSD capsicum の capability mode**（`capsicum_capability_mode = true`）: SIGHUP（と admin API のリロード）で設定ファイルを読み直せます。`cap_enter` の前に設定ファイルのあるディレクトリ（とアクセスログのディレクトリ）を開いておき、リロードのたびにファイル名を `openat(2)` + `O_RESOLVE_BENEATH` で開き直します。rename による置き換えや、そのディレクトリ内の相対シンボリックリンクの差し替え（Kubernetes の ConfigMap 方式）にも追従します（F-178）。TLS 証明書も `[tls] auto_reload = true` なら同じ仕組みでリロードされます（F-136）。
+> **FreeBSD capsicum の capability mode**（`capsicum_capability_mode = true`）: SIGHUP（と admin API のリロード）で設定ファイルを読み直せます。`cap_enter` の前に設定ファイルのあるディレクトリ（とアクセスログのディレクトリ）を開いておき、リロードのたびにファイル名を `openat(2)` + `O_RESOLVE_BENEATH` で開き直します。rename による置き換えや、そのディレクトリ内の相対シンボリックリンクの差し替え（Kubernetes の ConfigMap 方式）にも追従します（F-178）。TLS 証明書も `[tls] auto_reload = true` なら同じ仕組みでリロードされます（F-136）。`[logging]` のファイル（`app_file_path`・`error_file_path`）のディレクトリも同じように開いておくので、capability mode でも次の日のログファイルを作れます。
 >
 > capability mode のプロセスは新しいディレクトリを開くことも、接続・bind することもできません。これらが必要になるリロードは **拒否して以前の設定を維持します**（ログに `capability mode: ...; restart veil to apply this change`）。次の変更は再起動で反映してください。
 >

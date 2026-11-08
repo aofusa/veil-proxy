@@ -239,7 +239,6 @@ Provides high-performance async logging using ftlog. ftlog internally uses a bac
 | `format` | Log output format (text/json) | text |
 | `channel_size` | Internal channel buffer size (preallocated, ~88 bytes per slot) | 16384 |
 | `flush_interval_ms` | Disk flush interval (milliseconds) | 1000 |
-| `max_log_size` | Maximum log file size (bytes, 0=unlimited) | 104857600 |
 | `app_file_path` | App log (INFO/WARN/DEBUG/TRACE) output path | none (**stdout**) |
 | `error_file_path` | Error log (ERROR) output path | none (**stderr**) |
 
@@ -254,6 +253,15 @@ Application logs and error logs are routed to **separate destinations by level**
 | Access log | (per-request) | `[access_log].file_path` | **stdout** | `access` |
 
 When a file path is set for any stream, its **parent directory** is automatically added to `[security].landlock_write_paths` so logging is not denied when Landlock is enabled (daily-rotated files live under the same directory).
+
+### Log Files
+
+`app_file_path` and `error_file_path` start a new file every day at local midnight, and the date is part of the file name: `app_file_path = "/var/log/veil/veil.log"` writes to `/var/log/veil/veil-20261108.log` on 8 November 2026 (a path without an extension gets `-YYYYMMDD` appended). The file of the current day is the one being written; there is no undated file and no size limit, so remove old files with a cron job or `find -mtime`. The time zone offset is read once at startup.
+
+- If the log file cannot be opened at startup (missing directory, permissions), veil prints `veil: cannot open the log file <path>: <reason>` to stderr and exits with status 1.
+- If the next day's file cannot be opened, veil keeps writing to the current file and tries again every 60 seconds.
+- If a log destination cannot be written (disk full, a closed pipe, a full or unwritable stdout/stderr), the lines are dropped and veil keeps serving. When writing works again, the first line is a notice with the number of dropped lines (`N log lines were dropped because the log output could not be written`, WARN for the app log, ERROR for the error log, in the configured format).
+- With FreeBSD capsicum capability mode, veil opens the log directories before `cap_enter` and creates the daily files through them (see [Running: configuration reload](running.md)).
 
 ### Log Output Formats
 
@@ -290,7 +298,7 @@ error_file_path = "/var/log/veil/veil.error.log"  # optional
 [logging]
 level = "info"
 format = "json"
-file_path = "/var/log/veil.json"
+app_file_path = "/var/log/veil/veil.json"  # optional; stdout by default
 ```
 
 ## Structured Access Log

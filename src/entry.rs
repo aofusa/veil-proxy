@@ -185,7 +185,16 @@ pub fn run_server(opts: ServerOptions) {
     // ftlogを設定に基づいて初期化
     // ftlogは内部でバックグラウンドスレッドとチャネルを使用した非同期ログライブラリ
     // 追加の非同期化層（tokio::sync::mpsc等）は不要
-    let _guard = init_logging(&logging_config);
+    // B-343: ログファイルを開けなければ理由を出して止める（以前は panic）。標準エラーが書けなくても
+    // panic しないよう、書き込みの失敗は捨てる
+    let _guard = match init_logging(&logging_config) {
+        Ok(g) => g,
+        Err(e) => {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "veil: {}", e);
+            return;
+        }
+    };
 
     // B-44 第4段: RLIMIT_NOFILE の soft limit を hard limit まで引き上げる
     // （nginx の worker_rlimit_nofile 相当。F-116 多重化後の同時 fd 需要 ~1100 が
@@ -1144,6 +1153,16 @@ pub fn run_server(opts: ServerOptions) {
                 None
             }
         };
+        // B-344: `[logging]` のログファイル（app・error）の親ディレクトリ。日付が変わったときの新しいファイルを
+        // capability mode の中で開けるよう、cap_enter 前に登録する
+        let log_file_paths: Vec<std::path::PathBuf> = [
+            loaded_config.logging.resolved_app_path(),
+            loaded_config.logging.resolved_error_path(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(std::path::PathBuf::from)
+        .collect();
         std::thread::Builder::new()
             .name("veil-cap-enter".to_string())
             .spawn(move || {
@@ -1191,6 +1210,15 @@ pub fn run_server(opts: ServerOptions) {
                                     "capsicum: failed to register the access log directory fd; \
                                      reopening the log on SIGHUP will not work in capability mode: {}",
                                     e
+                                );
+                            }
+                        }
+                        for p in &log_file_paths {
+                            if let Err(e) = crate::security::capsicum::init_log_file_dirfd(p) {
+                                error!(
+                                    "capsicum: failed to register the directory fd of log file {:?}; \
+                                     in capability mode the log keeps going to the current file when the date changes: {}",
+                                    p, e
                                 );
                             }
                         }

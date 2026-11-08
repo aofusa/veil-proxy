@@ -151,9 +151,10 @@ level = "info"
 channel_size = 16384
 # Flush interval (milliseconds)
 flush_interval_ms = 1000
-# Maximum log file size (bytes, 0=no rotation)
-# Log file path (optional, defaults to stderr)
-# file_path = "/var/log/veil.log"
+# App log file (optional, defaults to stdout; a new dated file every day, e.g. veil-20261108.log)
+# app_file_path = "/var/log/veil/veil.log"
+# Error log file (optional, defaults to stderr)
+# error_file_path = "/var/log/veil/veil.error.log"
 
 [security]
 # Privilege dropping settings (Linux only)

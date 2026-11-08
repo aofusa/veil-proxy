@@ -415,24 +415,304 @@ fn escape_json(s: &str) -> String {
     result
 }
 
-/// ログ出力先（stdout / stderr / ローテーション付きファイル）を構築する
-///
-/// - `Some(path)`: `ftlog::appender::FileAppender`（日次ローテーション・内部バッファ）
-/// - `None`: `default_stderr` が true なら stderr、false なら stdout
-fn build_log_sink(file_path: Option<&str>, default_stderr: bool) -> Box<dyn io::Write + Send> {
-    match file_path {
-        Some(path) => {
-            let appender = ftlog::appender::FileAppender::builder()
-                .path(path)
-                .rotate(ftlog::appender::Period::Day)
-                .build();
-            Box::new(appender)
+// ====================
+// ログの出力先（B-343）
+// ====================
+//
+// ftlog のログスレッドは、root の writer が `Err` を返すと標準エラー出力へ `eprintln!` で知らせる。標準エラー出力も
+// 書けない（ディスクが満杯・読み手のいないパイプ）と、その `eprintln!` が panic してログスレッドが死ぬ。すると次に
+// ログを出したスレッドも（キューが閉じたことを `eprintln!` で知らせようとして）panic し、巻き戻しの途中の
+// `LoggerGuard` の drop（キューが閉じていると `expect` が panic）で 2 度目の panic になってプロセスが abort する。
+// そこで出力先の失敗はこの writer の中で吸収する（ftlog へは常に成功を返し、書けなかった行は数えて、次に書けた
+// ときに 1 行で知らせる）。ftlog の `FileAppender` も、日付が変わって次のファイルを開けないと `unwrap` で panic
+// する（サンドボックスの中・権限・inode の枯渇）ので使わず、`DailyFile` に置き換える。
+
+/// ログの出力先 1 つ（app または error）。書けなかった行は捨てて数える（B-343）。
+struct LogSink {
+    out: Box<dyn io::Write + Send>,
+    /// 書けずに捨てた行の数（次に書けたときに知らせて 0 に戻す）
+    dropped: u64,
+    /// 知らせる行の `type`・レベル（app の出力先は WARN、error の出力先は ERROR）
+    kind: &'static str,
+    level: Level,
+}
+
+impl LogSink {
+    fn new(out: Box<dyn io::Write + Send>, error: bool) -> Self {
+        let (kind, level) = if error {
+            ("error", Level::Error)
+        } else {
+            ("app", Level::Warn)
+        };
+        Self {
+            out,
+            dropped: 0,
+            kind,
+            level,
         }
+    }
+
+    /// 1 行を `head`・`tail` の順に書く（センチネルの前後）。書けなければ捨てて数え、失敗は返さない。
+    fn write_line(&mut self, head: &[u8], tail: &[u8], json: bool, offset: time::UtcOffset) {
+        if self.dropped > 0 {
+            let notice = dropped_lines_notice(self.dropped, self.kind, self.level, json, offset);
+            if self.out.write_all(notice.as_bytes()).is_err() {
+                self.dropped += 1;
+                return;
+            }
+            self.dropped = 0;
+        }
+        let ok = (head.is_empty() || self.out.write_all(head).is_ok())
+            && (tail.is_empty() || self.out.write_all(tail).is_ok());
+        if !ok {
+            self.dropped += 1;
+        }
+    }
+
+    fn flush(&mut self) {
+        // 失敗は次の書き込みで数える（ftlog へ返すと上と同じ panic の連鎖になる）
+        let _ = self.out.flush();
+    }
+}
+
+/// 書けずに捨てた行があったことを知らせる 1 行（その出力先の形式で。ftlog の行と同じく時刻は起動時のオフセット）。
+fn dropped_lines_notice(
+    dropped: u64,
+    kind: &str,
+    level: Level,
+    json: bool,
+    offset: time::UtcOffset,
+) -> String {
+    let now = OffsetDateTime::now_utc().to_offset(offset);
+    let message = format!(
+        "{} log lines were dropped because the log output could not be written",
+        dropped
+    );
+    if json {
+        let timestamp = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| now.to_string());
+        format!(
+            r#"{{"timestamp":"{}","level":"{}","type":"{}","target":"{}","file":"{}","line":{},"message":"{}"}}"#,
+            timestamp,
+            level,
+            kind,
+            module_path!(),
+            file!(),
+            line!(),
+            message
+        ) + "\n"
+    } else {
+        // ftlog の既定の書式（`<日時>.<ミリ秒>+<時> <遅延>ms <本文>`）に合わせる
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}{:+03} 0ms {} type={} logger [{}:{}] {}\n",
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second(),
+            now.millisecond(),
+            offset.whole_hours(),
+            level,
+            kind,
+            file!(),
+            line!(),
+            message
+        )
+    }
+}
+
+/// 起動時のローカル時刻のオフセット（日ごとのファイルの日付を決める。ftlog も行の時刻のオフセットを起動時に
+/// 1 回だけ決めて使い続ける。サンドボックスに入った後は `/etc/localtime` を読めないこともある）
+fn startup_local_offset() -> time::UtcOffset {
+    #[cfg(unix)]
+    {
+        // time の `current_local_offset` はスレッドが複数あると失敗するので、libc の localtime_r で読む
+        // SAFETY: `time(NULL)` は引数を書かない。`localtime_r` は再入可能で、ゼロ初期化した `tm`（POD）へ書くだけ。
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let now = unsafe { libc::time(std::ptr::null_mut()) };
+        if !unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+            if let Ok(o) = time::UtcOffset::from_whole_seconds(tm.tm_gmtoff as i32) {
+                return o;
+            }
+        }
+        time::UtcOffset::UTC
+    }
+    #[cfg(not(unix))]
+    {
+        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC)
+    }
+}
+
+/// 次の日のファイルを開けなかったときに、開き直しを試すまでの間隔
+const DAILY_FILE_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 日ごとに切り替わるログファイル（B-343）。名前は ftlog の `FileAppender`（`Period::Day`）と同じ
+/// `<名前>-<YYYYMMDD>.<拡張子>`（拡張子が無ければ `<名前>-<YYYYMMDD>`）で、日付は起動時のローカル時刻の
+/// オフセットで決める。次の日のファイルを開けないときは今のファイルへ書き続け、`DAILY_FILE_RETRY` ごとに
+/// 開き直しを試す（panic しない）。FreeBSD の capability mode では、起動時に登録した親ディレクトリの fd から
+/// 開く（B-344。`open_log_append`）。
+struct DailyFile {
+    base: std::path::PathBuf,
+    offset: time::UtcOffset,
+    file: Option<io::BufWriter<std::fs::File>>,
+    /// 今のファイルの日付（`YYYYMMDD` の数）
+    day: u32,
+    /// 次に日付を確かめる（または開き直しを試す）時刻
+    next_check: Instant,
+    /// ファイルを開く関数（試験で失敗を起こすために差し替える）
+    open: fn(&std::path::Path) -> io::Result<std::fs::File>,
+}
+
+impl DailyFile {
+    /// 今日のファイルを開いて作る（開けなければ起動を止める理由として返す）
+    fn create(base: &str, offset: time::UtcOffset) -> io::Result<Self> {
+        Self::create_with(base, offset, open_log_append, OffsetDateTime::now_utc())
+    }
+
+    fn create_with(
+        base: &str,
+        offset: time::UtcOffset,
+        open: fn(&std::path::Path) -> io::Result<std::fs::File>,
+        now_utc: OffsetDateTime,
+    ) -> io::Result<Self> {
+        let mut f = DailyFile {
+            base: std::path::PathBuf::from(base),
+            offset,
+            file: None,
+            day: 0,
+            next_check: Instant::now(),
+            open,
+        };
+        let local = now_utc.to_offset(offset);
+        let day = ymd_number(local);
+        let file = (f.open)(&dated_log_path(&f.base, day))?;
+        f.file = Some(io::BufWriter::new(file));
+        f.day = day;
+        f.next_check = Instant::now() + until_next_day(local);
+        Ok(f)
+    }
+
+    /// 日付が変わっていればその日のファイルへ切り替える。開けなければ今のファイルのまま、後でもう一度試す。
+    fn roll(&mut self, now_utc: OffsetDateTime, now: Instant) {
+        let local = now_utc.to_offset(self.offset);
+        let day = ymd_number(local);
+        if day == self.day {
+            self.next_check = now + until_next_day(local);
+            return;
+        }
+        match (self.open)(&dated_log_path(&self.base, day)) {
+            Ok(file) => {
+                if let Some(mut old) = self.file.replace(io::BufWriter::new(file)) {
+                    let _ = io::Write::flush(&mut old);
+                }
+                self.day = day;
+                self.next_check = now + until_next_day(local);
+            }
+            Err(_) => self.next_check = now + DAILY_FILE_RETRY,
+        }
+    }
+}
+
+impl io::Write for DailyFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let now = Instant::now();
+        if now >= self.next_check {
+            self.roll(OffsetDateTime::now_utc(), now);
+        }
+        match &mut self.file {
+            Some(f) => f.write(buf),
+            None => Err(io::Error::other("the log file is not open")),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.file {
+            Some(f) => f.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `YYYYMMDD` の数（日付の比較用）
+fn ymd_number(t: OffsetDateTime) -> u32 {
+    t.year().max(0) as u32 * 10_000 + t.month() as u32 * 100 + t.day() as u32
+}
+
+/// 次のローカル時刻の 0 時までの時間
+fn until_next_day(local: OffsetDateTime) -> std::time::Duration {
+    let next = local.date().next_day().map(|d| {
+        d.with_time(time::Time::MIDNIGHT)
+            .assume_offset(local.offset())
+    });
+    match next {
+        Some(next) => std::time::Duration::try_from(next - local).unwrap_or(DAILY_FILE_RETRY),
+        None => DAILY_FILE_RETRY,
+    }
+}
+
+/// ftlog の `FileAppender`（`Period::Day`）と同じ名前: `<名前>-<YYYYMMDD>.<拡張子>`・`<名前>-<YYYYMMDD>`
+fn dated_log_path(base: &std::path::Path, day: u32) -> std::path::PathBuf {
+    let ts = format!("{}{:02}{:02}", day / 10_000, day / 100 % 100, day % 100);
+    match (base.file_stem(), base.extension()) {
+        (Some(stem), Some(ext)) => base.with_file_name(format!(
+            "{}-{}.{}",
+            stem.to_string_lossy(),
+            ts,
+            ext.to_string_lossy()
+        )),
+        _ => base.with_file_name(format!(
+            "{}-{}",
+            base.file_name()
+                .map(|x| x.to_string_lossy())
+                .unwrap_or(Cow::from("log")),
+            ts
+        )),
+    }
+}
+
+/// ログファイルを追記用に開く（無ければ作る）。FreeBSD の capability mode では、起動時に登録した親ディレクトリの
+/// fd から開く（B-344）。
+fn open_log_append(path: &std::path::Path) -> io::Result<std::fs::File> {
+    #[cfg(target_os = "freebsd")]
+    if let Some(res) = crate::security::capsicum::open_log_file_append(path) {
+        return res;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// ログ出力先（stdout / stderr / 日ごとのファイル）を構築する
+///
+/// - `Some(path)`: `DailyFile`（日ごとに切り替え・内部バッファ）。今日のファイルを開けなければエラー
+/// - `None`: `default_stderr` が true なら stderr、false なら stdout
+fn build_log_sink(
+    file_path: Option<&str>,
+    default_stderr: bool,
+    offset: time::UtcOffset,
+) -> Result<Box<dyn io::Write + Send>, String> {
+    match file_path {
+        Some(path) => DailyFile::create(path, offset)
+            .map(|f| Box::new(f) as Box<dyn io::Write + Send>)
+            .map_err(|e| {
+                format!(
+                    "cannot open the log file {}: {}",
+                    dated_log_path(
+                        std::path::Path::new(path),
+                        ymd_number(OffsetDateTime::now_utc().to_offset(offset))
+                    )
+                    .display(),
+                    e
+                )
+            }),
         None => {
             if default_stderr {
-                Box::new(io::stderr())
+                Ok(Box::new(io::stderr()))
             } else {
-                Box::new(io::stdout())
+                Ok(Box::new(io::stdout()))
             }
         }
     }
@@ -443,11 +723,13 @@ fn build_log_sink(file_path: Option<&str>, default_stderr: bool) -> Box<dyn io::
 /// フォーマッタが埋め込んだセンチネル（`SENTINEL_APP` / `SENTINEL_ERROR`）を読み、
 /// アプリ本体ログ / エラーログの出力先へ振り分ける。センチネルバイトは除去して出力する。
 /// ftlog は 1 ログ行を 1 回の `write` で渡すため、行内の 1 バイト除去は前後 2 回の
-/// `write_all` で実現する（追加アロケーションなし）。
+/// `write_all` で実現する（追加アロケーションなし）。出力先の失敗は返さない（B-343。`LogSink`）。
 struct LogRoutingWriter {
-    app: Box<dyn io::Write + Send>,
-    error: Box<dyn io::Write + Send>,
+    app: LogSink,
+    error: LogSink,
     json: bool,
+    /// 捨てた行を知らせる行の時刻のオフセット
+    offset: time::UtcOffset,
 }
 
 impl io::Write for LogRoutingWriter {
@@ -457,35 +739,35 @@ impl io::Write for LogRoutingWriter {
             .iter()
             .position(|&b| b == SENTINEL_APP || b == SENTINEL_ERROR);
         let to_error = matches!(sentinel_pos, Some(i) if buf[i] == SENTINEL_ERROR);
-        let w: &mut dyn io::Write = if to_error {
+        let (json, offset) = (self.json, self.offset);
+        let w = if to_error {
             &mut self.error
         } else {
             &mut self.app
         };
 
-        if self.json {
+        if json {
             // JSON 部分（最初の '{' 以降）のみ出力。センチネルは '{' より前にあるため同時に除去される。
             if let Some(j) = buf.iter().position(|&b| b == b'{') {
-                w.write_all(&buf[j..])?;
+                w.write_line(&buf[j..], &[], json, offset);
             } else if let Some(i) = sentinel_pos {
-                w.write_all(&buf[..i])?;
-                w.write_all(&buf[i + 1..])?;
+                w.write_line(&buf[..i], &buf[i + 1..], json, offset);
             } else {
-                w.write_all(buf)?;
+                w.write_line(buf, &[], json, offset);
             }
         } else if let Some(i) = sentinel_pos {
             // テキスト形式: センチネルバイトのみ除去して前後を出力
-            w.write_all(&buf[..i])?;
-            w.write_all(&buf[i + 1..])?;
+            w.write_line(&buf[..i], &buf[i + 1..], json, offset);
         } else {
-            w.write_all(buf)?;
+            w.write_line(buf, &[], json, offset);
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.app.flush()?;
-        self.error.flush()
+        self.app.flush();
+        self.error.flush();
+        Ok(())
     }
 }
 
@@ -508,27 +790,31 @@ impl io::Write for LogRoutingWriter {
 /// > thread and computing as little as possible in the main/worker thread.
 ///
 /// 代わりに、ftlogの設定を最適化することで同等以上の効果を得られます。
-pub(crate) fn init_logging(config: &LoggingConfigSection) -> ftlog::LoggerGuard {
+///
+/// ログファイルを開けなければ（権限・ディレクトリが無い等）、起動を止める理由を返す（B-343。以前は panic）。
+pub(crate) fn init_logging(config: &LoggingConfigSection) -> Result<ftlog::LoggerGuard, String> {
     let level = parse_log_level(&config.level);
     let use_json = config.format == LogFormat::Json;
+    let offset = startup_local_offset();
 
     // app 本体ログ（既定: stdout）/ エラーログ（既定: stderr）の出力先を構築。
-    let app_sink = build_log_sink(config.resolved_app_path(), false);
-    let error_sink = build_log_sink(config.resolved_error_path(), true);
+    let app_sink = build_log_sink(config.resolved_app_path(), false, offset)?;
+    let error_sink = build_log_sink(config.resolved_error_path(), true, offset)?;
 
     let root = LogRoutingWriter {
-        app: app_sink,
-        error: error_sink,
+        app: LogSink::new(app_sink, false),
+        error: LogSink::new(error_sink, true),
         json: use_json,
+        offset,
     };
 
-    ftlog::builder()
+    Ok(ftlog::builder()
         .max_log_level(level)
         .bounded(config.channel_size, false)
         .format(AppLogFormat { json: use_json })
         .root(root)
         .try_init()
-        .expect("Failed to initialize ftlog")
+        .expect("Failed to initialize ftlog"))
 }
 
 /// kTLSの状態をログ出力
@@ -725,11 +1011,227 @@ mod tests {
         let app = Arc::new(Mutex::new(Vec::new()));
         let err = Arc::new(Mutex::new(Vec::new()));
         let w = LogRoutingWriter {
-            app: Box::new(SharedSink(app.clone())),
-            error: Box::new(SharedSink(err.clone())),
+            app: LogSink::new(Box::new(SharedSink(app.clone())), false),
+            error: LogSink::new(Box::new(SharedSink(err.clone())), true),
             json,
+            offset: time::UtcOffset::UTC,
         };
         (w, app, err)
+    }
+
+    /// 試験用: `fail` が立っている間は書けない（ENOSPC）出力先
+    struct FlakySink {
+        out: Arc<Mutex<Vec<u8>>>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl io::Write for FlakySink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(io::Error::from_raw_os_error(28)); // ENOSPC
+            }
+            self.out.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(io::Error::from_raw_os_error(28));
+            }
+            Ok(())
+        }
+    }
+
+    fn flaky_writer(
+        json: bool,
+    ) -> (
+        LogRoutingWriter,
+        Arc<Mutex<Vec<u8>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let w = LogRoutingWriter {
+            app: LogSink::new(
+                Box::new(FlakySink {
+                    out: out.clone(),
+                    fail: fail.clone(),
+                }),
+                false,
+            ),
+            error: LogSink::new(Box::new(SharedSink(Arc::new(Mutex::new(Vec::new())))), true),
+            json,
+            offset: time::UtcOffset::UTC,
+        };
+        (w, out, fail)
+    }
+
+    fn app_line(msg: &str) -> String {
+        format!(
+            "2024-01-01 0ms {}INFO type=app main [f:1] {}\n",
+            SENTINEL_APP as char, msg
+        )
+    }
+
+    /// B-343: 出力先が書けなくても ftlog へは失敗を返さず（返すとログスレッドが panic する）、捨てた行の数を
+    /// 次に書けたときに 1 行で知らせる。
+    #[test]
+    fn unwritable_output_is_not_an_error_and_dropped_lines_are_reported() {
+        let (mut w, out, fail) = flaky_writer(false);
+        w.write_all(app_line("first").as_bytes()).unwrap();
+        fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..3 {
+            assert_eq!(
+                w.write(app_line(&format!("lost{i}")).as_bytes()).unwrap(),
+                app_line("lost0").len()
+            );
+        }
+        w.flush().unwrap();
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        w.write_all(app_line("after").as_bytes()).unwrap();
+        let text = s(&out);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].ends_with("first"));
+        assert!(!text.contains("lost"));
+        assert!(
+            lines[1].contains("WARN type=app")
+                && lines[1].ends_with(
+                    "3 log lines were dropped because the log output could not be written"
+                ),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[2].ends_with("after"));
+        // 知らせた後は数え直す
+        w.write_all(app_line("again").as_bytes()).unwrap();
+        assert_eq!(s(&out).lines().count(), 4);
+    }
+
+    /// JSON 形式では知らせる行も JSON の 1 行（センチネル・ftlog の接頭辞なし）。
+    #[test]
+    fn dropped_lines_notice_is_a_json_line_in_json_format() {
+        let (mut w, out, fail) = flaky_writer(true);
+        fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        let line = format!(
+            "2024-01-01 0ms {}{{\"level\":\"INFO\",\"type\":\"app\",\"message\":\"x\"}}\n",
+            SENTINEL_APP as char
+        );
+        w.write_all(line.as_bytes()).unwrap();
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        w.write_all(line.as_bytes()).unwrap();
+        let text = s(&out);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            lines[0].starts_with('{') && lines[0].ends_with('}'),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains(r#""level":"WARN","type":"app""#),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains(r#""message":"1 log lines were dropped"#),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(lines[1], r#"{"level":"INFO","type":"app","message":"x"}"#);
+    }
+
+    /// 名前は ftlog の FileAppender（`Period::Day`）と同じ（既存の運用のファイル名を変えない）。
+    #[test]
+    fn dated_log_path_matches_ftlog_daily_names() {
+        use std::path::Path;
+        assert_eq!(
+            dated_log_path(Path::new("/var/log/veil/app.log"), 20261108),
+            Path::new("/var/log/veil/app-20261108.log")
+        );
+        assert_eq!(
+            dated_log_path(Path::new("logs/veil"), 20260105),
+            Path::new("logs/veil-20260105")
+        );
+        assert_eq!(
+            dated_log_path(Path::new("a.b.log"), 20261231),
+            Path::new("a.b-20261231.log")
+        );
+    }
+
+    fn at(y: i32, m: u8, d: u8, h: u8) -> OffsetDateTime {
+        time::Date::from_calendar_date(y, time::Month::try_from(m).unwrap(), d)
+            .unwrap()
+            .with_hms(h, 0, 0)
+            .unwrap()
+            .assume_utc()
+    }
+
+    fn fail_open(_: &std::path::Path) -> io::Result<std::fs::File> {
+        Err(io::Error::from_raw_os_error(13)) // EACCES
+    }
+
+    /// B-343: 日付が変わると次の日のファイルへ切り替える。開けなければ（ftlog は `unwrap` で panic した）
+    /// 今のファイルへ書き続け、後でもう一度試す。
+    #[test]
+    #[allow(clippy::disallowed_methods)] // 理由: 試験（書き出したファイルを読み戻す）
+    fn daily_file_rolls_over_and_keeps_writing_when_the_next_file_cannot_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("app.log");
+        let base_s = base.to_str().unwrap();
+        let utc = time::UtcOffset::UTC;
+        let mut f =
+            DailyFile::create_with(base_s, utc, open_log_append, at(2026, 11, 8, 23)).unwrap();
+        f.write_all(b"day1\n").unwrap();
+        // 次の日: 開けない
+        f.open = fail_open;
+        let now = Instant::now();
+        f.roll(at(2026, 11, 9, 0), now);
+        assert_eq!(f.day, 20261108);
+        assert_eq!(f.next_check, now + DAILY_FILE_RETRY);
+        f.write_all(b"still-day1\n").unwrap();
+        // 開けるようになったら切り替える
+        f.open = open_log_append;
+        f.roll(at(2026, 11, 9, 0), now);
+        assert_eq!(f.day, 20261109);
+        f.write_all(b"day2\n").unwrap();
+        f.flush().unwrap();
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+        assert_eq!(read("app-20261108.log"), "day1\nstill-day1\n");
+        assert_eq!(read("app-20261109.log"), "day2\n");
+        // 同じ日のうちは切り替えない（次の 0 時までの待ちを置き直すだけ）
+        f.roll(at(2026, 11, 9, 12), now);
+        assert_eq!(f.day, 20261109);
+        assert_eq!(
+            f.next_check,
+            now + std::time::Duration::from_secs(12 * 3600)
+        );
+    }
+
+    /// 今日のファイルを開けなければ、起動を止める理由を返す（ftlog は panic した）。
+    #[test]
+    fn daily_file_reports_an_error_when_the_first_file_cannot_be_opened() {
+        assert!(DailyFile::create_with(
+            "app.log",
+            time::UtcOffset::UTC,
+            fail_open,
+            at(2026, 1, 1, 0)
+        )
+        .is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir").join("app.log");
+        let err = build_log_sink(missing.to_str(), false, time::UtcOffset::UTC)
+            .err()
+            .unwrap();
+        assert!(err.starts_with("cannot open the log file "), "{err}");
+    }
+
+    #[test]
+    fn until_next_day_counts_to_local_midnight() {
+        let jst = time::UtcOffset::from_hms(9, 0, 0).unwrap();
+        // UTC 14:00 = JST 23:00 → 1 時間
+        let t = at(2026, 11, 8, 14).to_offset(jst);
+        assert_eq!(until_next_day(t), std::time::Duration::from_secs(3600));
+        assert_eq!(ymd_number(t), 20261108);
+        assert_eq!(ymd_number(at(2026, 11, 8, 15).to_offset(jst)), 20261109);
     }
 
     fn s(v: &Arc<Mutex<Vec<u8>>>) -> String {

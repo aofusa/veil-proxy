@@ -147,9 +147,10 @@ level = "info"
 channel_size = 16384
 # フラッシュ間隔（ミリ秒）
 flush_interval_ms = 1000
-# 最大ログファイルサイズ（バイト、0=ローテーションなし）
-# ログファイルパス（オプション、未指定で標準エラー出力）
-# file_path = "/var/log/veil.log"
+# アプリ本体ログのファイル（任意。未指定で標準出力。日ごとに日付の付いたファイル。例: veil-20261108.log）
+# app_file_path = "/var/log/veil/veil.log"
+# エラーログのファイル（任意。未指定で標準エラー出力）
+# error_file_path = "/var/log/veil/veil.error.log"
 
 [security]
 # 権限降格設定（Linux専用）

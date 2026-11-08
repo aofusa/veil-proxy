@@ -696,6 +696,9 @@
 | B-340 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-340-python-async-response-lost-on-close-race.md](bugs/B-340-python-async-response-lost-on-close-race.md) | Python の `async def` のハンドラの応答を、ワーカーがまれに取りこぼして 500 にする（ストリーミングは最後を落として打ち切る。100 万要求に 1 件ほど、v0.11.0 から）。閉じた旗をキューの錠の中で読む |
 | B-341 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-341-access-log-tail-lost-at-shutdown.md](bugs/B-341-access-log-tail-lost-at-shutdown.md) | SIGTERM で止めると、直前に処理した要求のアクセスログの行（ライターの `BufWriter` の 8KiB まで）が書かれずに消える（F-302 の前から）。全ワーカーの join の後にライターを止めて書き切るのを待つ（2 秒まで） |
 | B-342 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-342-prometheus-enabled-doc-default.md](bugs/B-342-prometheus-enabled-doc-default.md) | `[prometheus] enabled` の型の文書コメントが既定値を `true` と書いている（実際の既定・ガイド・`examples/config.toml` は `false`）。文書コメントを直す |
+| B-343 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-343-log-output-failure-aborts.md](bugs/B-343-log-output-failure-aborts.md) | ログの出力先（標準出力・標準エラー出力・ファイル）へ書けない（ディスク満杯・`/dev/full`・閉じたパイプ）と、ftlog のログのスレッドが `eprintln!` で panic し、連鎖してプロセスが abort する（v0.11.0 から）。書けない行は捨てて数え、書けたときに 1 行で知らせる。ftlog の `FileAppender` を panic しない日次のファイルに置き換え、起動時に開けなければ終了コード 1 |
+| B-344 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-344-capsicum-daily-log-file.md](bugs/B-344-capsicum-daily-log-file.md) | FreeBSD の capability mode で `[logging]` のファイルを使うと、地方時の 0 時に次のファイルをパスで開けずに panic して abort する（v0.11.0 から）。cap_enter の前にログのディレクトリの fd を登録し、そこから `openat` で作る |
+| B-345 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-345-logging-removed-keys-in-docs.md](bugs/B-345-logging-removed-keys-in-docs.md) | ガイドに無いキー `[logging] max_log_size`・`[logging] file_path` が載っている（黙って無視される）。ガイドを `app_file_path`・`error_file_path` に直し、ログファイルは日ごとで大きさの上限が無いことを書く |
 
 ---
 

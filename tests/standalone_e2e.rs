@@ -3827,3 +3827,102 @@ url = "http://127.0.0.1:{echo}"
         assert!(head.contains("x-real-ip: 1.2.3.4"), "{proto}: {head}");
     }
 }
+
+// ===================== B-343 =====================
+
+/// B-343: 標準出力・標準エラーへ書けなくても（ディスク満杯・`/dev/full`）落ちずに要求を処理し続け、
+/// SIGTERM で正常に終わる。以前は ftlog のロガースレッドが書き込みの失敗を `eprintln!` で報告しようとして
+/// panic し、次のログの呼び出しが panic → `LoggerGuard` の Drop の中で再び panic して abort していた。
+#[cfg(target_os = "linux")]
+#[test]
+fn b343_unwritable_log_output_does_not_abort() {
+    use std::process::{Child, Command, Stdio};
+
+    // 失敗したアサーションでプロセスを残さない
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let www = dir.path().join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), "full").unwrap();
+    // info のログ・アクセスログの両方を毎回書こうとさせる
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 2
+[logging]
+level = "info"
+[access_log]
+enabled = true
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+        www = tp(&www)
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let full = || {
+        Stdio::from(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        )
+    };
+    let mut veil = KillOnDrop(
+        Command::new(veil_bin())
+            .arg("-c")
+            .arg(&cfg_path)
+            .stdout(full())
+            .stderr(full())
+            .spawn()
+            .expect("failed to spawn veil"),
+    );
+    // 落ちたら 20 秒待たずに分かるように、終了も見ながら待つ（修正前は起動中に 134 で abort した）
+    wait_until(Duration::from_secs(20), || {
+        connect_local(port, Duration::from_millis(200)).is_ok()
+            || !matches!(veil.0.try_wait(), Ok(None))
+    });
+    assert!(
+        matches!(veil.0.try_wait(), Ok(None)) && wait_for_port(port, Duration::from_secs(1)),
+        "veil did not start: {:?}",
+        veil.0.try_wait()
+    );
+    for i in 0..50 {
+        let resp = http1_get(port, "/index.html")
+            .unwrap_or_else(|e| panic!("request {i}: {e} ({:?})", veil.0.try_wait()));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.text(), "full");
+    }
+    // ロガースレッドは 200ms ごとに flush を試みる。その後も生きていて要求を処理できる
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        veil.0.try_wait().unwrap().is_none(),
+        "veil exited while its log output was full: {:?}",
+        veil.0.try_wait()
+    );
+    assert_eq!(http1_get(port, "/index.html").unwrap().status, 200);
+
+    unsafe {
+        libc::kill(veil.0.id() as i32, libc::SIGTERM);
+    }
+    let status = wait_until(Duration::from_secs(20), || {
+        matches!(veil.0.try_wait(), Ok(Some(_)))
+    });
+    assert!(status, "veil did not exit after SIGTERM");
+    let status = veil.0.wait().unwrap();
+    assert!(status.success(), "exit status after SIGTERM: {status:?}");
+}

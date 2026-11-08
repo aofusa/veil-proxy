@@ -3639,6 +3639,92 @@ pub mod capsicum {
         }
     }
 
+    // ------------------------------------------------------------------
+    // B-344: `[logging]` のログファイル（app・error）の日ごとの切り替え
+    //
+    // ログファイルは日付ごとに `<名前>-<YYYYMMDD>.<拡張子>` を新しく開く（`logging::DailyFile`）。
+    // capability mode では絶対パスで開けないので、設定のパスの親ディレクトリの fd を cap_enter 前に
+    // 登録し、同じディレクトリのファイルを `openat(O_RESOLVE_BENEATH)` で開く。
+    // ------------------------------------------------------------------
+
+    /// 登録済みのログファイルの親ディレクトリ（設定のパスの親、dirfd）。
+    static LOG_FILE_DIRS: std::sync::Mutex<Vec<(PathBuf, RawFd)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// 設定のパスの親ディレクトリ（`DailyFile` が作るパスと同じ形で比べる）。
+    fn log_file_parent(path: &Path) -> PathBuf {
+        match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
+    }
+
+    /// `[logging]` のログファイルの親ディレクトリ fd を登録する（**`cap_enter` 前**に呼ぶこと）。
+    ///
+    /// 権利はアクセスログと同じ `CAP_LOOKUP`/`CAP_CREATE`/`CAP_WRITE`/`CAP_SEEK`/`CAP_FSTAT`/`CAP_FCNTL`
+    /// （読み取りはできない）。同じディレクトリは 1 回だけ登録する。
+    pub fn init_log_file_dirfd(path: &Path) -> io::Result<()> {
+        let parent = log_file_parent(path);
+        let mut dirs = LOG_FILE_DIRS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if dirs.iter().any(|(p, _)| *p == parent) {
+            return Ok(());
+        }
+        let (fd, _name) = open_named_file_dir(
+            path,
+            &[
+                CAP_LOOKUP, CAP_CREATE, CAP_WRITE, CAP_SEEK, CAP_FSTAT, CAP_FCNTL,
+            ],
+            false,
+        )?;
+        dirs.push((parent, fd));
+        info!(
+            "capsicum: registered the directory fd of log file {:?} (the daily log file can be opened in capability mode)",
+            path
+        );
+        Ok(())
+    }
+
+    /// 登録済みのディレクトリにあるログファイルを追記用に開く（無ければ作る）。
+    /// `None` = そのディレクトリは未登録（呼び出し側は通常の `OpenOptions` へ）。
+    pub fn open_log_file_append(abs: &Path) -> Option<io::Result<std::fs::File>> {
+        let parent = log_file_parent(abs);
+        let dirfd = {
+            let dirs = LOG_FILE_DIRS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            dirs.iter().find(|(p, _)| *p == parent)?.1
+        };
+        let name = match abs.file_name().map(|n| CString::new(n.as_bytes())) {
+            Some(Ok(n)) => n,
+            _ => {
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid log file name",
+                )))
+            }
+        };
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                name.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_APPEND
+                    | libc::O_CREAT
+                    | libc::O_CLOEXEC
+                    | O_RESOLVE_BENEATH,
+                0o666 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            Some(Err(io::Error::last_os_error()))
+        } else {
+            // SAFETY: openat が返した所有権のある有効な fd。
+            Some(Ok(unsafe { std::fs::File::from_raw_fd(fd) }))
+        }
+    }
+
     /// F-178: 名前付きファイルの dirfd 登録（cap_enter はしない。登録表の OnceLock も触らない）。
     #[cfg(test)]
     mod named_file_dir_tests {
@@ -3662,6 +3748,95 @@ pub mod capsicum {
             let mut out = String::new();
             file.read_to_string(&mut out)?;
             Ok(out)
+        }
+
+        /// B-344: 登録したログファイルの親ディレクトリの fd から、日付の付いた別名のファイルを作って追記できる。
+        /// 未登録のディレクトリは `None`（通常の open へ）。
+        #[test]
+        #[allow(clippy::disallowed_methods)] // 理由: 試験（書き出したファイルを読み戻す）
+        fn log_file_dir_opens_dated_files_in_the_registered_dir() {
+            use std::io::Write;
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("app.log");
+            init_log_file_dirfd(&base).unwrap();
+            // 同じディレクトリを 2 回登録しても 1 つ（fd を重ねて開かない）
+            init_log_file_dirfd(&dir.path().join("error.log")).unwrap();
+            let parent = log_file_parent(&base);
+            let n = LOG_FILE_DIRS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _)| *p == parent)
+                .count();
+            assert_eq!(n, 1);
+            let dated = dir.path().join("app-20261108.log");
+            for line in ["a\n", "b\n"] {
+                let mut f = open_log_file_append(&dated)
+                    .expect("the directory is registered")
+                    .unwrap();
+                f.write_all(line.as_bytes()).unwrap();
+            }
+            assert_eq!(std::fs::read_to_string(&dated).unwrap(), "a\nb\n");
+            let other = tempfile::tempdir().unwrap();
+            assert!(open_log_file_append(&other.path().join("app-20261108.log")).is_none());
+        }
+
+        /// B-344: capability mode の中では絶対パスでログファイルを開けない（ftlog の日次の切り替えは `unwrap` で
+        /// panic していた）が、cap_enter 前に親ディレクトリの fd を登録しておけば `open_log_file_append` で次の日の
+        /// ファイルを作って書ける。cap_enter は戻せないので fork した子で確かめる（FreeBSD の libc の malloc は
+        /// fork の前後で錠を取り直すので、子でも割り当てられる）。
+        #[test]
+        #[allow(clippy::disallowed_methods)] // 理由: 試験（書き出したファイルを読み戻す）
+        fn log_file_dir_opens_the_next_day_file_in_capability_mode() {
+            use std::io::Write;
+            use std::os::unix::ffi::OsStrExt;
+            let dir = tempfile::tempdir().unwrap();
+            init_log_file_dirfd(&dir.path().join("app.log")).unwrap();
+            let dated = dir.path().join("app-20261109.log");
+            let abs = CString::new(dated.as_os_str().as_bytes()).unwrap();
+
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                // ===== 子 =====
+                if unsafe { cap_enter() } != 0 {
+                    unsafe { libc::_exit(42) };
+                }
+                // 絶対パスでは開けない（ECAPMODE）
+                let fd = unsafe {
+                    libc::open(
+                        abs.as_ptr(),
+                        libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_CLOEXEC,
+                        0o666 as libc::c_uint,
+                    )
+                };
+                if fd >= 0 {
+                    unsafe { libc::_exit(10) };
+                }
+                let code = match open_log_file_append(&dated) {
+                    Some(Ok(mut f)) => {
+                        if f.write_all(b"next-day\n").is_ok() {
+                            0
+                        } else {
+                            13
+                        }
+                    }
+                    Some(Err(_)) => 11,
+                    None => 12,
+                };
+                unsafe { libc::_exit(code) };
+            }
+            let mut status: libc::c_int = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            assert!(libc::WIFEXITED(status), "child died: {status:#x}");
+            let code = libc::WEXITSTATUS(status);
+            if code == 42 {
+                eprintln!("cap_enter is not available; skipping");
+                return;
+            }
+            // 10: 絶対パスで開けた 11: 開けなかった 12: 未登録扱い 13: 書けなかった
+            assert_eq!(code, 0, "child exit code");
+            assert_eq!(std::fs::read_to_string(&dated).unwrap(), "next-day\n");
         }
 
         /// rename による置き換えでも、名前で引き直すので新しい内容が読める。
