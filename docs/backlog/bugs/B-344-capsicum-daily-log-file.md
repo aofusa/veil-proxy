@@ -33,3 +33,6 @@ cap_enter の前に開いたディレクトリの fd から開き直していた
     同じディレクトリの 2 回目の登録で fd を増やさない。未登録のディレクトリは `None`。
   - `log_file_dir_opens_the_next_day_file_in_capability_mode`: fork した子で cap_enter し、絶対パスでは開けない（`ECAPMODE`）が
     `open_log_file_append` では次の日のファイルを作って書けることを確かめる。
+- サンドボックスの E2E（`tools/qemu/bsd-security-e2e-guest.sh`、FreeBSD）: capability mode で `app_file_path`・`error_file_path` を
+  指定して起動し、日付の付いたファイルに cap_enter の後の行（`capability mode active`）とディレクトリの fd を登録した行が書かれ、
+  日付の無いファイルを作らないことを確かめる。

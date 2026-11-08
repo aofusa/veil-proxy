@@ -23,6 +23,8 @@
 #   - freebsd: capability mode 下でも SIGHUP で設定を読み直せる（F-178）。cap_enter 後に動かない
 #     変更（未登録の静的ルート・プロキシ）は拒否して前の設定を保つ。アクセスログを mv して
 #     SIGHUP すると同じパスで開き直す
+#   - freebsd: capability mode 下でも [logging] のファイル（日付の付いた名前）へ書ける。日付が変わったときの
+#     ファイルを作るため、ログのディレクトリの fd を cap_enter 前に登録する（B-344）
 set -u
 OS="${1:?os}"; BIN="${2:?veil binary}"
 PORT="${VEIL_PORT:-9443}"
@@ -114,6 +116,7 @@ reload_interval_secs = 3600
 $SEC
 [logging]
 level = "info"
+${LOGGING_EXTRA:-}
 $ACCESS_LOG
 $1
 [[route]]
@@ -447,6 +450,34 @@ allow_security_failures = true"
   kill "$OPID" 2>/dev/null; sleep 1
   grep -q 'panicked at' "$WORK/veil-ct.log" "$WORK/veil-fc.log" "$WORK/veil-fo.log" && { echo "FAIL: panic (fail-closed)"; ok=0; }
   SEC="$SEC_SAVED"; SERVER_EXTRA=""
+fi
+# B-344: capability mode でも [logging] のファイルへ書ける（日付の付いた名前。次の日のファイルを作れるよう、
+# ログのディレクトリの fd を cap_enter 前に登録する。0 時の切り替えそのものは単体試験が fork した子で確かめる）
+if [ "$OS" = "freebsd" ]; then
+  mkdir -p "$WORK/applog"
+  LOGGING_EXTRA="app_file_path = \"$WORK/applog/veil.log\"
+error_file_path = \"$WORK/applog/veil.error.log\""
+  write_cfg ""
+  "$BIN" --config "$WORK/veil.toml" > "$WORK/veil-lf.log" 2>&1 &
+  LPID=$!
+  lc=000
+  for i in $(seq 1 30); do
+    lc=$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost:$PORT/" || echo 000)
+    [ "$lc" = "200" ] && break; sleep 1
+  done
+  # ログのスレッドは flush_interval_ms（1 秒）ごとに書き出す
+  sleep 3
+  day=$(date +%Y%m%d)
+  echo "LOG-FILE http=$lc files=[$(ls "$WORK/applog" | tr '\n' ' ')]"
+  [ "$lc" = "200" ] || { echo "FAIL: capability mode with [logging] files did not serve"; tail -5 "$WORK/veil-lf.log"; ok=0; }
+  grep -q 'capability mode active' "$WORK/applog/veil-$day.log" 2>/dev/null \
+    || { echo "FAIL: the app log file was not written in capability mode"; tail -5 "$WORK/applog/veil-$day.log" 2>/dev/null; ok=0; }
+  grep -q 'registered the directory fd of log file' "$WORK/applog/veil-$day.log" 2>/dev/null \
+    || { echo "FAIL: the log directory was not registered before cap_enter"; ok=0; }
+  [ -e "$WORK/applog/veil.log" ] && { echo "FAIL: an undated log file was created"; ok=0; }
+  kill "$LPID" 2>/dev/null; sleep 1
+  grep -q 'panicked at' "$WORK/veil-lf.log" "$WORK/applog/"* 2>/dev/null && { echo "FAIL: panic (log files)"; ok=0; }
+  LOGGING_EXTRA=""
 fi
 if grep -q 'panicked at' "$WORK/veil.log"; then echo "FAIL: panic"; grep -A5 'panicked at' "$WORK/veil.log"; ok=0; fi
 grep -iE 'capability mode|pledge|unveil|chroot|privilege' "$WORK/veil.log" | head -12
