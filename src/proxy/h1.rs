@@ -1961,6 +1961,18 @@ async fn write_api_response(
         head.extend_from_slice(&body);
     }
     let streaming = resp.take_stream();
+    let len = body.len() as u64;
+    if streaming.is_none() && !inline_body {
+        // 大きな本文はコピーせず、ヘッダと 1 回の scatter-gather で送る（ヘッダ・本文を別々に書くと応答ごとに
+        // send(2) が 2 本になり、ループバックでは相手の受信の処理も 2 回走る。F-301）
+        return match timeout(WRITE_TIMEOUT, tls_stream.write_all_vectored(head, body)).await {
+            Ok((Ok(_), buf, _)) => {
+                crate::pool::request_buf_put(buf);
+                Some((tls_stream, status, len, client_wants_close))
+            }
+            _ => None,
+        };
+    }
     match timeout(WRITE_TIMEOUT, tls_stream.write_all(head)).await {
         Ok((Ok(_), buf)) => crate::pool::request_buf_put(buf),
         _ => return None,
@@ -1968,13 +1980,6 @@ async fn write_api_response(
     if let Some(stream) = streaming {
         let (tls_stream, sent) = Box::pin(write_api_chunked(tls_stream, stream)).await?;
         return Some((tls_stream, status, sent, client_wants_close));
-    }
-    let len = body.len() as u64;
-    if !inline_body {
-        match timeout(WRITE_TIMEOUT, tls_stream.write_all(body)).await {
-            Ok((Ok(_), _)) => {}
-            _ => return None,
-        }
     }
     Some((tls_stream, status, len, client_wants_close))
 }

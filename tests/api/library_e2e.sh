@@ -247,6 +247,37 @@ print("|".join(w for w in ("HELLOWORLD", "Hello, World!") if w in t))' "$P"
   # F-270: [api] compression = true（ルートの compress = false・256 バイト未満・ストリーミング）
   comp_suite "rust" "$B" /dataset/200 /dataset-raw/200 - /stream-big
   comp_suite "rust h2c" "$B" /dataset/200 /dataset-raw/200 - /stream-big --http2-prior-knowledge
+  # F-301: 3KB を超える本文はヘッダと 1 回の書き込みで送る。同じ接続で 2 回続けて受け、長さと中身を確かめる
+  expect "large identity body twice on one connection (HTTP/1.1)" "large ok" "$PY3" -I - "$P" <<'PY'
+import json, socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+buf = b""
+def more():
+    global buf
+    b = s.recv(65536)
+    if not b:
+        raise SystemExit("closed early")
+    buf += b
+def response():
+    global buf
+    while b"\r\n\r\n" not in buf:
+        more()
+    head, buf = buf.split(b"\r\n\r\n", 1)
+    n = int([l.split(b":", 1)[1] for l in head.split(b"\r\n")[1:] if l.lower().startswith(b"content-length:")][0])
+    while len(buf) < n:
+        more()
+    body, buf = buf[:n], buf[n:]
+    return head, body
+bodies = []
+for _ in range(2):
+    s.sendall(b"GET /dataset/200 HTTP/1.1\r\nHost: a\r\n\r\n")
+    head, body = response()
+    assert b" 200 " in head.split(b"\r\n")[0], head
+    json.loads(body)
+    bodies.append(body)
+assert bodies[0] == bodies[1] and len(bodies[0]) > 3072 and not buf, (len(bodies[0]), len(buf))
+print("large ok")
+PY
   expect "rust compression: small body stays identity" "ce=none" comp_probe br "$B/hello"
   expect "rust compression: HEAD has no body" "content-encoding: br" bash -c "curl -s -I -H 'accept-encoding: br' '$B/dataset/200' | tr A-Z a-z"
   expect "OpenAPI paths" '"/users/{id}"' curl -s "$B/openapi.json"
