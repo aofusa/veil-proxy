@@ -115,6 +115,30 @@ pub(crate) struct ReusableFileInfo {
     validators: std::sync::Arc<crate::static_response::Validators>,
     file_size: u64,
     last_modified: Option<SystemTime>,
+    /// 前のエントリが配信に使う fd（B-348）
+    shared_file: Option<std::sync::Arc<std::fs::File>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl ReusableFileInfo {
+    /// 開き直したファイルが前のエントリと同じ版か（大きさと更新時刻）
+    #[inline]
+    fn same_version(&self, len: u64, modified: Option<SystemTime>) -> bool {
+        self.file_size == len && self.last_modified == modified
+    }
+
+    /// 開き直したファイルが前のエントリと同じ版なら、前のエントリの fd（B-348）
+    #[inline]
+    pub(crate) fn fd_of_same_version(
+        &self,
+        meta: &std::fs::Metadata,
+    ) -> Option<std::sync::Arc<std::fs::File>> {
+        if self.same_version(meta.len(), meta.modified().ok()) {
+            self.shared_file.clone()
+        } else {
+            None
+        }
+    }
 }
 
 impl CachedFileInfo {
@@ -139,7 +163,7 @@ impl CachedFileInfo {
         // 同じパスの前のエントリがあれば MIME はそのまま、検証子は大きさと更新時刻が同じならそのまま使う
         // （open_file_cache だけのルートは要求ごとにここを通る。作り直すと MIME の推測と検証子の組み立てが毎回走る）
         let (mime_type, validators) = match prev {
-            Some(p) if p.file_size == meta.len() && p.last_modified == modified => {
+            Some(p) if p.same_version(meta.len(), modified) => {
                 (p.mime_type.clone(), p.validators.clone())
             }
             Some(p) => (
@@ -183,13 +207,31 @@ impl CachedFileInfo {
             validators: self.validators.clone(),
             file_size: self.file_size,
             last_modified: self.last_modified,
+            shared_file: self.shared_file.clone(),
         }
+    }
+
+    /// 高速経路で作ったエントリに配信用の fd を持たせる（B-348: HTTP/1.1 はこの fd で送る。無いとパスで開き直し、
+    /// 差し替えた後の中身をエントリの古い大きさ・検証子で返す）
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[inline]
+    pub(crate) fn set_shared_file(&mut self, file: std::sync::Arc<std::fs::File>) {
+        self.shared_file = Some(file);
     }
 
     /// メタデータ取得時に開いた fd（キャッシュと共有）。無ければ呼び出し側が開く。
     #[inline]
     pub fn shared_file(&self) -> Option<&std::sync::Arc<std::fs::File>> {
         self.shared_file.as_ref()
+    }
+
+    /// このエントリの版（B-349。静的コンテンツキャッシュの本体がこれと同じ版のときだけ使う）
+    #[inline]
+    pub fn version(&self) -> super::FileVersion {
+        super::FileVersion {
+            len: self.file_size,
+            modified: self.last_modified,
+        }
     }
 
     /// キャッシュが有効かどうかをチェック

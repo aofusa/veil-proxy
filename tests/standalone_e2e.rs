@@ -2766,6 +2766,145 @@ watch = false
     wait_all("/w/sub/b.txt", "x2", "mv in a new directory");
 }
 
+// ===================== B-348・B-349 =====================
+
+/// 静的配信の 2 つのキャッシュ（open_file_cache のメタデータと fd、static_file_cache の本体）が、ファイルを差し替えた後も
+/// 応答ごとに 1 つの版（`Content-Length`・`ETag` と本文が同じ版）を返す（B-348・B-349）。HTTP/1.1 と h2c で同じファイルを
+/// 交互に取る。
+///
+/// - `/a/`（本体キャッシュ無し、open_file_cache は 600 秒）: h2c の読み直し（Linux・FreeBSD の高速経路）が open_file_cache の
+///   エントリを fd の無いものに置き換えると、HTTP/1.1 は `mv` で差し替えた後のファイルをパスで開き、エントリの古い大きさで
+///   切って返していた（どの版にも無い本文。B-348）。
+/// - `/b/`（open_file_cache は 2 秒、本体キャッシュは 600 秒）: 期限の切れた open_file_cache だけが新しい版になると、HTTP/1.1 は
+///   古い本体を新しい大きさで切って返し、h2c は新しい版のヘッダで古い本体を返していた（B-349）。
+#[test]
+fn b348_b349_static_caches_answer_one_version_per_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let www_a = dir.path().join("www_a");
+    let www_b = dir.path().join("www_b");
+    for d in [&www_a, &www_b] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(www_a.join("f.txt"), "AAAA").unwrap();
+    std::fs::write(www_b.join("f.txt"), "AAAAAAAA").unwrap();
+    let port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+allow_h2c = true
+http2_enabled = true
+threads = 1
+[logging]
+level = "warn"
+[performance]
+open_file_cache_enabled = true
+open_file_cache_valid_duration_secs = 600
+[static_file_cache]
+enabled = true
+valid_duration_secs = 600
+
+[[route]]
+[route.conditions]
+path = "/a/*"
+[route.action]
+type = "File"
+path = "{www_a}"
+mode = "sendfile"
+[route.static_file_cache]
+enabled = false
+
+[[route]]
+[route.conditions]
+path = "/b/*"
+[route.action]
+type = "File"
+path = "{www_b}"
+mode = "sendfile"
+[route.open_file_cache]
+valid_duration_secs = 2
+"#,
+        www_a = tp(&www_a),
+        www_b = tp(&www_b),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+
+    // (本文, ETag)。Content-Length は本文の長さと一致すること
+    let h1 = |p: &str| -> (String, Option<String>) {
+        let r = http1_request(port, "GET", p, &[], b"").unwrap();
+        assert_eq!(r.status, 200, "HTTP/1.1 {p}\n{}", veil.log());
+        let body = r.text();
+        assert_eq!(
+            r.header("content-length"),
+            Some(body.len().to_string().as_str()),
+            "HTTP/1.1 {p}: the body {body:?} does not match its Content-Length\n{}",
+            veil.log()
+        );
+        (body, r.header("etag").map(str::to_string))
+    };
+    let h2 = |p: &str| -> (String, Option<String>) {
+        let (st, headers, body) = h2_get_full(port, false, p, &[]);
+        assert_eq!(st, 200, "h2c {p}\n{}", veil.log());
+        let find = |n: &str| headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+        let body = String::from_utf8_lossy(&body).into_owned();
+        if let Some(cl) = find("content-length") {
+            assert_eq!(
+                cl,
+                body.len().to_string(),
+                "h2c {p}: the body {body:?} does not match its Content-Length\n{}",
+                veil.log()
+            );
+        }
+        (body, find("etag"))
+    };
+    // `mv` での差し替え（inode が変わる）
+    let mv_replace = |root: &std::path::Path, body: &str| {
+        let tmp = dir.path().join(".tmp-f.txt");
+        std::fs::write(&tmp, body).unwrap();
+        std::fs::rename(&tmp, root.join("f.txt")).unwrap();
+    };
+
+    // B-348: HTTP/1.1 がエントリを作り、h2c が読み直す
+    assert_eq!(h1("/a/f.txt").0, "AAAA");
+    for _ in 0..2 {
+        assert_eq!(h2("/a/f.txt").0, "AAAA");
+    }
+    mv_replace(&www_a, "BBBBBBBB");
+    // 有効期限内のエントリは古い版のまま。本文もその版（エントリの fd から送る）
+    assert_eq!(h1("/a/f.txt").0, "AAAA", "{}", veil.log());
+    // h2c は Linux・FreeBSD では開き直して新しい版を返し、エントリも新しい版にする（ほかの OS はエントリの版のまま）
+    let (after, _) = h2("/a/f.txt");
+    assert!(
+        after == "AAAA" || after == "BBBBBBBB",
+        "h2c /a/f.txt: {after:?}"
+    );
+    assert_eq!(h1("/a/f.txt").0, after, "{}", veil.log());
+
+    // B-349: 本体キャッシュ（600 秒）より先に open_file_cache（2 秒）が期限切れになる
+    for _ in 0..2 {
+        assert_eq!(h2("/b/f.txt").0, "AAAAAAAA");
+    }
+    for (body, what) in [("BB", "shrunk"), ("CCCCCCCCCCCC", "grown")] {
+        mv_replace(&www_b, body);
+        std::thread::sleep(Duration::from_millis(2500));
+        // HTTP/1.1 が open_file_cache だけを新しい版にする
+        let (got1, etag1) = h1("/b/f.txt");
+        assert_eq!(got1, body, "HTTP/1.1 after the file {what}\n{}", veil.log());
+        // h2c は新しい版のエントリ（2 秒以内）と同じ版の本文を返す
+        let (got2, etag2) = h2("/b/f.txt");
+        assert_eq!(got2, body, "h2c after the file {what}\n{}", veil.log());
+        assert_eq!(etag2, etag1, "h2c after the file {what}");
+    }
+}
+
 // ===================== F-271 =====================
 
 /// 1 本の接続で生の HTTP/1.1 の要求を順に送り、応答を Content-Length で区切って読む（F-271。keep-alive の確認用）

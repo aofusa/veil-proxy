@@ -356,6 +356,15 @@ pub struct OpenFileCacheConfig {
     pub watch: Option<bool>,
 }
 
+/// ファイルのどの版か（大きさと更新時刻）。静的コンテンツキャッシュの本体は、応答のヘッダ（`Content-Length`・検証子）を
+/// 作った open_file_cache のエントリと同じ版のときだけ使う（B-349。2 つのキャッシュは別々に期限が切れるので、差し替えの後は
+/// 違う版を持つことがある）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileVersion {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
 /// キャッシュされたファイル情報（スタブ）
 #[cfg(not(feature = "cache"))]
 #[derive(Clone, Debug)]
@@ -750,6 +759,7 @@ where
 pub async fn get_cached_content_cache(
     _path: &std::path::Path,
     _cfg: &StaticContentCacheConfig,
+    _version: FileVersion,
 ) -> Option<bytes::Bytes> {
     None
 }
@@ -761,6 +771,7 @@ pub fn insert_content_cache_bytes(
     _data: bytes::Bytes,
     _mime: std::sync::Arc<str>,
     _cfg: &StaticContentCacheConfig,
+    _version: FileVersion,
 ) {
 }
 

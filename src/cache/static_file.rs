@@ -213,7 +213,8 @@ pub async fn get_static_file_with_content(
         }
         // 本体キャッシュもヒットしていれば offload ゼロ（ホットパス絶対規則:
         // Bytes::clone() のみ）。
-        if let Some(data) = content_cache::get_cached(path, content_cfg).await {
+        // B-349: 本体はこのエントリと同じ版のときだけ使う（違えば下で読み直して両方を揃える）
+        if let Some(data) = content_cache::get_cached(path, content_cfg, meta.version()).await {
             return Some(StaticFileOutcome::File(meta, data));
         }
         // 本体キャッシュのみ未ヒット: 下の高速経路（offload）で open+read し直す。
@@ -243,6 +244,8 @@ pub async fn get_static_file_with_content(
             let shareable = containment.is_none_or(|c| resolve::is_strictest_root(c.root, path));
             #[cfg(target_os = "freebsd")]
             let shareable = true;
+            // B-348: open_file_cache へ入れるエントリには開いた fd も持たせる（HTTP/1.1 はその fd で送る）
+            let keep_fd = shareable && file_cache::effective_params(ofc).is_some();
             let owned = path.to_path_buf();
             // containment が不要な場合（固定ファイルルート）は余分な確保をしない。
             let owned_root: Option<PathBuf> = containment.map(|c| c.root.to_path_buf());
@@ -251,7 +254,13 @@ pub async fn get_static_file_with_content(
             // ブロックしない（F-153 の open_beneath_for_request/open_static_ro と同じ許容箇所）。
             #[allow(clippy::disallowed_methods)]
             let loaded = crate::runtime::offload::offload(move || {
-                open_and_read_fast(&owned, owned_root.as_deref(), reuse.as_ref(), limit)
+                open_and_read_fast(
+                    &owned,
+                    owned_root.as_deref(),
+                    reuse.as_ref(),
+                    limit,
+                    keep_fd,
+                )
             })
             .await;
             let outcome = loaded?;
@@ -269,6 +278,7 @@ pub async fn get_static_file_with_content(
                             meta.mime_type.clone(),
                             content_cfg,
                             content_stamp,
+                            meta.version(),
                         );
                     }
                     return Some(StaticFileOutcome::File(meta, data));
@@ -293,20 +303,79 @@ pub async fn get_static_file_with_content(
     //    点のみ、以前は呼び出し側が担っていたものをここへ統合した）。ここは
     //    canonicalize ベースなので per-route 検査（`sendfile_base_contains`）を
     //    省略してはならない。
-    let meta = file_cache::get_file_info_with_config(path, ofc).await?;
-    if let Some(c) = containment {
-        if !sendfile_base_contains(&meta.canonical_path, c.canonical_base, c.root) {
-            return Some(StaticFileOutcome::Forbidden);
+    // B-349: 本体はエントリと同じ版を使う（本体キャッシュの版を照合し、無ければエントリの fd から読む）。パスから読むと、
+    // 差し替えた後の中身をエントリの古い大きさ・検証子で返す。読んだ後にファイルが同じ版のままでなければ（`cp` の上書きの
+    // ように同じ inode のまま中身が変わると、エントリの fd も新しい中身を読む）エントリを捨てて 1 回だけ開き直す
+    let mut reopened = false;
+    loop {
+        let meta = file_cache::get_file_info_with_config(path, ofc).await?;
+        if let Some(c) = containment {
+            if !sendfile_base_contains(&meta.canonical_path, c.canonical_base, c.root) {
+                return Some(StaticFileOutcome::Forbidden);
+            }
+        }
+        if !meta.is_file {
+            return Some(StaticFileOutcome::Directory(meta));
+        }
+        let Ok(reserved) = reserve_uncached(meta.file_size, cache_limit(content_cfg)) else {
+            return Some(StaticFileOutcome::Busy);
+        };
+        // fd の無いエントリ（開けなかったとき）だけパスから読む
+        let Some(fd) = meta.shared_file() else {
+            let data = content_cache::get_or_load(path, content_cfg).await?;
+            return Some(StaticFileOutcome::File(meta, charge(data, reserved)));
+        };
+        let version = meta.version();
+        if let Some(data) = content_cache::get_cached(path, content_cfg, version).await {
+            return Some(StaticFileOutcome::File(meta, charge(data, reserved)));
+        }
+        let fd = fd.clone();
+        // 理由付き allow: offload 専用ワーカースレッド内で実行され、イベントループをブロックしない
+        #[allow(clippy::disallowed_methods)]
+        let read = crate::runtime::offload::offload(move || read_shared(&fd, version)).await;
+        if let Some(data) = read {
+            content_cache::insert_bytes(
+                path,
+                data.clone(),
+                meta.mime_type.clone(),
+                content_cfg,
+                version,
+            );
+            return Some(StaticFileOutcome::File(meta, charge(data, reserved)));
+        }
+        file_cache::get_file_cache().invalidate(path);
+        content_cache::invalidate(path);
+        if reopened {
+            return None;
+        }
+        reopened = true;
+    }
+}
+
+/// open_file_cache のエントリの fd から、そのエントリの版の本体を読む（B-349）。オフセット指定なのでファイル位置を動かさず、
+/// ほかの要求（HTTP/1.1 の `sendfile`・`pread`）と同じ fd を使える。読めない・読み終えた後のファイルがその版（大きさと
+/// 更新時刻）でない（同じ inode のまま書き換えられた）ときは `None`
+fn read_shared(file: &std::fs::File, version: super::FileVersion) -> Option<Bytes> {
+    let mut buf = vec![0u8; usize::try_from(version.len).ok()?];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut buf, 0).ok()?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut read = 0usize;
+        while read < buf.len() {
+            match file.seek_read(&mut buf[read..], read as u64) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => read += n,
+            }
         }
     }
-    if !meta.is_file {
-        return Some(StaticFileOutcome::Directory(meta));
-    }
-    let Ok(reserved) = reserve_uncached(meta.file_size, cache_limit(content_cfg)) else {
-        return Some(StaticFileOutcome::Busy);
-    };
-    let data = content_cache::get_or_load(path, content_cfg).await?;
-    Some(StaticFileOutcome::File(meta, charge(data, reserved)))
+    let now = file.metadata().ok()?;
+    let same = now.len() == version.len && now.modified().ok() == version.modified;
+    same.then(|| Bytes::from(buf))
 }
 
 /// `path`（`containment` が `None` の場合）または `containment.root`
@@ -393,6 +462,7 @@ fn open_and_read_fast(
     root: Option<&Path>,
     prev: Option<&file_cache::ReusableFileInfo>,
     cache_limit: u64,
+    keep_fd: bool,
 ) -> Option<FastOutcome> {
     #[cfg(target_os = "linux")]
     {
@@ -407,7 +477,7 @@ fn open_and_read_fast(
             return Some(FastOutcome::Unavailable);
         };
         match opened {
-            Ok((file, meta)) => finish_fast(path, file, meta, prev, cache_limit),
+            Ok((file, meta)) => finish_fast(path, file, meta, prev, cache_limit, keep_fd),
             // 登録済みルート配下と判定された上での失敗（404 相当）。
             Err(_) => None,
         }
@@ -424,7 +494,7 @@ fn open_and_read_fast(
                 // 伴わないため、本体読み込みが必須の本関数では fd を再利用できる
                 // `open_static_ro` を使い、その fd から fstat する）。
                 let meta = file.metadata().ok()?;
-                finish_fast(path, file, meta, prev, cache_limit)
+                finish_fast(path, file, meta, prev, cache_limit, keep_fd)
             }
             Err(_) => None,
         }
@@ -442,8 +512,9 @@ fn finish_fast(
     meta: std::fs::Metadata,
     prev: Option<&file_cache::ReusableFileInfo>,
     cache_limit: u64,
+    keep_fd: bool,
 ) -> Option<FastOutcome> {
-    let info = CachedFileInfo::from_open_metadata(path, &meta, prev);
+    let mut info = CachedFileInfo::from_open_metadata(path, &meta, prev);
     if !info.is_file {
         return Some(FastOutcome::Directory(info));
     }
@@ -453,6 +524,15 @@ fn finish_fast(
         return Some(FastOutcome::Busy);
     };
     let data = read_into_bytes(&mut file, &meta)?;
+    // B-348: open_file_cache のエントリには配信に使う fd も持たせる（読み取りはオフセット指定だけなので、読んで位置が
+    // 進んだ fd も共有できる）。前のエントリが同じ版の fd を持っていればそれを引き継ぎ、開いた fd はここ（offload）で閉じる
+    // （本体キャッシュの無いルートは要求ごとにここを通る。毎回新しい fd に替えると、前の fd を閉じる close(2) がワーカーで走る）
+    if keep_fd {
+        let fd = prev
+            .and_then(|p| p.fd_of_same_version(&meta))
+            .unwrap_or_else(|| std::sync::Arc::new(file));
+        info.set_shared_file(fd);
+    }
     Some(FastOutcome::File(info, charge(data, reserved)))
 }
 
@@ -646,6 +726,112 @@ mod tests {
         assert_eq!(&third.validators.content_type[..], b"text/plain");
     }
 
+    /// 高速経路を使えないファイル（登録していないディレクトリ。高速経路の無い OS では全部）の本体は、open_file_cache のエントリの
+    /// fd からエントリの版を読むこと（B-349）。以前はパスから読み、差し替えた後の中身をエントリの古い大きさ・検証子で返していた。
+    /// 同じ inode のまま書き換えられて読んだ中身がエントリの版でなければ、エントリを捨てて開き直す
+    #[test]
+    fn fallback_reads_the_entry_version_from_its_fd() {
+        let dir = tempdir().unwrap();
+        let ofc = test_ofc();
+        let content_cfg = test_content_cfg();
+        let get = |path: &Path| match block_on_fresh_thread(|| {
+            futures::executor::block_on(get_static_file_with_content(
+                path,
+                Some(&ofc),
+                &content_cfg,
+                None,
+            ))
+        }) {
+            Some(StaticFileOutcome::File(meta, data)) => {
+                assert_eq!(meta.file_size, data.len() as u64, "{path:?}: one version");
+                data
+            }
+            _ => panic!("expected a file"),
+        };
+
+        // `mv` での差し替え: 有効期限内のエントリは古い版のまま。本体キャッシュから消えても、エントリの fd から同じ版を読む
+        let path = write_file(&dir, "b349.txt", b"AAAA");
+        assert_eq!(&get(&path)[..], b"AAAA");
+        let tmp = write_file(&dir, ".b349.tmp", b"BBBBBBBB");
+        std::fs::rename(&tmp, &path).unwrap();
+        content_cache::invalidate(&path);
+        assert_eq!(&get(&path)[..], b"AAAA");
+
+        // 同じ inode のままの上書き（`cp`）: 読んだ後の大きさがエントリと違うので、開き直して新しい版を返す
+        let inplace = write_file(&dir, "b349-inplace.txt", b"CCCC");
+        assert_eq!(&get(&inplace)[..], b"CCCC");
+        std::fs::write(&inplace, b"DDDDDD").unwrap();
+        content_cache::invalidate(&inplace);
+        assert_eq!(&get(&inplace)[..], b"DDDDDD");
+    }
+
+    /// HTTP/1.1 の配信（open_file_cache のエントリの fd で送る）と高速経路（HTTP/2・HTTP/3）が同じファイルを使っても、
+    /// エントリの fd と大きさが同じ版のままであること（B-348）。高速経路が fd の無いエントリに置き換えると、HTTP/1.1 は
+    /// パスで開き直し、差し替えた後の中身をエントリの古い大きさで返していた
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn fast_path_keeps_an_fd_in_the_open_file_cache_entry() {
+        use std::os::unix::fs::FileExt;
+        let roots = registered_test_roots();
+        let ofc = test_ofc();
+        // 本体キャッシュの無いルート（要求ごとに高速経路を通る）
+        let content_cfg = StaticContentCacheConfig {
+            enabled: false,
+            ..test_content_cfg()
+        };
+        let entry = |path: &Path| {
+            block_on_fresh_thread(|| {
+                futures::executor::block_on(file_cache::get_file_info_with_config(path, Some(&ofc)))
+            })
+            .expect("an open_file_cache entry")
+        };
+        let fast = |path: &Path| match block_on_fresh_thread(|| {
+            futures::executor::block_on(get_static_file_with_content(
+                path,
+                Some(&ofc),
+                &content_cfg,
+                None,
+            ))
+        }) {
+            Some(StaticFileOutcome::File(_, data)) => data,
+            _ => panic!("expected a file"),
+        };
+        // エントリの fd から読む（HTTP/1.1 と同じくオフセット指定）
+        let body = |info: &CachedFileInfo| {
+            let f = info.shared_file().expect("the entry holds an fd");
+            let mut buf = vec![0u8; info.file_size as usize + 8];
+            let n = f.read_at(&mut buf, 0).unwrap();
+            buf.truncate(n);
+            buf
+        };
+
+        // 高速経路が先: エントリは開いた fd を持つ
+        let first = write_file_in(roots.dirs[0].path(), "b348-fast-first.txt", b"one");
+        assert_eq!(&fast(&first)[..], b"one");
+        assert_eq!(body(&entry(&first)), b"one");
+
+        // HTTP/1.1 が先: 同じ版を読み直す高速経路は、エントリを作り直しても HTTP/1.1 が開いた fd を引き継ぐ
+        let path = write_file_in(roots.dirs[0].path(), "b348.txt", b"AAAA");
+        let h1 = entry(&path);
+        assert_eq!(&fast(&path)[..], b"AAAA");
+        assert!(std::sync::Arc::ptr_eq(
+            h1.shared_file().expect("the entry holds an fd"),
+            entry(&path).shared_file().expect("the entry holds an fd")
+        ));
+
+        // `mv` での差し替え（inode が変わる）: 有効期限内のエントリは古い版のまま、大きさと中身が揃う
+        let tmp = write_file_in(roots.dirs[0].path(), ".b348.tmp", b"BBBBBBBB");
+        std::fs::rename(&tmp, &path).unwrap();
+        let stale = entry(&path);
+        assert_eq!(stale.file_size, 4);
+        assert_eq!(body(&stale), b"AAAA");
+        // 高速経路は新しい版を読み、新しい版の fd でエントリを置き換える
+        assert_eq!(&fast(&path)[..], b"BBBBBBBB");
+        let fresh = entry(&path);
+        assert_eq!(fresh.file_size, 8);
+        assert_eq!(body(&fresh), b"BBBBBBBB");
+    }
+
     /// 内容とサイズを正しく返すこと（高速経路が使えない環境でもフォールバック経路で
     /// 同じ結果になること）。
     #[test]
@@ -681,11 +867,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_file(&dir, "fallback.txt", b"fallback");
         assert!(matches!(
-            open_and_read_fast(&path, Some(dir.path()), None, u64::MAX),
+            open_and_read_fast(&path, Some(dir.path()), None, u64::MAX, false),
             Some(FastOutcome::Unavailable)
         ));
         assert!(matches!(
-            open_and_read_fast(&path, None, None, u64::MAX),
+            open_and_read_fast(&path, None, None, u64::MAX, false),
             Some(FastOutcome::Unavailable)
         ));
     }
@@ -796,11 +982,9 @@ mod tests {
         // **プロセス全体で共有されるシングルトン**であり、他のテストが並列に挿入すると
         // 件数が動いて偽陽性になる（実際に単体では通るのに全体実行でだけ落ちた）。
         // 「このパスがキャッシュされていないこと」を直接確かめる。
-        let cached = block_on_fresh_thread(|| {
-            futures::executor::block_on(content_cache::get_cached(&path, &content_cfg))
-        });
+        // 版を問わずにエントリの有無を見る（B-349 の版の照合で見落とさない）
         assert!(
-            cached.is_none(),
+            !content_cache::is_cached(&path),
             "max_file_size_bytes を超えるファイルは本体キャッシュへ挿入されない"
         );
 
@@ -858,11 +1042,9 @@ mod tests {
         );
 
         // 本体が content cache に入っていないこと（読まれていない証拠）。
-        let cached = block_on_fresh_thread(|| {
-            futures::executor::block_on(content_cache::get_cached(&secret_path, &content_cfg))
-        });
+        // 版を問わずにエントリの有無を見る（B-349 の版の照合で見落とさない）
         assert!(
-            cached.is_none(),
+            !content_cache::is_cached(&secret_path),
             "封じ込め検査に失敗した場合は本体キャッシュへ挿入されてはならない（本体を \
              読んでいない証拠）"
         );
@@ -891,11 +1073,9 @@ mod tests {
             _ => panic!("ディレクトリは Directory を返すべき"),
         }
 
-        let cached = block_on_fresh_thread(|| {
-            futures::executor::block_on(content_cache::get_cached(&subdir, &content_cfg))
-        });
+        // 版を問わずにエントリの有無を見る（B-349 の版の照合で見落とさない）
         assert!(
-            cached.is_none(),
+            !content_cache::is_cached(&subdir),
             "ディレクトリの場合は本体を読んでいないので content cache にも入らない"
         );
     }
@@ -1046,11 +1226,9 @@ mod tests {
         }
 
         // 本体が content cache に入っていないこと（読まれていない証拠）。
-        let cached = block_on_fresh_thread(|| {
-            futures::executor::block_on(content_cache::get_cached(&file_in_b, &content_cfg))
-        });
+        // 版を問わずにエントリの有無を見る（B-349 の版の照合で見落とさない）
         assert!(
-            cached.is_none(),
+            !content_cache::is_cached(&file_in_b),
             "クロスルートアクセスが拒否された場合は本体キャッシュへ挿入されてはならない \
              （本体を読んでいない証拠）"
         );

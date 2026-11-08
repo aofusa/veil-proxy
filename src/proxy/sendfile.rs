@@ -144,7 +144,7 @@ pub(super) async fn handle_sendfile(
     // `file_info` / `idx_info` は所有値なのでフィールドをムーブする（clone による
     // PathBuf / String の確保をしない）。open_file_cache が開いた fd を共有していれば
     // それを使い、open/close を省く（nginx の open_file_cache と同じ）。
-    let (mut final_path, mut file_size, mime_type, mut shared_file, mut validators) =
+    let (mut final_path, mut file_size, mime_type, mut shared_file, mut validators, mut modified) =
         if !file_info.is_file {
             let filename = index_filename.unwrap_or("index.html");
             let index_path = file_info.canonical_path.join(filename);
@@ -159,6 +159,7 @@ pub(super) async fn handle_sendfile(
                         idx_info.mime_type,
                         shared,
                         idx_info.validators,
+                        idx_info.last_modified,
                     )
                 }
                 _ => {
@@ -176,6 +177,7 @@ pub(super) async fn handle_sendfile(
                 file_info.mime_type,
                 shared,
                 file_info.validators,
+                file_info.last_modified,
             )
         };
 
@@ -201,6 +203,7 @@ pub(super) async fn handle_sendfile(
         {
             shared_file = sib.info.shared_file().cloned();
             file_size = sib.info.file_size;
+            modified = sib.info.last_modified;
             final_path = sib.path;
             validators = sib.validators;
             compression = crate::static_response::no_compression();
@@ -237,7 +240,11 @@ pub(super) async fn handle_sendfile(
         } if !sreq.head => {
             let content_cfg =
                 cache::effective_static_content_cache_config(static_file_cache_config);
-            match load_file_bytes(&file, &final_path, file_size, &mime_type, &content_cfg).await {
+            let version = cache::FileVersion {
+                len: file_size,
+                modified,
+            };
+            match load_file_bytes(&file, &final_path, version, &mime_type, &content_cfg).await {
                 Some(data) => {
                     let level = cache::compressed::compression_level(enc, compression);
                     let ident = cache::compressed::file_ident(file_size, validators.mtime_secs);
@@ -450,6 +457,7 @@ pub(super) async fn handle_sendfile(
         &file,
         &final_path,
         file_size,
+        modified,
         &mime_type,
         static_file_cache_config,
         transfer_offset,
@@ -535,6 +543,7 @@ pub(super) async fn handle_sendfile_userspace(
     file: &crate::runtime::io::File,
     file_path: &Path,
     file_size: u64,
+    modified: Option<std::time::SystemTime>,
     mime_type: &str,
     static_file_cache_config: Option<&cache::StaticContentCacheRouteConfig>,
     transfer_offset: i64,
@@ -599,7 +608,11 @@ pub(super) async fn handle_sendfile_userspace(
     if content_cfg.enabled && file_size <= content_cfg.max_file_size_bytes {
         // キャッシュはファイル全体を保持する（Range リクエストであっても部分内容だけを
         // 挿入すると、後続の別範囲・全体リクエストが正しく解決できなくなるため）。
-        let cached = load_file_bytes(file, file_path, file_size, mime_type, &content_cfg).await;
+        let version = cache::FileVersion {
+            len: file_size,
+            modified,
+        };
+        let cached = load_file_bytes(file, file_path, version, mime_type, &content_cfg).await;
 
         if let Some(data) = cached {
             let start = transfer_offset as usize;
@@ -814,18 +827,22 @@ async fn sendfile_body(
 /// ファイル全体を `Bytes` で得る（静的コンテンツキャッシュが有効ならキャッシュから、無ければ開いている fd から 1 回の
 /// `read_exact_at` で読み、キャッシュに入れる）。読めなければ `None`。
 ///
+/// `version` は応答のヘッダを作った open_file_cache のエントリの版で、`file` はそのエントリの fd（B-349）。キャッシュの
+/// 本体は同じ版のときだけ使い、読んだ本体はその版として入れる（違う版の本体を古い大きさで切って返さない）。
+///
 /// `cache::get_or_load` は `std::fs::read(path)` で **開き直す**ため使えない（FreeBSD capability mode = `cap_enter` 下では
 /// 絶対パス open が禁止されている、F-123）。既に開いている fd を使えば open/close も増えない。
 pub(super) async fn load_file_bytes(
     file: &crate::runtime::io::File,
     file_path: &Path,
-    file_size: u64,
+    version: cache::FileVersion,
     mime_type: &str,
     content_cfg: &cache::StaticContentCacheConfig,
 ) -> Option<bytes::Bytes> {
+    let file_size = version.len;
     let cacheable = content_cfg.enabled && file_size <= content_cfg.max_file_size_bytes;
     if cacheable {
-        if let Some(data) = cache::get_cached_content_cache(file_path, content_cfg).await {
+        if let Some(data) = cache::get_cached_content_cache(file_path, content_cfg, version).await {
             return Some(data);
         }
     }
@@ -843,6 +860,7 @@ pub(super) async fn load_file_bytes(
                     data.clone(),
                     Arc::from(mime_type),
                     content_cfg,
+                    version,
                 );
             }
             Some(data)

@@ -701,6 +701,8 @@
 | B-345 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-345-logging-removed-keys-in-docs.md](bugs/B-345-logging-removed-keys-in-docs.md) | ガイドに無いキー `[logging] max_log_size`・`[logging] file_path` が載っている（黙って無視される）。ガイドを `app_file_path`・`error_file_path` に直し、ログファイルは日ごとで大きさの上限が無いことを書く |
 | B-346 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-346-bsd-security-e2e-stale-binary.md](bugs/B-346-bsd-security-e2e-stale-binary.md) | BSD の VM の `security-e2e` が、ソースを同期せず前に `build` した release のバイナリのまま走るので、古いコミットのバイナリでも PASS する。`build` してから走らせる |
 | B-347 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-347-standalone-e2e-f271-stale-after-f293.md](bugs/B-347-standalone-e2e-f271-stale-after-f293.md) | 自己完結型 E2E の f271 が、F-293 の既定（Proxy-Wasm の失敗は本文の無い 503）より前のルートの固定応答を期待したままで、v0.11.0 から失敗していた（自己完結型 E2E は CI でもリリース前の試験でも走っていなかった）。期待値を直し、AGENTS.md の試験の手順に足す |
+| B-348 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-348-fast-path-drops-open-file-cache-fd.md](bugs/B-348-fast-path-drops-open-file-cache-fd.md) | HTTP/2・HTTP/3 の静的配信（Linux・FreeBSD の高速経路）が open_file_cache のエントリを fd の無いものに置き換えるので、有効期限内に `mv` で差し替えると HTTP/1.1 は新しいファイルをパスで開き、エントリの古い大きさで切って返す（どの版にも無い本文）。高速経路でもエントリに fd を持たせ、同じ版なら前の fd を引き継ぐ |
+| B-349 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-349-content-cache-version-mismatch.md](bugs/B-349-content-cache-version-mismatch.md) | 静的コンテンツキャッシュの本体が open_file_cache のエントリと違う版を持つと（2 つは別々に期限が切れる）、HTTP/2・HTTP/3 は新しい版のヘッダで古い本体を返し（`Content-Length` と DATA の長さが合わない）、HTTP/1.1 は古い本体を新しい大きさで切って返す（v0.6.0 から）。本体に版を持たせて照合し、フォールバックの経路はエントリの fd から読む |
 
 ---
 

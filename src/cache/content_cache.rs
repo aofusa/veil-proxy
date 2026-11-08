@@ -192,6 +192,8 @@ struct CachedContent {
     cached_at: Instant,
     /// 読み込む前に読んだ監視の世代（F-272）
     stamp: Option<super::watch::Stamp>,
+    /// どの版のファイルから読んだか（B-349。パスから読んだもの（`get_or_load`）は分からないので `None`）
+    version: Option<super::FileVersion>,
 }
 
 struct ContentCache {
@@ -295,6 +297,7 @@ impl ContentCache {
         &self,
         path: &Path,
         cfg: &StaticContentCacheConfig,
+        want: Option<super::FileVersion>,
     ) -> Option<(Bytes, Arc<str>)> {
         if !cfg.enabled {
             return None;
@@ -302,6 +305,10 @@ impl ContentCache {
         let entry = self.entries.get(path)?;
         // F-272: 監視しているルートが作った後に変わっていたら作り直す（原子変数の読み取り 1 回）
         if !super::watch::fresh(entry.stamp, cfg.watch_gen) {
+            return None;
+        }
+        // B-349: 応答のヘッダを作ったエントリと違う版の本体は使わない（呼び出し元はその版を読み直す）
+        if want.is_some() && entry.version != want {
             return None;
         }
         let ttl = Duration::from_secs(cfg.valid_duration_secs);
@@ -355,7 +362,7 @@ impl ContentCache {
     where
         F: FnOnce() -> Arc<str>,
     {
-        if let Some(hit) = self.try_hit(path, cfg).await {
+        if let Some(hit) = self.try_hit(path, cfg, None).await {
             return Some(hit);
         }
 
@@ -396,6 +403,7 @@ impl ContentCache {
                     mime_type: mime.clone(),
                     cached_at: Instant::now(),
                     stamp,
+                    version: None,
                 },
                 cfg,
             );
@@ -407,8 +415,13 @@ impl ContentCache {
     /// キャッシュヒット時のみ内容を返す（F-150）。ミス時は一切ロードしない
     /// （呼び出し元が既に開いている fd から自前で読み込み、`insert_bytes` で登録する
     /// 設計を前提とする。HTTP/1.1 のユーザー空間 TLS 静的配信向け）。
-    async fn get_cached(&self, path: &Path, cfg: &StaticContentCacheConfig) -> Option<Bytes> {
-        match self.try_hit(path, cfg).await {
+    async fn get_cached(
+        &self,
+        path: &Path,
+        cfg: &StaticContentCacheConfig,
+        version: super::FileVersion,
+    ) -> Option<Bytes> {
+        match self.try_hit(path, cfg, Some(version)).await {
             Some((data, _mime)) => Some(data),
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
@@ -432,7 +445,7 @@ impl ContentCache {
     /// （`revalidate_mtime` は既定 `false` であり、この trade-off が効くのはこの経路を
     /// 明示的に選んだ場合のみ）。
     ///
-    /// `stamp` は読む前に読んだ監視の世代（F-272）。
+    /// `stamp` は読む前に読んだ監視の世代（F-272）、`version` は読んだファイルの版（B-349）。
     fn insert_bytes(
         &self,
         path: &Path,
@@ -440,6 +453,7 @@ impl ContentCache {
         mime: Arc<str>,
         cfg: &StaticContentCacheConfig,
         stamp: Option<super::watch::Stamp>,
+        version: super::FileVersion,
     ) {
         let len = data.len() as u64;
         if !cfg.enabled || len > cfg.max_file_size_bytes {
@@ -454,6 +468,7 @@ impl ContentCache {
                 mime_type: mime,
                 cached_at: Instant::now(),
                 stamp,
+                version: Some(version),
             },
             cfg,
         );
@@ -499,18 +514,30 @@ where
 
 /// キャッシュヒット時のみ内容を返す（グローバルシングルトン、F-150）。
 /// ミス時は一切ロードしない。詳細は `ContentCache::get_cached` 参照。
-pub async fn get_cached(path: &Path, cfg: &StaticContentCacheConfig) -> Option<Bytes> {
-    CONTENT_CACHE.get_cached(path, cfg).await
+///
+/// `version` は応答のヘッダを作った open_file_cache のエントリの版（B-349）。違う版の本体はミスにする。
+pub async fn get_cached(
+    path: &Path,
+    cfg: &StaticContentCacheConfig,
+    version: super::FileVersion,
+) -> Option<Bytes> {
+    CONTENT_CACHE.get_cached(path, cfg, version).await
 }
 
 /// 既に読み込み済みのバイト列をキャッシュへ登録する（グローバルシングルトン、F-150）。
 /// 詳細は `ContentCache::insert_bytes` 参照。
 ///
 /// 監視しているルートの世代は登録の時点で読む（F-272。読む前に読んだ世代を持っている呼び出し元は
-/// `insert_bytes_stamped` を使う）。
-pub fn insert_bytes(path: &Path, data: Bytes, mime: Arc<str>, cfg: &StaticContentCacheConfig) {
+/// `insert_bytes_stamped` を使う）。`version` は `data` を読んだファイルの版（B-349）。
+pub fn insert_bytes(
+    path: &Path,
+    data: Bytes,
+    mime: Arc<str>,
+    cfg: &StaticContentCacheConfig,
+    version: super::FileVersion,
+) {
     let stamp = super::watch::stamp(cfg.watch_gen);
-    CONTENT_CACHE.insert_bytes(path, data, mime, cfg, stamp);
+    CONTENT_CACHE.insert_bytes(path, data, mime, cfg, stamp, version);
 }
 
 /// [`insert_bytes`] の、読む前に読んだ監視の世代を付ける版（F-272。静的配信の高速経路）。
@@ -521,8 +548,15 @@ pub(crate) fn insert_bytes_stamped(
     mime: Arc<str>,
     cfg: &StaticContentCacheConfig,
     stamp: Option<super::watch::Stamp>,
+    version: super::FileVersion,
 ) {
-    CONTENT_CACHE.insert_bytes(path, data, mime, cfg, stamp);
+    CONTENT_CACHE.insert_bytes(path, data, mime, cfg, stamp, version);
+}
+
+/// テスト用: 版を問わずにエントリがあるか
+#[cfg(test)]
+pub(crate) fn is_cached(path: &Path) -> bool {
+    CONTENT_CACHE.entries.contains_key(path)
 }
 
 /// 指定パスのキャッシュエントリを無効化する（読み込み失敗時等に既存の
@@ -572,6 +606,14 @@ mod tests {
             revalidate_mtime: false,
             watch: false,
             watch_gen: None,
+        }
+    }
+
+    /// 本体の版（B-349。更新時刻の無い版）
+    fn test_version(len: u64) -> crate::cache::FileVersion {
+        crate::cache::FileVersion {
+            len,
+            modified: None,
         }
     }
 
@@ -908,8 +950,9 @@ mod tests {
         let path = write_file(&dir, "uncached.txt", b"exists but not cached");
         let cfg = test_cfg();
 
-        let result =
-            block_on_fresh_thread(|| futures::executor::block_on(cache.get_cached(&path, &cfg)));
+        let result = block_on_fresh_thread(|| {
+            futures::executor::block_on(cache.get_cached(&path, &cfg, test_version(21)))
+        });
         assert_eq!(result, None, "未登録なら実ファイルが存在してもミスになる");
         assert_eq!(
             cache.entries.len(),
@@ -930,15 +973,30 @@ mod tests {
         let payload = Bytes::from_static(b"round trip payload");
         let mime: Arc<str> = Arc::from("text/plain");
 
-        cache.insert_bytes(&path, payload.clone(), mime.clone(), &cfg, None);
+        let version = test_version(payload.len() as u64);
+        cache.insert_bytes(&path, payload.clone(), mime.clone(), &cfg, None, version);
 
-        let hit =
-            block_on_fresh_thread(|| futures::executor::block_on(cache.get_cached(&path, &cfg)));
+        let hit = block_on_fresh_thread(|| {
+            futures::executor::block_on(cache.get_cached(&path, &cfg, version))
+        });
         assert_eq!(
             hit,
             Some(payload),
             "insert_bytes で登録した内容がそのまま返る"
         );
+        // B-349: 違う版（大きさ・更新時刻）を求められたら使わない
+        for other in [
+            test_version(version.len + 1),
+            crate::cache::FileVersion {
+                modified: Some(std::time::SystemTime::UNIX_EPOCH),
+                ..version
+            },
+        ] {
+            let miss = block_on_fresh_thread(|| {
+                futures::executor::block_on(cache.get_cached(&path, &cfg, other))
+            });
+            assert_eq!(miss, None, "{other:?}");
+        }
     }
 
     /// F-150: `insert_bytes` は `max_file_size_bytes` 超過を拒否する。
@@ -956,11 +1014,13 @@ mod tests {
             Arc::from("text/plain"),
             &cfg,
             None,
+            test_version(9),
         );
 
         assert_eq!(cache.entries.len(), 0, "上限を超えるバイト列は挿入されない");
-        let hit =
-            block_on_fresh_thread(|| futures::executor::block_on(cache.get_cached(&path, &cfg)));
+        let hit = block_on_fresh_thread(|| {
+            futures::executor::block_on(cache.get_cached(&path, &cfg, test_version(9)))
+        });
         assert_eq!(hit, None);
     }
 
@@ -979,6 +1039,7 @@ mod tests {
             Arc::from("text/plain"),
             &cfg,
             None,
+            test_version(4),
         );
 
         assert_eq!(cache.entries.len(), 0, "無効時は insert_bytes も何もしない");
