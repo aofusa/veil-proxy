@@ -116,7 +116,7 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | `screen` | QMP の screendump で VGA 画面を PNG に保存（既定 `${WORKDIR}/screen.png`）。シリアルに何も出ない状態の確認用（F-176） |
 | `sendkeys` | QMP の send-key でキー入力（`qmp-sendkeys.py` の引数をそのまま渡す。例: `sendkeys --type 'fsck -y'`）（F-176） |
 | `rescue` | 異常終了後にシングルユーザーの fsck 待ちで止まった VM を、シリアルから `fsck -y` → `reboot` で戻して SSH 到達まで待つ（全 OS。`rescue.py`）（F-176） |
-| `security-e2e` | OS 固有のサンドボックス下での E2E（FreeBSD capsicum / OpenBSD pledge+unveil / NetBSD chroot+特権降格）。`build` 済みの release バイナリで、静的配信・トラバーサル・SIGHUP の証明書リロード・特権降格を確かめる（`bsd-security-e2e.sh <os> <arch>` も同じ）（F-176） |
+| `security-e2e` | OS 固有のサンドボックス下での E2E（FreeBSD capsicum / OpenBSD pledge+unveil / NetBSD chroot+特権降格）。同期した今のソースで release をビルドしてから（ビルド済みならすぐ終わる。B-346）、静的配信・トラバーサル・SIGHUP の証明書リロード・特権降格を確かめる（`bsd-security-e2e.sh <os> <arch>` も同じ）（F-176） |
 | `grow` | ルート FS の拡張（FreeBSD: growfs、NetBSD aarch64: `resize_root=YES` で再起動。NetBSD x86_64 は B-82 のため不可＝`/work` で代替） |
 
 > **`sync` / `build` / `e2e` / `fetch` は VM が起動済みであることが前提。**

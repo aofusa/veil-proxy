@@ -1540,7 +1540,9 @@ cmd_fetch() {
 # F-176: OS 固有のサンドボックス下での E2E（FreeBSD capsicum / OpenBSD pledge+unveil /
 # NetBSD chroot+特権降格）。`build` 済みの release バイナリを使う。
 cmd_security_e2e() {
-    cmd_wait "${SYNC_WAIT_TIMEOUT:-900}" >/dev/null 2>&1 || die "VM の SSH に到達できない"
+    # B-346: 同期した今のソースで release をビルドしてから走らせる（ビルド済みなら cargo はすぐ終わる）。以前は
+    # 既にある release のバイナリをそのまま使い、古いコミットのバイナリでも PASS になった。
+    cmd_build
     local bin="${GUEST_ROOT}/target/${CARGO_PROFILE}/veil"
     cmd_ssh "test -x ${bin}" || die "release バイナリが無い（先に build）: ${bin}"
     cmd_scp "${HERE}/bsd-security-e2e-guest.sh" "${SSH_USER}@127.0.0.1:/tmp/bsd-security-e2e-guest.sh"
