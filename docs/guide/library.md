@@ -1294,10 +1294,12 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
   turns: one runs requests back to back while it holds the GIL, a second waits for the GIL and takes over as soon as
   a handler releases it (`time.sleep`, blocking I/O, C extensions that drop the GIL), and the rest sleep, so blocking
   handlers still overlap up to the number of threads. `offload=False` runs on the network worker and is for
-  trivially cheap handlers only. Pure-Python handlers are limited to the GIL's parallelism; for CPU-bound work use
-  several processes. Each request runs in a new `contextvars.Context`, so a context variable set by one request is
-  not seen by the next; `threading.local` values stay with the handler thread and are seen by later requests on it
-  (before 0.12 they were cleared on every request).
+  trivially cheap handlers only: every network worker takes the GIL itself, without the turn-taking above, so more
+  threads make it slower (on 4 CPUs, 4 threads served 42–70% of the requests of 2 threads in our measurement).
+  Pure-Python handlers are limited to the GIL's parallelism; for CPU-bound work use several processes. Each request
+  runs in a new `contextvars.Context`, so a context variable set by one request is not seen by the next;
+  `threading.local` values stay with the handler thread and are seen by later requests on it (before 0.12 they were
+  cleared on every request).
 - **Inside the server** a handler receives a Rust-backed request (`veil._veil.NativeRequest`, an instance of
   `veil.Request` for `isinstance`) with the same attributes and methods; attributes are created only when the
   handler reads them, and common return values (`str`, `bytes`, `dict`/`list`, `None`, `veil.Response`) are turned
@@ -1452,23 +1454,34 @@ streams of a connection that are ready in one loop iteration go out in one write
 
 ### Python: FastAPI (uvicorn) and veil
 
+This table comes from another machine than the ones above: an AMD Ryzen AI Z2 Extreme (8 cores / 16 threads, Linux 6.6
+under WSL2) with the same layout (the server on one physical core, CPUs 0-1, 2 server threads / workers; wrk 4.1 on
+CPUs 2-3), `wrk -t2 -c64 -d10s`, 3 rounds alternating the order of the targets, median (2026-11-08). Python 3.12,
+FastAPI 0.162 / uvicorn 0.54 with uvloop and httptools, pydantic 2.14. The v0.11.0 rows are the previous binding in the
+same alternating run. Raw data: [`docs/perf/linux_python_bench_raw.tsv`](../perf/linux_python_bench_raw.tsv).
+
 | Target | plaintext req/s | json req/s | p99 ms (plaintext) | CPU µs/req (plaintext) | RSS MB |
 |---|---:|---:|---:|---:|---:|
-| FastAPI `async def`, uvicorn 1 worker | 5,502 | 4,333 | 14.46 | 189.4 | 49.4 |
-| FastAPI `async def`, uvicorn 2 workers | 6,859 | 5,473 | 10.17 | 296.2 | 136.4 |
-| FastAPI `def`, uvicorn 2 workers | 3,661 | 3,174 | 50.23 | 551.5 | 140.6 |
-| veil, `offload=True` (default), 2 threads | 25,494 | 22,567 | 6.70 | 71.1 | 31.3 |
-| veil, `offload=False`, 2 threads | 26,229 | 24,226 | 2.95 | 77.0 | 30.4 |
+| FastAPI `async def`, uvicorn 1 worker | 9,916 | 7,474 | 14.16 | 102.8 | 49.0 |
+| FastAPI `async def`, uvicorn 2 workers | 21,873 | 17,201 | 6.02 | 92.3 | 133.8 |
+| FastAPI `def`, uvicorn 2 workers | 14,119 | 13,085 | 30.21 | 140.9 | 138.3 |
+| veil, `offload=True` (default), 2 threads | 206,599 | 168,852 | 0.76 | 9.5 | 36.6 |
+| veil, `offload=False`, 2 threads | 236,838 | 161,223 | 0.74 | 7.5 | 35.1 |
+| veil, `async def`, 2 threads | 153,451 | 132,653 | 1.02 | 11.2 | 36.5 |
+| veil v0.11.0, `offload=True`, 2 threads | 69,245 | 70,802 | 2.71 | 27.1 | 33.9 |
+| veil v0.11.0, `offload=False`, 2 threads | 26,157 | 21,047 | 5.19 | 65.2 | 32.4 |
+| veil v0.11.0, `async def`, 2 threads | 88,731 | 92,418 | 2.41 | 19.8 | 33.9 |
 
-FastAPI 0.143 / uvicorn 0.54 with uvloop and httptools; pydantic 2. uvicorn's workers are processes, veil runs one
-process. The veil rows were re-measured after F-212 (5 alternating rounds against the previous binding,
-`docs/artifacts/f212_ab_py.tsv`; before F-212: 15,848 / 12,237 req/s and 110 µs/req with `offload=True`); the
-FastAPI rows are from the F-201 run. veil serves **3.7–4.4× the requests of FastAPI with 2 workers** (4.6–5.6× of one
-worker) with about a quarter of the CPU per request and less than a quarter of the memory, because HTTP parsing,
-routing and the response are done in Rust and only the handler body runs in Python (the request object is created in
-Rust and only the attributes the handler reads become Python objects). Python handlers are still serialized by the GIL, so a
-single process does not scale with cores; `offload=True` keeps the event loop free of the GIL at the cost of a
-handoff to the handler pool (the higher p99).
+uvicorn's workers are processes, veil runs one process. veil serves **7–11× the requests of FastAPI with 2 workers**
+(15–24× of one worker) with about a tenth of the CPU per request and about a quarter of the memory, because HTTP
+parsing, routing and the response are done in Rust and only the handler body runs in Python (the request object is
+created in Rust and only the attributes the handler reads become Python objects). Against v0.11.0, `offload=True` is
+3.0× (plaintext) / 2.4× (json), `offload=False` 9.1× / 7.7× and `async def` 1.7× / 1.4×, with less than half the
+p99: each thread that calls Python keeps its Python thread state instead of creating it for every request, the
+handler threads of `offload=True` take turns (one runs requests back to back while it holds the GIL, one more waits
+for it and the rest sleep, instead of all of them competing for the GIL), and completions reach each network worker
+through one notification. Python handlers are still serialized by the GIL, so a single process does not scale with
+cores; `offload=True` keeps the event loop free of the GIL at the cost of a handoff to the handler threads.
 
 ## Platforms
 
