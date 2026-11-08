@@ -349,6 +349,9 @@ F-158（HTTP/2 インライン初回 poll）の A/B 結果は
   `SRV_CPUS=0 GEN_CPUS=1,2,3 UP_CPUS=1,2,3 SRV_THREADS=1 LOAD_THREADS=3 sh tools/perf/bsd/run_perf_bsd.sh -r 4 -d 10`。
 - `bsd/cpu_per_req.sh`: 全シナリオのサーバの CPU 時間 / 要求（ns）と rps を veil・nginx で交互に測る。VM はホストの
   負荷で rps が大きく揺れる（同じバイナリでラウンドごとに 3 割下がることがある）ので、効率の比較はこれを主にする。
+- `bsd/version_ab_bsd.sh`: 同じ全シナリオを 2 つの veil のビルドで交互に測る（リリース間の退行確認。v0.12.0）。
+  バイナリはそれぞれ別のディレクトリに `veil` という名前で置く:
+  `A_DIR=/root/ab/old B_DIR=/root/ab/new sh tools/perf/bsd/version_ab_bsd.sh > ab.tsv`。
 - `bsd/syscalls_per_req.sh`・`bsd/profile_cpu.sh`: 1 要求あたりの syscall（DTrace）と関数別の CPU。profile プローブの
   `ustack` は aarch64 の FreeBSD では取れないので、呼び出し元はコードを読んで追う。
 
