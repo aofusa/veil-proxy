@@ -692,6 +692,7 @@
 | B-337 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-337-iouring-queued-sqe-outlives-closed-fd.md](bugs/B-337-iouring-queued-sqe-outlives-closed-fd.md) | 取り消しの提出が失敗すると、閉じた fd の番号へ SQE が届く（接続をまたいだ漏洩になり得る。その op の SQE の fd を -1 へ書き換える） |
 | B-338 | P2 | **取り下げ（仮説を実測で否定）** | [bugs/B-338-epoll-unclaimed-read-rearm-churn.md](bugs/B-338-epoll-unclaimed-read-rearm-churn.md) | epoll で待機者のいない読み取りイベントのたびに武装を上げ下げしている、という仮説（h2c 54KB の退行の原因の候補）。`epoll_ctl` は main の 100 分の 1 で、往復は起きていなかった |
 | B-339 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-339-epoll-level-trigger-sticky-wake-order.md](bugs/B-339-epoll-level-trigger-sticky-wake-order.md) | epoll のレベルトリガで起こす順が届いた順にならず、CPU を使い切る負荷で一部の要求が 2 周分待つ（JSON の gzip の p99 が main の 1.4 倍）。読み取りの待ちを待ち始めた順に起こす |
+| B-340 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-340-python-async-response-lost-on-close-race.md](bugs/B-340-python-async-response-lost-on-close-race.md) | Python の `async def` のハンドラの応答を、ワーカーがまれに取りこぼして 500 にする（ストリーミングは最後を落として打ち切る。100 万要求に 1 件ほど、v0.11.0 から）。閉じた旗をキューの錠の中で読む |
 
 ---
 

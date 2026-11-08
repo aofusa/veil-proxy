@@ -310,11 +310,18 @@ impl Out {
     async fn recv(&self) -> Option<Ev> {
         loop {
             self.wake.reset();
-            if let Some(ev) = self.q.lock().unwrap().pop_front() {
-                return Some(ev);
-            }
-            if self.tx_closed.load(Ordering::Acquire) {
-                return None;
+            {
+                // B-340: 閉じた旗はキューの錠を持ったまま見る（`api::bridge::AsyncReceiver::recv` と同じ）。ループは
+                // 「積む → 閉じる」の順なので、錠を放してから旗を見ると、空を見た後に積まれて閉じられた応答を捨てて
+                // 500（ストリーミングなら最後の End を落として打ち切り）にしていた。錠の中で空なら、積むのも閉じるのも
+                // この後になる
+                let mut q = self.q.lock().unwrap();
+                if let Some(ev) = q.pop_front() {
+                    return Some(ev);
+                }
+                if self.tx_closed.load(Ordering::Acquire) {
+                    return None;
+                }
             }
             self.wake.wait().await;
         }
