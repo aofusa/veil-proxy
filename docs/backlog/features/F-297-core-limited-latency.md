@@ -150,3 +150,20 @@ HTTP/2 の 54KB の転送で −4%（下の「HTTP/2 の転送の退行」）。
 参考（同じプロファイル）: この行のサーバの CPU の 35% は本文の移動だった。カーネルが送信バッファの新しいページを毎回ゼロで埋める
 `clear_page_erms`（`tcp_sendmsg` → `skb_page_frag_refill` → `alloc_pages`。Ubuntu の既定 `CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y`）が 18.5%、`copyin` が 8.6%、
 ユーザ空間で `write_buf` へ写す `memcpy` が約 8%。ゼロ埋めは `init_on_alloc=0` で消える（カーネルの堅牢化を外す設定）。
+
+## 最終の A/B（v0.12.0 の候補 4fbe17a3 と v0.11.0、aofish WSL、5 ラウンドの交互 A/B の中央値）
+
+`tools/perf/api_ab.py --scenario latency`（サーバ 8 CPU、1024 接続、`/baseline11?a=1&b=2`、固定レートは CO 補正の待ち時間）。
+生データは `docs/perf/linux_api_ab_raw.tsv`。
+
+| 行 | epoll（v0.11.0 → v0.12.0） | io_uring（v0.11.0 → v0.12.0） |
+|---|---|---|
+| 飽和 req/s | 372,007 → 578,847（1.56×） | 338,088 → 664,215（1.96×） |
+| 飽和の CPU/要求 | 21.1 → 13.4 µs | 23.2 → 11.8 µs |
+| 300k の p99 | 2.3 → 1.8 ms | 18.7 → 3.6 ms |
+| 400k の達成率・p99 | 0.94・367 ms → 1.00・1.3 ms | 0.89・843 ms → 1.00・3.9 ms |
+| 475k の達成率・p99 | 0.80・1.17 s → 1.00・6.5 ms | 0.68・1.92 s → 1.00・1.7 ms |
+| 500k の達成率・p99 | 0.76・1.43 s → 1.00・22.4 ms | 0.69・1.89 s → 1.00・4.2 ms |
+
+500k（HttpArena の latency-500k-8cpu の形）は両方のバックエンドで達成率 1.00 になった。io_uring の分は F-300（提出をまとめる）による。
+

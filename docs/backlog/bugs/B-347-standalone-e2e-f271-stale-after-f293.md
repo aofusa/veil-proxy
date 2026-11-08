@@ -26,3 +26,6 @@ v0.11.0 のタグでも同じ。veil の挙動は F-293 の仕様どおり（`fa
 ## テスト
 
 `cargo test --test standalone_e2e` を `full`・`full,epoll` の両方で回し、全件通ることを確かめる（結果は下に追記する）。
+
+結果（`96cbc81b`、Linux x86_64、2026-11-08）: `full`・`full,epoll` とも 50 件すべて通った（`f271_wasm_respond_body_phase_reuse_and_data_files` を含む）。
+直す前の `c9689c23` では両方とも f271 の 1 件だけが落ちていた（49 件は通過）。
