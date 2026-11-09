@@ -1,0 +1,9 @@
+# cargo-audit の除外。やむを得ず残すものだけを理由付きで書く（AGENTS.md「プロトコル準拠・サンドボックス」、B-158）。
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0459: libsqlite3-sys 0.30 が同梱する C の SQLite の CVE-2026-119375（修正は 0.39 以上）。
+    # 使うのは tools/tokio-compat/ecosystem（公開しない試験用クレート）の sqlx だけで、veil の本体・配布物には入らない。
+    # sqlx の最新（0.9.0）も libsqlite3-sys は 0.38 未満を要求するので、修正版を選べない。試験は `sqlite::memory:` に
+    # 固定の SQL を流すだけ。sqlx が 0.39 以上に対応したら上げて、ここから消す（B-356）。
+    "RUSTSEC-2026-0459",
+]
