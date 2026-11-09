@@ -15,7 +15,7 @@ publish = false
 
 [dependencies]
 # 0.12 は保守終了の rustls-pemfile（RUSTSEC-2025-0134）に依存していたので 0.14 に上げた（B-158）
-tonic = { version = "0.14", features = ["tls-aws-lc"] }
+tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"
 tokio = { version = "1", features = ["full"] }
@@ -24,6 +24,15 @@ axum = "0.8"
 serde_json = "1"
 toml = "0.8"
 sha2 = "0.10"
+
+# rustls の暗号プロバイダは veil 本体（src/tls_provider.rs）・試験用のクレートと同じ target 別（B-358）。
+# OpenBSD の x86_64 は .text を実行専用で載せるので、AWS-LC の s2n-bignum の x86_64 のコードが .text の中の定数表を
+# 読んだ時点で SIGSEGV になる（TLS の最初のハンドシェイクで制御プレーンのプロセスごと落ちる）。
+[target.'cfg(any(target_os = "openbsd", target_os = "netbsd"))'.dependencies]
+tonic = { version = "0.14", features = ["tls-ring"] }
+
+[target.'cfg(not(any(target_os = "openbsd", target_os = "netbsd")))'.dependencies]
+tonic = { version = "0.14", features = ["tls-aws-lc"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

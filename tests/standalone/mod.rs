@@ -20,11 +20,39 @@ pub fn tp(p: &Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
 
+/// この試験のプロセスの fd の上限（ソフト）をハードの上限まで上げる。
+///
+/// OpenBSD は ssh の root でもソフトの上限が 128 で、並列の試験の接続・ランタイム・一時ファイルで足りなくなる（B-359）。
+/// 最初の 1 回だけ働く。上げられないときはそのまま続ける（macOS はハードが無制限でも `OPEN_MAX` を超える値を拒否する）。
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    static RAISED: std::sync::Once = std::sync::Once::new();
+    RAISED.call_once(|| {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: 有効な rlimit のポインタを渡すだけ。プロセス全体の値を上げても他のスレッドの動作は変わらない
+        unsafe {
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0
+                && limit.rlim_cur < limit.rlim_max
+            {
+                limit.rlim_cur = limit.rlim_max.min(65536);
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn raise_nofile_limit() {}
+
 /// TCP と UDP の両方で空いているポートを 1 つ返す（bind して即解放）。
 ///
 /// HTTP/3 は TLS と同じ番号の UDP で待ち受ける。Windows では Hyper-V などが UDP だけ予約する範囲があり
 /// （`netsh int ipv4 show excludedportrange protocol=udp`）、TCP で空いていても UDP の bind が `WSAEACCES` で失敗する（B-352）。
 pub fn free_port() -> u16 {
+    raise_nofile_limit();
     let mut rejected = Vec::new();
     for _ in 0..64 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -78,6 +106,7 @@ impl VeilProcess {
 
     /// 任意の実行ファイル（ライブラリのサンプル等）を `-c` 無しで起動する場合にも使える汎用版。
     pub fn spawn_with(bin: &Path, config: &Path, env: &[(&str, &str)], args: &[&str]) -> Self {
+        raise_nofile_limit();
         let log_dir = tempfile::tempdir().unwrap();
         let log_path = log_dir.path().join("veil.log");
         let log = std::fs::File::create(&log_path).unwrap();

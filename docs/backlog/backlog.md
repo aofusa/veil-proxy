@@ -711,6 +711,8 @@
 | B-355 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-355-run-client-timeout-sig-proxy.md](bugs/B-355-run-client-timeout-sig-proxy.md) | `run_perf.sh` のクライアントの打ち切りが `docker run` のシグナル転送で効かず、スイートが止まり続ける。 |
 | B-356 | P3 | 対応済み（feat/v0120-perf） | [bugs/B-356-audit-libsqlite3-sys-test-crate.md](bugs/B-356-audit-libsqlite3-sys-test-crate.md) | 試験用クレート（`tools/tokio-compat/ecosystem`）の libsqlite3-sys の勧告で cargo-audit が失敗する（修正版を選べないので理由付きで除外）。 |
 | B-357 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-357-wrk-rps-wall-clock-jump.md](bugs/B-357-wrk-rps-wall-clock-jump.md) | 計測ツールが wrk の `Requests/sec`（壁時計の差で割る）を使っていて、WSL2 の壁時計の戻りで HTTP/1.1 の行が最大 1.7 倍に見える。要求数を設定の秒数で割る |
+| B-358 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-358-vds-server-aws-lc-openbsd-xonly.md](bugs/B-358-vds-server-aws-lc-openbsd-xonly.md) | 試験用の制御プレーン（`tools/vds/server`）が全 OS で AWS-LC を使っていて、OpenBSD x86_64 では最初の TLS のハンドシェイクで SIGSEGV になる（`.text` の実行専用のマップと s2n-bignum の定数表）。OpenBSD・NetBSD は `ring` にして本体・試験用クレートと揃えた |
+| B-359 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-359-standalone-e2e-nofile-limit.md](bugs/B-359-standalone-e2e-nofile-limit.md) | 自己完結型 E2E が fd の上限を上げず、OpenBSD の ssh の既定（ソフト 128）で試験のランタイムの作成が `EMFILE` になる。試験のプロセスの入口でソフトの上限をハードの上限（65536 まで）へ上げる |
 
 ---
 
