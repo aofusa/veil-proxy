@@ -384,9 +384,11 @@ async fn wait_until_done(read_fd: RawFd, done: &Arc<AtomicBool>) {
     // ただし SQE の提出は park でまとめて行う（F-300）ので、`done` を確認して積んだ POLL_ADD は同じスレッドの
     // 他のタスクが動く間 SQ に残っている。その間に完了の write が来て、別の待機者がカウンタを読み捨てると、
     // 後から提出された POLL_ADD は読むものが無く、次の完了まで眠る（読み捨ての無い負荷の末尾で要求が永久に
-    // 止まった。B-354）。読み捨ての前に SQ を全部カーネルへ渡し、渡せなければ読み捨てない（fd は読める
-    // まま残るので、次の POLL_ADD がすぐ完了する）。積んだ後で完了した待機者は渡した時点の readable で完了し、
-    // 読み捨ての後に `done` を確認する待機者は（完了の write が読み捨てより前なので）`done` を観測する。
+    // 止まった。B-354）。読み捨ては周回（park から park まで）の最初の待機者が 1 回だけ行い、その前に SQ を全部
+    // カーネルへ渡す（`notify_drain_turn`。渡せなければ読み捨てない。fd は読めるまま残るので、次の POLL_ADD が
+    // すぐ完了する）。積んだ後で完了した待機者は渡した時点の readable で完了し、読み捨ての後に `done` を確認する
+    // 待機者は（完了の write が読み捨てより前なので）`done` を観測する。読み捨ての後に来た完了はカウンタに残るので、
+    // その周回の後に積まれた POLL_ADD も次の提出で完了する（周回の 2 番目以降の待機者は読み捨てなくてよい）。
     // veil_rt_uring は target_os = "linux" 限定（build.rs）のため read_fd/write_fd は
     // 常に同一の eventfd。
     #[cfg(veil_rt_uring)]
@@ -396,7 +398,7 @@ async fn wait_until_done(read_fd: RawFd, done: &Arc<AtomicBool>) {
         }
         // eventfd が読み取り可能（=どれかのオフロードが完了）になるまで待つ。
         let _ = wait_readable_fd(read_fd).await;
-        if crate::runtime::executor::submit_all_queued_sqes() {
+        if crate::runtime::executor::notify_drain_turn() {
             drain_notify(read_fd);
         }
     }
@@ -986,6 +988,25 @@ mod drain_tests {
             // SAFETY: gate はこの試験が作った eventfd で、ここで 1 度だけ閉じる。
             unsafe { libc::close(gate) };
             assert_eq!(finished.get(), 2, "a waiter never woke up");
+        });
+    }
+
+    /// 読み捨ての順番は 1 周回に 1 回だけ回ってくること（待機者ごとにシステムコールを増やさない）。
+    #[test]
+    fn the_drain_turn_comes_once_per_park() {
+        if crate::runtime::ring::IoUring::new(8, 0).is_err() {
+            eprintln!("io_uring unavailable; skipping");
+            return;
+        }
+        crate::runtime::block_on(async {
+            use crate::runtime::executor::notify_drain_turn;
+            // block_on の周回の途中なので 1 回目で順番を取り、同じ周回の 2 回目以降は回ってこない
+            assert!(notify_drain_turn(), "the first waiter of a round drains");
+            assert!(!notify_drain_turn(), "only one drain per round");
+            assert!(!notify_drain_turn(), "only one drain per round");
+            // park を挟むと次の周回
+            crate::runtime::time::sleep(Duration::from_millis(1)).await;
+            assert!(notify_drain_turn(), "the next round drains again");
         });
     }
 

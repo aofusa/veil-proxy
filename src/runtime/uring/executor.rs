@@ -9,7 +9,7 @@
 //! - CQE を受け取ると対応する Waker を呼ぶ
 //! - Future は `OpState` として登録され、完了時に結果を格納する
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -968,6 +968,7 @@ pub static CQ_OVERFLOW_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// `IORING_OP_TIMEOUT` を高々 1 本アームし、起床後にその結果を回収してから
 /// `timer::fire_expired` で満了分の Waker を起こす。
 pub fn wait_for_completions() -> std::io::Result<()> {
+    PARK_ROUND.with(|r| r.set(r.get().wrapping_add(1)));
     arm_kernel_timeout_if_needed();
 
     if let Err(e) = with_ring(|ring| ring.submit_and_wait(1)) {
@@ -1081,11 +1082,35 @@ pub fn submit_sqes() -> std::io::Result<()> {
     }
 }
 
+thread_local! {
+    /// park（`wait_for_completions`）の回数。park から次の park までを 1 周回と数える
+    static PARK_ROUND: Cell<u64> = const { Cell::new(0) };
+    /// `offload` の通知 eventfd を最後に読み捨てた周回
+    static NOTIFY_DRAIN_ROUND: Cell<u64> = const { Cell::new(u64::MAX) };
+}
+
+/// `offload` の通知 eventfd を今読み捨ててよいかを返す（`true` なら呼び出し側が読み捨てる）。B-354。
+///
+/// 複数のタスクが同じ fd を POLL_ADD で待つので、まだ SQ にある POLL_ADD のシグナルを読み捨てると、その待機は
+/// 次の完了まで眠る。読み捨ての前に SQ を全部カーネルへ渡し、渡せなければ `false` を返す（fd は読めるまま残るので、
+/// 次の POLL_ADD がすぐ完了する）。読み捨ては 1 周回に 1 回だけにする（待機者ごとに読むと、N 本の待機で 1 周回に
+/// `read` が N 本と、前の待機者が積み直した POLL_ADD を流す `io_uring_enter` が N 本要る）。
+pub(crate) fn notify_drain_turn() -> bool {
+    let round = PARK_ROUND.with(Cell::get);
+    if NOTIFY_DRAIN_ROUND.with(Cell::get) == round {
+        return false;
+    }
+    if !submit_all_queued_sqes() {
+        return false;
+    }
+    NOTIFY_DRAIN_ROUND.with(|d| d.set(round));
+    true
+}
+
 /// 積まれている SQE を今すぐ提出し、全部カーネルへ渡せたら `true` を返す（一時的なエラーで残れば `false`）。
 ///
-/// [`submit_sqes`] と同じく I/O の Future からは呼ばない（F-300）。`offload` の通知 eventfd を読み捨てる前にだけ
-/// 使う（複数のタスクが同じ fd で待つ経路で、まだ SQ にある POLL_ADD のシグナルを捨てないため。B-354）。
-pub(crate) fn submit_all_queued_sqes() -> bool {
+/// [`submit_sqes`] と同じく I/O の Future からは呼ばない（F-300）。[`notify_drain_turn`] だけが使う。
+fn submit_all_queued_sqes() -> bool {
     RING.with(|r| {
         let ring = r.borrow();
         // リングが無い（実行器だけの単体テスト）ときは積まれた SQE も無い

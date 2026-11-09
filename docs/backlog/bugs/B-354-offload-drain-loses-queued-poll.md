@@ -32,17 +32,22 @@ F-300 で SQE の提出を park の `submit_and_wait` にまとめたので、PO
 
 ## 対応
 
-読み捨ての前に SQ を全部カーネルへ渡す（`executor::submit_all_queued_sqes`）。一時的なエラーで渡せなかったら読み捨てない（fd は読めるまま残るので、
-次の POLL_ADD がすぐ完了する）。
+読み捨ては周回（park から次の park まで）の最初の待機者が 1 回だけ行い、その前に SQ を全部カーネルへ渡す（`executor::notify_drain_turn`）。一時的なエラーで渡せなかったら
+読み捨てない（fd は読めるまま残るので、次の POLL_ADD がすぐ完了する）。
 
 - 読み捨ての前に積まれていた POLL_ADD は、提出の時点の readable で完了する。
 - 読み捨ての後に `done` を確認する待機者は、完了の write が読み捨てより前なので `done` を観測する。
+- 読み捨ての後に来た完了はカウンタに残るので、同じ周回の後から積まれた POLL_ADD も次の提出で完了する（周回の 2 番目以降の待機者は読み捨てなくてよい）。
 
-`wait_until_done` が複数の待機者が読み捨てる唯一の経路（F-299 の `Inbox` は受け手が 1 タスク、reactor は `wake_all_readers`）。増える syscall は、SQ に残りが
-あるときの `io_uring_enter` 1 本だけで、offload のスレッドの往復に比べて無視できる（[計測](../../perf/platform_verification.md)）。
+`wait_until_done` が複数の待機者が読み捨てる唯一の経路（F-299 の `Inbox` は受け手が 1 タスク、reactor は `wake_all_readers`）。最初の修正は待機者ごとに SQ を流して
+読み捨てる形で、キャッシュ無しの静的配信で CPU/要求が約 3% 増えた（前の待機者が積み直した POLL_ADD を流す `io_uring_enter` が待機者ごとに 1 本要る）ので、1 周回に 1 回へ変えた。
+以前は待機者ごとの `read(2)`（ほとんどは `EAGAIN`）が 1 周回に待機者の本数だけあったので、修正前より syscall は減る（[計測](../../perf/platform_verification.md)）。
 
 ## テスト
 
 - 単体（io_uring）: `runtime::offload::drain_tests::a_drain_keeps_the_signal_of_a_wait_still_in_the_sq`（上の順を確定させる）、
-  `many_concurrent_offloads_all_complete`（64 タスク × 64 回）。
+  `the_drain_turn_comes_once_per_park`、`many_concurrent_offloads_all_complete`（64 タスク × 64 回）。
 - 全項目の交互 A/B が止まらずに完走すること。
+
+結果（Linux x86_64、2026-11-09）: 読み捨ての前の提出を外すと（`notify_drain_turn` の提出の判定を外して）、`a_drain_keeps_the_signal_of_a_wait_still_in_the_sq` は 5 秒待って
+`a waiter never woke up`（`left: 1`、`right: 2`）で落ちる。修正後は単体・E2E が通り、A/B は [platform_verification.md](../../perf/platform_verification.md)。
