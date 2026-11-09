@@ -760,7 +760,7 @@ mod tests {
         // 同じ inode のままの上書き（`cp`）: 読んだ後の大きさがエントリと違うので、開き直して新しい版を返す
         let inplace = write_file(&dir, "b349-inplace.txt", b"CCCC");
         assert_eq!(&get(&inplace)[..], b"CCCC");
-        std::fs::write(&inplace, b"DDDDDD").unwrap();
+        write_file(&dir, "b349-inplace.txt", b"DDDDDD");
         content_cache::invalidate(&inplace);
         assert_eq!(&get(&inplace)[..], b"DDDDDD");
     }
