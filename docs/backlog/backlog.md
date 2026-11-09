@@ -710,6 +710,7 @@
 | B-354 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-354-offload-drain-loses-queued-poll.md](bugs/B-354-offload-drain-loses-queued-poll.md) | io_uring で `offload` の待機者が通知を取りこぼし、負荷の末尾で要求が永久に止まる（F-300 の退行。SQ にある POLL_ADD のシグナルを別の待機者が読み捨てる）。 |
 | B-355 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-355-run-client-timeout-sig-proxy.md](bugs/B-355-run-client-timeout-sig-proxy.md) | `run_perf.sh` のクライアントの打ち切りが `docker run` のシグナル転送で効かず、スイートが止まり続ける。 |
 | B-356 | P3 | 対応済み（feat/v0120-perf） | [bugs/B-356-audit-libsqlite3-sys-test-crate.md](bugs/B-356-audit-libsqlite3-sys-test-crate.md) | 試験用クレート（`tools/tokio-compat/ecosystem`）の libsqlite3-sys の勧告で cargo-audit が失敗する（修正版を選べないので理由付きで除外）。 |
+| B-357 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-357-wrk-rps-wall-clock-jump.md](bugs/B-357-wrk-rps-wall-clock-jump.md) | 計測ツールが wrk の `Requests/sec`（壁時計の差で割る）を使っていて、WSL2 の壁時計の戻りで HTTP/1.1 の行が最大 1.7 倍に見える。要求数を設定の秒数で割る |
 
 ---
 

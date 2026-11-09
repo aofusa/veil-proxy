@@ -93,8 +93,16 @@ sample_stats() { # container -> "cpu_pct mem_mb" averaged over 3 samples during 
 
 parse_wrk() { # logfile -> "reqps transfer latavg latp99 non2xx"
     local f="$1"
-    local reqps transfer latavg latp99 non2xx
-    reqps=$(awk '/Requests\/sec:/{print $2}' "$f")
+    local reqps transfer latavg latp99 non2xx reqs secs
+    # wrk の Requests/sec は gettimeofday の差で割る。WSL2 の壁時計（Docker Desktop の VM も同じ）は約 29 秒ごとに合わせて 1.6 秒ほど
+    # 戻ることがあり（B-357）、10 秒の実行で 1.2 倍の値になる。要求数を WRK_ARGS の秒数で割る
+    reqs=$(awk '/ requests in /{print $1; exit}' "$f")
+    secs=$(printf '%s\n' "$WRK_ARGS" | grep -oE -- '-d *[0-9]+s' | grep -oE '[0-9]+' | head -1)
+    if [ -n "$reqs" ] && [ -n "$secs" ]; then
+        reqps=$(awk -v n="$reqs" -v s="$secs" 'BEGIN{printf "%.2f", n/s}')
+    else
+        reqps=$(awk '/Requests\/sec:/{print $2}' "$f")
+    fi
     transfer=$(awk '/Transfer\/sec:/{print $2}' "$f")
     latavg=$(awk '/Latency/{print $2; exit}' "$f")           # from Thread Stats line
     latp99=$(awk '/ 99%/{print $2}' "$f")                    # from --latency distribution

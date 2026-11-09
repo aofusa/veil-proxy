@@ -439,6 +439,7 @@ cargo build --release --features full,epoll --target-dir target-epoll      # epo
 python3 tools/perf/proxy_ab.py --base <旧の veil> --new target-uring/release/veil --rounds 3 --out r.tsv
 python3 tools/perf/proxy_ab.py --base A --new B --cases '^h2c_file' --rounds 5   # 名前を正規表現で絞る
 python3 tools/perf/proxy_ab.py --base A --new B --cases '_file_' --no-file-caches  # キャッシュ無しの静的配信（HTTP/2・HTTP/3 は要求ごとに offload）
+python3 tools/perf/proxy_ab.py --base A --new B --cases '^h1' --access-log /dev/shm/ab.log  # veil の JSON アクセスログを有効に（ケースごとに消す。tmpfs に置くとディスクを測らない）
 python3 tools/perf/proxy_ab.py --summary r.tsv
 
 # サーバが律速になる条件（下の注意を参照）
@@ -465,6 +466,7 @@ LD_LIBRARY_PATH=~/h2load-h3/lib python3 tools/perf/proxy_ab.py --base A --new B 
 - `tools/perf/h3load`（quinn）はクライアントが律速で、同じ条件でも回ごとに 16k〜105k へ分かれる。版の比較には QUIC 対応の h2load を使う。
 - wrk の `timeout` は `errs` に入れず TSV の `wrk_timeouts` へ分ける。wrk は `gettimeofday` の差で判定するので、時計が戻るとその瞬間に処理中の全接続を
   数える（WSL2 は 30 秒ごとに約 75 ms 戻り、1 回の実行で 100 件前後の偽の `timeout` になる。Max の遅延は動かない）。
+  戻りが大きいとき（v0.12.0 の最後の計測では約 29 秒ごとに合わせて 1.6 秒）は wrk の `Requests/sec` が高く出るので（4 秒の実行で 1.7 倍）、`proxy_ab.py` と `run_perf.sh` は要求数を設定の秒数で割る（[B-357](../../docs/backlog/bugs/B-357-wrk-rps-wall-clock-jump.md)）。
 
 ## kTLS + HTTP/2 の回帰の手順（`ktls_h2_repro.sh`、B-75・F-297）
 

@@ -50,7 +50,7 @@ def cases():
     return out
 
 
-def write_config(path, work, threads, ktls, file_caches):
+def write_config(path, work, threads, ktls, file_caches, access_log):
     # キャッシュ無しの静的配信は、HTTP/2・HTTP/3 が要求ごとに offload する（B-354 の経路）
     static_cache = """
 [static_file_cache]
@@ -64,6 +64,13 @@ enabled = true
 valid_duration_secs = 60
 max_entries = 1024
 """ if file_caches else ""
+    # 上流の nginx は `access_log off` のまま（測るのは veil の行の費用）
+    access_log_section = f"""
+[access_log]
+enabled = true
+format = "json"
+file_path = "{access_log}"
+""" if access_log else ""
     path.write_text(f"""[server]
 listen = "127.0.0.1:{TLS}"
 listen_cleartext = "127.0.0.1:{CLEAR}"
@@ -87,7 +94,7 @@ ktls_fallback_enabled = true
 [http3]
 enabled = true
 listen = "127.0.0.1:{TLS}"
-{static_cache}
+{static_cache}{access_log_section}
 [upstreams."backend"]
 algorithm = "round_robin"
 servers = ["http://127.0.0.1:{BACKEND}/"]
@@ -153,8 +160,10 @@ def prepare(work):
     )
 
 
-def parse_wrk(out):
-    rps = float(re.search(r"Requests/sec:\s+([0-9.]+)", out).group(1))
+def parse_wrk(out, secs):
+    # wrk の Requests/sec は gettimeofday の差で割る。WSL2 の壁時計は約 29 秒ごとに合わせて 1.6 秒ほど戻ることがあり（B-357）、4 秒の実行が
+    # 2.4 秒に見えて 1.7 倍の値になる（CPU/要求はその分小さく見える）。要求数を設定の秒数で割る
+    rps = int(re.search(r"(\d+) requests in ", out).group(1)) / secs
     p99 = 0.0
     m = re.search(r"^\s*99%\s+([0-9.]+)(us|ms|s)\s*$", out, re.M)
     if m:
@@ -181,7 +190,7 @@ def load_cmd(args, name, tool, url, secs):
     pin = ["taskset", "-c", args.proxy_load_cpus if proxied else args.load_cpus]
     t = str(args.proxy_load_threads if proxied else args.load_threads)
     if tool == "wrk":
-        return pin + ["wrk", "-t", t, "-c", str(args.conns), "-d", f"{secs}s", "--latency", url], parse_wrk
+        return pin + ["wrk", "-t", t, "-c", str(args.conns), "-d", f"{secs}s", "--latency", url], lambda out: parse_wrk(out, secs)
     if tool == "h2load":
         return pin + ["h2load", "-t", t, "-c", str(args.conns), "-m", str(args.streams), "-D", str(secs), url], parse_h2load
     if Path(args.h3load).name.startswith("h2load"):
@@ -227,6 +236,8 @@ def measure(args, binary, config, target, rnd, case, writer):
         u1, s1 = cpu_ticks(srv.pid)
     finally:
         stop(srv)
+        if args.access_log:
+            Path(args.access_log).unlink(missing_ok=True)  # ケースごとに消す（tmpfs に置くと積もった分がメモリを食う）
     n = max(rps * args.duration, 1.0)
     row = [rnd, target, name, f"{rps:.0f}", f"{p99:.0f}", errs, timeouts, f"{(u1 - u0 + s1 - s0) * 1e6 / n:.2f}",
            f"{(u1 - u0) * 1e6 / n:.2f}", f"{(s1 - s0) * 1e6 / n:.2f}"]
@@ -278,6 +289,8 @@ def main():
     ap.add_argument("--ktls", action="store_true", help="turn kTLS on for both sides")
     ap.add_argument("--no-file-caches", action="store_true",
                     help="serve the files without open_file_cache and the content cache (HTTP/2 and HTTP/3 offload every request)")
+    ap.add_argument("--access-log", metavar="PATH",
+                    help="turn on the JSON access log of veil and write it to PATH (use a tmpfs path to leave the disk out)")
     args = ap.parse_args()
     if args.summary:
         summarize(args.summary)
@@ -296,7 +309,7 @@ def main():
         work = Path(tmp)
         prepare(work)
         config = work / "config.toml"
-        write_config(config, work, args.threads, args.ktls, not args.no_file_caches)
+        write_config(config, work, args.threads, args.ktls, not args.no_file_caches, args.access_log)
         nginx_conf = work / "nginx.conf"
         write_nginx(nginx_conf, work, args.backend_workers)
         backend = subprocess.Popen(
