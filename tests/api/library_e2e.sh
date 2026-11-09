@@ -76,7 +76,20 @@ print(out.decode())' "$@"; }
 
 ok()   { echo "  ok   $*"; }
 bad()  { echo "  FAIL $*"; FAIL=1; }
-free_port() { "$PY3" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+# TCP と UDP の両方で空いている番号（L4 の UDP・HTTP/3 は同じ番号の UDP で待ち受ける。Windows は Hyper-V などが UDP だけ予約する範囲がある。B-352）
+free_port() { "$PY3" -c '
+import socket
+held = []
+for _ in range(64):
+    t = socket.socket(); t.bind(("127.0.0.1", 0)); p = t.getsockname()[1]
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        u.bind(("127.0.0.1", p))
+    except OSError:
+        held.append(t); u.close(); continue
+    print(p); break
+else:
+    raise SystemExit("no port is free for both TCP and UDP")'; }
 # wait_port <port> [pid]: 最大 30 秒（VM を同時に動かす高負荷のホストでは起動に 10 秒を超えることがある）。
 # pid を渡すと、そのプロセスが終了した時点で失敗にする。
 wait_port() {

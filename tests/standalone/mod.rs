@@ -20,13 +20,22 @@ pub fn tp(p: &Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
 
-/// 空いている TCP ポートを 1 つ返す（bind して即解放）。
+/// TCP と UDP の両方で空いているポートを 1 つ返す（bind して即解放）。
+///
+/// HTTP/3 は TLS と同じ番号の UDP で待ち受ける。Windows では Hyper-V などが UDP だけ予約する範囲があり
+/// （`netsh int ipv4 show excludedportrange protocol=udp`）、TCP で空いていても UDP の bind が `WSAEACCES` で失敗する（B-352）。
 pub fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    let mut rejected = Vec::new();
+    for _ in 0..64 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+        // 同じ番号を次の周回で引かないように、失敗したものは持ったままにする
+        rejected.push(listener);
+    }
+    panic!("no port is free for both TCP and UDP");
 }
 
 /// 自己署名証明書（localhost / 127.0.0.1）を書き出す。

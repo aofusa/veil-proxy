@@ -705,6 +705,7 @@
 | B-349 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-349-content-cache-version-mismatch.md](bugs/B-349-content-cache-version-mismatch.md) | 静的コンテンツキャッシュの本体が open_file_cache のエントリと違う版を持つと（2 つは別々に期限が切れる）、HTTP/2・HTTP/3 は新しい版のヘッダで古い本体を返し（`Content-Length` と DATA の長さが合わない）、HTTP/1.1 は古い本体を新しい大きさで切って返す（v0.6.0 から）。本体に版を持たせて照合し、フォールバックの経路はエントリの fd から読む |
 | B-350 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-350-windows-udp-bind-error-zero.md](bugs/B-350-windows-udp-bind-error-zero.md) | Windows の UDP の bind の失敗が `closesocket` の後にエラーを読むので「os error 0」になる。 |
 | B-351 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-351-windows-http3-multiple-workers-bind-fail.md](bugs/B-351-windows-http3-multiple-workers-bind-fail.md) | Windows で HTTP/3 のワーカーが 2 本目から bind に失敗し、起動のたびにエラーログを出す。失敗したワーカーも数えるので秘密鍵のゼロ化が次のリロードまで遅れる。リスナーごとに 1 本へ。 |
+| B-352 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-352-free-port-tcp-only.md](bugs/B-352-free-port-tcp-only.md) | 試験の `free_port` が TCP しか見ず、Windows の UDP だけの予約範囲に当たってライブラリ E2E が落ちる（3 件の実体）。 |
 | B-353 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-353-windows-sockaddr-unaligned-ref.md](bugs/B-353-windows-sockaddr-unaligned-ref.md) | Windows の `storage_to_sockaddr` が整列していないバッファへの参照を作る（未定義動作）。 |
 | B-354 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-354-offload-drain-loses-queued-poll.md](bugs/B-354-offload-drain-loses-queued-poll.md) | io_uring で `offload` の待機者が通知を取りこぼし、負荷の末尾で要求が永久に止まる（F-300 の退行。SQ にある POLL_ADD のシグナルを別の待機者が読み捨てる）。 |
 
