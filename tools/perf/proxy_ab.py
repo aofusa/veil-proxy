@@ -50,7 +50,20 @@ def cases():
     return out
 
 
-def write_config(path, work, threads, ktls):
+def write_config(path, work, threads, ktls, file_caches):
+    # キャッシュ無しの静的配信は、HTTP/2・HTTP/3 が要求ごとに offload する（B-354 の経路）
+    static_cache = """
+[static_file_cache]
+enabled = true
+valid_duration_secs = 60
+max_entries = 1024
+max_file_size_bytes = 1048576
+""" if file_caches else ""
+    route_cache = """[route.open_file_cache]
+enabled = true
+valid_duration_secs = 60
+max_entries = 1024
+""" if file_caches else ""
     path.write_text(f"""[server]
 listen = "127.0.0.1:{TLS}"
 listen_cleartext = "127.0.0.1:{CLEAR}"
@@ -74,13 +87,7 @@ ktls_fallback_enabled = true
 [http3]
 enabled = true
 listen = "127.0.0.1:{TLS}"
-
-[static_file_cache]
-enabled = true
-valid_duration_secs = 60
-max_entries = 1024
-max_file_size_bytes = 1048576
-
+{static_cache}
 [upstreams."backend"]
 algorithm = "round_robin"
 servers = ["http://127.0.0.1:{BACKEND}/"]
@@ -102,11 +109,7 @@ type = "File"
 path = "{work}/www/"
 [route.security]
 allowed_methods = ["HEAD", "GET"]
-[route.open_file_cache]
-enabled = true
-valid_duration_secs = 60
-max_entries = 1024
-""")
+{route_cache}""")
 
 
 def write_nginx(path, work, workers):
@@ -273,6 +276,8 @@ def main():
     ap.add_argument("--nginx", default=shutil.which("nginx") or "/usr/sbin/nginx")
     ap.add_argument("--h3load", help="a QUIC h2load or the tools/perf/h3load binary; without it the HTTP/3 cases are skipped")
     ap.add_argument("--ktls", action="store_true", help="turn kTLS on for both sides")
+    ap.add_argument("--no-file-caches", action="store_true",
+                    help="serve the files without open_file_cache and the content cache (HTTP/2 and HTTP/3 offload every request)")
     args = ap.parse_args()
     if args.summary:
         summarize(args.summary)
@@ -291,7 +296,7 @@ def main():
         work = Path(tmp)
         prepare(work)
         config = work / "config.toml"
-        write_config(config, work, args.threads, args.ktls)
+        write_config(config, work, args.threads, args.ktls, not args.no_file_caches)
         nginx_conf = work / "nginx.conf"
         write_nginx(nginx_conf, work, args.backend_workers)
         backend = subprocess.Popen(

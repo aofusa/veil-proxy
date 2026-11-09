@@ -438,6 +438,7 @@ cargo build --release --features full,epoll --target-dir target-epoll      # epo
 
 python3 tools/perf/proxy_ab.py --base <旧の veil> --new target-uring/release/veil --rounds 3 --out r.tsv
 python3 tools/perf/proxy_ab.py --base A --new B --cases '^h2c_file' --rounds 5   # 名前を正規表現で絞る
+python3 tools/perf/proxy_ab.py --base A --new B --cases '_file_' --no-file-caches  # キャッシュ無しの静的配信（HTTP/2・HTTP/3 は要求ごとに offload）
 python3 tools/perf/proxy_ab.py --summary r.tsv
 
 # サーバが律速になる条件（下の注意を参照）
