@@ -708,6 +708,7 @@
 | B-352 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-352-free-port-tcp-only.md](bugs/B-352-free-port-tcp-only.md) | 試験の `free_port` が TCP しか見ず、Windows の UDP だけの予約範囲に当たってライブラリ E2E が落ちる（3 件の実体）。 |
 | B-353 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-353-windows-sockaddr-unaligned-ref.md](bugs/B-353-windows-sockaddr-unaligned-ref.md) | Windows の `storage_to_sockaddr` が整列していないバッファへの参照を作る（未定義動作）。 |
 | B-354 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-354-offload-drain-loses-queued-poll.md](bugs/B-354-offload-drain-loses-queued-poll.md) | io_uring で `offload` の待機者が通知を取りこぼし、負荷の末尾で要求が永久に止まる（F-300 の退行。SQ にある POLL_ADD のシグナルを別の待機者が読み捨てる）。 |
+| B-355 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-355-run-client-timeout-sig-proxy.md](bugs/B-355-run-client-timeout-sig-proxy.md) | `run_perf.sh` のクライアントの打ち切りが `docker run` のシグナル転送で効かず、スイートが止まり続ける。 |
 
 ---
 

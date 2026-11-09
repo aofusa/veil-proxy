@@ -33,7 +33,9 @@ H2C_ARGS="${H2C_ARGS:--t4 -n 120000 -c100 -m10}"   # h2c 負荷
 # 止まらないための安全弁**（B-75: epoll + kTLS のハングで h2load が 36 分間ぶら下がり、
 # フルスイートが停止した）。超過した場合はそのイテレーションを NA として次へ進む。
 # `timeout` は docker CLI を殺すだけでコンテナは残るため、必ず `--name` を付けて
-# 明示的に `docker rm -f` する（`run_client` 参照）。
+# 明示的に `docker rm -f` する（`run_client` 参照）。`timeout -k` が要る: CLI は SIGTERM をコンテナの
+# PID 1（h2load。ハンドラが無いのでカーネルが捨てる）へ転送して待ち続けるので、SIGTERM だけでは
+# `timeout` が戻らない（B-355: スイートが 13 時間止まった）。
 CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-180}"
 
 # 計測クライアントを名前付きで起動し、`CLIENT_TIMEOUT` 秒で打ち切るラッパ。
@@ -42,9 +44,9 @@ run_client() { # logfile docker-run-args...
     local logfile="$1"; shift
     local name="perf-client-$$"
     docker rm -f "$name" >/dev/null 2>&1
-    timeout "$CLIENT_TIMEOUT" docker run --rm --name "$name" "$@" > "$logfile" 2>&1
+    timeout -k 10 "$CLIENT_TIMEOUT" docker run --rm --name "$name" "$@" > "$logfile" 2>&1
     local rc=$?
-    if [ $rc -eq 124 ]; then
+    if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
         echo "!! 計測クライアントが ${CLIENT_TIMEOUT}s を超過（サーバ側ハングの疑い）: $logfile" >&2
         docker rm -f "$name" >/dev/null 2>&1
     fi
