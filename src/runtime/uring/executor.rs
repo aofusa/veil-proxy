@@ -1081,6 +1081,24 @@ pub fn submit_sqes() -> std::io::Result<()> {
     }
 }
 
+/// 積まれている SQE を今すぐ提出し、全部カーネルへ渡せたら `true` を返す（一時的なエラーで残れば `false`）。
+///
+/// [`submit_sqes`] と同じく I/O の Future からは呼ばない（F-300）。`offload` の通知 eventfd を読み捨てる前にだけ
+/// 使う（複数のタスクが同じ fd で待つ経路で、まだ SQ にある POLL_ADD のシグナルを捨てないため。B-354）。
+pub(crate) fn submit_all_queued_sqes() -> bool {
+    RING.with(|r| {
+        let ring = r.borrow();
+        // リングが無い（実行器だけの単体テスト）ときは積まれた SQE も無い
+        let Some(ring) = ring.as_ref() else {
+            return true;
+        };
+        if let Err(e) = ring.submit_pending() {
+            let _ = submit_enter_error(e);
+        }
+        ring.sq_pending() == 0
+    })
+}
+
 /// 未提出の SQE があれば提出する。実行器の周回の途中から呼ぶ（失敗は次の park が受け取る）。
 fn flush_sqes() {
     // リングが無い（実行器だけの単体テスト）ときは積まれた SQE も無い

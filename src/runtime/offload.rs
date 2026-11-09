@@ -379,9 +379,14 @@ where
 async fn wait_until_done(read_fd: RawFd, done: &Arc<AtomicBool>) {
     // ===== io_uring バックエンド: POLL_ADD 待機 =====
     //
-    // POLL_ADD の完了は eventfd への write 時点で CQE として **各待機者に個別に** 記録される
+    // カーネルへ渡し済みの POLL_ADD の完了は eventfd への write 時点で CQE として **各待機者に個別に** 記録される
     // （後から他タスクがカウンタを drain しても、既に発行された完了は失われない）。
-    // そのため「wait → drain → done 再確認」の素朴なループで取りこぼしが無い。
+    // ただし SQE の提出は park でまとめて行う（F-300）ので、`done` を確認して積んだ POLL_ADD は同じスレッドの
+    // 他のタスクが動く間 SQ に残っている。その間に完了の write が来て、別の待機者がカウンタを読み捨てると、
+    // 後から提出された POLL_ADD は読むものが無く、次の完了まで眠る（読み捨ての無い負荷の末尾で要求が永久に
+    // 止まった。B-354）。読み捨ての前に SQ を全部カーネルへ渡し、渡せなければ読み捨てない（fd は読める
+    // まま残るので、次の POLL_ADD がすぐ完了する）。積んだ後で完了した待機者は渡した時点の readable で完了し、
+    // 読み捨ての後に `done` を確認する待機者は（完了の write が読み捨てより前なので）`done` を観測する。
     // veil_rt_uring は target_os = "linux" 限定（build.rs）のため read_fd/write_fd は
     // 常に同一の eventfd。
     #[cfg(veil_rt_uring)]
@@ -391,7 +396,9 @@ async fn wait_until_done(read_fd: RawFd, done: &Arc<AtomicBool>) {
         }
         // eventfd が読み取り可能（=どれかのオフロードが完了）になるまで待つ。
         let _ = wait_readable_fd(read_fd).await;
-        drain_notify(read_fd);
+        if crate::runtime::executor::submit_all_queued_sqes() {
+            drain_notify(read_fd);
+        }
     }
 
     // ===== reactor（readiness）バックエンド: done 検査つき専用 Future で待機 =====
@@ -911,6 +918,103 @@ mod b226_tests {
                 assert!(r.is_err(), "the panic must reach the caller");
             }
             assert_eq!(super::offload(|| 7u32).await, 7);
+        });
+    }
+}
+
+// B-354: `offload` の通知 eventfd を読み捨てても、まだ SQ にある待機を取りこぼさない
+#[cfg(all(test, veil_rt_uring))]
+mod drain_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    fn signal(fd: RawFd) {
+        // SAFETY: fd はこの試験の中で生きている eventfd。
+        unsafe { signal_notify(fd) };
+    }
+
+    /// 待機 X の POLL_ADD がまだ SQ にある間に X の完了の write が来て、先に起きた待機 A がカウンタを読み捨てても、
+    /// X は起きること。以前は読み捨てで X のシグナルが消え、後から提出された POLL_ADD が次の完了まで眠った。
+    ///
+    /// 実行の順を確定させる: X は別の eventfd（`gate`）で、A は通知 eventfd で待ち、`gate` → 通知の順に書く。
+    /// 同じ park で CQE が順に届くので、X → A の順に poll される。X は通知 fd の待ちを 1 回 poll して
+    /// SQ に積んでから完了を立てる（ワーカースレッドの完了がこの窓に当たった状況）。
+    #[test]
+    fn a_drain_keeps_the_signal_of_a_wait_still_in_the_sq() {
+        if crate::runtime::ring::IoUring::new(8, 0).is_err() {
+            eprintln!("io_uring unavailable; skipping");
+            return;
+        }
+        crate::runtime::block_on(async {
+            let (read_fd, write_fd) = current_thread_notify_fds().expect("notify fds");
+            // SAFETY: eventfd は整数引数のみを取り、失敗は直後に検査する。
+            let gate = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            assert!(gate >= 0, "eventfd");
+            let a_done = Arc::new(AtomicBool::new(false));
+            let finished = Rc::new(Cell::new(0u32));
+
+            let x_finished = Rc::clone(&finished);
+            crate::runtime::spawn(async move {
+                let _ = wait_readable_fd(gate).await;
+                let x_done = Arc::new(AtomicBool::new(false));
+                let mut wait = std::pin::pin!(wait_until_done(read_fd, &x_done));
+                assert!(futures::poll!(wait.as_mut()).is_pending());
+                x_done.store(true, Ordering::Release);
+                signal(write_fd);
+                wait.await;
+                x_finished.set(x_finished.get() + 1);
+            });
+            let a_finished = Rc::clone(&finished);
+            let a_wait = Arc::clone(&a_done);
+            crate::runtime::spawn(async move {
+                wait_until_done(read_fd, &a_wait).await;
+                a_finished.set(a_finished.get() + 1);
+            });
+
+            // 2 本の POLL_ADD をカーネルへ渡す（park で提出される）
+            crate::runtime::time::sleep(Duration::from_millis(2)).await;
+            signal(gate);
+            a_done.store(true, Ordering::Release);
+            signal(write_fd);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while finished.get() < 2 && Instant::now() < deadline {
+                crate::runtime::time::sleep(Duration::from_millis(2)).await;
+            }
+            // SAFETY: gate はこの試験が作った eventfd で、ここで 1 度だけ閉じる。
+            unsafe { libc::close(gate) };
+            assert_eq!(finished.get(), 2, "a waiter never woke up");
+        });
+    }
+
+    /// 同じワーカーで多数のタスクが同時に `offload` を待っても、全部完了すること。
+    #[test]
+    fn many_concurrent_offloads_all_complete() {
+        if crate::runtime::ring::IoUring::new(8, 0).is_err() {
+            eprintln!("io_uring unavailable; skipping");
+            return;
+        }
+        crate::runtime::block_on(async {
+            for round in 0..64u32 {
+                let finished = Rc::new(Cell::new(0u32));
+                for i in 0..64u32 {
+                    let finished = Rc::clone(&finished);
+                    crate::runtime::spawn(async move {
+                        assert_eq!(offload(move || i).await, i);
+                        finished.set(finished.get() + 1);
+                    });
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while finished.get() < 64 && Instant::now() < deadline {
+                    crate::runtime::yield_now().await;
+                    if finished.get() < 64 {
+                        crate::runtime::time::sleep(Duration::from_micros(200)).await;
+                    }
+                }
+                assert_eq!(finished.get(), 64, "round {round}: a waiter never woke up");
+            }
         });
     }
 }
