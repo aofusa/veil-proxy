@@ -304,15 +304,17 @@ pub async fn run_http3_server_async(
     // 設定を Rc で共有（quiche::Config は Clone できないため）
     let quic_config = Rc::new(RefCell::new(quic_config));
 
-    // F-105: 証明書ホットリロード。本ワーカーを登録し、現在の配信世代をローカルに控える。
-    // 起動直後は上で cert/key をロード済みなので、ローカル世代を現在値に合わせて即時リロードを避ける。
-    crate::tls_reload::register_http3_worker();
-    let mut local_cert_gen = crate::tls_reload::http3_cert_generation();
-
     // UDP ソケットを作成（独自ランタイム上、`src/runtime/` のバックエンド経由）
     // SO_REUSEPORT を設定して複数ワーカーで並列処理を可能に
     // GSO/GRO は config.gso_gro_enabled に基づいて設定
     let socket = QuicUdpSocket::bind_reuseport_with_gso(bind_addr, config.gso_gro_enabled)?;
+
+    // F-105: 証明書ホットリロード。本ワーカーを登録し、現在の配信世代をローカルに控える。
+    // 起動直後は上で cert/key をロード済みなので、ローカル世代を現在値に合わせて即時リロードを避ける。
+    // 登録は bind の後（bind に失敗したワーカーを数えると、適用する者のいない分だけ秘密鍵の平文のゼロ化が
+    // 次のリロードまで遅れる。B-351）。
+    crate::tls_reload::register_http3_worker();
+    let mut local_cert_gen = crate::tls_reload::http3_cert_generation();
     HTTP3_LOG_ONCE_GSO_GRO.call_once(|| {
         info!(
             "[HTTP/3] GSO enabled: {}, GRO enabled: {} (config gso_gro_enabled: {})",

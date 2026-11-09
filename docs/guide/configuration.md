@@ -427,7 +427,8 @@ listener keeps the `[server]` default.
 Shared by all listeners (one per process): the certificate (`[tls]`, including SNI certificates), the routes
 (`[[route]]` — use `host` / `path` conditions to separate traffic), the `[http2]` / `[http3]` tuning,
 `max_concurrent_connections`, `[admin]` and `[prometheus]`. `Alt-Svc` advertises the UDP port of the first listener
-with HTTP/3. Each listener runs its own `threads` worker threads (and as many HTTP/3 workers when `http3 = true`).
+with HTTP/3. Each listener runs its own `threads` worker threads (and as many HTTP/3 workers when `http3 = true`;
+on Windows HTTP/3 runs one worker per listener, because a UDP port cannot be shared between sockets there).
 
 Validation rules (`veil -t`), in addition to the ones above:
 

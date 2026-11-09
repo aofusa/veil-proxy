@@ -417,7 +417,7 @@ TLS や平文のポートを 2 つ以上開くときは [`[[listener]]`](#複数
 全リスナーで共有するもの（プロセスに 1 個）: 証明書（`[tls]`。SNI の複数証明書を含む）、ルート（`[[route]]`。分けたいときは
 `host`・`path` の条件で）、`[http2]`・`[http3]` のチューニング、`max_concurrent_connections`、`[admin]`・`[prometheus]`。
 `Alt-Svc` は HTTP/3 の最初のリスナーの UDP ポートを広告します。各リスナーは自分の `threads` 本のワーカースレッドを持ちます
-（`http3 = true` なら HTTP/3 のワーカーも同じ数）。
+（`http3 = true` なら HTTP/3 のワーカーも同じ数。Windows は UDP のポートを複数のソケットで共有できないので、HTTP/3 はリスナーごとに 1 本）。
 
 検証規則（`veil -t`）。上の規則に加えて:
 

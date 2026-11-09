@@ -704,6 +704,7 @@
 | B-348 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-348-fast-path-drops-open-file-cache-fd.md](bugs/B-348-fast-path-drops-open-file-cache-fd.md) | HTTP/2・HTTP/3 の静的配信（Linux・FreeBSD の高速経路）が open_file_cache のエントリを fd の無いものに置き換えるので、有効期限内に `mv` で差し替えると HTTP/1.1 は新しいファイルをパスで開き、エントリの古い大きさで切って返す（どの版にも無い本文）。高速経路でもエントリに fd を持たせ、同じ版なら前の fd を引き継ぐ |
 | B-349 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-349-content-cache-version-mismatch.md](bugs/B-349-content-cache-version-mismatch.md) | 静的コンテンツキャッシュの本体が open_file_cache のエントリと違う版を持つと（2 つは別々に期限が切れる）、HTTP/2・HTTP/3 は新しい版のヘッダで古い本体を返し（`Content-Length` と DATA の長さが合わない）、HTTP/1.1 は古い本体を新しい大きさで切って返す（v0.6.0 から）。本体に版を持たせて照合し、フォールバックの経路はエントリの fd から読む |
 | B-350 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-350-windows-udp-bind-error-zero.md](bugs/B-350-windows-udp-bind-error-zero.md) | Windows の UDP の bind の失敗が `closesocket` の後にエラーを読むので「os error 0」になる。 |
+| B-351 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-351-windows-http3-multiple-workers-bind-fail.md](bugs/B-351-windows-http3-multiple-workers-bind-fail.md) | Windows で HTTP/3 のワーカーが 2 本目から bind に失敗し、起動のたびにエラーログを出す。失敗したワーカーも数えるので秘密鍵のゼロ化が次のリロードまで遅れる。リスナーごとに 1 本へ。 |
 | B-353 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-353-windows-sockaddr-unaligned-ref.md](bugs/B-353-windows-sockaddr-unaligned-ref.md) | Windows の `storage_to_sockaddr` が整列していないバッファへの参照を作る（未定義動作）。 |
 | B-354 | P1 | 修正済み（feat/v0120-perf） | [bugs/B-354-offload-drain-loses-queued-poll.md](bugs/B-354-offload-drain-loses-queued-poll.md) | io_uring で `offload` の待機者が通知を取りこぼし、負荷の末尾で要求が永久に止まる（F-300 の退行。SQ にある POLL_ADD のシグナルを別の待機者が読み捨てる）。 |
 

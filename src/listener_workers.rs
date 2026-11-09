@@ -446,7 +446,22 @@ async fn serve_cleartext(mut stream: TcpStream, peer_addr: SocketAddr, id: usize
     }
 }
 
-/// HTTP/3（QUIC/UDP）のリスナー 1 個の `workers` 本のワーカーを起動する。
+/// HTTP/3 のリスナー 1 個に起動するワーカーの数。
+///
+/// Windows には UDP の受信を複数のソケットへ分ける仕組み（Linux の `SO_REUSEPORT`・FreeBSD の
+/// `SO_REUSEPORT_LB`）が無く、同じポートへの 2 本目からの `bind` は `WSAEADDRINUSE` で失敗する（各ワーカーが
+/// `ERROR` を出して止まり、起動のたびに残りの全本数ぶんのログが出ていた。B-351）。QUIC の接続の状態はワーカーの
+/// 中にあるので、`SO_REUSEADDR` で重ねて受信先が定まらないようにもできない。1 本にする。
+#[cfg(feature = "http3")]
+fn http3_worker_count(requested: usize) -> usize {
+    if cfg!(windows) {
+        requested.min(1)
+    } else {
+        requested
+    }
+}
+
+/// HTTP/3（QUIC/UDP）のリスナー 1 個の `workers` 本のワーカーを起動し、起動した本数を返す。
 ///
 /// TCP 側と同様に thread-per-core: 各ワーカーが SO_REUSEPORT UDP ソケットを持ち、カーネルがフロー（5-tuple）
 /// 単位でパケットを分散する。QUIC 状態はワーカー内で完結する（スレッドローカルの `H3_SEND_SCRATCH` 等は
@@ -466,7 +481,15 @@ pub(crate) fn spawn_http3_listener(
     copied: &Arc<std::sync::atomic::AtomicUsize>,
     env: &WorkerEnv,
     handles: &mut Vec<thread::JoinHandle<()>>,
-) {
+) -> usize {
+    let requested = workers;
+    let workers = http3_worker_count(requested);
+    if workers != requested {
+        info!(
+            "listener \"{}\" HTTP/3 runs one worker on this platform ({} configured): a UDP port cannot be shared between sockets here",
+            spec.name, requested
+        );
+    }
     info!(
         "listener \"{}\" HTTP/3 {} (UDP) workers={}",
         spec.name, addr, workers
@@ -512,6 +535,7 @@ pub(crate) fn spawn_http3_listener(
         });
         handles.push(handle);
     }
+    workers
 }
 
 // B-181: accept の失敗の後の待ち方。
@@ -574,6 +598,17 @@ pub(crate) fn is_resource_exhausted(e: &std::io::Error) -> bool {
     {
         // WSAEMFILE・WSAENOBUFS
         matches!(e.raw_os_error(), Some(10024 | 10055))
+    }
+}
+
+#[cfg(all(test, feature = "http3"))]
+mod http3_worker_tests {
+    use super::http3_worker_count;
+
+    #[test]
+    fn windows_runs_one_http3_worker_per_listener() {
+        assert_eq!(http3_worker_count(8), if cfg!(windows) { 1 } else { 8 });
+        assert_eq!(http3_worker_count(1), 1);
     }
 }
 

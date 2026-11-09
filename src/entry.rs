@@ -1402,11 +1402,10 @@ pub fn run_server(opts: ServerOptions) {
                 .http3_config
                 .to_http3_config(&loaded_config.tls_cert_path, &loaded_config.tls_key_path);
             for (spec, addr) in h3_listeners {
-                let workers = spec.worker_count(num_threads);
-                crate::listener_workers::spawn_http3_listener(
+                total += crate::listener_workers::spawn_http3_listener(
                     spec,
                     addr,
-                    workers,
+                    spec.worker_count(num_threads),
                     &http3_server_base,
                     &loaded_config.tls_cert_pem,
                     &loaded_config.tls_key_pem,
@@ -1414,7 +1413,6 @@ pub fn run_server(opts: ServerOptions) {
                     &worker_env,
                     &mut handles,
                 );
-                total += workers;
             }
         }
         total

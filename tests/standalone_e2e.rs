@@ -519,6 +519,70 @@ path = "{www}"
     assert_eq!(location, Some(want.as_str()));
 }
 
+/// HTTP/3 のワーカーを複数本指定しても、全部のワーカーが正常に動き、`bind` の失敗のエラーログが出ない。
+/// Windows は UDP のポートを共有できないのでリスナーごとに 1 本で動く（B-351）。
+#[cfg(feature = "http3")]
+#[test]
+fn b351_http3_with_several_workers_starts_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let tls_port = free_port();
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+threads = 3
+[logging]
+level = "info"
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+[http3]
+enabled = true
+
+[[route]]
+[route.conditions]
+path = "/ok"
+[route.action]
+type = "Respond"
+status = 200
+body = "ok"
+"#,
+        cert = tp(&cert),
+        key = tp(&key),
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(tls_port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+    for i in 0..8 {
+        let (status, body) = h3_request(tls_port, "GET", "/ok", b"");
+        assert_eq!(
+            (status, body.as_slice()),
+            (200, b"ok".as_slice()),
+            "request {i}"
+        );
+    }
+    // ログは非同期に書かれるので、起動の行が見えるまで待ってから見る
+    let log_has_workers = wait_until(Duration::from_secs(10), || {
+        veil.log().contains("(UDP) workers=")
+    });
+    assert!(log_has_workers, "{}", veil.log());
+    let log = veil.log();
+    assert!(!log.contains("Server error"), "{log}");
+    let want = if cfg!(windows) {
+        "workers=1"
+    } else {
+        "workers=3"
+    };
+    assert!(log.contains(want), "{log}");
+}
+
 /// F-200: 削除されたキーは移行先を示すエラーで起動しない（`-t`）。
 #[test]
 fn f200_removed_keys_are_rejected_with_migration_hint() {
