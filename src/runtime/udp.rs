@@ -145,22 +145,26 @@ fn sockaddr_to_storage(addr: &SocketAddr) -> (Vec<u8>, i32) {
     }
 }
 
+/// `buf` は `[u8; N]` の受け口（境界は 1 バイト）なので、`SOCKADDR_IN` などへの参照を作らず、境界の揃った
+/// 値へ写してから読む（揃っていない参照は未定義動作。B-353）。
 #[cfg(windows)]
 fn storage_to_sockaddr(buf: &[u8]) -> io::Result<SocketAddr> {
     if buf.len() >= std::mem::size_of::<SOCKADDR_IN>() {
-        // SAFETY: buf.len() >= size_of::<SOCKADDR_IN>() を確認済みで、SOCKADDR の sa_family は先頭の読み取りのみ。
-        let family = unsafe { (*(buf.as_ptr() as *const SOCKADDR)).sa_family };
+        // sa_family は先頭の 2 バイト（ネイティブのバイト順）
+        let family = u16::from_ne_bytes([buf[0], buf[1]]);
         if family == AF_INET {
-            // SAFETY: family が AF_INET で buf は SOCKADDR_IN 以上の長さ。
-            let sin = unsafe { &*(buf.as_ptr() as *const SOCKADDR_IN) };
+            // SAFETY: buf.len() >= size_of::<SOCKADDR_IN>() を確認済み。read_unaligned は境界を問わず、
+            // SOCKADDR_IN は任意のビットパターンが有効な POD。
+            let sin = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const SOCKADDR_IN) };
             // SAFETY: union フィールド S_addr は IPv4 アドレスとして常に有効な 32 ビット整数。
             let ip = std::net::Ipv4Addr::from(u32::from_be(unsafe { sin.sin_addr.S_un.S_addr }));
             let port = u16::from_be(sin.sin_port);
             return Ok(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)));
         }
         if family == AF_INET6 && buf.len() >= std::mem::size_of::<SOCKADDR_IN6>() {
-            // SAFETY: family が AF_INET6 で buf.len() >= size_of::<SOCKADDR_IN6>() を確認済み。
-            let sin6 = unsafe { &*(buf.as_ptr() as *const SOCKADDR_IN6) };
+            // SAFETY: buf.len() >= size_of::<SOCKADDR_IN6>() を確認済み。read_unaligned は境界を問わず、
+            // SOCKADDR_IN6 は任意のビットパターンが有効な POD。
+            let sin6 = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const SOCKADDR_IN6) };
             // SAFETY: union フィールド Byte は 16 バイト配列で任意のビットパターンが有効。
             let ip = std::net::Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
             let port = u16::from_be(sin6.sin6_port);
@@ -335,17 +339,22 @@ impl UdpSocket {
                 )
             };
             if ret == SOCKET_ERROR {
+                // 誤りは閉じる前に読む（closesocket が成功するとスレッドの誤りが 0 に戻り、利用者には
+                // 「os error 0」としか見えない。B-350）
+                let e = last_wsa_error();
                 // SAFETY: sock は自分の所有する有効なソケットで、エラー返却前にここで 1 度だけ閉じる。
                 unsafe { closesocket(sock) };
-                return Err(last_wsa_error());
+                return Err(e);
             }
             let (storage, len) = sockaddr_to_storage(&addr);
             // SAFETY: sock は有効なソケット。storage は sockaddr_to_storage が作った len バイトの SOCKADDR バイト列。
             let ret = unsafe { WinSock::bind(sock, storage.as_ptr() as *const SOCKADDR, len) };
             if ret == SOCKET_ERROR {
+                // B-350: 上と同じく閉じる前に読む
+                let e = last_wsa_error();
                 // SAFETY: sock は自分の所有する有効なソケットで、エラー返却前にここで 1 度だけ閉じる。
                 unsafe { closesocket(sock) };
-                return Err(last_wsa_error());
+                return Err(e);
             }
         }
 
@@ -621,6 +630,34 @@ impl Drop for UdpSocket {
         // SAFETY: self.fd は自分の所有するソケットで、Drop により 1 度だけ閉じる。
         unsafe {
             closesocket(crate::runtime::handle::win::to_socket(self.fd));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B-350: bind の失敗は OS の誤りのまま返す（閉じてから読むと Windows では 0 になり「os error 0」と出ていた）
+    #[test]
+    fn a_failed_bind_reports_the_os_error() {
+        // TEST-NET-1（RFC 5737）は手元のアドレスにならない。`ip_nonlocal_bind` の環境では bind が通るので確かめない
+        match UdpSocket::bind("192.0.2.1:0".parse().unwrap()) {
+            Ok(_) => eprintln!("non-local bind is allowed here; skipping"),
+            Err(e) => assert_ne!(e.raw_os_error(), Some(0), "{e}"),
+        }
+    }
+
+    // B-353: アドレスの受け口は `u8` の配列なので、境界が揃っていなくても読めること
+    #[cfg(windows)]
+    #[test]
+    fn storage_to_sockaddr_reads_an_unaligned_buffer() {
+        for text in ["127.0.0.1:8443", "[::1]:8443"] {
+            let addr: SocketAddr = text.parse().unwrap();
+            let (bytes, _) = sockaddr_to_storage(&addr);
+            let mut unaligned = vec![0u8; bytes.len() + 1];
+            unaligned[1..].copy_from_slice(&bytes);
+            assert_eq!(storage_to_sockaddr(&unaligned[1..]).unwrap(), addr);
         }
     }
 }

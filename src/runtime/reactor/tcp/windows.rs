@@ -98,17 +98,22 @@ fn sockaddr_to_storage(addr: &SocketAddr) -> (Vec<u8>, i32) {
     }
 }
 
+/// `buf` は `[u8; 128]` の受け口（境界は 1 バイト）なので、`SOCKADDR_IN` などへの参照を作らず、境界の揃った
+/// 値へ写してから読む（揃っていない参照は未定義動作。B-353）。
 fn storage_to_sockaddr(buf: &[u8]) -> io::Result<SocketAddr> {
     if buf.len() >= std::mem::size_of::<SOCKADDR_IN>() {
-        let family = unsafe { (*(buf.as_ptr() as *const SOCKADDR)).sa_family };
+        // sa_family は先頭の 2 バイト（ネイティブのバイト順）
+        let family = u16::from_ne_bytes([buf[0], buf[1]]);
         if family == AF_INET {
-            let sin = unsafe { &*(buf.as_ptr() as *const SOCKADDR_IN) };
+            // SAFETY: 長さは確認済み。read_unaligned は境界を問わず、SOCKADDR_IN は任意のビットパターンが有効な POD。
+            let sin = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const SOCKADDR_IN) };
             let ip = std::net::Ipv4Addr::from(u32::from_be(unsafe { sin.sin_addr.S_un.S_addr }));
             let port = u16::from_be(sin.sin_port);
             return Ok(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)));
         }
         if family == AF_INET6 && buf.len() >= std::mem::size_of::<SOCKADDR_IN6>() {
-            let sin6 = unsafe { &*(buf.as_ptr() as *const SOCKADDR_IN6) };
+            // SAFETY: 長さは確認済み。read_unaligned は境界を問わず、SOCKADDR_IN6 は任意のビットパターンが有効な POD。
+            let sin6 = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const SOCKADDR_IN6) };
             let ip = std::net::Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
             let port = u16::from_be(sin6.sin6_port);
             let scope_id = unsafe { sin6.Anonymous.sin6_scope_id };
