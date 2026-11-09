@@ -22,3 +22,5 @@ L4 の UDP プロキシと、API の L4 UDP ハンドラが通る `runtime::udp:
 ## テスト
 
 単体: `runtime::udp::tests::a_failed_bind_reports_the_os_error`（手元に無いアドレスへの `bind`。`os error 0` にならないこと。全 OS）。
+
+結果: Windows 実機（aofish）で単体 1145 件が通った（`60fc2a63`。[platform_verification.md](../../perf/platform_verification.md)）。

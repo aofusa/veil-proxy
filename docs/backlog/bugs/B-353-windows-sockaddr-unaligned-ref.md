@@ -17,3 +17,5 @@ abort し得る（x86_64・aarch64 の実機では読めるので、これまで
 ## テスト
 
 単体（Windows のみ）: `runtime::udp::tests::storage_to_sockaddr_reads_an_unaligned_buffer`（1 バイトずらしたバッファから IPv4・IPv6 を読む）。
+
+結果: Windows 実機（aofish）で通った（`60fc2a63`）。

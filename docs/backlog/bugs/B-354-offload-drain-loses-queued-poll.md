@@ -50,4 +50,6 @@ F-300 で SQE の提出を park の `submit_and_wait` にまとめたので、PO
 - 全項目の交互 A/B が止まらずに完走すること。
 
 結果（Linux x86_64、2026-11-09）: 読み捨ての前の提出を外すと（`notify_drain_turn` の提出の判定を外して）、`a_drain_keeps_the_signal_of_a_wait_still_in_the_sq` は 5 秒待って
-`a waiter never woke up`（`left: 1`、`right: 2`）で落ちる。修正後は単体・E2E が通り、A/B は [platform_verification.md](../../perf/platform_verification.md)。
+`a waiter never woke up`（`left: 1`、`right: 2`）で落ちる。修正後は単体・E2E が通り、全項目の交互 A/B（`df6b5aae`）は 69 構成・全 834 計測が止まらずに完走した（Non-2xx 0）。
+キャッシュ無しの静的配信（`proxy_ab.py --no-file-caches`、要求ごとに offload、`c9689c23` → `df6b5aae`）は全 10 ケースで rps の比 0.994〜1.058。問題の HTTP/3 の 3B は
+待機者ごとに読み捨てる最初の修正の 0.931（CPU/要求 50.83 → 52.43 µs）から 1.004（50.24 → 50.04 µs）に戻った（[platform_verification.md](../../perf/platform_verification.md)）。

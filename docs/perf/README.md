@@ -1,141 +1,360 @@
-# docs/perf — パフォーマンス計測サマリ（v0.11.0）
+# docs/perf — パフォーマンス計測サマリ（v0.12.0）
 
-Veil の HTTP/1.1・HTTP/2・h2c・HTTP/3・gRPC・WebSocket・L4 のスループットを、nginx と前の版（v0.10.1）を基準に計測した
-**最新の結果だけ**をまとめる（過去の計測は git 履歴で辿れる）。
+v0.12.0 は、API ライブラリの経路の 4 領域（JSON + 圧縮・コア制限下の遅延・unary gRPC・Python のハンドラ）と、既定の Linux ビルド
+（io_uring）の 1 要求あたりの費用を改善した（[F-295](../backlog/features/F-295-v0120-perf-harness.md) とその子チケット）。
+ここには、前の版の v0.11.0 と交互に測った **最新の結果だけ** をまとめる（過去の計測は git 履歴で辿れる）。
 
 | ファイル | 内容 |
 |---|---|
-| [`linux_suite_ab_raw.tsv`](linux_suite_ab_raw.tsv) | Linux x86_64 のフルスイート（`suite_ab.sh`、v0.10.1 と交互、nginx の同じ仕事の相手を含む）の生データ |
-| [`linux_remeasure_raw.tsv`](linux_remeasure_raw.tsv) | 上で v0.10.1 との比が 0.95 を下回った 15 構成を 5 反復で測り直した生データ |
+| [`linux_api_ab_raw.tsv`](linux_api_ab_raw.tsv) | API の経路（`tools/perf/api_ab.py` の json・latency・grpc・python）の v0.11.0 との交互 A/B の生データ |
+| [`linux_python_bench_raw.tsv`](linux_python_bench_raw.tsv) | Python のハンドラと FastAPI（uvicorn）の比較（`tools/api-bench/run_bench.py --group python`）の生データ |
+| [`linux_python_i5_raw.tsv`](linux_python_i5_raw.tsv) | Python の目標値を測った機械（i5-3320M）での v0.11.0 との交互 A/B（`veil-load`）の生データ |
+| [`linux_loadgen_calib_raw.tsv`](linux_loadgen_calib_raw.tsv) | 負荷生成の道具（`wrk` と `veil-load`）と置き場所の較正の生データ |
+| [`linux_proxy_ab_raw.tsv`](linux_proxy_ab_raw.tsv) | プロキシ本体（`tools/perf/proxy_ab.py`。HTTP/1.1・TLS・h2c・HTTP/2・HTTP/3 の静的配信と中継）の交互 A/B の生データ |
+| [`linux_suite_ab_raw.tsv`](linux_suite_ab_raw.tsv) | Docker のフルスイート（`suite_ab.sh`。v0.11.0 と交互、nginx の同じ仕事の相手を含む）の生データ |
+| [`linux_remeasure_raw.tsv`](linux_remeasure_raw.tsv) | 上で v0.11.0 との比が 0.95 を下回った 9 構成を、順を入れ替えて 5 回測り直した生データ |
+| [`linux_native_log_ktls_raw.tsv`](linux_native_log_ktls_raw.tsv) | Docker を使わないアクセスログの有無・kTLS・スイートと同じ形のワーカー数の交互 A/B（`proxy_ab.py`）の生データ（`wrk_timeouts` が 0 より大きい行は壁時計の戻りが入っているので集計から除く） |
+| [`freebsd_v0110_ab_raw.tsv`](freebsd_v0110_ab_raw.tsv) | FreeBSD の v0.11.0 との交互 A/B（rps・CPU/要求）の生データ |
 | [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv) | FreeBSD 14.3 aarch64 の `run_perf_bsd.sh`（標準・サーバ律速 × 54KB・3B、nginx と）の生データ |
-| [`freebsd_v0101_ab_raw.tsv`](freebsd_v0101_ab_raw.tsv) | FreeBSD の v0.10.1 と v0.11.0 の候補の交互 A/B（rps・CPU/要求）の生データ |
-| [`platform_verification.md`](platform_verification.md) | 全プラットフォームの試験（v0.11.0） |
+| [`platform_verification.md`](platform_verification.md) | 全プラットフォームの試験（v0.12.0） |
 
 ---
 
-## Linux x86_64（2026-11-06、aofish の Docker Desktop、コンテナ間）
+## 要求との対応
+
+外部の値は HttpArena への提出（v0.10.1）のもの。結果は aofish（下の「計測条件」）の 8 CPU で、v0.11.0 → v0.12.0 の交互 A/B の中央値。
+
+| 領域 | 外部の値 | 目標 | 結果 |
+|---|---|---|---|
+| JSON + 圧縮（json-comp、[F-296](../backlog/features/F-296-json-comp-throughput.md)・[B-331](../backlog/bugs/B-331-brotli-huge-mapping-per-request.md)） | 36.7k req/s（CPU 約 900%） | 最低でも数倍、理想は数十万 req/s | `gzip, br` で epoll 12,978 → 58,703（**4.52×**）、io_uring 13,104 → 83,167（**6.35×**）。p99 26〜27 ms → 5〜7 ms |
+| コア制限下の遅延（latency-500k-8cpu、[F-297](../backlog/features/F-297-core-limited-latency.md)・[B-332](../backlog/bugs/B-332-reactor-hot-connection-starves-others.md)） | 達成率 0.7455、p99 数百万 µs | 8 CPU で 500k を維持し p99 を大きく下げる | 500k 固定で達成率 0.76 → **1.00**・p99 1.43 s → 22 ms（epoll）、0.69 → **1.00**・1.89 s → 4.2 ms（io_uring） |
+| gRPC（unary、[F-298](../backlog/features/F-298-grpc-unary-fast-path.md)・[B-333](../backlog/bugs/B-333-h2-trailers-flush-per-stream.md)） | p99 が悪い | スループットを落とさず p99・p99.9 を下げる | 256 接続 × 100 ストリームで 318k → 1.60M・p99.9 1.95 s → 26 ms（epoll）、186k → 1.66M・283 → 28 ms（io_uring） |
+| Python（2 スレッド、`offload=True`、[F-299](../backlog/features/F-299-python-gil-lane.md)・[B-334](../backlog/bugs/B-334-python-thread-state-per-call.md)・[F-302](../backlog/features/F-302-access-log-hot-path.md)） | 25.5k plaintext / 22.6k json | 50k 以上、できれば 70k（1 プロセス） | 21.5k → **58.4k** / 20.7k → **57.2k**、`async def` は 70.7k / 69.8k（`api_ab.py`）。`run_bench.py` では 69k → 207k / 71k → 169k。目標値の機械（i5-3320M、`veil-load`）では 22.9k → 48.4k / 20.4k → 46.1k |
+| io_uring（計測の途中で発見、[F-300](../backlog/features/F-300-iouring-batched-submission.md)） | 既定の Linux ビルドの CPU/要求が epoll より 4 割多い | API の 3 領域（JSON + 圧縮・遅延・gRPC。Python の wheel は Linux でも epoll）で epoll と同等以上 | 3 領域の 15 行のうち 14 行で同等以上（gRPC の 256 接続 × 1 ストリームが 0.88）。下の「io_uring と epoll」 |
+
+- **JSON + 圧縮の「数十万」は 8 CPU では届かない。** `gzip, br` の 1 要求あたりの CPU は 95 µs（io_uring）で、うち 63 µs（3 分の 2）が
+  gzip の圧縮（`gzip, br` には既定の順で gzip を選ぶ。無圧縮は 32.5 µs）。
+  外部の計測（64 論理 CPU）は、B-331 で 8 MiB の `mmap` とその錠の競合が消えた分だけ CPU の数に比例して伸びるはずだが、外部の再計測はしていない。
+- **Python の目標値の 25.5k / 22.6k は、別の機械（i5-3320M、2 コア 4 スレッド）で `run_bench.py`（`wrk`、アクセスログ無し）で測った値。**
+  その機械には `wrk` が無いので、同じ配置（サーバ CPU 0-1・負荷 CPU 2-3、2 スレッド、64 接続）を `veil-load` で測ると 22,850 → 48,417（2.12×）/
+  20,373 → 46,069（2.26×）。目標値から 50k に要る倍率（1.96× / 2.21×）は超えたが、`veil-load` の値そのものは 50k に届かない（下の
+  「i5-3320M（目標値の機械）」）。aofish では改修前が 2 万前後になる `api_ab.py` で 50k を超え、`run_bench.py` では改修前の 2.4〜3.0 倍。
+  `offload=True` は既定のまま、マルチプロセスは使わない。
+- データプレーンは Rust のまま（io_uring・epoll・kTLS・rustls）。新しい io_uring のオペコードは足していない。
+
+---
+
+## API の経路（`api_ab.py`、2026-11-07〜08）
+
+- 比較: v0.11.0（タグ `43c8045a`）と v0.12.0 の候補（json・latency・grpc は `4fbe17a3`、python は `03cb80d0`）。どちらの木にも同じ
+  `tools/perf/api-app`（HttpArena の `veil-api` と同じ形のハンドラ）を置いてビルドした。
+- 5 ラウンドの交互 A/B の中央値（Python 3.14 だけ 3 ラウンド）。**全計測でエラー・Non-2xx 0**。
+- `4fbe17a3` の後の変更（F-302 のアクセスログ、B-340・B-341、B-343・B-344 のログの出力）は、アクセスログを有効にした経路と
+  ログの出力だけを変える。F-302 は自身の A/B（チケット）とこの表の Python の行（`03cb80d0`）、全体は Docker のフルスイート（`df6b5aae`）で確かめた。
+
+### JSON + 圧縮（`--scenario json`、256 接続、`/json/{count}`）
+
+| 行 | epoll（v0.11.0 → v0.12.0） | io_uring（v0.11.0 → v0.12.0） | CPU/要求（epoll・io_uring） |
+|---|---|---|---|
+| 無圧縮 | 151,002 → 188,949（1.25×） | 118,747 → 242,594（2.04×） | 52.0 → 41.6・66.3 → 32.5 µs |
+| gzip | 61,925 → 62,706（1.01×） | 61,967 → 81,632（1.32×） | 127.7 → 125.4・127.7 → 97.6 µs |
+| `gzip, br` | 12,978 → **58,703**（4.52×）、p99 26.4 → 7.1 ms | 13,104 → **83,167**（6.35×）、p99 27.4 → 4.8 ms | 294.9 → 134.3・286.7 → 95.3 µs |
+
+br は要求ごとの 8 MiB のリングバッファの `mmap`・`munmap` をやめ、全量を 1 回で圧縮する（B-331・F-296）。io_uring の伸びが
+epoll より大きいのは F-300（提出をまとめる）と F-301（3KB を超える本文をヘッダと 1 回で書く）の分。
+
+### コア制限下の遅延（`--scenario latency`、1024 接続、`/baseline11?a=1&b=2`）
+
+固定レートの行は予定の時刻から測る（Coordinated Omission を含む）。達成率は実際の req/s ÷ 予定の req/s。
+
+| 行 | epoll（v0.11.0 → v0.12.0） | io_uring（v0.11.0 → v0.12.0） |
+|---|---|---|
+| 飽和の req/s | 372,007 → 578,847（1.56×） | 338,088 → 664,215（1.96×） |
+| 飽和の CPU/要求 | 21.1 → 13.4 µs | 23.2 → 11.8 µs |
+| 300k の p99 | 2.3 → 1.8 ms | 18.7 → 3.6 ms |
+| 400k の達成率・p99 | 0.94・367 ms → 1.00・1.3 ms | 0.89・843 ms → 1.00・3.9 ms |
+| 475k の達成率・p99 | 0.80・1.17 s → 1.00・6.5 ms | 0.68・1.92 s → 1.00・1.7 ms |
+| 500k の達成率・p99 | 0.76・1.43 s → **1.00・22.4 ms** | 0.69・1.89 s → **1.00・4.2 ms** |
+
+v0.11.0 の 8 CPU の飽和（epoll 372k）は外部の latency-500k-8cpu の値（372k）とほぼ同じで、この計測が外部の結果を再現している。
+epoll は要求ごとの登録の上げ下げをやめ（F-297）、速い接続がワーカーを占有しないようにした（B-332）。
+
+### gRPC（`--scenario grpc`、`veil-load --mode grpc`、unary）
+
+| 行 | epoll（v0.11.0 → v0.12.0） | io_uring（v0.11.0 → v0.12.0） |
+|---|---|---|
+| 256 接続 × 100 ストリーム | 317,906 → 1,602,602（5.0×）、p99.9 1.95 s → 26.4 ms | 185,788 → 1,661,655（8.9×）、p99.9 283 → 27.9 ms |
+| 64 接続 × 10 ストリーム | 356,385 → 889,739（2.5×）、p99 19.5 → 1.5 ms | 177,579 → 910,501（5.1×）、p99 8.5 → 1.2 ms |
+| 256 接続 × 1 ストリーム | 213,419 → 321,887（1.51×）、p99 2.3 → 1.6 ms | 170,769 → 283,252（1.66×）、p99 2.7 → 1.6 ms |
+| 固定 200k の達成率・p99 | 1.00・126 ms → 1.00・2.6 ms | 0.85・1.10 s → 1.00・1.9 ms |
+| 固定 300k の達成率・p99 | 0.92・977 ms → **1.00・3.4 ms** | 0.56・2.67 s → **1.00・4.1 ms** |
+| （参考）h2 の GET、256 接続 × 100 ストリーム | 1,995,971 → 2,239,649（1.12×）、最大 1.49 s → 26 ms | 992,185 → 2,408,244（2.43×）、最大 45 → 21 ms |
+
+- 本文の揃った unary の要求は、本文のチャネル・中継のタスクを作らずに起動し、応答・トレーラを 1 回の書き込みで送る（F-298・B-333）。
+- 参考の行の epoll の p50 は 4.5 → 11.5 ms に上がった。閉ループの平均の遅延は「同時の要求数 ÷ スループット」（25,600 ÷ 224 万 ≒ 11.4 ms）で決まり、
+  v0.11.0 の小さな p50 は、一部の接続を 1.5 秒待たせて残りを速く回していた分（B-332 の不公平）。最大は 1.49 s → 26 ms。
+- 1 要求あたりのシステムコール（epoll、256 接続 × 1 ストリーム）: `send` 1.99 → 0.95、`epoll_ctl` 2.98 → 0、`poll` 3.98 → 2.85。
+
+### Python（`--scenario python`、サーバ CPU 0-3、64 接続、アクセスログ有効）
+
+`tools/api-bench/python` の `veil_app.py`（`/plaintext`・`/json`）を、Python 3.12 と 3.14 の venv で v0.11.0 と v0.12.0 の wheel に
+入れ替えて測った。「1 コア」はサーバを 1 つの物理コア（CPU 0-1）に固定した回。
+
+| 行（ハンドラ 2 スレッド） | Python 3.12 | Python 3.14 | 3.12、1 コア |
+|---|---|---|---|
+| `offload=True`（既定）、plaintext | 21,494 → **58,404**（2.72×）、p99 8.4 → 1.9 ms | 19,163 → 60,762（3.17×） | 35,418 → 58,207（1.64×） |
+| `offload=True`（既定）、json | 20,745 → **57,198**（2.76×）、p99 8.9 → 2.1 ms | 20,795 → 57,171（2.75×） | 35,561 → 57,476（1.62×） |
+| `offload=False`、plaintext | 17,872 → 61,897（3.46×） | 16,842 → 64,391（3.82×） | 21,127 → 62,161（2.94×） |
+| `offload=False`、json | 17,759 → 57,163（3.22×） | 16,831 → 55,631（3.31×） | 20,350 → 53,839（2.65×） |
+| `async def`、plaintext | 23,110 → 70,688（3.06×） | 23,366 → 70,777（3.03×） | 40,599 → 52,438（1.29×） |
+| `async def`、json | 23,746 → 69,753（2.94×） | 23,355 → 71,159（3.05×） | 38,622 → 51,284（1.33×） |
+
+- ハンドラ 4 スレッドの `offload=True` は 3.12 で 53,950 → 99,206（plaintext）・46,439 → 92,694（json）。
+- CPU/要求は `offload=True`・2 スレッドで 90.3 → 33.4 µs。GIL を握ったまま続けて処理する走者 1 本と控え 1 本の交代（F-299）、
+  thread state の使い回し（B-334）、アクセスログの値を写すだけにする（F-302）の分。
+- v0.11.0 は 1 コアに固定した方が速い（`offload=True` で 35.4k と 21.5k）。v0.12.0 の `offload=True`・`offload=False` は 4 CPU と 1 コアで
+  ほぼ同じ（58.4k と 58.2k）。`async def` は 1 コアでは 52k に下がる（4 CPU では 70.7k）。
+- `offload=False` はネットワークのワーカーがそれぞれ GIL を取ってハンドラを呼ぶので、ハンドラの走者の交代（F-299）が無い。4 スレッドにすると
+  2 スレッドより遅い（3.12 の json で 57.2k → 24.3k。ライブラリのガイドに書いた）。
+
+### Python と FastAPI（`run_bench.py --group python`）
+
+ライブラリのガイド（[`docs/guide/library.md`](../guide/library.md)）の表と同じ回。サーバを CPU 0-1（1 物理コア）に固定し、
+`wrk -t2 -c64 -d10s` を CPU 2-3 から、3 ラウンドの中央値。アクセスログは無効（FastAPI 側に合わせる）。
+FastAPI 0.162 / uvicorn 0.54（uvloop・httptools）、Python 3.12。
+
+| 対象 | plaintext | json | p99（plaintext） | CPU/要求 | RSS |
+|---|---:|---:|---:|---:|---:|
+| FastAPI `async def`、uvicorn 1 ワーカー | 9,916 | 7,474 | 14.16 ms | 102.8 µs | 49.0 MB |
+| FastAPI `async def`、uvicorn 2 ワーカー | 21,873 | 17,201 | 6.02 ms | 92.3 µs | 133.8 MB |
+| FastAPI `def`、uvicorn 2 ワーカー | 14,119 | 13,085 | 30.21 ms | 140.9 µs | 138.3 MB |
+| veil `offload=True`（既定） | **206,599** | **168,852** | 0.76 ms | 9.5 µs | 36.6 MB |
+| veil `offload=False` | 236,838 | 161,223 | 0.74 ms | 7.5 µs | 35.1 MB |
+| veil `async def` | 153,451 | 132,653 | 1.02 ms | 11.2 µs | 36.5 MB |
+| v0.11.0 `offload=True` | 69,245 | 70,802 | 2.71 ms | 27.1 µs | 33.9 MB |
+| v0.11.0 `offload=False` | 26,157 | 21,047 | 5.19 ms | 65.2 µs | 32.4 MB |
+| v0.11.0 `async def` | 88,731 | 92,418 | 2.41 ms | 19.8 µs | 33.9 MB |
+
+`api_ab.py` の 1 コアの行（58k）とは、アクセスログの有無と負荷生成（`wrk` の 2 スレッドを CPU 2-3、`veil-load` の 8 スレッドを CPU 8-15）が
+違う（どちらもパイプライン無しの HTTP/1.1、64 接続）。差の大部分は負荷の置き場所による。同じサーバ（v0.12.0 の `offload=True`、ログ無し）を
+4 通りの負荷で交互に 3 ラウンド測った中央値（[`linux_loadgen_calib_raw.tsv`](linux_loadgen_calib_raw.tsv)）:
+
+| 負荷 | plaintext | json |
+|---|---:|---:|
+| `wrk` 2 スレッド、CPU 2-3（`run_bench.py` の配置） | 235,951 | 179,179 |
+| `veil-load` 2 スレッド、CPU 2-3 | 182,115（0.77×） | 169,667（0.95×） |
+| `wrk` 8 スレッド、CPU 8-15 | 62,642 | 64,439 |
+| `veil-load` 8 スレッド、CPU 8-15（`api_ab.py` の配置） | 62,502（1.00×） | 61,948（0.96×） |
+
+負荷を CPU 8-15 に置くと道具によらず 62k 前後に下がる（WSL2 の中からは L3 が 1 つに見え、理由は切り分けていない）。CPU 2-3 の 2 スレッドでは
+`veil-load` が `wrk` より低く出る（plaintext で 0.77 倍）。
+
+### i5-3320M（目標値の機械、2026-11-08）
+
+Python の目標値（25.5k / 22.6k）を `run_bench.py` で測った機械（Intel Core i5-3320M、2 コア 4 スレッド、Python 3.12、Linux 6.8）。
+`run_bench.py` と同じ配置（サーバ CPU 0-1、負荷 CPU 2-3、64 接続、パイプライン無し）で、`wrk` が無いので `tools/perf/veil-load`（2 スレッド）を使い、
+`veil_app.py` の wheel を v0.11.0（`43c8045a`）と v0.12.0 の候補（`c9689c23`）で入れ替えて 5 ラウンド交互に測った中央値。
+生データは [`linux_python_i5_raw.tsv`](linux_python_i5_raw.tsv)。**全計測でエラー 0**。
+
+| 行（ハンドラ 2 スレッド） | アクセスログ無し（目標値と同じ） | アクセスログ有効 | CPU/要求（ログ無し） |
+|---|---|---|---|
+| `offload=True`（既定）、plaintext | 22,850 → **48,417**（2.12×）、p99 7.0 → 2.3 ms | 20,556 → 45,681（2.22×） | 78.2 → 41.0 µs |
+| `offload=True`（既定）、json | 20,373 → **46,069**（2.26×）、p99 8.3 → 2.5 ms | 18,833 → 43,413（2.31×） | 83.0 → 42.6 µs |
+| `offload=False`、plaintext | 24,909 → 45,344（1.82×） | 19,370 → 42,997（2.22×） | 79.2 → 42.9 µs |
+| `offload=False`、json | 23,215 → 41,111（1.77×） | 18,296 → 39,171（2.14×） | 84.9 → 48.0 µs |
+| `async def`、plaintext | 23,967 → 27,422（1.14×） | 23,286 → 28,039（1.20×） | 75.3 → 61.9 µs |
+| `async def`、json | 22,283 → 24,667（1.11×） | 22,048 → 25,257（1.15×） | 78.5 → 66.6 µs |
+
+- **`veil-load` の値では 50k に届かない。** 目標値から 50k に要る倍率（plaintext 1.96×・json 2.21×）は超えた（2.12×・2.26×）。改修前の値は
+  目標値の 0.90 倍（22,850 と 25.5k、20,373 と 22.6k）で、同じ比なら v0.12.0 は `wrk` で 54k / 51k に当たる（推定。この機械の `wrk` では測っていない）。
+- サーバの 2 つの CPU は使い切っている（48.4k × 41.0 µs ≒ 2.0 CPU 秒/秒）。この機械の `veil-load` で 50k を超えるには、1 要求あたり 40 µs を
+  切る必要がある。
+- `async def` は 1 コアでは伸びが小さい（aofish の 1 コアでも 1.29×）。目標（`offload=True`）の外なので、この版では追っていない。
+- レーンの走者が、列が空になっても GIL を握ったまま 20・50 µs 次の要求を待つ試作は、同じバイナリの待ち 0 と比べて ±2% の範囲で、
+  速くならなかった（入れていない。F-299）。
+
+---
+
+## プロキシ本体（`proxy_ab.py`、2026-11-08）
+
+- 比較: v0.11.0（`43c8045a`）と v0.12.0 の候補（`4fbe17a3`）の `veil` を Docker を使わずに交互に（3 ラウンド × 2 回、中央値）。
+- 構成: 静的配信（3B・54KB）と上流（nginx、平文 HTTP/1.1）への中継を、平文 HTTP/1.1・TLS の HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3 で。
+  - 標準: サーバ CPU 0-7・8 スレッド、負荷 CPU 8-13（6 スレッド）、上流の nginx は CPU 12-15。
+  - サーバ律速: サーバ CPU 0-3・4 スレッド、負荷 CPU 4-13（10 スレッド）。
+  - HTTP/3: 標準の配置で `h2load`（QUIC）。
+- **全計測でエラー・Non-2xx 0**（TSV の `wrk_timeouts` は WSL2 の時計の巻き戻りによる `wrk` の偽の timeout。下の「計測条件」）。
+
+| 組 | バックエンド | 構成数 | 比の中央値 | 最小〜最大 | 0.95 未満 | CPU/要求の比の中央値 |
+|---|---|---:|---:|---|---:|---:|
+| 標準 | io_uring | 16 | **1.093** | 0.952〜1.291 | 0 | 0.888 |
+| 標準 | epoll | 16 | **1.020** | 0.941〜1.181 | 2 | 0.976 |
+| サーバ律速 | io_uring | 16 | **1.175** | 1.036〜1.507 | 0 | 0.852 |
+| サーバ律速 | epoll | 16 | **1.065** | 0.929〜1.217 | 1 | 0.937 |
+| HTTP/3 | io_uring | 4 | **1.111** | 1.046〜1.161 | 0 | 0.887 |
+| HTTP/3 | epoll | 4 | **1.019** | 1.001〜1.134 | 0 | 0.983 |
+
+- 0.95 を下回ったのは epoll の静的配信の 54KB の h2c（標準 0.941・サーバ律速 0.929）と h2（標準 0.946）だけ。B-332 で速い接続が
+  ワーカーを占有しないようにした（1 回の poll の予算と poller を見る間隔）公平の代価で、予算・間隔を外したときだけ戻る。
+  外すと 1 つの接続が温かい作業集合のまま続けて書けるのでキャッシュの局所性が上がるが、gRPC の p99.9 が秒単位に戻る。
+  3B の行・HTTP/1.1 の行と、io_uring（完了の順で公平）には出ない（[F-297](../backlog/features/F-297-core-limited-latency.md) の「公平の代価」）。
+- 大きく伸びたのは io_uring の静的配信の 3B（HTTP/1.1 1.20〜1.51、h2・h2c 1.25〜1.33）。F-300 で SQE を park でまとめて提出し、
+  HTTP/2 のストリームの初回 poll をその場で行うようにした分。
+
+### io_uring と epoll
+
+各版の io_uring ÷ epoll の rps。バックエンドごとに別の回で測った値の比で、数 % の揺れを含む。
+
+| 対象 | v0.11.0 | v0.12.0 | 0.95 未満の行（v0.11.0 → v0.12.0） |
+|---|---|---|---:|
+| API の 3 領域（JSON・遅延・gRPC、15 行） | 0.50〜1.01（1.00 以上は 4 行。うち 2 行は両方とも達成率 1.00 の固定レート） | 0.88〜1.42（1.00 以上は 14 行。うち固定レートの 6 行は両方とも達成率 1.00） | 11 → 1 |
+| プロキシ・標準（16 構成） | 中央値 0.90、0.64〜1.11 | 中央値 0.98、0.74〜1.18 | 11 → 6 |
+| プロキシ・サーバ律速（16 構成） | 中央値 0.96、0.57〜1.23 | 中央値 1.04、0.71〜1.34 | 7 → 3 |
+| プロキシ・HTTP/3（4 構成） | 中央値 0.83、0.69〜0.94 | 中央値 0.89、0.74〜0.97 | 4 → 3 |
+
+Python の wheel は Linux でも epoll のビルドなので、この比には入らない。
+
+残り（v0.12.0 の要求の外。原因は確かめていない）:
+
+- **HTTP/2。** 静的配信の 54KB の h2c（標準 0.74・サーバ律速 0.71）・3B の h2（0.90・0.79）・3B の h2c（標準 0.94）、中継の 54KB の h2c（標準 0.85）・
+  3B の h2（標準 0.948）。
+  54KB の行の見立て: HTTP/2 の送出はどちらのバックエンドも `write_buf` を 1 回で書くが、io_uring は送信の完了まで接続のタスクが待つ。
+  10 ストリーム × 54KB は 128KB ごとのフラッシュに分かれ、io_uring ではフラッシュごとに park を 1 周回する。送信中も次のフレームを組み立てる
+  二重のバッファが要る。
+- **HTTP/3。** 54KB の静的配信 0.74・中継 0.88、3B の静的配信 0.90。UDP の送出の経路（io_uring は `SENDMSG` の SQE、reactor は `sendmmsg(2)`）が違う。
+- **HTTP/1.1 の静的配信の 3B。** 平文の標準 0.91、TLS のサーバ律速 0.92（同じ 3B の平文のサーバ律速は 1.34）。
+- **gRPC の 256 接続 × 1 ストリーム（0.88）。** CPU/要求が 27.9 µs と 24.5 µs。HTTP/1.1 の同じ形（1024 接続 × 1 要求）は io_uring が 1.15 倍速い。
+
+io_uring の v0.11.0 → v0.12.0 は、プロキシの 36 構成のうち 35 で同じか速い（下限は標準の h2c の中継の 54KB の 0.952。3 ラウンドとも
+v0.11.0 より 2〜6% 遅く、CPU/要求は 82 → 86 µs。同じ構成のサーバ律速では 1.12 倍）。
+
+---
+
+## Linux x86_64 のフルスイート（Docker、`suite_ab.sh`）
+
+2026-11-10、aofish の Docker Desktop、コンテナ間（計測条件は下の「計測条件」）。
 
 - 比較:
-  - v0.11.0 の最終候補（`feat/v0110-tickets` の `325e92c3`。v0.11.0 前のセキュリティスキャンの修正 B-313〜B-325 を含む）、
+  - v0.12.0 の最終候補（`feat/v0120-perf` の `df6b5aae`）、イメージは `veil:v0120-uring`
+  - v0.11.0 の最終候補（`325e92c3`。タグ `43c8045a` との `src/` の差は L4 のピン留めの共通化・macOS のログのレベル・mesh-linkerd の修正で、ここで測る経路は同じ）、
     イメージは `veil:v0110-rc`
-  - v0.10.1（タグ `e1ee3f3b`、`veil:v0101-rel`）
   - `nginx:alpine`
-- イメージ: どちらも `cargo build --profile dist --features full`（io_uring）を、同じ実行イメージ
-  （`cgr.dev/chainguard/glibc-dynamic`）に `/veil` だけ差し替えて入れた
-- 実行: `BASE=v0101-rel NEW=v0110-rc NGINX=1 bash tools/perf/suite_ab.sh`（69 構成 × 3 反復、構成ごとに順を入れ替えて交互、約 2.2 時間）
-- **全 834 計測で Non-2xx = 0、NA 行ゼロ**
+- イメージ: どちらも `cargo build --profile dist --features full`（io_uring）を、同じ実行イメージに `/veil` だけ差し替えて入れた。
+- 実行: `BASE=v0110-rc NEW=v0120-uring NGINX=1 bash tools/perf/suite_ab.sh`（69 構成 × 3 反復、構成ごとに順を入れ替えて交互、約 2 時間）。
+- wrk の rps は要求数 ÷ 設定の秒数で求めている（[B-357](../backlog/bugs/B-357-wrk-rps-wall-clock-jump.md)）。aofish の Docker の VM は壁時計が戻るので、同じボリュームに残っていた wrk のログ 766 本のうち 193 本が
+  10 秒の実行を 9.5 秒未満（最短 7.3 秒）と報告している（wrk の `Requests/sec` のままだと、その行は最大 1.37 倍に見える）。
+- **全 834 計測で Non-2xx = 0、NA 行ゼロ。**
 
-### v0.10.1 との退行確認（交互 A/B）
+### v0.11.0 との退行確認（交互 A/B）
 
 | プロトコル | 組数 | 比の中央値 | 最小 | 最大 | 0.95 未満 |
 |---|---|---|---|---|---|
-| HTTP/1.1 | 54 | 0.993 | 0.905 | 1.197 | 4 |
-| HTTP/2 | 45 | 0.984 | 0.898 | 1.090 | 5 |
-| HTTP/3 | 19 | 0.999 | 0.852 | 1.176 | 4 |
-| h2c | 2 | 1.045 | 1.014 | 1.075 | 0 |
-| gRPC | 6 | 0.980 | 0.922 | 1.013 | 1 |
-| gRPC over HTTP/3 | 6 | 1.002 | 0.942 | 1.079 | 1 |
-| WebSocket | 1 | 3.129 | — | — | 0 |
-| **全体** | 133 | **0.993** | — | — | 15 |
+| HTTP/1.1 | 54 | 1.015 | 0.889 | 1.112 | 5 |
+| HTTP/2 | 45 | 1.042 | 0.932 | 1.195 | 3 |
+| HTTP/3 | 19 | 1.038 | 0.933 | 1.147 | 1 |
+| h2c | 2 | 1.034 | 1.022 | 1.047 | 0 |
+| gRPC | 6 | 1.067 | 1.055 | 1.227 | 0 |
+| gRPC over HTTP/3 | 6 | 1.060 | 0.984 | 1.165 | 0 |
+| WebSocket | 1 | 0.922 | — | — | 1 |
+| **全体** | 133 | **1.029** | 0.889 | 1.227 | 10 |
 
-0.95 を下回った 15 組は、その構成だけ 5 反復で測り直した（`linux_remeasure_raw.tsv`、34 組）。
+0.95 を下回った 10 組の 9 構成は、1 反復ずつ順を入れ替えて 5 回測り直した（`linux_remeasure_raw.tsv`、18 組）。
 
-| プロトコル | 組数 | 比の中央値 | 最小 | 最大 |
+| プロトコル | 組数 | 比の中央値 | 最小 | 最大 | 0.95 未満 |
+|---|---|---|---|---|---|
+| HTTP/1.1 | 8 | 1.022 | 0.901 | 1.081 | 2 |
+| HTTP/2 | 7 | 0.992 | 0.968 | 1.075 | 0 |
+| HTTP/3 | 2 | 1.070 | 1.064 | 1.075 | 0 |
+| WebSocket | 1 | 1.027 | — | — | 0 |
+| **全体** | 18 | **1.023** | 0.901 | 1.081 | 2 |
+
+このスイートの比は 1 回ごとに大きく揺れる（例: `h2_1_proxy_otel` の HTTP/2 のラウンドごとの比は 0.822・1.053・1.300・1.199・0.996）。100 接続のコンテナ間では veil は CPU を使い切らず、
+rps は負荷生成と仮想 CPU の起床の待ちで決まる。
+
+測り直しで 0.95 未満に残ったのは、どちらもアクセスログ有り・ファイルキャッシュ無しの HTTP/1.1（TLS）の 2 組だけ（`h2_1_feat_access_log` 0.901、`h3_file_access_log` 0.916。
+同じ構成の HTTP/2・HTTP/3 は 0.974〜1.064）。要求あたりの費用は下がっていて、rps だけが下がっている。
+
+| `h2_1_feat_access_log`（5 ラウンド） | v0.11.0 | v0.12.0 |
+|---|---|---|
+| rps | 29,097 | 26,215 |
+| コンテナの CPU | 580% | 446% |
+| 1,000 rps あたりの CPU | 19.95% | 17.00%（−15%） |
+
+- `h3_file_access_log` も同じ形（rps 29,482 → 27,008、CPU 579% → 449%、1,000 rps あたり 19.64% → 16.64%）。p99 は 3 反復のスイートで 10.88 → 9.26 ms と 9.31 → 8.46 ms。
+- v0.11.0 だけ、ログ有りの行（スイートで 28,196・30,632）がログ無しの同じ形の行（`h2_1_feat_metrics` 26,552・`h2_1_feat_admin` 26,894・`h3_file_metrics` 25,679）より速い。
+  v0.12.0 はログ有り（25,909・27,246）とログ無し（27,319・27,420・26,070）が同じ水準。v0.11.0 は要求ごとに futex でログのスレッドを起こしていて（[B-335](../backlog/bugs/B-335-access-log-writer-wake-per-request.md)）、
+  その起床が仮想 CPU を眠らせない効果で rps が上がっている可能性があるが、これは確かめていない。
+- Docker を使わない同じ経路の交互 A/B（`proxy_ab.py`、ファイルキャッシュ無し、`wrk_timeouts` が 0 の行の中央値、[`linux_native_log_ktls_raw.tsv`](linux_native_log_ktls_raw.tsv)。全行エラー 0）では
+  v0.12.0 が速く、ログ有りの退行は無い。
+
+| 条件（アクセスログ有り、new/base の rps の比） | HTTP/1.1 3B | HTTP/1.1 + TLS 3B | HTTP/1.1 54KB | HTTP/1.1 + TLS 54KB |
 |---|---|---|---|---|
-| HTTP/1.1 | 13 | 1.014 | 0.994 | 1.052 |
-| HTTP/2 | 12 | 0.999 | 0.953 | 1.116 |
-| HTTP/3 | 7 | 1.019 | 0.994 | 1.147 |
-| gRPC over HTTP/3 | 1 | 1.051 | — | — |
-| gRPC | 1 | 0.940 | — | — |
-| **全体** | 34 | **1.013** | 0.940 | 1.147 |
+| 4 ワーカー（サーバ律速、CPU/要求 µs） | 1.187（40.33 → 32.14） | 1.315（40.97 → 31.65） | 1.362（42.83 → 31.69） | 1.282（72.54 → 55.56） |
+| 8 ワーカー | 1.744 | 1.379 | 1.569 | 1.171 |
+| 8 ワーカーの「ログ有り ÷ ログ無し」の rps（v0.11.0 → v0.12.0） | 0.66 → 1.01 | 0.76 → 1.02 | 0.68 → 1.03 | 0.91 → 0.98 |
 
-- **退行なし。** フルスイートの 0.85〜0.95 は、`suite_ab.sh` が構成ごとに片方の反復をまとめて測るので、このホストの時間で変わる
-  揺れ（同じイメージでも ±15%）が片側に乗ったもの。測り直しでは 0.94 の 1 組を除いて 0.95 以上。
-- 残った `h2_1_feat_grpc`（gRPC unary を h2c の上流へ中継、k6）の 0.94 は、セキュリティ修正の前の候補でも 0.90〜0.93 だった。
-  `h2load -t4 -c50 -m10` で同じ経路に 13 万 req/s を流して `perf stat` で 1 要求あたりの命令数を交互に採ると、v0.10.1 が
-  110,655〜111,389、v0.11.0 の候補が 111,025〜112,266（差 1% 未満）、スループットも同等（127,924〜133,342 対 119,010〜132,289）。
-  k6 の 2 万 req/s はクライアントと上流（grpcbin）で決まっていて、veil の差ではない。
-- WebSocket（`h2_1_feat_websocket`、k6）は v0.10.1 の約 1 万 req/s に対し約 3.2 万 req/s で、セキュリティ修正の前の候補でも同じだった。
-  B-306 で中継が両方向を同時に待つようにし、アイドル時の最大 100ms のポーリングをやめた後の値（変更ごとの切り分けはしていない）。
-- セキュリティ修正（B-313〜B-325）のうち、毎回の要求で通るもの（HTTP/1.1 の要求の前の空行の数え方と 431 の検査、上流の HTTP/2 の
-  資格情報のヘッダの never-indexed、キャッシュの鍵のルートの名前空間）は、測り直しの範囲で差にならなかった。
+スイートと同じ形（16 ワーカーで全 CPU を負荷と共有、`wrk -t4 -c100`、TLS + 54KB、ログ有り、9 ラウンド）でも 44,844 → 48,939（1.091、CPU/要求 129.17 → 112.59 µs）。
+kTLS の有無でも同じ（`h1tls_file` の kTLS 有り、ファイルキャッシュ有り: サーバ律速 3B 1.304・54KB 1.117、8 ワーカー 3B 1.100・54KB 1.072）。
 
 ### nginx との比較（同じ仕事の相手、Req/s 中央値）
 
-対応は `tools/perf/vs_nginx.py` の表のとおり（中継は `base_proxy`、圧縮は `base_compression`、中継 + 圧縮は `base_proxy_compression`、
-それ以外は `base`）。
+対応は `tools/perf/vs_nginx.py` の表のとおり（中継は `base_proxy`、圧縮は `base_compression`、中継 + 圧縮は `base_proxy_compression`、それ以外は `base`）。
 
 | プロトコル | 構成数 | 対 nginx の中央値 | 最小 | 最大 | nginx 未満 |
 |---|---|---|---|---|---|
-| HTTP/1.1 | 54 | 0.70 | 0.41 | 2.99 | 43 |
-| HTTP/2 | 45 | **1.45** | 0.90 | 4.00 | 15 |
-| HTTP/3 | 19 | 0.96 | 0.78 | 1.06 | 17 |
-| h2c | 2 | **1.86** | 1.81 | 1.91 | 0 |
+| HTTP/1.1 | 54 | 0.75 | 0.41 | 2.94 | 32 |
+| HTTP/2 | 45 | **1.47** | 0.96 | 3.57 | 1 |
+| HTTP/3 | 19 | 1.00 | 0.93 | 1.06 | 9 |
+| h2c | 2 | **1.74** | 1.59 | 1.90 | 0 |
 
 代表的な構成:
 
 | 構成 | プロトコル | nginx | veil | 対 nginx |
 |---|---|---|---|---|
-| `h2_1_ktls_0_lb_cbpf_ofc_1`（静的） | HTTP/2 | 34,520 | 49,884 | **1.45×** |
-| `h2_1_feat_proxy`（中継） | HTTP/2 | 23,951 | 39,043 | **1.63×** |
-| `h2_1_proxy_compression`（中継 + 圧縮） | HTTP/2 | 6,543 | 24,907 | **3.81×** |
-| `h2_1_proxy_compression`（中継 + 圧縮） | HTTP/1.1 | 9,270 | 26,825 | **2.89×** |
-| `h2_1_feat_compression`（毎回圧縮） | HTTP/1.1 | 11,985 | 26,747 | **2.23×** |
-| `h3_proxy_cache`（中継 + キャッシュ） | HTTP/1.1 | 42,764 | 54,513 | **1.27×** |
-| `h2_0_feat_l4`（L4 平文） | HTTP/1.1 | 62,143 | 84,374 | **1.36×** |
-| `h2c_file` / `h2c_proxy` | h2c | 70,879 / 38,249 | 135,684 / 69,422 | **1.91× / 1.81×** |
-| `h2_1_ktls_0_lb_kernel_ofc_1`（静的） | HTTP/1.1 | 62,143 | 47,574 | 0.77× |
-| `h2_0_ktls_0_lb_cbpf_ofc_0`（静的、ファイルキャッシュ無し） | HTTP/1.1 | 62,143 | 25,692 | 0.41× |
-| `h3_file_metrics`（静的） | HTTP/3 | 23,051 | 22,730 | 0.99× |
-| `h3_proxy`（中継） | HTTP/3 | 21,131 | 19,376 | 0.92× |
+| `h2_1_ktls_0_lb_cbpf_ofc_1`（静的） | HTTP/2 | 30,262 | 42,688 | **1.41×** |
+| `h2_1_feat_proxy`（中継） | HTTP/2 | 19,956 | 39,341 | **1.97×** |
+| `h2_1_proxy_compression`（中継 + 圧縮） | HTTP/2 | 7,503 | 23,484 | **3.13×** |
+| `h2_1_proxy_compression`（中継 + 圧縮） | HTTP/1.1 | 8,652 | 25,001 | **2.89×** |
+| `h2_1_feat_compression`（毎回圧縮） | HTTP/1.1 | 10,506 | 26,600 | **2.53×** |
+| `h3_proxy_cache`（中継 + キャッシュ） | HTTP/1.1 | 37,346 | 50,393 | **1.35×** |
+| `h2_0_feat_l4`（L4 平文） | HTTP/1.1 | 57,529 | 65,399 | **1.14×** |
+| `h2c_file` / `h2c_proxy` | h2c | 65,984 / 42,775 | 125,317 / 67,926 | **1.90× / 1.59×** |
+| `h2_1_ktls_0_lb_kernel_ofc_1`（静的） | HTTP/1.1 | 57,529 | 43,491 | 0.76× |
+| `h2_0_ktls_0_lb_cbpf_ofc_0`（静的、ファイルキャッシュ無し） | HTTP/1.1 | 57,529 | 27,414 | 0.48× |
+| `h3_file_metrics`（静的） | HTTP/3 | 21,856 | 20,589 | 0.94× |
+| `h3_proxy`（中継） | HTTP/3 | 18,136 | 18,997 | 1.05× |
 
-nginx を下回る行の読み方（このホストは 16 vCPU で、v0.10.0 までの 4 コアのホストと違い負荷生成の側が先に詰まる）:
-
-- **HTTP/1.1 の静的配信は負荷生成で決まっている。** サーバの CPU 時間 / 要求は、ファイルキャッシュ有り（`*_ofc_1`）で veil 94.6µs
-  に対し nginx 113.7µs と veil が少ない。`wrk` のスレッドと接続を増やすと順位が変わる（同じ構成、54KB・TLS）:
-
-  | 負荷 | nginx | veil |
-  |---|---|---|
-  | `wrk -t4 -c100`（スイートと同じ） | 55,521 | 43,365 |
-  | `wrk -t8 -c400` | 85,770 | 68,438 |
-  | `wrk -t12 -c400` | 62,517 | **111,135** |
-
-  veil は既定（`threads = 0`＝16 スレッド）で 100 接続を薄く分けるので、少ない負荷ではスレッドの起床が 1 要求あたりに乗る
-  （`threads = 4` なら CPU/要求は 44µs）。負荷を見た接続の振り分けは別の設計変更として残す。
-- **`*_ofc_0`（ファイルキャッシュ無し）は比較の条件が揃っていない。** nginx の `base` は `open_file_cache` を有効にしている。
-  veil の同じ条件は `*_ofc_1`（`[static_file_cache]` + `open_file_cache`）。
-- **HTTP/3 は同等。** 静的配信の 19 構成は veil・nginx とも 2.2〜2.4 万 req/s に並び（負荷生成の `h2load` の HTTP/3 の上限）、
-  CPU/要求は veil 67〜69µs・nginx 71µs。中継（`h3_proxy*`）の 0.78〜0.94 は、CPU/要求 veil 102µs・nginx 91µs で、
-  上流への HTTP/1.1 の中継の分。
+nginx の HTTP/1.1 の基準（`base`）は反復ごとに 53,635・57,529・58,302 と揺れている（中央値の 57,529 を使った）。HTTP/1.1 の比の読み方は v0.11.0 の
+切り分けと同じで、`wrk -t4 -c100` のこのスイートは負荷生成の側で決まる行が多く、`*_ofc_0`（ファイルキャッシュ無し）は nginx の `base` が
+`open_file_cache` を有効にしているので条件が揃っていない。v0.12.0 ではこの切り分けの計測はやり直していない。サーバが律速の条件での比較は上の「プロキシ本体」。
 
 ---
 
-## FreeBSD 14.3 aarch64（2026-11-06、QEMU + HVF、ネイティブ）
+## FreeBSD 14.3 aarch64（2026-11-08、QEMU + HVF、ネイティブ）
 
-- コミット: `650d6695`（v0.11.0 の候補、セキュリティ修正の前）。その後の変更（B-313〜B-325）は FreeBSD の単体・E2E・
-  security-e2e（capsicum）で確かめた（[platform_verification.md](platform_verification.md)）。VM のメモリ 4GB・4 コア。
-- 実行: `tools/perf/bsd/run_perf_bsd.sh -r 4 -d 10`（54KB と `-p /small.html` の 3B）。
-  - サーバ律速は `SRV_CPUS=0 GEN_CPUS=1,2,3 UP_CPUS=1,2,3 SRV_THREADS=1 LOAD_THREADS=3`。
+- コミット: `c9689c23`（v0.12.0 の候補。最終候補と `src/` は同じ）。VM のメモリ 4GB・4 コア。
+- 実行: v0.11.0 との交互 A/B は `tools/perf/bsd/version_ab_bsd.sh`（4 ラウンド、8 シナリオ × 3B・54KB）、対 nginx は
+  `tools/perf/bsd/run_perf_bsd.sh -r 4 -d 10`（54KB と `-p /small.html` の 3B。サーバ律速は `SRV_CPUS=0 GEN_CPUS=1,2,3 UP_CPUS=1,2,3
+  SRV_THREADS=1 LOAD_THREADS=3`）。
 - **全計測でエラー 0**
 
-### v0.10.1 との退行確認（交互 A/B）
+### v0.11.0 との退行確認（交互 A/B）
 
-同じ VM で v0.10.1 と v0.11.0 の候補（`--features full-freebsd`）を交互に 4 ラウンド（8 シナリオ × 3B・54KB）。比は v0.11.0 / v0.10.1 の
+同じ VM で v0.11.0（`43c8045a`）と v0.12.0 の候補（どちらも `--features full-freebsd` の release）を交互に 4 ラウンド。比は v0.12.0 / v0.11.0 の
 中央値（rps は大きいほど、CPU/要求は小さいほど良い）。
 
 | シナリオ | 3B rps | 3B CPU/要求 | 54KB rps | 54KB CPU/要求 |
 |---|---|---|---|---|
-| `h1_file_plain` | 0.985 | 1.002 | 0.999 | 0.986 |
-| `h1_file_tls` | 1.009 | 0.996 | 1.018 | 0.993 |
-| `h1_proxy_tls` | 0.994 | 1.008 | 0.990 | 1.010 |
-| `h2_file_tls` | 0.959 | 1.042 | 0.999 | 1.001 |
-| `h2_proxy_tls` | 0.973 | 1.028 | 0.978 | 1.022 |
-| `h2c_file_plain` | 0.980 | 1.019 | 0.996 | 1.003 |
-| `h3_file` | 1.028 | 0.972 | 1.011 | 0.987 |
-| `l4_tcp` | 1.015 | 0.986 | 0.997 | 1.008 |
+| `h1_file_plain` | 1.033 | 0.938 | 0.999 | 0.983 |
+| `h1_file_tls` | 0.973 | 1.002 | 0.999 | 0.992 |
+| `h1_proxy_tls` | 1.063 | 0.940 | 1.007 | 0.999 |
+| `h2_file_tls` | **1.174** | **0.850** | 0.986 | 0.990 |
+| `h2_proxy_tls` | 1.061 | 0.938 | 0.983 | 1.012 |
+| `h2c_file_plain` | **1.203** | **0.831** | 1.028 | 0.897 |
+| `h3_file` | 0.997 | 1.002 | 1.045 | 0.956 |
+| `l4_tcp` | 1.027 | 0.972 | 1.025 | 0.981 |
 
-HTTP/2・h2c の 2〜4% は、HTTP/2・h2c の 3 シナリオ（と比べる `h1_file_tls`）を 8 ラウンドで測り直すと 3B で rps 0.981〜0.997・CPU/要求 1.004〜1.020、
-54KB で 0.998〜1.019・0.981〜1.013 だった。VM の揺れの範囲で、**退行なし**と判断した（候補の修正を 1 つ試したが差が出ず、入れていない）。
+**退行なし。** HTTP/2・h2c の 3B は 17〜20% 速く、CPU/要求は 15〜17% 少ない（変更ごとの切り分けはしていない）。
+`h1_file_tls` 3B の 0.973 は CPU/要求が同じ（1.002）で、VM の揺れの範囲。
 
 ### 対 nginx
 
@@ -143,60 +362,114 @@ HTTP/2・h2c の 2〜4% は、HTTP/2・h2c の 3 シナリオ（と比べる `h1
 
 | シナリオ | 大きさ | nginx（標準） | veil（標準） | 標準 | サーバ律速 |
 |---|---|---|---|---|---|
-| `h1_file_tls`（HTTPS 静的） | 54KB | 21,122 | 28,686 | **1.36** | **1.46** |
-| `h2_file_tls`（HTTP/2 静的） | 54KB | 20,112 | 27,701 | **1.38** | **1.52** |
-| `h1_file_plain`（平文 HTTP/1.1 静的） | 54KB | 47,824 | 48,659 | 1.02 | 1.00 |
-| `h2c_file_plain`（h2c 静的） | 54KB | 61,702 | 52,315 | 0.85 | **1.15** |
-| `h3_file`（HTTP/3 静的） | 54KB | 3,141 | 3,037 | 0.97 | 0.97 |
-| `h1_proxy_tls`（HTTPS 中継） | 54KB | 15,201 | 16,608 | **1.09** | 1.03 |
-| `h2_proxy_tls`（HTTP/2 中継） | 54KB | 11,360 | 14,321 | **1.26** | **1.40** |
-| `l4_tcp`（L4 TCP） | 54KB | 34,136 | 39,676 | **1.16** | **1.11** |
-| `h1_file_tls` | 3B | 215,209 | 203,357 | 0.94 | 1.00 |
-| `h2_file_tls` | 3B | 318,374 | 412,608 | **1.30** | 1.03 |
-| `h1_file_plain` | 3B | 276,332 | 301,399 | **1.09** | **1.10** |
-| `h2c_file_plain` | 3B | 137,118 | 590,464 | **4.31** | **1.17** |
-| `h3_file` | 3B | 126,174 | 128,536 | 1.02 | 0.96 |
-| `h1_proxy_tls` | 3B | 124,034 | 114,403 | 0.92 | 0.97 |
-| `h2_proxy_tls` | 3B | 61,788 | 98,608 | **1.60** | **1.80** |
-| `l4_tcp` | 3B | 166,572 | 165,033 | 0.99 | 0.95 |
+| `h1_file_tls`（HTTPS 静的） | 54KB | 28,934 | 38,111 | **1.32** | **1.49** |
+| `h2_file_tls`（HTTP/2 静的） | 54KB | 26,243 | 37,950 | **1.45** | **1.54** |
+| `h1_file_plain`（平文 HTTP/1.1 静的） | 54KB | 62,357 | 63,227 | 1.01 | 0.96 |
+| `h2c_file_plain`（h2c 静的） | 54KB | 83,774 | 71,677 | 0.86 | **1.19** |
+| `h3_file`（HTTP/3 静的） | 54KB | 4,128 | 3,891 | 0.94 | 0.98 |
+| `h1_proxy_tls`（HTTPS 中継） | 54KB | 19,648 | 21,799 | **1.11** | **1.12** |
+| `h2_proxy_tls`（HTTP/2 中継） | 54KB | 15,825 | 20,066 | **1.27** | **1.40** |
+| `l4_tcp`（L4 TCP） | 54KB | 44,554 | 50,087 | **1.12** | **1.12** |
+| `h1_file_tls` | 3B | 282,482 | 265,388 | 0.94 | **1.08** |
+| `h2_file_tls` | 3B | 192,303 | 697,348 | **3.63** | **1.22** |
+| `h1_file_plain` | 3B | 359,866 | 385,177 | **1.07** | **1.16** |
+| `h2c_file_plain` | 3B | 132,025 | 786,363 | **5.96** | **1.65** |
+| `h3_file` | 3B | 158,120 | 170,547 | **1.08** | 0.98 |
+| `h1_proxy_tls` | 3B | 160,096 | 147,680 | 0.92 | 1.04 |
+| `h2_proxy_tls` | 3B | 44,354 | 86,675 | **1.95** | **1.61** |
+| `l4_tcp` | 3B | 219,206 | 210,890 | 0.96 | 0.90 |
 
-- VM の rps はホストの負荷で大きく揺れる（同じバイナリでもラウンドごとに 3 割動く）。0.90〜1.05 の行は誤差の範囲。
-- `h2c_file_plain` 54KB の標準 0.85 は負荷生成が律速（サーバ律速では 1.15）。
+- VM の rps はホストの負荷で大きく揺れる（同じバイナリでもラウンドごとに 3 割動く。nginx の `h2_file_tls` 3B の標準は v0.11.0 の回の
+  318k に対して今回 192k）。0.90〜1.05 の行は誤差の範囲で、版の間の比較は上の交互 A/B で行う。
+- `h2c_file_plain` 54KB の標準 0.86 は負荷生成が律速（サーバ律速では 1.19）。
 - `h3_file` 54KB は、FreeBSD の quiche（`boringssl-boring-crate`）の経路で、本文をパケットへ詰めるコピーと quiche の内部の確保が
   上位（v0.8.0 から同じ残り）。
+- この計測の後に直した静的配信のキャッシュの不具合（[B-348](../backlog/bugs/B-348-fast-path-drops-open-file-cache-fd.md)・
+  [B-349](../backlog/bugs/B-349-content-cache-version-mismatch.md)）は、キャッシュに当たる経路を変えない（当たったときに増えるのは
+  版の比較 2 つ）。静的配信の構成の交互 A/B で確かめた（[platform_verification.md](platform_verification.md)）。
 
 ---
 
 ## 計測条件
 
-### Linux（`tools/perf/`）
+### API の経路・プロキシ本体（`api_ab.py`・`proxy_ab.py`・`run_bench.py`）
 
-- Docker のコンテナ間通信（aofish: 16 vCPU の Docker Desktop / WSL2。veil・nginx・上流・負荷生成で共有）。kTLS は直交表の `ktls`
-  因子でだけ有効
-- 負荷: HTTP/1.1 は `wrk -t4 -c100 -d10s`、HTTP/2・HTTP/3 は `h2load -t4 -c100 -m10`、gRPC・WebSocket は k6
-- 配信: `/`（54,576B の index.html）。上流は nginx（平文 HTTP/1.1）
-- 利用者の別の計測（`vp-bench*` のコンテナ）が動いている間は待つ（`suite_ab.sh` の外側のスクリプトで確認）
+- aofish の WSL2（AMD Ryzen AI Z2 Extreme、8 コア 16 スレッド、カーネル 6.6.87.2、Hyper-V の下）。Docker は使わず、ループバックで測る。
+- CPU は `lscpu -e` の CORE 列で兄弟（同じ物理コアの 2 スレッド）が隣り合う（0-1 がコア 0）。サーバと負荷を物理コアで分ける。
+- `api_ab.py`: サーバ CPU 0-7（8 スレッド）・負荷 CPU 8-15。Python はサーバ CPU 0-3、1 コアの回は 0-1。負荷は `tools/perf/veil-load`
+  （閉ループと固定レート。固定レートは全接続を順に使い、次の予定まで眠る）。
+- `proxy_ab.py`: 上の「プロキシ本体」の配置。HTTP/1.1 は `wrk`、HTTP/2・h2c は `h2load`、HTTP/3 は QUIC 対応の `h2load`。
+- 計測中はほかのプロセス（別の作業の計測・ビルド）を止める（WSL の `/tmp/vp-bench.lock`）。
+- i5-3320M（目標値の機械）: サーバ CPU 0-1（1 物理コア）、`veil-load` の 2 スレッドを CPU 2-3。計測中はビルドを止める。
+- wrk の `timeout` は `gettimeofday` の差で判定するので、WSL2 の時計が戻る（30 秒ごとに約 75 ms）とその瞬間に処理中の全接続を数える。
+  1 回の実行で 100 件前後の偽の timeout になり、最大の遅延は動かない。TSV の `wrk_timeouts` に分けてエラーに数えない。
+
+### Linux のフルスイート（Docker、`suite_ab.sh`）
+
+- Docker のコンテナ間通信（aofish の Docker Desktop / WSL2、16 vCPU を veil・nginx・上流・負荷生成で共有）。kTLS は直交表の `ktls` 因子でだけ有効。
+- 負荷: HTTP/1.1 は `wrk -t4 -c100 -d10s`、HTTP/2・HTTP/3 は `h2load -t4 -c100 -m10`、gRPC・WebSocket は k6。
+- 配信: `/`（54,576B の index.html）。上流は nginx（平文 HTTP/1.1）。
+- 計測中はほかの作業を止める（WSL の `/tmp/vp-bench.lock`）。
 
 ### FreeBSD（`tools/perf/bsd/`）
 
 - ゲストの中のループバック。計測対象は 0,1 コア（サーバ律速は 0）、負荷生成と上流（別の nginx）は 2,3 コア（同 1,2,3）
 - 負荷: HTTP/1.1 は `wrk -t2 -c64`、HTTP/2・h2c は `h2load -t2 -c64 -m32`、HTTP/3 は `h3load -t2 -c64 -m32`（quinn + h3）
 - 静的配信は `[static_file_cache]` + `open_file_cache`（nginx も `open_file_cache`）
+- v0.11.0 との交互 A/B（`version_ab_bsd.sh`）は 1 シナリオ 8 秒で、ラウンドごとに 2 つのビルドの順を入れ替える。CPU/要求は計測対象の
+  プロセスの CPU 時間（`ps -o time`）÷ 要求数
 - 手で A/B するときは、バイナリの名前を `veil` のままにする（`pkill -x veil` で止まらない名前にすると、`SO_REUSEPORT` で
   前のプロセスが同じポートで受け続け、計測が混ざる）
 
 ## 再現手順
 
-### Linux（Docker）
+### API の経路・プロキシ本体（Docker を使わない）
 
 ```bash
-cargo build --profile dist --features full     # 新しい側（ベースは git worktree で v0.10.1 を同じようにビルド）
+# 比べる版を git worktree で取り出し、api-app・veil-load は同じソースを両方の木に置いてビルドする（tools/perf/README.md）
+git worktree add ../veil-base v0.11.0
+cp -r tools/perf/api-app tools/perf/api_ab.py ../veil-base/tools/perf/
+(cd tools/perf/veil-load && cargo build --release)
+(cd tools/perf/api-app && cargo build --release)                 # io_uring（--features epoll で epoll）
+(cd ../veil-base/tools/perf/api-app && cargo build --release)
+python3 tools/perf/api_ab.py --new . --base ../veil-base --scenario json
+python3 tools/perf/api_ab.py --new . --base ../veil-base --scenario latency --rates 300000,400000,475000,500000 --rounds 5
+python3 tools/perf/api_ab.py --new . --base ../veil-base --scenario grpc
+python3 tools/perf/api_ab.py --new . --base ../veil-base --new-venv <新の venv> --base-venv <旧の venv> --scenario python
+
+# プロキシ本体（両方の veil を cargo build --release --features full（,epoll）でビルドしておく）
+python3 tools/perf/proxy_ab.py --base <旧の veil> --new <新の veil> --rounds 3 --duration 4 \
+  --cases '^(h1|h1tls|h2c|h2)_(proxy|file)_'
+python3 tools/perf/proxy_ab.py --base <旧の veil> --new <新の veil> --rounds 3 --duration 4 \
+  --server-cpus 0-3 --threads 4 --load-cpus 4-13 --load-threads 10 --proxy-load-cpus 4-11 --proxy-load-threads 8 \
+  --cases '^(h1|h1tls|h2c|h2)_(proxy|file)_'
+LD_LIBRARY_PATH=<h2load-h3>/lib python3 tools/perf/proxy_ab.py --base <旧の veil> --new <新の veil> --rounds 3 --duration 4 \
+  --h3load <h2load-h3>/h2load --cases '^h3_'
+
+# Python と FastAPI（tools/api-bench/README.md）
+WRK_BIN=/usr/bin/wrk python3 tools/api-bench/run_bench.py --group python --rounds 3
+
+# 目標値の機械（2 コア 4 スレッド）。wrk の代わりに veil-load を run_bench.py と同じ配置で（--no-access-log の有無で 2 回）
+python3 tools/perf/api_ab.py --new . --base ../veil-base --new-venv <新の venv> --base-venv <旧の venv> --scenario python \
+  --server-cpus 0,1 --load-cpus 2,3 --load-threads 2 --conns 64 --py-variants offload,inline,async --py-threads 2 \
+  --rounds 5 --no-access-log
+```
+
+負荷生成の較正は、`veil_app.py`（`BENCH_ACCESS_LOG=0`）を CPU 0-1 で 1 回起動し、`wrk -t2`・`veil-load -t 2`（CPU 2-3）と
+`wrk -t8`・`veil-load -t 8`（CPU 8-15）を 64 接続・10 秒ずつ順に当てる（ラウンドごとに順を逆にする）。
+
+### Linux のフルスイート（Docker）
+
+```bash
+cargo build --profile dist --features full     # 新しい側（ベースは git worktree で v0.11.0 を同じようにビルド）
 # どちらも cgr.dev/chainguard/glibc-dynamic に /veil だけを入れたイメージにする（veil:new・veil:base）
 bash tools/perf/gen_configs.sh
-BASE=base NEW=new bash tools/perf/suite_ab.sh
-python3 tools/perf/suite_ab_summary.py tools/perf/results/suite_ab/<日時>.tsv base new   # 対 v0.10.1
+BASE=base NEW=new NGINX=1 bash tools/perf/suite_ab.sh
+python3 tools/perf/suite_ab_summary.py tools/perf/results/suite_ab/<日時>.tsv base new   # 対 v0.11.0
 python3 tools/perf/vs_nginx.py tools/perf/results/suite_ab/<日時>.tsv veil_new           # 対 nginx
-CONFIG_GLOB=<構成> NGINX=0 ITERATIONS=5 BASE=base NEW=new bash tools/perf/suite_ab.sh     # 測り直し
+# 測り直し（1 反復ずつ BASE と NEW を入れ替えて 5 回。1 回の中では BASE → NEW の順に測るので、入れ替えないと順序が片側に乗る）
+CONFIG_GLOB=<構成> NGINX=0 ITERATIONS=1 BASE=base NEW=new bash tools/perf/suite_ab.sh
+CONFIG_GLOB=<構成> NGINX=0 ITERATIONS=1 BASE=new NEW=base bash tools/perf/suite_ab.sh
 ```
 
 ### FreeBSD（QEMU VM）
@@ -210,4 +483,8 @@ sh tools/perf/bsd/run_perf_bsd.sh -r 4 -d 10                        # 54KB
 sh tools/perf/bsd/run_perf_bsd.sh -r 4 -d 10 -p /small.html         # 3B
 SRV_CPUS=0 GEN_CPUS=1,2,3 UP_CPUS=1,2,3 SRV_THREADS=1 LOAD_THREADS=3 \
   sh tools/perf/bsd/run_perf_bsd.sh -r 4 -d 10                      # サーバ律速
+# v0.11.0 との交互 A/B: v0.11.0 を別の木で同じ feature（full-freebsd）の release にビルドし、2 つを別のディレクトリに veil の名前で置く
+mkdir -p /root/ab/old /root/ab/new
+cp <v0.11.0 の木>/target/release/veil /root/ab/old/veil && cp target/release/veil /root/ab/new/veil
+A_DIR=/root/ab/old B_DIR=/root/ab/new sh tools/perf/bsd/version_ab_bsd.sh > ab.tsv
 ```

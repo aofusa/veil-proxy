@@ -30,3 +30,5 @@ v0.12.0 の Windows の検証（C の例のログ）で、起動のたびに `Se
 - 単体: `listener_workers::http3_worker_tests::windows_runs_one_http3_worker_per_listener`。
 - 自己完結型 E2E: `b351_http3_with_several_workers_starts_cleanly`（`threads = 3`・HTTP/3 有効で起動し、HTTP/3 の要求が通り、ログに
   `Server error` が無く、`workers=` が Windows は 1・ほかは 3）。
+
+結果: Windows 実機の単体・自己完結型 E2E（48 件）と、ほかの OS の自己完結型 E2E が通った（[platform_verification.md](../../perf/platform_verification.md)）。

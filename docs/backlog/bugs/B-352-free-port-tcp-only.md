@@ -21,4 +21,7 @@ TCP で空いていても UDP の `bind` が `WSAEACCES`（10013）で失敗す�
 
 ## テスト
 
-Windows のライブラリ E2E・自己完結型 E2E が全部通ること（[platform_verification.md](../../perf/platform_verification.md)）。
+Windows のライブラリ E2E・自己完結型 E2E が全部通ること。
+
+結果: 修正の後は aofish で全部通った（ライブラリ E2E は 32 分、自己完結型 E2E は 48 件。`60fc2a63`。[platform_verification.md](../../perf/platform_verification.md)）。修正の前は UDP だけの予約範囲（50000–50059・50690–50889）
+に当たったポートで `bind` が失敗してライブラリ E2E が落ちていた。

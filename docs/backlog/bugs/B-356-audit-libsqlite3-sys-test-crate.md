@@ -24,4 +24,4 @@ v0.12.0 の最終の検証（`tools/container_security` の cargo-audit）で見
 
 ## 確認
 
-aofish の `tools/container_security`（cargo_audit を含むフル）で確かめる（[platform_verification.md](../../perf/platform_verification.md)）。
+aofish の `tools/container_security`（cargo_audit を含むフル）で確かめた（`df6b5aae`）。`cargo_audit: ok`、全フェーズで失敗 0（[platform_verification.md](../../perf/platform_verification.md)）。
