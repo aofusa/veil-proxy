@@ -421,6 +421,26 @@ pub fn get_file_cache() -> Option<std::sync::Arc<()>> {
 /// `fetch_file_info` と同じ設計）。
 #[cfg(not(feature = "cache"))]
 async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileInfo> {
+    // F-304: 経路と属性がカーネルのキャッシュにあれば offload を通らない（`file_cache.rs::fetch_file_info` と同じ）
+    #[cfg(target_os = "linux")]
+    if let Some(res) = crate::cache::resolve::open_cached_for_request(path) {
+        let (_file, st) = res.ok()?;
+        let mime_type: std::sync::Arc<str> = crate::static_response::intern_mime(
+            mime_guess::from_path(path).first_or_octet_stream().as_ref(),
+        );
+        return Some(CachedFileInfo {
+            canonical_path: path.into(),
+            file_size: st.len,
+            validators: crate::static_response::Validators::shared_for_file(
+                st.len,
+                st.modified,
+                &mime_type,
+            ),
+            mime_type,
+            last_modified: st.modified,
+            is_file: st.is_file,
+        });
+    }
     let path = path.to_path_buf();
     crate::runtime::offload::offload(move || {
         // F-153: カーネル封じ込め（openat2、Linux 専用）による解決を優先する。

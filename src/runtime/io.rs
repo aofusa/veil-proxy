@@ -233,11 +233,45 @@ impl File {
         f.read_to_end(buf)
     }
 
-    /// オフセット位置から読み取る（Unix: `pread`、Windows: `seek_read`。コールドパスのみ）
+    /// オフセット位置から読み取る（Unix: `pread`、Windows: `seek_read`）。
+    ///
+    /// F-304: Linux はページキャッシュにある分を `preadv2(RWF_NOWAIT)` でワーカーの上で読み、ディスクを待つときだけ
+    /// offload で読む（ワーカーを塞がない）。`RWF_NOWAIT` を受け付けないファイルシステム（overlayfs 等）は従来の `pread`
     #[cfg(unix)]
     pub async fn read_at<T: IoBufMut>(&self, mut buf: T, offset: u64) -> BufResult<usize, T> {
         use std::os::unix::io::AsRawFd;
         let fd = self.inner.get().as_raw_fd();
+        #[cfg(target_os = "linux")]
+        {
+            let len = buf.bytes_total();
+            match nowait::pread(fd, buf.write_ptr(), len, offset) {
+                nowait::Read::Done(n) => {
+                    // SAFETY: カーネルが先頭 n バイトを書いた
+                    unsafe {
+                        buf.set_init(n);
+                    }
+                    return (Ok(n), buf);
+                }
+                nowait::Read::Miss => {
+                    return match self.read_offloaded(offset, len, false).await {
+                        Ok(data) => {
+                            // SAFETY: data.len() <= len（offload は len までしか読まない）
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    data.as_ptr(),
+                                    buf.write_ptr(),
+                                    data.len(),
+                                );
+                                buf.set_init(data.len());
+                            }
+                            (Ok(data.len()), buf)
+                        }
+                        Err(e) => (Err(e), buf),
+                    };
+                }
+                nowait::Read::Unsupported => {}
+            }
+        }
         let ret = unsafe {
             libc::pread(
                 fd,
@@ -253,6 +287,37 @@ impl File {
             buf.set_init(ret as usize);
         }
         (Ok(ret as usize), buf)
+    }
+
+    /// ページキャッシュに無い範囲を offload で読む（F-304）。書き込み先は閉包が持つ `Vec`（offload の途中で要求が
+    /// 取り消されても、呼び出し側のバッファへ書かない）。`exact` なら `len` まで（EOF で止まる）読み切る
+    #[cfg(target_os = "linux")]
+    async fn read_offloaded(&self, offset: u64, len: usize, exact: bool) -> io::Result<Vec<u8>> {
+        let file = match &self.inner {
+            FileInner::Shared(f) => std::sync::Arc::clone(f),
+            FileInner::Owned(f) => std::sync::Arc::new(f.try_clone()?),
+        };
+        crate::runtime::offload::offload(move || {
+            use std::os::unix::fs::FileExt;
+            let mut data = vec![0u8; len];
+            let mut n = 0;
+            while n < len {
+                match file.read_at(&mut data[n..], offset + n as u64) {
+                    Ok(0) => break,
+                    Ok(k) => {
+                        n += k;
+                        if !exact {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            data.truncate(n);
+            Ok(data)
+        })
+        .await
     }
 
     /// オフセット位置から読み取る（Windows 版: `FileExt::seek_read`）。
@@ -271,7 +336,8 @@ impl File {
         }
     }
 
-    /// オフセット位置からバッファを全部読む（Unix: pread ループ）
+    /// オフセット位置からバッファを全部読む（Unix: pread ループ。F-304: Linux は [`File::read_at`] と同じく
+    /// ページキャッシュにある分をワーカーの上で読み、残りがディスクを待つなら残りを 1 回の offload で読む）
     #[cfg(unix)]
     pub async fn read_exact_at<T: IoBufMut>(&self, mut buf: T, offset: u64) -> BufResult<usize, T> {
         use std::os::unix::io::AsRawFd;
@@ -279,6 +345,40 @@ impl File {
         let total = buf.bytes_total();
         let mut read = 0;
         while read < total {
+            #[cfg(target_os = "linux")]
+            {
+                // SAFETY: read < total なので書き込み先はバッファの中
+                let ptr = unsafe { buf.write_ptr().add(read) };
+                match nowait::pread(fd, ptr, total - read, offset + read as u64) {
+                    nowait::Read::Done(0) => break, // EOF
+                    nowait::Read::Done(n) => {
+                        read += n;
+                        continue;
+                    }
+                    nowait::Read::Miss => {
+                        match self
+                            .read_offloaded(offset + read as u64, total - read, true)
+                            .await
+                        {
+                            Ok(data) => {
+                                // SAFETY: data.len() <= total - read（offload は残りの長さまでしか読まない）
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        data.as_ptr(),
+                                        buf.write_ptr().add(read),
+                                        data.len(),
+                                    );
+                                }
+                                read += data.len();
+                            }
+                            Err(e) => return (Err(e), buf),
+                        }
+                        // offload は EOF か残り全部まで読んだ
+                        break;
+                    }
+                    nowait::Read::Unsupported => {}
+                }
+            }
             let ret = unsafe {
                 libc::pread(
                     fd,
@@ -320,6 +420,93 @@ impl File {
             buf.set_init(read);
         }
         (Ok(read), buf)
+    }
+}
+
+/// `len` バイトのファイル全体をページキャッシュだけから読む（F-304。`preadv2(RWF_NOWAIT)` なのでワーカーの上で呼べる）。
+/// ページキャッシュに無い・`RWF_NOWAIT` を受け付けない・ファイルが縮んだときは `None`（呼び出し側は offload の経路で読む）。
+/// 使うのは静的配信の本体キャッシュ（`cache` feature）だけ
+#[cfg(all(target_os = "linux", feature = "cache"))]
+pub(crate) fn read_cached_exact(file: &std::fs::File, len: usize) -> Option<Vec<u8>> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let mut buf: Vec<u8> = Vec::with_capacity(len);
+    let mut read = 0usize;
+    while read < len {
+        // SAFETY: read < len <= capacity なので書き込み先は確保済みの領域の中
+        let ptr = unsafe { buf.as_mut_ptr().add(read) };
+        match nowait::pread(fd, ptr, len - read, read as u64) {
+            nowait::Read::Done(0) => return None,
+            nowait::Read::Done(n) => read += n,
+            nowait::Read::Miss | nowait::Read::Unsupported => return None,
+        }
+    }
+    // SAFETY: 先頭 len バイトをカーネルが書いた
+    unsafe { buf.set_len(len) };
+    Some(buf)
+}
+
+/// ページキャッシュにある分だけを読む `preadv2(RWF_NOWAIT)`（F-304。Linux 4.14+）
+#[cfg(target_os = "linux")]
+mod nowait {
+    use std::io;
+    use std::os::unix::io::RawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `<linux/fs.h>` の `RWF_NOWAIT`
+    const RWF_NOWAIT: libc::c_int = 0x8;
+
+    /// `RWF_NOWAIT` を受け付けないファイル（`FMODE_NOWAIT` を持たない overlayfs・9p 等）・`preadv2` の無いカーネル・
+    /// seccomp で拒否する環境を一度でも見たか。見たら以後は従来の `pread` だけを使う（失敗する syscall を毎回足さない。
+    /// 対応するファイルシステムと混在する配置では、そちらも従来の `pread` になる）
+    static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) enum Read {
+        /// 読めた（0 は EOF）
+        Done(usize),
+        /// 先頭がページキャッシュに無い（読むにはディスクを待つ）
+        Miss,
+        /// ここでは決めない（呼び出し側の従来の `pread` が読み、エラーも従来どおりに返す）
+        Unsupported,
+    }
+
+    /// `fd` の `offset` から `ptr..ptr+len` へ、ページキャッシュにある分だけ読む
+    pub(super) fn pread(fd: RawFd, ptr: *mut u8, len: usize, offset: u64) -> Read {
+        if UNSUPPORTED.load(Ordering::Relaxed) {
+            return Read::Unsupported;
+        }
+        let iov = libc::iovec {
+            iov_base: ptr.cast(),
+            iov_len: len,
+        };
+        loop {
+            // SAFETY: ptr..ptr+len は呼び出し側が持つ書き込み可能な領域、iov はこの呼び出しの間だけ有効なスタックの値。
+            // 位置は (pos_l, pos_h) で渡す（64 ビットのカーネルは pos_l だけを使い、32 ビットは上位を pos_h から取る）
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_preadv2,
+                    fd,
+                    &iov as *const libc::iovec,
+                    1 as libc::c_int,
+                    offset as libc::c_ulong,
+                    ((offset >> 16) >> 16) as libc::c_ulong,
+                    RWF_NOWAIT,
+                )
+            };
+            if ret >= 0 {
+                return Read::Done(ret as usize);
+            }
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::EAGAIN) => Read::Miss,
+                Some(libc::EINTR) => continue,
+                Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EPERM) => {
+                    UNSUPPORTED.store(true, Ordering::Relaxed);
+                    Read::Unsupported
+                }
+                _ => Read::Unsupported,
+            };
+        }
     }
 }
 
@@ -389,8 +576,24 @@ impl OpenOptions {
         self
     }
 
+    /// 開く。F-304: 読み取り専用で経路と属性がカーネルのキャッシュにあれば（Linux）ワーカーの上でブロックせずに開き、
+    /// それ以外（ディスクを読み得る open）は offload で開く（ワーカーを塞がない）
     pub async fn open(self, path: impl AsRef<std::path::Path>) -> io::Result<File> {
         let path = path.as_ref();
+        #[cfg(target_os = "linux")]
+        if !self.write_like {
+            if let Some(res) = crate::cache::resolve::open_cached_for_request(path) {
+                return res.map(|(inner, _st)| File {
+                    inner: FileInner::Owned(inner),
+                });
+            }
+        }
+        let path = path.to_path_buf();
+        crate::runtime::offload::offload(move || self.open_blocking(&path)).await
+    }
+
+    /// 同期の open（offload の中で呼ぶ）
+    fn open_blocking(self, path: &std::path::Path) -> io::Result<File> {
         // F-123: FreeBSD capability mode 下では絶対パス open が禁止されるため、読み取り
         // 専用 open は登録済みルート dirfd 相対の openat へ切り替える（非該当・非 cap-mode
         // 時は下の通常経路。Linux/その他 OS はこのブロック自体がコンパイルされない）。
@@ -478,6 +681,89 @@ mod tests {
         let (result, _) = futures::executor::block_on(stream.write_all(data.clone()));
         assert_eq!(result.unwrap(), 5);
         assert_eq!(stream.written, data);
+    }
+
+    /// F-304: `read_at`・`read_exact_at` が位置・長さ・EOF を従来の `pread` と同じに扱うこと（ページキャッシュに
+    /// ある分は `preadv2(RWF_NOWAIT)`、無ければ offload）。ページキャッシュを捨てた後も同じ内容を返す
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_at_and_read_exact_at_match_file_contents() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f304_read.bin");
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        {
+            // 理由付き allow: テストのフィクスチャ作成（ホットパス外）
+            #[allow(clippy::disallowed_methods)]
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&data).unwrap();
+            f.sync_all().unwrap();
+        }
+        // 理由付き allow: テストのフィクスチャ（ホットパス外）
+        #[allow(clippy::disallowed_methods)]
+        let std_file = std::fs::File::open(&path).unwrap();
+        let check = |file: &File| {
+            for &(off, len) in &[(0usize, 4096usize), (70_000, 65_536), (199_000, 4096)] {
+                let (res, buf) =
+                    futures::executor::block_on(file.read_at(Vec::with_capacity(len), off as u64));
+                let n = res.unwrap();
+                assert!(n > 0 && n <= len);
+                assert_eq!(&buf[..n], &data[off..off + n]);
+            }
+            let (res, buf) =
+                futures::executor::block_on(file.read_exact_at(Vec::with_capacity(data.len()), 0));
+            assert_eq!(res.unwrap(), data.len());
+            assert_eq!(buf, data);
+            // EOF を越える長さは EOF まで
+            let (res, buf) =
+                futures::executor::block_on(file.read_exact_at(Vec::with_capacity(8192), 196_000));
+            assert_eq!(res.unwrap(), 4000);
+            assert_eq!(buf, &data[196_000..]);
+            // EOF の位置は 0
+            let (res, _) =
+                futures::executor::block_on(file.read_at(Vec::with_capacity(16), 200_000));
+            assert_eq!(res.unwrap(), 0);
+        };
+        let shared = File::from_shared(std::sync::Arc::new(std_file.try_clone().unwrap()));
+        check(&shared);
+        // ページキャッシュを捨てる（書き戻し済みのページは特権なしで捨てられる）。対応するファイルシステムでは
+        // RWF_NOWAIT が EAGAIN になり、offload の経路で読む
+        // SAFETY: 開いている fd への助言だけ
+        unsafe {
+            libc::posix_fadvise(std_file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+        let owned = File {
+            inner: FileInner::Owned(std_file),
+        };
+        check(&owned);
+    }
+
+    /// F-304: offload の読み取りは呼び出し側のバッファへ書かず、`exact` なら EOF まで・そうでなければ 1 回だけ読む
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_offloaded_reads_requested_range() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f304_offload.bin");
+        let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        // 理由付き allow: テストのフィクスチャ作成（ホットパス外）
+        #[allow(clippy::disallowed_methods)]
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&data).unwrap();
+        // 理由付き allow: テストのフィクスチャ（ホットパス外）
+        #[allow(clippy::disallowed_methods)]
+        let file = File {
+            inner: FileInner::Owned(std::fs::File::open(&path).unwrap()),
+        };
+        let got = futures::executor::block_on(file.read_offloaded(1000, 5000, true)).unwrap();
+        assert_eq!(got, &data[1000..6000]);
+        let got = futures::executor::block_on(file.read_offloaded(9000, 5000, true)).unwrap();
+        assert_eq!(got, &data[9000..]);
+        let got = futures::executor::block_on(file.read_offloaded(2000, 100, false)).unwrap();
+        assert_eq!(got, &data[2000..2100]);
+        let got = futures::executor::block_on(file.read_offloaded(10_000, 100, true)).unwrap();
+        assert!(got.is_empty());
     }
 
     #[test]

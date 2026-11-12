@@ -102,6 +102,7 @@
         "poll",
         "prctl",
         "pread64",
+        "preadv2",
         "prlimit64",
         "pwrite64",
         "read",

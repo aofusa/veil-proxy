@@ -161,6 +161,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     6, // lstat (DNS解決: シンボリックリンク確認)
     8, // lseek
     17, // pread64
+    327, // preadv2 (静的配信のページキャッシュだけの読み取り RWF_NOWAIT。F-304)
     18, // pwrite64
     19, // readv
     20, // writev
@@ -321,6 +322,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     6, // lstat (DNS解決: シンボリックリンク確認)
     8, // lseek
     17, // pread64
+    327, // preadv2 (静的配信のページキャッシュだけの読み取り RWF_NOWAIT。F-304)
     18, // pwrite64
     19, // readv
     20, // writev
@@ -501,6 +503,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     65,  // readv
     66,  // writev
     67,  // pread64
+    286, // preadv2 (静的配信のページキャッシュだけの読み取り RWF_NOWAIT。F-304)
     68,  // pwrite64
     71,  // sendfile (kTLS ゼロコピー転送)
     73,  // ppoll (DNS応答待機)
@@ -653,6 +656,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     65,  // readv
     66,  // writev
     67,  // pread64
+    286, // preadv2 (静的配信のページキャッシュだけの読み取り RWF_NOWAIT。F-304)
     68,  // pwrite64
     71,  // sendfile (kTLS ゼロコピー転送)
     73,  // ppoll (DNS応答待機 + reactor の readiness try-first チェック)
@@ -4865,6 +4869,10 @@ mod tests {
             ("restart_syscall", libc::SYS_restart_syscall),
             ("futex", libc::SYS_futex),
             ("openat2", libc::SYS_openat2),
+            // F-304: 静的配信のページキャッシュだけの読み取り（RWF_NOWAIT）・属性（AT_STATX_DONT_SYNC）
+            ("preadv2", libc::SYS_preadv2),
+            ("statx", libc::SYS_statx),
+            ("fcntl", libc::SYS_fcntl),
             ("eventfd2", libc::SYS_eventfd2),
             // glibc 2.35+ は新しいスレッドごとに rseq を登録し、EPERM だと abort する（B-156。aarch64 に無かった）
             ("rseq", libc::SYS_rseq),

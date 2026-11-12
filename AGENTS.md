@@ -120,6 +120,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   絶対シンボリックリンクは Linux=`EXDEV`・FreeBSD=`ENOTCAPABLE` で拒否されるので、その場合だけ従来経路で再判定する（B-89）。
 - FreeBSD の静的配信はヘッダも `sendfile(2)` の `sf_hdtr` で 1 syscall（平文 HTTP/1.1 のみ。TLS 経路に通すと平文漏洩。F-155）。
 - HTTP/2・HTTP/3 の静的配信は `static_file_cache` と `open_file_cache` をセットで有効にして初めて offload ゼロになる（F-157）。
+- Linux の静的配信の open・`statx`・読み取りは、カーネルのキャッシュで済むときだけワーカーの上で行う（`openat2` の
+  `RESOLVE_CACHED`・`preadv2(RWF_NOWAIT)`。`EAGAIN`・非対応はその場で offload へ回す。ブロックし得る形で呼ばない。F-304）。
 - FreeBSD の平文 h2c は、静的コンテンツキャッシュの本体（共有メモリ。`cache::shm`）の DATA を `sendfile(2)` + `sf_hdtr`
   で送る（`Http2Connection::enable_zero_copy` は平文の h2c のリスナーだけで呼ぶ。TLS で呼ぶと平文漏洩。F-240）。
 - HTTP/2 の要求は、HEADERS の直後に END_STREAM 付き DATA の全量が読み取りバッファに見えていれば溜める経路で起動する（本文の

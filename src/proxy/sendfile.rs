@@ -675,13 +675,10 @@ pub(super) async fn handle_sendfile_userspace(
     #[cfg(all(veil_ktls, target_os = "linux"))]
     let header_buf = header_buf.unwrap_or_default();
 
-    // ヘッダー送信（タイムアウト付き。平文で sendfile(2) に対応しないファイルはヘッダを送り済み）
-    if !header_buf.is_empty() {
-        let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
-        if !matches!(write_result, Ok((Ok(_), _))) {
-            return None;
-        }
-    }
+    // ヘッダは本文の最初の塊と一緒に送る（rustls は両方を送信キューへ積んで writev 1 回、平文は sendmsg 1 回。以前は
+    // ヘッダを先に別に書いていたので、1 応答に書き込みが 1 回・TLS のレコードが 1 つ多かった。F-304）。平文で sendfile(2)
+    // に対応しないファイルはヘッダを送り済み（空）
+    let mut header = (!header_buf.is_empty()).then_some(header_buf);
 
     let mut total_sent = 0u64;
     let mut offset = transfer_offset as u64;
@@ -712,18 +709,42 @@ pub(super) async fn handle_sendfile_userspace(
         returned_buf.set_valid_len(n);
         let write_buf = returned_buf.into_truncated();
 
-        let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(write_buf)).await;
+        let with_header = header.is_some();
+        let write_result = match header.take() {
+            Some(h) => timeout(WRITE_TIMEOUT, tls_stream.write_all_vectored(h, write_buf))
+                .await
+                .map(|(res, _, returned)| (res, returned)),
+            None => timeout(WRITE_TIMEOUT, tls_stream.write_all(write_buf))
+                .await
+                .map(|(res, returned)| (res.map(|_| ()), returned)),
+        };
         match write_result {
-            Ok((Ok(_), returned)) => {
+            Ok((Ok(()), returned)) => {
                 buf_put_vec(returned);
                 total_sent += n as u64;
                 offset += n as u64;
             }
+            // ヘッダを送れなかった（接続は使えない）
+            Ok((Err(_), returned)) if with_header => {
+                buf_put_vec(returned);
+                return None;
+            }
+            Err(_) if with_header => return None,
             Ok((Err(_), returned)) => {
                 buf_put_vec(returned);
                 break;
             }
             Err(_) => break,
+        }
+    }
+
+    // 本文を 1 バイトも読めなかった（読み取りの失敗・ファイルが縮んだ）: ヘッダだけ送って閉じる（従来と同じ）
+    if let Some(h) = header {
+        if !matches!(
+            timeout(WRITE_TIMEOUT, tls_stream.write_all(h)).await,
+            Ok((Ok(_), _))
+        ) {
+            return None;
         }
     }
 

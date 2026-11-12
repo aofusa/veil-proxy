@@ -127,13 +127,14 @@ impl ReusableFileInfo {
         self.file_size == len && self.last_modified == modified
     }
 
-    /// 開き直したファイルが前のエントリと同じ版なら、前のエントリの fd（B-348）
+    /// 開き直したファイル（大きさ `len`・更新時刻 `modified`）が前のエントリと同じ版なら、前のエントリの fd（B-348）
     #[inline]
     pub(crate) fn fd_of_same_version(
         &self,
-        meta: &std::fs::Metadata,
+        len: u64,
+        modified: Option<SystemTime>,
     ) -> Option<std::sync::Arc<std::fs::File>> {
-        if self.same_version(meta.len(), meta.modified().ok()) {
+        if self.same_version(len, modified) {
             self.shared_file.clone()
         } else {
             None
@@ -159,40 +160,43 @@ impl CachedFileInfo {
         meta: &std::fs::Metadata,
         prev: Option<&ReusableFileInfo>,
     ) -> Self {
-        let modified = meta.modified().ok();
+        Self::from_open_attrs(path, meta.len(), meta.modified().ok(), meta.is_file(), prev)
+    }
+
+    /// 開いたファイルの属性（大きさ・更新時刻・通常ファイルか）から構築する（[`Self::from_open_metadata`] の本体。
+    /// F-304 の `statx` の値からも作る）
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub(crate) fn from_open_attrs(
+        path: &Path,
+        len: u64,
+        modified: Option<SystemTime>,
+        is_file: bool,
+        prev: Option<&ReusableFileInfo>,
+    ) -> Self {
         // 同じパスの前のエントリがあれば MIME はそのまま、検証子は大きさと更新時刻が同じならそのまま使う
         // （open_file_cache だけのルートは要求ごとにここを通る。作り直すと MIME の推測と検証子の組み立てが毎回走る）
         let (mime_type, validators) = match prev {
-            Some(p) if p.same_version(meta.len(), modified) => {
-                (p.mime_type.clone(), p.validators.clone())
-            }
+            Some(p) if p.same_version(len, modified) => (p.mime_type.clone(), p.validators.clone()),
             Some(p) => (
                 p.mime_type.clone(),
-                crate::static_response::Validators::shared_for_file(
-                    meta.len(),
-                    modified,
-                    &p.mime_type,
-                ),
+                crate::static_response::Validators::shared_for_file(len, modified, &p.mime_type),
             ),
             None => {
                 let mime_type: std::sync::Arc<str> = crate::static_response::intern_mime(
                     mime_guess::from_path(path).first_or_octet_stream().as_ref(),
                 );
-                let validators = crate::static_response::Validators::shared_for_file(
-                    meta.len(),
-                    modified,
-                    &mime_type,
-                );
+                let validators =
+                    crate::static_response::Validators::shared_for_file(len, modified, &mime_type);
                 (mime_type, validators)
             }
         };
         Self {
             canonical_path: path.into(),
-            file_size: meta.len(),
+            file_size: len,
             validators,
             mime_type,
             last_modified: modified,
-            is_file: meta.is_file(),
+            is_file,
             shared_file: None,
             cached_at: Instant::now(),
             stamp: None,
@@ -412,6 +416,28 @@ impl OpenFileCache {
     // 理由付き allow: 同期 FS は offload 閉包内（専用ワーカースレッド）で実行され、イベントループを塞がない。
     #[allow(clippy::disallowed_methods)]
     pub(crate) async fn fetch_file_info(&self, path: &Path) -> Option<CachedFileInfo> {
+        // F-304: 経路と属性がカーネルのキャッシュにあれば（静的配信のほぼ全部）ワーカーの上でブロックせずに開く。
+        // offload の往復（プールのスレッドへの受け渡しと完了の通知）を省く。I/O が要るときだけ下の offload へ
+        #[cfg(target_os = "linux")]
+        if let Some(res) = crate::cache::resolve::open_cached_for_request(path) {
+            return match res {
+                Ok((file, st)) => {
+                    let mut info = CachedFileInfo::from_open_attrs(
+                        path,
+                        st.len,
+                        st.modified,
+                        st.is_file,
+                        None,
+                    );
+                    if st.is_file {
+                        info.set_shared_file(std::sync::Arc::new(file));
+                    }
+                    Some(info)
+                }
+                // 登録済みルートの配下で「無い」等と決まった（下の offload の経路の Err と同じく未検出）
+                Err(_) => None,
+            };
+        }
         let path = path.to_path_buf();
         crate::runtime::offload::offload(move || {
             // F-153: カーネル封じ込め（openat2/capsicum）による解決を優先する。

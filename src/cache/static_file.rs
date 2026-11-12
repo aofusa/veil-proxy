@@ -250,19 +250,31 @@ pub async fn get_static_file_with_content(
             // containment が不要な場合（固定ファイルルート）は余分な確保をしない。
             let owned_root: Option<PathBuf> = containment.map(|c| c.root.to_path_buf());
             let limit = cache_limit(content_cfg);
-            // 理由付き allow: offload 専用ワーカースレッド内で実行され、イベントループを
-            // ブロックしない（F-153 の open_beneath_for_request/open_static_ro と同じ許容箇所）。
-            #[allow(clippy::disallowed_methods)]
-            let loaded = crate::runtime::offload::offload(move || {
-                open_and_read_fast(
-                    &owned,
-                    owned_root.as_deref(),
-                    reuse.as_ref(),
-                    limit,
-                    keep_fd,
-                )
-            })
-            .await;
+            // F-304: 経路・属性・本体がカーネルのキャッシュにあれば、ワーカーの上でブロックせずに開いて読む（offload の往復と、
+            // HTTP/3 で応答が 1 周回遅れるのを無くす）。ディスクを待つときだけ下の offload で読む
+            #[cfg(target_os = "linux")]
+            let on_worker =
+                open_and_read_cached(path, owned_root.as_deref(), reuse.as_ref(), limit, keep_fd);
+            #[cfg(not(target_os = "linux"))]
+            let on_worker: Option<Option<FastOutcome>> = None;
+            let loaded = match on_worker {
+                Some(loaded) => loaded,
+                // 理由付き allow: offload 専用ワーカースレッド内で実行され、イベントループを
+                // ブロックしない（F-153 の open_beneath_for_request/open_static_ro と同じ許容箇所）。
+                #[allow(clippy::disallowed_methods)]
+                None => {
+                    crate::runtime::offload::offload(move || {
+                        open_and_read_fast(
+                            &owned,
+                            owned_root.as_deref(),
+                            reuse.as_ref(),
+                            limit,
+                            keep_fd,
+                        )
+                    })
+                    .await
+                }
+            };
             let outcome = loaded?;
 
             match outcome {
@@ -501,6 +513,47 @@ fn open_and_read_fast(
     }
 }
 
+/// [`open_and_read_fast`] をワーカーの上で行う（F-304）。経路と属性（`openat2(RESOLVE_CACHED)` と `statx`）と本体
+/// （`preadv2(RWF_NOWAIT)`）がカーネルのキャッシュにあるときだけ結果を返し（`Some`。中身は `open_and_read_fast` と同じ意味）、
+/// ディスクを待つ・使えないときは `None`（呼び出し側は offload で `open_and_read_fast` を呼ぶ。開いた fd はここで閉じる）
+#[cfg(target_os = "linux")]
+fn open_and_read_cached(
+    path: &Path,
+    root: Option<&Path>,
+    prev: Option<&file_cache::ReusableFileInfo>,
+    cache_limit: u64,
+    keep_fd: bool,
+) -> Option<Option<FastOutcome>> {
+    let opened = match root {
+        Some(root) => resolve::open_cached_in_root(root, path),
+        None => resolve::open_cached_for_request(path),
+    }?;
+    let (file, st) = match opened {
+        Ok(v) => v,
+        // 登録済みルート配下と判定された上での失敗（404 相当。`open_and_read_fast` と同じ）
+        Err(_) => return Some(None),
+    };
+    let mut info = CachedFileInfo::from_open_attrs(path, st.len, st.modified, st.is_file, prev);
+    if !info.is_file {
+        return Some(Some(FastOutcome::Directory(info)));
+    }
+    // B-321: キャッシュに入らない大きさなら、読む前に読む量を予約する（読めずに offload へ回すときは予約を戻す）
+    let Ok(reserved) = reserve_uncached(st.len, cache_limit) else {
+        return Some(Some(FastOutcome::Busy));
+    };
+    let data = crate::runtime::io::read_cached_exact(&file, usize::try_from(st.len).ok()?)?;
+    if keep_fd {
+        let fd = prev
+            .and_then(|p| p.fd_of_same_version(st.len, st.modified))
+            .unwrap_or_else(|| std::sync::Arc::new(file));
+        info.set_shared_file(fd);
+    }
+    Some(Some(FastOutcome::File(
+        info,
+        charge(Bytes::from(data), reserved),
+    )))
+}
+
 /// open+fstat 直後・本体を読む前にディレクトリ判定を行い、問題なければ本体を
 /// 読み込む（F-154: per-route 封じ込め検査は `open_and_read_fast` 側の
 /// `open_beneath_in_root`/`open_beneath_for_request` の呼び分けに移った。
@@ -529,7 +582,7 @@ fn finish_fast(
     // （本体キャッシュの無いルートは要求ごとにここを通る。毎回新しい fd に替えると、前の fd を閉じる close(2) がワーカーで走る）
     if keep_fd {
         let fd = prev
-            .and_then(|p| p.fd_of_same_version(&meta))
+            .and_then(|p| p.fd_of_same_version(meta.len(), meta.modified().ok()))
             .unwrap_or_else(|| std::sync::Arc::new(file));
         info.set_shared_file(fd);
     }
@@ -1127,7 +1180,14 @@ mod tests {
         // 高速経路が使えるプラットフォーム（Linux/FreeBSD）でのみ、offload が
         // 1 回で済むことを主張する。それ以外のプラットフォームは元々フォールバック
         // 経路（2 回 offload）しか持たないため、この主張自体が成立しない。
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        // F-304: Linux は経路・属性・本体がカーネルのキャッシュにあればワーカーの上で開いて読むので 0 回
+        // （RESOLVE_CACHED・RWF_NOWAIT の無いカーネル・ファイルシステムでは従来どおり 1 回）
+        #[cfg(target_os = "linux")]
+        assert!(
+            call_count <= 1,
+            "登録済みディレクトリルート配下のファイルは offload 1 回以内で完結するべき: {call_count}"
+        );
+        #[cfg(target_os = "freebsd")]
         assert_eq!(
             call_count, 1,
             "登録済みディレクトリルート配下のファイルは offload 1 回で完結するべき"
@@ -1300,5 +1360,142 @@ mod tests {
         let mut buf = String::new();
         std::io::Read::read_to_string(&mut file, &mut buf).unwrap();
         assert_eq!(buf, "normal file");
+    }
+
+    /// F-304: 登録済みルート配下の（キャッシュにある）ファイルはワーカーの上で開け、属性が `metadata` と一致し、
+    /// 返す fd は `O_NONBLOCK` を外してあること。`RESOLVE_CACHED` の無いカーネル（5.12 未満）では `None`（従来の経路）
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_cached_opens_registered_file_with_matching_attributes() {
+        use std::os::unix::io::AsRawFd;
+        let roots = registered_test_roots();
+        let path = write_file_in(roots.dirs[0].path(), "f304_cached.txt", b"cached open");
+        // 理由付き allow: テストの比較対象（ホットパス外）
+        #[allow(clippy::disallowed_methods)]
+        let meta = std::fs::metadata(&path).unwrap();
+        let Some(res) = resolve::open_cached_for_request(&path) else {
+            eprintln!("skip: RESOLVE_CACHED is not available on this kernel");
+            return;
+        };
+        let (file, st) = res.expect("a cached file under a registered root opens");
+        assert!(st.is_file);
+        assert_eq!(st.len, 11);
+        assert_eq!(st.modified, meta.modified().ok());
+        // SAFETY: 開いている fd の状態フラグを読むだけ
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "regular files keep blocking semantics"
+        );
+        let mut buf = [0u8; 11];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"cached open");
+    }
+
+    /// F-304: HTTP/2・HTTP/3 の静的配信（本体キャッシュ無し）は、ページキャッシュにある本体をワーカーの上で読み
+    /// （offload 0 回）、ページキャッシュを捨てた後は offload で同じ中身を読むこと
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn content_path_reads_on_worker_and_falls_back_after_page_cache_drop() {
+        use std::os::unix::io::AsRawFd;
+        let roots = registered_test_roots();
+        let public_root = roots.dirs[0].path();
+        let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 253) as u8).collect();
+        let file_path = write_file_in(public_root, "f304_body.bin", &payload);
+        let ofc = test_ofc();
+        let content_cfg = StaticContentCacheConfig {
+            enabled: false,
+            ..test_content_cfg()
+        };
+        let canonical_public = public_root.canonicalize().unwrap();
+        let fetch = || {
+            block_on_fresh_thread(|| {
+                reset_offload_call_count();
+                let r = futures::executor::block_on(get_static_file_with_content(
+                    &file_path,
+                    Some(&ofc),
+                    &content_cfg,
+                    Some(RouteContainment {
+                        root: public_root,
+                        canonical_base: Some(canonical_public.as_path()),
+                    }),
+                ));
+                (r, offload_call_count())
+            })
+        };
+        let body = |r: Option<StaticFileOutcome>| match r {
+            Some(StaticFileOutcome::File(_, data)) => data,
+            _ => panic!("a regular file under the route must be served"),
+        };
+        let (r, worker_calls) = fetch();
+        assert_eq!(body(r).as_ref(), payload.as_slice());
+        // 理由付き allow: テストのフィクスチャ（ホットパス外）
+        #[allow(clippy::disallowed_methods)]
+        let f = std::fs::File::open(&file_path).unwrap();
+        f.sync_all().unwrap();
+        // SAFETY: 開いている fd への助言だけ（書き戻し済みのページは特権なしで捨てられる）
+        unsafe {
+            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+        let (r, _) = fetch();
+        assert_eq!(body(r).as_ref(), payload.as_slice());
+        // ページキャッシュにある本体はワーカーの上で読む（RESOLVE_CACHED・RWF_NOWAIT の無い環境は 1 回）
+        assert!(worker_calls <= 1, "{worker_calls}");
+    }
+
+    /// F-304: 名前付きパイプは相手を待たずに開け（ワーカーを止めない）、通常ファイルとして扱わないこと
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_cached_does_not_block_on_fifo() {
+        let roots = registered_test_roots();
+        let fifo = roots.dirs[0].path().join("f304_fifo");
+        // 理由付き allow: テストのフィクスチャ作成（ホットパス外）
+        #[allow(clippy::disallowed_methods)]
+        let _ = std::fs::remove_file(&fifo);
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: NUL 終端のパスで名前付きパイプを作るだけ
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let r = resolve::open_cached_for_request(&p).map(|r| r.map(|(_, st)| st.is_file));
+            let _ = tx.send(r.map(|r| r.ok()));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening a FIFO must not wait for a writer");
+        // 開けたなら通常ファイルではない（RESOLVE_CACHED の無いカーネルでは None）
+        assert!(matches!(got, None | Some(Some(false))), "{got:?}");
+    }
+
+    /// F-304: ルートの外へ出る経路（`..`・絶対シンボリックリンク）と登録されていないパスは開かない
+    /// （`None` = 従来の経路が判定する。カーネルが拒否するので Ok にはならない）
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_cached_never_escapes_registered_root() {
+        let roots = registered_test_roots();
+        let root_a = roots.dirs[0].path();
+        let outside = tempdir().unwrap();
+        let secret = write_file(&outside, "f304_secret.txt", b"secret");
+        let dotdot = root_a.join("..").join(
+            secret
+                .strip_prefix(root_a.parent().unwrap())
+                .unwrap_or(secret.as_path()),
+        );
+        assert!(!matches!(
+            resolve::open_cached_for_request(&dotdot),
+            Some(Ok(_))
+        ));
+        let link = root_a.join("f304_abs_link");
+        // 理由付き allow: テストのフィクスチャ作成（ホットパス外）
+        #[allow(clippy::disallowed_methods)]
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert!(!matches!(
+            resolve::open_cached_for_request(&link),
+            Some(Ok(_))
+        ));
+        assert!(resolve::open_cached_for_request(&secret).is_none());
     }
 }

@@ -147,6 +147,40 @@ pub fn open_beneath_for_request(full_path: &Path) -> Option<io::Result<(File, Me
     }
 }
 
+/// 開いたファイルの属性（[`open_cached_for_request`]。`statx(2)` の `AT_STATX_DONT_SYNC` で得る）
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+pub struct CachedStat {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
+    pub is_file: bool,
+}
+
+/// ワーカーの上でブロックせずに開く（F-304。Linux 5.12+）。
+///
+/// [`open_beneath_for_request`] と同じ登録済みルートの dirfd へ `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS |
+/// RESOLVE_CACHED)` を発行する。`RESOLVE_CACHED` は経路の解決がカーネルのキャッシュ（dentry）だけで済まないとき
+/// （ディスクの読み込み・再検証が要るとき）は `EAGAIN` を返すので、ブロックしない。属性は
+/// `statx(AT_STATX_DONT_SYNC)`（ネットワークのファイルシステムでもサーバへ問い合わせない）。名前付きパイプ・デバイスの
+/// open で相手を待たないよう `O_NONBLOCK` で開き、通常ファイルだけ開いた後で外す（返す fd の状態は従来の経路と同じ）。
+///
+/// - `Some(Ok(..))`: 開けた。`Some(Err(..))`: 登録済みルートの配下で、キャッシュだけで「無い」等と決まった（404 相当）。
+/// - `None`: ここでは決められない（キャッシュに無い・古いカーネル・未登録のルート・`EXDEV` 等で再判定が要る）。
+///   呼び出し側は従来の offload の経路（[`open_beneath_for_request`]）へ進むこと。
+#[cfg(target_os = "linux")]
+pub fn open_cached_for_request(full_path: &Path) -> Option<io::Result<(File, CachedStat)>> {
+    linux_impl::open_cached(None, full_path)
+}
+
+/// [`open_cached_for_request`] のルート指定版（F-154 の [`open_beneath_in_root`] と同じく、`root` の dirfd だけで開く）
+#[cfg(target_os = "linux")]
+pub fn open_cached_in_root(
+    root: &Path,
+    full_path: &Path,
+) -> Option<io::Result<(File, CachedStat)>> {
+    linux_impl::open_cached(Some(root), full_path)
+}
+
 /// 「このルートの」dirfd に対して相対 open する（F-154）。
 ///
 /// `open_beneath_for_request` と異なり、探索対象を **呼び出し側が指定した `root` 一つ**
@@ -594,6 +628,165 @@ mod linux_impl {
             }
         }
         None
+    }
+
+    /// `RESOLVE_CACHED`（Linux 5.12+）が使えないと分かったか（`EINVAL` を一度でも観測したら true）
+    static RESOLVE_CACHED_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+    /// `<linux/openat2.h>` の `RESOLVE_CACHED`
+    const RESOLVE_CACHED: u64 = 0x20;
+    /// `<linux/fcntl.h>` の `AT_STATX_DONT_SYNC`（キャッシュの属性をそのまま返す）
+    const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
+    /// `<linux/stat.h>` の `STATX_TYPE | STATX_MODE | STATX_MTIME | STATX_SIZE`
+    const STATX_WANTED: u32 = 0x1 | 0x2 | 0x40 | 0x200;
+    const STATX_MTIME: u32 = 0x40;
+
+    /// `<linux/stat.h>` の `struct statx_timestamp`
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct StatxTimestamp {
+        tv_sec: i64,
+        tv_nsec: u32,
+        reserved: i32,
+    }
+
+    /// `<linux/stat.h>` の `struct statx`（256 バイト。`libc` クレートの定義は glibc と musl で揃っていないので
+    /// 自前で持つ。ABI は安定。読むのは mask・mode・size・mtime だけで、残りはカーネルが書く領域として持つ）
+    #[repr(C)]
+    #[derive(Default)]
+    struct Statx {
+        mask: u32,
+        blksize: u32,
+        attributes: u64,
+        nlink: u32,
+        uid: u32,
+        gid: u32,
+        mode: u16,
+        spare0: u16,
+        ino: u64,
+        size: u64,
+        blocks: u64,
+        attributes_mask: u64,
+        atime: StatxTimestamp,
+        btime: StatxTimestamp,
+        ctime: StatxTimestamp,
+        mtime: StatxTimestamp,
+        rest: [u64; 16],
+    }
+
+    const _: () = assert!(std::mem::size_of::<Statx>() == 256);
+
+    /// 開いている fd の属性をキャッシュから読む（ブロックしない）
+    fn statx_dont_sync(fd: RawFd) -> io::Result<super::CachedStat> {
+        let mut st = Statx::default();
+        // SAFETY: fd は呼び出し側が持つ有効な fd。パスは空の C 文字列（AT_EMPTY_PATH で fd 自身を指す）、
+        // st は 256 バイトの書き込み先
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                fd,
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | AT_STATX_DONT_SYNC,
+                STATX_WANTED,
+                &mut st as *mut Statx as *mut libc::c_void,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(super::CachedStat {
+            len: st.size,
+            modified: (st.mask & STATX_MTIME != 0)
+                .then(|| statx_time(st.mtime))
+                .flatten(),
+            is_file: u32::from(st.mode) & libc::S_IFMT == libc::S_IFREG,
+        })
+    }
+
+    /// `statx_timestamp` を `SystemTime` へ（`std::fs::Metadata::modified` と同じ値）
+    fn statx_time(t: StatxTimestamp) -> Option<std::time::SystemTime> {
+        let nanos = std::time::Duration::from_nanos(u64::from(t.tv_nsec));
+        if t.tv_sec >= 0 {
+            std::time::SystemTime::UNIX_EPOCH
+                .checked_add(std::time::Duration::from_secs(t.tv_sec as u64))?
+                .checked_add(nanos)
+        } else {
+            std::time::SystemTime::UNIX_EPOCH
+                .checked_sub(std::time::Duration::from_secs(t.tv_sec.unsigned_abs()))?
+                .checked_add(nanos)
+        }
+    }
+
+    /// [`super::open_cached_for_request`]・[`super::open_cached_in_root`] の Linux 実装（F-304）。要求ごとに確保しない
+    /// （パスはスタックへ写す）
+    pub(super) fn open_cached(
+        root: Option<&Path>,
+        full_path: &Path,
+    ) -> Option<io::Result<(File, super::CachedStat)>> {
+        if openat2_unavailable() || RESOLVE_CACHED_UNAVAILABLE.load(Ordering::Relaxed) {
+            return None;
+        }
+        let roots = LINUX_ROOTS.get()?;
+        let r = match root {
+            // ルート指定（`open_in_root` と同じ。そのルートの dirfd だけ）
+            Some(root) => roots.iter().find(|r| r.root == root)?,
+            // `open_for_request` と同じルート（前方一致した最初の = 最も深いもの）
+            None => roots.iter().find(|r| full_path.starts_with(&r.root))?,
+        };
+        let rel = full_path.strip_prefix(&r.root).ok()?.as_os_str().as_bytes();
+        let rel = if rel.is_empty() { b".".as_slice() } else { rel };
+        let mut buf = [0u8; 1024];
+        // 長いパス・NUL を含むパスは従来の経路で扱う
+        if rel.len() >= buf.len() || rel.contains(&0) {
+            return None;
+        }
+        buf[..rel.len()].copy_from_slice(rel);
+        // O_NONBLOCK: 名前付きパイプ・デバイスの open は相手を待って止まる（RESOLVE_CACHED は経路の解決だけを縛る）。
+        // 通常ファイルは開いた後で外す（配信の sendfile・pread の振る舞いを従来の fd と揃える）
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64,
+            mode: 0,
+            resolve: libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | RESOLVE_CACHED,
+        };
+        // SAFETY: dirfd は登録済みのルートの fd（プロセスの終わりまで開いている）。buf は NUL 終端の
+        // パス（上で長さを確かめた）、how はこの呼び出しの間だけ有効なスタックの値
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                r.dirfd,
+                buf.as_ptr(),
+                &how as *const OpenHow as *const libc::c_void,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                // 解決にディスクの読み込み・再検証が要る: offload の経路で開く
+                Some(libc::EAGAIN) => None,
+                // RESOLVE_CACHED を知らないカーネル（5.12 未満）。以後は試さない
+                Some(libc::EINVAL) => {
+                    RESOLVE_CACHED_UNAVAILABLE.store(true, Ordering::Relaxed);
+                    None
+                }
+                // openat2 が使えない・このパスだけ再判定が要る（EXDEV/ELOOP）: offload の経路が判定と記録をする
+                _ if is_unsupported(&e) || is_retry_fallback(&e) => None,
+                _ => Some(Err(e)),
+            };
+        }
+        let fd = ret as RawFd;
+        // SAFETY: openat2 が返した所有権のある有効な fd
+        let file = unsafe { File::from_raw_fd(fd) };
+        let st = match statx_dont_sync(fd) {
+            Ok(st) => st,
+            // 属性が読めない: 閉じて従来の経路へ
+            Err(_) => return None,
+        };
+        // SAFETY: fd は上で開いた有効な fd。F_SETFL の 0 は O_NONBLOCK を外す（他の状態フラグは付けていない）
+        if st.is_file && unsafe { libc::fcntl(fd, libc::F_SETFL, 0) } < 0 {
+            return None;
+        }
+        Some(Ok((file, st)))
     }
 
     /// ルートを毎回新規 open する汎用版（テスト・アドホック呼び出し向け）。
