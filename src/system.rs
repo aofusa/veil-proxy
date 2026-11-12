@@ -814,11 +814,19 @@ const SKF_AD_CPU: u32 = 36;
 /// BPF命令列（sock_filter配列）
 #[cfg(target_os = "linux")]
 pub(crate) fn create_reuseport_cbpf_program(num_workers: u32) -> Vec<libc::sock_filter> {
+    create_reuseport_cbpf_range_program(0, num_workers)
+}
+
+/// グループの添字 `base..base + count` へだけ振り分ける CBPF プログラムを生成する（`base + hash % count`）。
+/// `base` が 0 のときは [`create_reuseport_cbpf_program`] の 5 命令と同じ（加算の命令を入れない）。
+/// 接続の集約（F-303）が、増やしたワーカーへだけ新しい接続を受けさせるときに使う。
+#[cfg(target_os = "linux")]
+pub(crate) fn create_reuseport_cbpf_range_program(base: u32, count: u32) -> Vec<libc::sock_filter> {
     // 0 除算を避けるため、num_workers は最低 1 として扱う（呼び出し側では
     // ワーカー数 0 は発生しないはずだが、ここでも防御的にガードする）。
-    let num_workers = num_workers.max(1);
+    let num_workers = count.max(1);
 
-    vec![
+    let mut program = vec![
         // LD A, [SKF_AD_OFF + SKF_AD_RXHASH]: skb->hash（フロー4タプルハッシュ）を読み込み
         libc::sock_filter {
             code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
@@ -848,14 +856,24 @@ pub(crate) fn create_reuseport_cbpf_program(num_workers: u32) -> Vec<libc::sock_
             jf: 0,
             k: num_workers,
         },
-        // RET A: Aレジスタの値（ソケットインデックス）を返す
-        libc::sock_filter {
-            code: (libc::BPF_RET | libc::BPF_A) as u16,
+    ];
+    // ALU ADD #base: A = A + base（範囲の先頭へずらす。F-303）
+    if base > 0 {
+        program.push(libc::sock_filter {
+            code: (libc::BPF_ALU | libc::BPF_ADD | libc::BPF_K) as u16,
             jt: 0,
             jf: 0,
-            k: 0,
-        },
-    ]
+            k: base,
+        });
+    }
+    // RET A: Aレジスタの値（ソケットインデックス）を返す
+    program.push(libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_A) as u16,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    });
+    program
 }
 
 /// CBPFプログラムをソケットにアタッチする
@@ -871,8 +889,21 @@ pub(crate) fn create_reuseport_cbpf_program(num_workers: u32) -> Vec<libc::sock_
 /// 成功時はOk(()), 失敗時はエラー
 #[cfg(target_os = "linux")]
 pub(crate) fn attach_reuseport_cbpf(fd: i32, num_workers: usize) -> io::Result<()> {
-    let program = create_reuseport_cbpf_program(num_workers as u32);
+    attach_cbpf_program(fd, &create_reuseport_cbpf_program(num_workers as u32))
+}
 
+/// グループの添字 `base..base + count` へだけ振り分ける CBPF プログラムをアタッチする（F-303）。
+/// 付け替えはカーネルがプログラムを入れ替えるだけで、受理は止まらない
+#[cfg(target_os = "linux")]
+pub(crate) fn attach_reuseport_cbpf_range(fd: i32, base: usize, count: usize) -> io::Result<()> {
+    attach_cbpf_program(
+        fd,
+        &create_reuseport_cbpf_range_program(base as u32, count as u32),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn attach_cbpf_program(fd: i32, program: &[libc::sock_filter]) -> io::Result<()> {
     #[repr(C)]
     struct SockFprog {
         len: u16,
@@ -991,6 +1022,35 @@ mod tests {
 
         // 命令4: RET A
         assert_eq!(program[4].code, (libc::BPF_RET | libc::BPF_A) as u16);
+    }
+
+    /// 範囲の振り分け（F-303）は MOD の後に ADD #base を挟む。base 0 は従来の 5 命令と同じ
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_create_reuseport_cbpf_range_program_adds_base() {
+        assert_eq!(
+            create_reuseport_cbpf_range_program(0, 4)
+                .iter()
+                .map(|i| (i.code, i.k))
+                .collect::<Vec<_>>(),
+            create_reuseport_cbpf_program(4)
+                .iter()
+                .map(|i| (i.code, i.k))
+                .collect::<Vec<_>>()
+        );
+        let program = create_reuseport_cbpf_range_program(4, 2);
+        assert_eq!(program.len(), 6);
+        assert_eq!(
+            program[3].code,
+            (libc::BPF_ALU | libc::BPF_MOD | libc::BPF_K) as u16
+        );
+        assert_eq!(program[3].k, 2);
+        assert_eq!(
+            program[4].code,
+            (libc::BPF_ALU | libc::BPF_ADD | libc::BPF_K) as u16
+        );
+        assert_eq!(program[4].k, 4);
+        assert_eq!(program[5].code, (libc::BPF_RET | libc::BPF_A) as u16);
     }
 
     /// num_workers == 0 は max(1) でガードされ、0除算にならないこと。

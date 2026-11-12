@@ -444,6 +444,26 @@ pub(crate) static HTTP3_ACTIVE_STREAMS: Lazy<prometheus::IntGauge> = Lazy::new(|
     gauge
 });
 
+// 接続を集約しているワーカーの数（リスナーごと。F-303）。変わったときだけ書く（要求の経路には載らない）
+#[cfg(feature = "metrics")]
+static ACTIVE_WORKERS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "active_workers",
+        "Number of workers receiving new connections on each listener",
+    )
+    .namespace("veil_proxy");
+    let gauge = IntGaugeVec::new(opts, &["listener"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// リスナーの新しい接続を受けるワーカーの数を記録する（F-303）
+#[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
+pub(crate) fn set_active_workers(listener: &str, n: usize) {
+    #[cfg(feature = "metrics")]
+    ACTIVE_WORKERS.with_label_values(&[listener]).set(n as i64);
+}
+
 // ====================
 // アロケーション計測ゲージ（F-165 Phase 1、`alloc-stats` feature）
 // ====================

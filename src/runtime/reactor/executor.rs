@@ -486,7 +486,11 @@ fn park(timeout: Option<Duration>) {
     }
     let n = EVENT_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
-        match with_poller(|p| p.wait(&mut buf, timeout_ms_ceil(timeout))) {
+        // F-303: park の時間を測る（ワーカーの使用率。ワーカー以外のスレッドでは何もしない）
+        let park_started = crate::active_workers::park_begin();
+        let waited = with_poller(|p| p.wait(&mut buf, timeout_ms_ceil(timeout)));
+        crate::active_workers::park_end(park_started);
+        match waited {
             Ok(n) => n,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::Interrupted {

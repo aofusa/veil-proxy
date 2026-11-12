@@ -110,6 +110,8 @@ pub(crate) struct WorkerEnv {
     /// CPU アフィニティのコア（リスナーごとに先頭のコアから割り当てる。今までと同じ）
     pub core_ids: Option<Vec<core_affinity::CoreId>>,
     pub balancing: ReuseportBalancing,
+    /// 接続を負荷に見合う本数のワーカーへ集約する（Linux の TCP リスナーのみ。F-303）
+    pub concentrate_connections: bool,
     /// 同時接続数の上限（プロセス全体。0 = 無制限）
     pub max_conn: usize,
     /// capability mode・pledge・sandbox_init のバリア（bind を終えたワーカーの数。B-163）
@@ -222,6 +224,14 @@ fn spawn_workers<S, Fut>(
     S: Fn(TcpStream, SocketAddr) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = ()> + 'static,
 {
+    // Linux の TCP リスナーは接続を負荷に見合う本数のワーカーへ集約する（UDS は SO_REUSEPORT が無い。F-303）
+    #[cfg(target_os = "linux")]
+    let active_set =
+        if env.concentrate_connections && matches!(source, WorkerListenerSource::Tcp(_)) {
+            crate::active_workers::ActiveSet::new(label, workers)
+        } else {
+            None
+        };
     for thread_id in 0..workers {
         let source = source.clone();
         let serve = serve.clone();
@@ -236,13 +246,28 @@ fn spawn_workers<S, Fut>(
             pin_to_core(&label, thread_id, assigned_core);
 
             crate::runtime::block_on(async move {
+                // グループの添字とワーカーの順を一致させる（F-303。アクティブセットはグループの先頭の N 本）
+                #[cfg(target_os = "linux")]
+                if let Some(set) = active_set {
+                    set.wait_bind_turn(thread_id);
+                }
                 let listener = match source.obtain(balancing, workers, thread_id) {
                     Ok(l) => l,
                     Err(e) => {
                         error!("[{} {}] Bind error: {}", label, thread_id, e);
+                        #[cfg(target_os = "linux")]
+                        if let Some(set) = active_set {
+                            set.on_bound(thread_id, None);
+                        }
                         return;
                     }
                 };
+                #[cfg(target_os = "linux")]
+                if let Some(set) = active_set {
+                    use crate::runtime::handle::AsRawFd as _;
+                    set.on_bound(thread_id, Some(listener.as_raw_fd()));
+                    set.attach_current_worker(thread_id);
+                }
                 // capability mode・pledge・sandbox_init のバリア: bind 完了を通知（コールドパス。B-163）
                 #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
                 listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -325,6 +350,7 @@ fn spawn_workers<S, Fut>(
                             // ConnectionGuard がスコープ内で生存している間、接続がカウントされる
                             // パニック時も Drop が呼ばれるため、カウンターの整合性が保証される
                             let _guard = ConnectionGuard::new();
+                            let _ticket = crate::active_workers::ConnectionTicket::new();
                             fut.await;
                         });
                     };

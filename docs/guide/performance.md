@@ -140,6 +140,53 @@ reuseport_balancing = "cbpf"
 - **Linux 4.6 or higher** (SO_ATTACH_REUSEPORT_CBPF support)
 - Automatically falls back to kernel default if CBPF attach fails
 
+### Connection Concentration (Linux)
+
+#### Overview
+
+When every worker receives connections, each one handles a few requests and then sleeps until the next one
+arrives. Waking up and going back to sleep costs more than the request itself on small responses: with 100
+HTTP/1.1 connections spread over 16 workers, more than half of the CPU per request was spent there. Veil therefore
+sends new connections to only as many workers as the load needs (Linux TCP listeners, on by default).
+
+Every 100 ms a control thread reads each worker's busy time and request rate and decides how many workers
+(N) receive new connections. It replaces the CBPF program of the listener's SO_REUSEPORT group, so new
+connections go to the first N workers; accepting never stops.
+
+- At start, after 5 seconds without load, and when the number of connections suddenly doubles, all workers receive
+  connections.
+- When the active workers are mostly idle, N is reduced (by at most half at a time) and the change is kept only
+  if throughput does not drop.
+- When the active workers are saturated, or busy enough that more workers might help (for example a proxy that
+  waits for its upstream), N is increased by half and the change is kept only if throughput rises by 5% or more.
+  Failed attempts are retried at growing intervals. The intervals start over when the load changes (the number of
+  connections doubles or halves, or there is no load for 5 seconds), so a failed attempt during a short warm-up
+  does not hold back the load that follows.
+- N never goes below a quarter of the workers (at least 2).
+
+Existing HTTP/1.1 keep-alive connections follow a change: the workers that hand connections over answer the next
+response with `Connection: close`, and the client reconnects to the new set. HTTP/2 connections are not moved
+(when they cannot move, the change is undone). The number of active workers is exported as
+`veil_proxy_active_workers{listener}`.
+
+#### Configuration
+
+```toml
+[performance]
+# true = concentrate connections (Linux TCP listeners) [default]
+# false = always spread new connections over all workers
+concentrate_connections = true
+```
+
+While enabled, the listener's steering program replaces `reuseport_balancing`. UDS listeners and HTTP/3 (UDP) are
+not affected. If the program cannot be attached (for example a seccomp profile that denies it), veil logs a
+warning and keeps spreading connections over all workers.
+
+#### When to turn it off
+
+Each change makes the moved HTTP/1.1 clients reconnect (a new TLS handshake). Turn concentration off if the clients
+cannot reconnect cheaply, or if every worker is pinned to a dedicated core that should share the load evenly.
+
 ### Huge Pages (Large OS Pages)
 
 #### Overview

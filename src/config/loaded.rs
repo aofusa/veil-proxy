@@ -40,6 +40,8 @@ pub struct LoadedConfig {
     pub optimized_router: Arc<routing::OptimizedRouter>,
     pub ktls_config: KtlsConfig,
     pub reuseport_balancing: ReuseportBalancing,
+    /// 接続を負荷に見合う本数のワーカーへ集約する（F-303）
+    pub concentrate_connections: bool,
     pub num_threads: usize,
     /// Huge Pages (Large OS Pages) を有効化するかどうか
     pub huge_pages_enabled: bool,
@@ -979,6 +981,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         optimized_router,
         ktls_config,
         reuseport_balancing: config.performance.reuseport_balancing,
+        concentrate_connections: config.performance.concentrate_connections.unwrap_or(true),
         num_threads,
         huge_pages_enabled: config.performance.huge_pages_enabled,
         global_security: config.security,

@@ -924,6 +924,8 @@ pub(crate) fn log_access(
     client_ip: &str,
     upstream: &str,
 ) {
+    // 要求の完了を数える（接続の集約のスループットの測定。F-303）
+    crate::active_workers::note_response();
     // 出力先が 1 つも無ければ何もしない。本関数はリクエストごとに呼ばれ、以前は
     // ログもメトリクスも無効な構成でも経過時間・時刻の読み取り（2 回）と from_utf8（4 回）
     // を毎回行っていた（FreeBSD のプロファイルで from_utf8 と __vdso_gettc が上位）。

@@ -971,7 +971,11 @@ pub fn wait_for_completions() -> std::io::Result<()> {
     PARK_ROUND.with(|r| r.set(r.get().wrapping_add(1)));
     arm_kernel_timeout_if_needed();
 
-    if let Err(e) = with_ring(|ring| ring.submit_and_wait(1)) {
+    // F-303: park の時間を測る（ワーカーの使用率。ワーカー以外のスレッドでは何もしない）
+    let park_started = crate::active_workers::park_begin();
+    let waited = with_ring(|ring| ring.submit_and_wait(1));
+    crate::active_workers::park_end(park_started);
+    if let Err(e) = waited {
         park_enter_error(e)?;
     }
 

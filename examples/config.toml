@@ -467,6 +467,14 @@ ktls_fallback_enabled = true
 #            場合の選択肢（キャッシュ・セッション再利用効率向上、Linux 4.6+必須）
 reuseport_balancing = "cbpf"
 
+# 接続を負荷に見合う本数のワーカーへ集める（Linux の TCP リスナー）【既定 true】
+# ワーカーごとの使用率と要求レートを 100ms ごとに見て、新しい接続を受けるワーカーの本数を変える
+# （SO_REUSEPORT のグループの CBPF プログラムを差し替える。有効な間は reuseport_balancing より優先）。
+# 集めると要求の間に眠るワーカーが減り、1 要求あたりの CPU が下がる。負荷が上がると広げ、
+# HTTP/1.1 のキープアライブの接続は応答の区切りで Connection: close を返して張り直させる（HTTP/2 は動かさない）。
+# false: 常に全ワーカーへ振り分ける。UDS のリスナー・HTTP/3 は対象外
+# concentrate_connections = true
+
 # Huge Pages (Large OS Pages) の使用
 # true: mimallocでHuge Pages（2MB）を優先使用し、TLBミスを削減
 # false: 通常の4KBページを使用

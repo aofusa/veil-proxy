@@ -1697,6 +1697,11 @@ pub struct PerformanceConfigSection {
     /// - "cbpf": フローハッシュ（4タプル）ベースのCBPF振り分け（Linux 4.6+必須）
     #[serde(default)]
     pub reuseport_balancing: ReuseportBalancing,
+    /// 接続を負荷に見合う本数のワーカーへ集約する（Linux の TCP リスナー。F-303）。
+    /// 接続を全ワーカーへ散らすと要求の間に眠るワーカーが増え、1 要求あたりのサイクルが増える。
+    /// 既定 true（負荷が上がるとワーカーを増やす。false は全ワーカーへ常に振り分ける）
+    #[serde(default)]
+    pub concentrate_connections: Option<bool>,
     /// Huge Pages (Large OS Pages) の使用
     ///
     /// mimallocでHuge Pages（2MB）を優先使用し、TLBミスを削減します。

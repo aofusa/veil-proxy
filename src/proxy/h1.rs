@@ -427,16 +427,23 @@ pub(super) async fn handle_requests(
 
                 // Connection ヘッダーチェック（Keep-Alive / Upgrade対応）。B-307: 全ての `Connection` ヘッダを
                 // トークンに分けて比べる（確保しない。`close, foo` も close、`x-upgrade-hint` は upgrade ではない）
-                let client_wants_close: bool = crate::http_utils::header_has_token(
-                    &headers_for_proxy,
-                    b"connection",
-                    b"close",
-                );
                 let is_upgrade_connection: bool = crate::http_utils::header_has_token(
                     &headers_for_proxy,
                     b"connection",
                     b"upgrade",
                 );
+                // F-303: 接続の集約の制御が既存の接続の移動を求めていたら、応答の後に閉じる（クライアントは張り直して
+                // 別のワーカーへ振り分けられる）。本文の無い要求で、後ろにパイプライン化された要求が届いていないときだけ
+                // （閉じると届いている要求を捨てることになる）。アップグレードは閉じない
+                let client_wants_close: bool = crate::http_utils::header_has_token(
+                    &headers_for_proxy,
+                    b"connection",
+                    b"close",
+                ) || (content_length == 0
+                    && !is_chunked
+                    && !is_upgrade_connection
+                    && accumulated.is_empty()
+                    && crate::active_workers::take_shed());
 
                 // WebSocket Upgrade チェック: Connection: upgrade と Upgrade: websocket の両方が要る。
                 // RFC 6455 §4.1: GET・HTTP/1.1 だけ（それ以外はアップグレードせず通常の要求として扱う）

@@ -381,6 +381,8 @@ pub mod server;
 mod entry;
 // リスナー 1 個のワーカー群の起動（F-260。entry.rs は配線だけ）
 mod listener_workers;
+// 接続を少数のワーカーへ集約する（アクティブセットの自動調整。F-303）
+pub(crate) mod active_workers;
 pub use entry::run;
 pub use entry::{run_server, ServerOptions};
 

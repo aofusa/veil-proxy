@@ -1081,6 +1081,7 @@ pub fn run_server(opts: ServerOptions) {
     let worker_env = crate::listener_workers::WorkerEnv {
         core_ids: core_ids.clone(),
         balancing: reuseport_balancing,
+        concentrate_connections: loaded_config.concentrate_connections,
         max_conn: max_connections,
         #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]
         listeners_ready: std::sync::Arc::clone(&listeners_ready),
@@ -1120,6 +1121,9 @@ pub fn run_server(opts: ServerOptions) {
     if !loaded_config.listeners.iter().any(|l| l.tls) {
         info!("No TLS listener: plaintext-only server");
     }
+    // 接続を負荷に見合う本数のワーカーへ集約する（F-303。対象のリスナーが無ければ何もしない）
+    #[cfg(target_os = "linux")]
+    crate::active_workers::spawn_controller();
 
     // FreeBSD capability mode（オプトイン）: 全リスナー（TLS・平文）のワーカーの bind 完了を待って
     // `cap_enter(2)` する。cap_enter はプロセス全体に即時に効くため、bind が

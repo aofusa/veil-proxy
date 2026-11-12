@@ -45,6 +45,7 @@ GET /__metrics
 | `veil_proxy_http_request_size_bytes` | Histogram | - | リクエストボディサイズ |
 | `veil_proxy_http_response_size_bytes` | Histogram | - | レスポンスボディサイズ |
 | `veil_proxy_http_active_connections` | Gauge | host | アクティブな接続数 |
+| `veil_proxy_active_workers` | Gauge | listener | Linux の TCP リスナーごとの、新しい接続を受けるワーカーの数（`[performance] concentrate_connections`。`listener` はリスナーの名前、暗黙のリスナーは `tls`・`cleartext`） |
 | `veil_proxy_http_upstream_health` | Gauge | upstream, server | アップストリーム健康状態（1=healthy, 0=unhealthy） |
 | `veil_proxy_vds_connected` | Gauge | - | VDS: 制御プレーンが応答している間 1（`[vds] enabled` のときだけ。F-211） |
 | `veil_proxy_vds_applied_info` | Gauge | version_info | VDS: 適用中のスナップショットの版（値は常に 1） |

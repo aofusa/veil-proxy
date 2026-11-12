@@ -45,6 +45,7 @@ only move on HTTP/1.1, because the proxy response cache (`[route.cache]`) serves
 | `veil_proxy_http_request_size_bytes` | Histogram | - | Request body size |
 | `veil_proxy_http_response_size_bytes` | Histogram | - | Response body size |
 | `veil_proxy_http_active_connections` | Gauge | host | Active connection count |
+| `veil_proxy_active_workers` | Gauge | listener | Workers that receive new connections on each Linux TCP listener (`[performance] concentrate_connections`; `listener` = the listener name, `tls` / `cleartext` for the implicit ones) |
 | `veil_proxy_http_upstream_health` | Gauge | upstream, server | Upstream health status (1=healthy, 0=unhealthy) |
 | `veil_proxy_vds_connected` | Gauge | - | VDS: 1 while a control plane answers (only with `[vds] enabled`, F-211) |
 | `veil_proxy_vds_applied_info` | Gauge | version_info | VDS: the snapshot version being served (always 1) |

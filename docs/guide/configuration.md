@@ -36,6 +36,7 @@ The following table lists default values for major configuration options:
 | `[prometheus]` | `enabled` | `false` | Enable Prometheus metrics |
 | `[prometheus]` | `path` | `"/__metrics"` | Metrics endpoint path |
 | `[performance]` | `reuseport_balancing` | `"kernel"` | SO_REUSEPORT balancing |
+| `[performance]` | `concentrate_connections` | `true` | Linux TCP listeners: send new connections to only as many workers as the load needs, adjusted every 100 ms (see [Performance](performance.md#connection-concentration-linux)). `false` = spread over all workers |
 | `[performance]` | `huge_pages_enabled` | `false` | Enable Huge Pages |
 | `[performance]` | `keepalive_direct_read_ms` | `20` | io_uring, plaintext HTTP/1.1 keep-alive: read the next request directly for this long before waiting without a buffer (`0` = always wait first; F-205) |
 | `[performance]` | `open_file_cache_enabled` | `false` | Enable OpenFileCache |

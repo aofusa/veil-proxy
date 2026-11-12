@@ -169,6 +169,10 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 ### リスナー・ワーカー
 
 - リスナーは必ず `server::create_listener`（UDS は `server::bind_unix_listener`）経由で作る（F-156/F-164）。
+- 接続の集約（`[performance] concentrate_connections`。Linux の TCP）は、制御スレッドが SO_REUSEPORT のグループの CBPF を
+  差し替えて新しい接続を先頭の N 本へ振り分ける。ワーカーは順に bind する（グループの添字とワーカーの順を一致させる）。
+  ホットパスに足すのは Relaxed の加算（park の前後・応答・接続の数）と、動かす接続の `take_shed` だけ。N は測って決める
+  （使用率だけで決めない。上流を待つ中継は使用率が上がらない）。負荷が変わったら失敗の待ちを捨てる（F-303）。
 - ワーカーを増やすときは共有すべき状態（LB 状態・接続数カウンタ・ヘルスチェッカー）をリスナーにつき 1 個にする（F-156）。
 - `[server].listen` は TLS 専用（平文は受けない）。平文 HTTP/1.1・h2c の計測・テストは `[server].listen_cleartext` に
   `enable_secure_redirect = false` を付けて使う（既定の `true` は https への 301 だけを返す。F-163/B-80/F-200）。
