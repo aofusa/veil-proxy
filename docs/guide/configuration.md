@@ -96,7 +96,7 @@ The following table lists default values for major configuration options:
 | `[http3]` | `max_field_section_size` | `65536` | Largest request header section in bytes, advertised as `SETTINGS_MAX_FIELD_SECTION_SIZE` and checked when a HEADERS frame announces its length and while QPACK decodes it (32 bytes added per field, RFC 9114 §4.2.2). A larger section closes the connection; a section over veil's request header limit (8 KB) but within this one gets 431. Same default as `[http2] max_header_list_size` |
 | `[http3]` | `recv_drain_max` | `1024` | **reactor backends only** (FreeBSD/OpenBSD/NetBSD/macOS, and Linux `--features epoll`): max UDP datagrams drained per event-loop iteration (1..=4096). Larger values amortize the per-iteration fixed cost (select/timer round-trip + connection sweep) over more datagrams — F-151 measured a 3.2x throughput swing from this quantity alone — at the cost of delaying sends/timeouts/backend wakeups (p99 latency). The default was 64 before v0.8.0; 1024 raised FreeBSD HTTP/3 3B throughput by 37% (p99 11 → 14 ms). The Linux io_uring default backend uses the `mmsg_batch_size` RECVMSG pipeline instead and ignores this key |
 | `[http3]` | `compression_enabled` | `false` | Enable compression |
-| `[http3]` | `gso_gro_enabled` | `false` | Enable GSO/GRO |
+| `[http3]` | `gso_gro_enabled` | `true` | Enable GSO/GRO (turned off per socket automatically when the kernel rejects a segmented send) |
 | `[http3]` | `alt_svc_enabled` | `true` | Advertise HTTP/3 via Alt-Svc on H1/H2 responses (when `[http3] enabled = true`) |
 | `[http3]` | `alt_svc` | _(auto)_ | Override Alt-Svc header value (default: `h3=":PORT"; ma=…` from listen port) |
 | `[http3]` | `alt_svc_ma_secs` | `86400` | max-age for auto-generated Alt-Svc |

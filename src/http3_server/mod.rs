@@ -527,7 +527,7 @@ pub struct Http3ServerConfig {
     pub initial_max_streams_bidi: u64,
     /// 初期最大単方向ストリーム数
     pub initial_max_streams_uni: u64,
-    /// GSO/GRO を有効化するかどうか（デフォルト: false）
+    /// GSO/GRO を有効化するかどうか（デフォルト: true。F-305）
     pub gso_gro_enabled: bool,
     /// QUIC 輻輳制御アルゴリズム名（quiche `set_cc_algorithm_name`）。デフォルト: `"cubic"`（v0.8.0）
     pub cc_algorithm: String,
@@ -590,7 +590,7 @@ impl Default for Http3ServerConfig {
             initial_max_stream_data_uni: 1_000_000,
             initial_max_streams_bidi: 100,
             initial_max_streams_uni: 100,
-            gso_gro_enabled: false,
+            gso_gro_enabled: true,
             cc_algorithm: "cubic".to_string(),
             pacing: true,
             max_pacing_rate: None,
@@ -3218,6 +3218,153 @@ mod tests {
             seg,
             seg
         ));
+    }
+
+    /// B-361: GSO を有効にしたソケットでも、cmsg の無い単発の送信は分割されない（1200 バイトを超える単発のパケット・
+    /// 経路 MTU の探索のパケットがそのまま届く）。束は cmsg のセグメント長で分かれる
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gso_socket_keeps_single_large_packets_whole() {
+        let recv = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        recv.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let dest = recv.local_addr().unwrap();
+        let sock = Rc::new(
+            crate::udp::socket::QuicUdpSocket::bind_reuseport_with_gso(
+                "127.0.0.1:0".parse().unwrap(),
+                true,
+            )
+            .unwrap(),
+        );
+        if !sock.gso_enabled() {
+            eprintln!("UDP GSO unsupported by this kernel; skipping");
+            return;
+        }
+        let mut batch = vec![9u8; 1350];
+        for b in [4u8, 5, 6] {
+            batch.extend_from_slice(&[b; 1300]);
+        }
+        let sends = vec![
+            event_loop::SendRaw {
+                batch_start: 0,
+                len: 1350,
+                seg_size: 1350,
+                segments: 1,
+                dest,
+            },
+            event_loop::SendRaw {
+                batch_start: 1350,
+                len: 3 * 1300,
+                seg_size: 1300,
+                segments: 3,
+                dest,
+            },
+        ];
+        let s2 = sock.clone();
+        crate::runtime::block_on(async move {
+            let mut scratch = crate::udp::socket::MmsgSendScratch::with_batch(8);
+            event_loop::send_mmsg_flush(&s2, &batch, &sends, &mut scratch).await;
+        });
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        while got.len() < 4 {
+            match recv.recv_from(&mut buf) {
+                Ok((n, _)) => got.push((n, buf[0])),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("missing datagram after {got:?}: {e}"),
+            }
+        }
+        assert_eq!(got, vec![(1350, 9), (1300, 4), (1300, 5), (1300, 6)]);
+        assert!(sock.gso_enabled());
+    }
+
+    /// F-305: カーネルが GSO の束を拒む経路（チェックサムを付けないソケット。`SO_NO_CHECK` で `EINVAL` になる）では、
+    /// ソケットの GSO を下ろし、拒まれた束を 1 パケットずつ送り直す（パケットを失わない）。sendmmsg の経路と
+    /// io_uring の送出の経路（使えるときだけ）の両方で確かめる
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gso_rejection_falls_back_to_single_packets() {
+        #[cfg(veil_rt_uring)]
+        let uring = crate::runtime::ring::IoUring::new(8, 0).is_ok();
+        #[cfg(not(veil_rt_uring))]
+        let uring = false;
+        let mut paths = vec![false];
+        if uring {
+            paths.push(true);
+        } else {
+            eprintln!("io_uring unavailable; checking only the sendmmsg path");
+        }
+        for use_uring in paths {
+            let recv = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            recv.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let dest = recv.local_addr().unwrap();
+            let sock = Rc::new(
+                crate::udp::socket::QuicUdpSocket::bind_reuseport_with_gso(
+                    "127.0.0.1:0".parse().unwrap(),
+                    true,
+                )
+                .unwrap(),
+            );
+            if !sock.gso_enabled() {
+                eprintln!("UDP GSO unsupported by this kernel; skipping");
+                return;
+            }
+            let on: libc::c_int = 1;
+            // SAFETY: 有効な UDP ソケットに c_int の値を渡す
+            let r = unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NO_CHECK,
+                    &on as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(r, 0);
+            // 100 + 100 + 50 バイトの 3 パケットの束
+            let mut batch = vec![1u8; 100];
+            batch.extend_from_slice(&[2u8; 100]);
+            batch.extend_from_slice(&[3u8; 50]);
+            let sends = vec![event_loop::SendRaw {
+                batch_start: 0,
+                len: batch.len(),
+                seg_size: 100,
+                segments: 3,
+                dest,
+            }];
+            let s2 = sock.clone();
+            let still_gso = crate::runtime::block_on(async move {
+                #[cfg(veil_rt_uring)]
+                if use_uring {
+                    event_loop::put_uring_udp_send(crate::runtime::udp_send::UringUdpSend::new(
+                        s2.as_raw_fd(),
+                        8,
+                    ));
+                }
+                let mut scratch = crate::udp::socket::MmsgSendScratch::with_batch(8);
+                event_loop::send_mmsg_flush(&s2, &batch, &sends, &mut scratch).await;
+                #[cfg(veil_rt_uring)]
+                if use_uring {
+                    assert!(
+                        event_loop::take_uring_udp_send().is_some(),
+                        "the io_uring send path was not used"
+                    );
+                }
+                s2.gso_enabled()
+            });
+            assert!(!still_gso, "GSO stayed enabled (uring={use_uring})");
+            let mut got = Vec::new();
+            let mut buf = [0u8; 2048];
+            while got.len() < 3 {
+                match recv.recv_from(&mut buf) {
+                    Ok((n, _)) => got.push((n, buf[0])),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => panic!("a split packet was lost (uring={use_uring}): {e}"),
+                }
+            }
+            assert_eq!(got, vec![(100, 1), (100, 2), (50, 3)], "uring={use_uring}");
+        }
     }
 
     // --------------------

@@ -183,8 +183,8 @@ listen = "0.0.0.0:443"
 # Maximum idle timeout (milliseconds, default: 30000)
 max_idle_timeout = 30000
 
-# Maximum UDP payload size (default: 1350)
-max_udp_payload_size = 1350
+# Maximum UDP payload size: the upper bound of path MTU discovery (default: 1452)
+max_udp_payload_size = 1452
 
 # Initial maximum data size (entire connection, default: 10000000)
 initial_max_data = 10000000
@@ -227,13 +227,17 @@ initial_max_streams_uni = 100
 #     this fallback path and for DNS resolution
 #     (docker/assets/security/seccomp.json ships with them).
 #
-# Notes:
-#   - Supported on Linux 5.0+
-#   - May not work as expected in some virtual environments or Docker
-#   - Set to false if issues occur
+#   - Receivers that use GRO (e.g. Linux clients) also spend less CPU per request.
 #
-# Default: false
-gso_gro_enabled = false
+# Notes:
+#   - Supported on Linux 5.0+ (ignored on other platforms)
+#   - When the outgoing device cannot send with GSO (the kernel rejects a segmented
+#     send with EIO/EINVAL, e.g. no checksum offload or an IPsec route), veil turns
+#     GSO off for that socket, resends the rejected batch one packet at a time and
+#     logs a warning once
+#
+# Default: true
+gso_gro_enabled = true
 
 # Alt-Svc (HTTP/3 advertisement on HTTP/1.1 and HTTP/2 responses; F-94)
 # All Alt-Svc keys live under [http3]. Effective only when [http3] enabled = true.

@@ -1106,15 +1106,15 @@ pub struct Http3ConfigSection {
     /// 効果:
     /// - 複数の小さなUDPパケットを一度に送受信
     /// - システムコール回数の削減
-    /// - CPU使用率の低減
+    /// - CPU使用率の低減（受け手も GRO でまとめて受け取れる）
     ///
     /// 注意:
-    /// - Linux 5.0+ でサポート
-    /// - 一部の仮想環境やDockerでは期待通りに動作しない場合あり
-    /// - 問題が発生した場合は false に設定してください
+    /// - Linux 5.0+ でサポート（他の OS では無視）
+    /// - 送信先の経路のデバイスが GSO で送れない（カーネルが `EIO`・`EINVAL` で拒む）ときは、
+    ///   そのソケットの GSO を自動で下ろし、拒まれた束を 1 パケットずつ送り直す（F-305）
     ///
-    /// デフォルト: false
-    #[serde(default)]
+    /// デフォルト: true（F-305。以前は false）
+    #[serde(default = "default_true")]
     pub gso_gro_enabled: bool,
 
     // ====================
@@ -1300,7 +1300,7 @@ impl Default for Http3ConfigSection {
             initial_max_streams_uni: default_h3_max_streams(),
             compression_enabled: false,
             compression: Http3CompressionConfig::default(),
-            gso_gro_enabled: false,
+            gso_gro_enabled: true,
             cc_algorithm: default_h3_cc_algorithm(),
             pacing: true,
             max_pacing_rate: None,

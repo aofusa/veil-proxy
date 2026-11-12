@@ -818,6 +818,9 @@ pub(super) fn finalize_send_entry(
 /// `scratch.batch_size()` ごとにチャンク分割し、各チャンクをスタック配列（`MMSG_BATCH_MAX` 上限、
 /// ヒープ確保なし）で組み立てて `send_mmsg_async` へ渡す。`sends` は GSO 無効展開により
 /// バッチ幅を超え得るため、ここでチャンク化して漏れなく送出する。
+///
+/// F-305: カーネルが GSO の束を拒んだら（この経路では GSO で送れない）、ソケットの GSO を下ろし、拒まれた束を
+/// 1 パケットずつ送り直す（`gso_rejected`）。
 pub(super) async fn send_mmsg_flush(
     socket: &Rc<QuicUdpSocket>,
     batch: &[u8],
@@ -833,19 +836,18 @@ pub(super) async fn send_mmsg_flush(
             let mut i = 0;
             while i < sends.len() {
                 let k = (sends.len() - i).min(batch_n);
-                // k..MMSG_BATCH_MAX は末尾要素の複製で埋め、`[..k]` で捨てる（複製分は送出されない）。
-                let chunk: [crate::udp::socket::SendmmsgEntry; crate::udp::socket::MMSG_BATCH_MAX] =
-                    std::array::from_fn(|j| {
-                        let s = &sends[i + j.min(k - 1)];
-                        crate::udp::socket::SendmmsgEntry {
-                            data: &batch[s.batch_start..s.batch_start + s.len],
-                            seg_size: s.seg_size,
-                            segments: s.segments,
-                            dest: s.dest,
+                let chunk = send_chunk(batch, &sends[i..i + k]);
+                match send.send_batch(&chunk[..k]).await {
+                    Ok(rejected) if !rejected.is_empty() => {
+                        let pieces = gso_rejected(socket, &chunk[..k], rejected);
+                        for part in pieces.chunks(batch_n) {
+                            if let Err(e) = send.send_batch(part).await {
+                                warn!("[HTTP/3] io_uring sendmsg flush error: {}", e);
+                            }
                         }
-                    });
-                if let Err(e) = send.send_batch(&chunk[..k]).await {
-                    warn!("[HTTP/3] io_uring sendmsg flush error: {}", e);
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("[HTTP/3] io_uring sendmsg flush error: {}", e),
                 }
                 i += k;
             }
@@ -859,22 +861,76 @@ pub(super) async fn send_mmsg_flush(
     let mut i = 0;
     while i < sends.len() {
         let k = (sends.len() - i).min(batch_n);
-        // k..MMSG_BATCH_MAX は末尾要素の複製で埋め、`[..k]` で捨てる（複製分は送出されない）。
-        let chunk: [crate::udp::socket::SendmmsgEntry; crate::udp::socket::MMSG_BATCH_MAX] =
-            std::array::from_fn(|j| {
-                let s = &sends[i + j.min(k - 1)];
-                crate::udp::socket::SendmmsgEntry {
-                    data: &batch[s.batch_start..s.batch_start + s.len],
-                    seg_size: s.seg_size,
-                    segments: s.segments,
-                    dest: s.dest,
+        let chunk = send_chunk(batch, &sends[i..i + k]);
+        match socket.send_mmsg_async(&chunk[..k], scratch).await {
+            Ok(rejected) if !rejected.is_empty() => {
+                let pieces = gso_rejected(socket, &chunk[..k], rejected);
+                for part in pieces.chunks(batch_n) {
+                    if let Err(e) = socket.send_mmsg_async(part, scratch).await {
+                        warn!("[HTTP/3] sendmmsg flush error: {}", e);
+                    }
                 }
-            });
-        if let Err(e) = socket.send_mmsg_async(&chunk[..k], scratch).await {
-            warn!("[HTTP/3] sendmmsg flush error: {}", e);
+            }
+            Ok(_) => {}
+            Err(e) => warn!("[HTTP/3] sendmmsg flush error: {}", e),
         }
         i += k;
     }
+}
+
+/// 送信エントリ `sends`（`MMSG_BATCH_MAX` 件まで）を `batch` のスライスを指す送出の記述子の配列にする。
+/// 末尾の `MMSG_BATCH_MAX - sends.len()` 件は最後の要素の複製で埋める（呼び出し側が `[..sends.len()]` で捨てる。
+/// スタック配列なのでヒープ確保は無い）
+fn send_chunk<'a>(
+    batch: &'a [u8],
+    sends: &[SendRaw],
+) -> [crate::udp::socket::SendmmsgEntry<'a>; crate::udp::socket::MMSG_BATCH_MAX] {
+    let k = sends.len();
+    std::array::from_fn(|j| {
+        let s = &sends[j.min(k - 1)];
+        crate::udp::socket::SendmmsgEntry {
+            data: &batch[s.batch_start..s.batch_start + s.len],
+            seg_size: s.seg_size,
+            segments: s.segments,
+            dest: s.dest,
+        }
+    })
+}
+
+/// F-305: GSO の束を拒まれたときの後始末。ソケットの GSO を下ろし（以後の周回は束を作らない）、拒まれた束
+/// （`rejected` の添字）を 1 パケットずつのエントリに分けて返す（呼び出し側が送り直す）。ソケットにつき 1 回だけ
+/// 通る冷たい経路なので確保してよい
+fn gso_rejected<'a>(
+    socket: &QuicUdpSocket,
+    chunk: &[crate::udp::socket::SendmmsgEntry<'a>],
+    rejected: crate::udp::socket::GsoRejected,
+) -> Vec<crate::udp::socket::SendmmsgEntry<'a>> {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    if socket.disable_gso() {
+        LOGGED.call_once(|| {
+            warn!(
+                "[HTTP/3] the kernel rejected a UDP GSO send on this path; sending packets one at a time instead"
+            );
+        });
+    }
+    let mut pieces = Vec::new();
+    for (j, e) in chunk.iter().enumerate() {
+        if !rejected.contains(j) {
+            continue;
+        }
+        let seg = (e.seg_size as usize).max(1);
+        pieces.extend(
+            e.data
+                .chunks(seg)
+                .map(|p| crate::udp::socket::SendmmsgEntry {
+                    data: p,
+                    seg_size: p.len() as u16,
+                    segments: 1,
+                    dest: e.dest,
+                }),
+        );
+    }
+    pieces
 }
 
 /// GSO セグメント上限（UDP GSO の一般的な最大セグメント数）

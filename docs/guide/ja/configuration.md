@@ -94,7 +94,7 @@
 | `[http3]` | `max_field_section_size` | `65536` | 要求のヘッダの大きさの上限（バイト）。`SETTINGS_MAX_FIELD_SECTION_SIZE` として広告し、HEADERS フレームの長さの宣言の時点と QPACK の復号（1 フィールドにつき 32 バイトを足す。RFC 9114 §4.2.2）で検査する。超えた接続は閉じる。veil の要求ヘッダの上限（8KB）を超えてこれ以下の要求は 431。既定は `[http2] max_header_list_size` と同じ |
 | `[http3]` | `recv_drain_max` | `1024` | **reactor バックエンド専用**（FreeBSD/OpenBSD/NetBSD/macOS、Linux の `--features epoll`）: 1 イテレーションあたりに掻き出す UDP データグラム数の上限（1..=4096）。大きくするほど 1 イテレーションあたりの固定費（select/タイマー往復 + 接続スイープ）を多くのデータグラムへ償却できる（F-151 でこの量だけで 3.2 倍の差を実測）が、drain 中は送信・タイムアウト・バックエンド通知が待たされるため p99 レイテンシとのトレードオフ。v0.8.0 より前の既定は 64。1024 で FreeBSD の HTTP/3 3B が 37% 伸びた（p99 は 11 → 14ms）。Linux 既定の io_uring バックエンドは `mmsg_batch_size` の RECVMSG パイプラインを使うため本キーを参照しない |
 | `[http3]` | `compression_enabled` | `false` | 圧縮を有効化 |
-| `[http3]` | `gso_gro_enabled` | `false` | GSO/GROを有効化 |
+| `[http3]` | `gso_gro_enabled` | `true` | GSO/GROを有効化（カーネルが GSO の送信を拒んだらそのソケットだけ自動で切る） |
 | `[http3]` | `alt_svc_enabled` | `true` | H1/H2 応答へ Alt-Svc で HTTP/3 を広告（`[http3] enabled = true` 時のみ） |
 | `[http3]` | `alt_svc` | _(自動)_ | Alt-Svc ヘッダー値の上書き（未指定時は listen ポートから `h3=":PORT"; ma=…`） |
 | `[http3]` | `alt_svc_ma_secs` | `86400` | 自動生成 Alt-Svc の max-age（秒） |

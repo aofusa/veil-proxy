@@ -13,6 +13,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use crate::runtime::handle::AsRawFd;
+use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
 
@@ -56,6 +57,43 @@ pub fn clamp_mmsg_batch(n: usize) -> usize {
     n.clamp(1, MMSG_BATCH_MAX)
 }
 
+/// 1 回の送出（`MMSG_BATCH_MAX` 件まで）のうち、GSO の束をカーネルが拒んだエントリの添字の集合（F-305）。
+/// 拒まれた束は送られていない。呼び出し側はソケットの GSO を下ろし、束を 1 パケットずつ送り直す
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GsoRejected(u128);
+
+// 添字のビットが u128 に収まること
+const _: () = assert!(MMSG_BATCH_MAX <= 128);
+
+impl GsoRejected {
+    /// `i` 番目のエントリを拒まれたものとして記録する
+    #[inline]
+    pub fn mark(&mut self, i: usize) {
+        self.0 |= 1u128 << i;
+    }
+
+    /// 拒まれたエントリが無いか
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// `i` 番目のエントリが拒まれたか
+    #[inline]
+    pub fn contains(self, i: usize) -> bool {
+        i < 128 && (self.0 >> i) & 1 == 1
+    }
+}
+
+/// GSO の束（`segments > 1`）の送信の失敗が「この経路では GSO で送れない」を意味するか（F-305）。
+/// `EIO` はデバイスがチェックサムのオフロードを持たない・IPsec の経路、`EINVAL` はチェックサムを付けないソケット等。
+/// どちらも束を分けて送れば通る（GSO の無い送信と同じ扱いになる）。`EMSGSIZE`（経路 MTU を超える）は GSO と関係なく
+/// 起きるので含めない
+#[inline]
+pub fn is_gso_rejection(errno: i32) -> bool {
+    errno == libc::EIO || errno == libc::EINVAL
+}
+
 /// GSO 送信結果
 #[derive(Debug)]
 pub struct GsoSendResult {
@@ -80,8 +118,8 @@ pub struct GroRecvResult {
 pub struct QuicUdpSocket {
     /// 内部 UDP ソケット
     socket: UdpSocket,
-    /// GSO 有効化フラグ
-    gso_enabled: bool,
+    /// GSO 有効化フラグ。カーネル・デバイスが GSO の送信を拒んだら下ろす（`disable_gso`。F-305）
+    gso_enabled: Cell<bool>,
     /// GRO 有効化フラグ
     gro_enabled: bool,
     /// ローカルアドレス
@@ -104,7 +142,7 @@ impl QuicUdpSocket {
 
         let mut instance = Self {
             socket,
-            gso_enabled: false,
+            gso_enabled: Cell::new(false),
             gro_enabled: false,
             local_addr,
         };
@@ -248,7 +286,7 @@ impl QuicUdpSocket {
 
         let mut instance = Self {
             socket,
-            gso_enabled: false,
+            gso_enabled: Cell::new(false),
             gro_enabled: false,
             local_addr,
         };
@@ -270,10 +308,11 @@ impl QuicUdpSocket {
         {
             let fd = self.socket.as_raw_fd();
 
-            // UDP_SEGMENT (GSO) を有効化
-            // 注意: setsockopt での設定はデフォルト値。実際の GSO は
-            // sendmsg の CMSG で指定する必要がある
-            let gso_size: libc::c_int = GSO_SEGMENT_SIZE as libc::c_int;
+            // UDP_SEGMENT (GSO) に対応しているかを確かめる。値は 0（既定の分割なし）にする。束ごとのセグメント長は
+            // sendmsg の cmsg で渡す。B-361: 以前は 1200 を設定しており、ソケット単位の値は cmsg の無い単発の送信にも
+            // 効くため、1200 バイトを超える単発のパケット（経路 MTU の探索のパケット等）がカーネルで 1200 と残りに
+            // 分けられて壊れていた
+            let gso_size: libc::c_int = 0;
             // SAFETY: fd は self.socket が所有する有効なソケット。gso_size は c_int を指し長さはその大きさ。
             let result = unsafe {
                 libc::setsockopt(
@@ -284,7 +323,7 @@ impl QuicUdpSocket {
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 )
             };
-            self.gso_enabled = result == 0;
+            self.gso_enabled.set(result == 0);
 
             // UDP_GRO を有効化
             let gro_enabled: libc::c_int = 1;
@@ -437,7 +476,7 @@ impl QuicUdpSocket {
     ) -> io::Result<GsoSendResult> {
         use std::mem::MaybeUninit;
 
-        if !self.gso_enabled || data.len() <= segment_size as usize {
+        if !self.gso_enabled.get() || data.len() <= segment_size as usize {
             // GSO 無効または単一パケットの場合は通常送信
             return self
                 .send_single_sync(data, target)
@@ -584,7 +623,7 @@ impl QuicUdpSocket {
         note = "Use send_gso_async() instead - this function does not handle EAGAIN properly"
     )]
     pub async fn send_gso(&self, packets: &[&[u8]], target: SocketAddr) -> io::Result<usize> {
-        if !self.gso_enabled || packets.is_empty() {
+        if !self.gso_enabled.get() || packets.is_empty() {
             // GSO 無効または空の場合は個別送信
             let mut total = 0;
             for packet in packets {
@@ -629,7 +668,7 @@ impl QuicUdpSocket {
         segment_size: u16,
         target: SocketAddr,
     ) -> io::Result<usize> {
-        if !self.gso_enabled || combined.is_empty() {
+        if !self.gso_enabled.get() || combined.is_empty() {
             // GSO 無効: 元のパケット境界通りに個別送信（追加確保なし）。
             let mut total = 0;
             for &(start, len) in offsets {
@@ -731,7 +770,8 @@ impl QuicUdpSocket {
     ///   取れない）。よって「送れた件数だけ先頭を進めて再呼び出し」し、-1 で初めて errno を
     ///   得る。EAGAIN（送信バッファ満杯）は `wait_writable_fd`（既存 POLL_ADD）で待って再開。
     ///   先頭メッセージの恒久エラー（EMSGSIZE 等）は当該メッセージのみ skip + warn して継続する
-    ///   （QUIC 再送で回復する）。
+    ///   （QUIC 再送で回復する）。GSO の束を拒まれたエントリ（[`is_gso_rejection`]）は戻り値に添字を返す
+    ///   （呼び出し側が GSO を下ろして 1 パケットずつ送り直す。F-305）。
     /// - cancel-safety: 唯一の await ポイントは `wait_writable_fd`。drop されてもカーネルへ
     ///   未確定の副作用は残さない（sendmmsg 自体は同期・非ブロッキング）。
     #[cfg(target_os = "linux")]
@@ -739,10 +779,11 @@ impl QuicUdpSocket {
         &self,
         entries: &[SendmmsgEntry<'_>],
         scratch: &mut MmsgSendScratch,
-    ) -> io::Result<()> {
+    ) -> io::Result<GsoRejected> {
+        let mut rejected = GsoRejected::default();
         let count = entries.len().min(scratch.batch_size());
         if count == 0 {
-            return Ok(());
+            return Ok(rejected);
         }
 
         // 各エントリを mmsghdr へ変換（addr / iovec / cmsg を per-entry の Box 固定領域へ書く）。
@@ -796,7 +837,10 @@ impl QuicUdpSocket {
                 }
                 // 先頭メッセージの恒久エラー: 当該メッセージのみ skip して継続（QUIC 再送で回復）。
                 // EMSGSIZE は DF を立てた経路 MTU の探索で大きすぎた探索のパケット（想定内）
-                if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                if entries[sent].segments > 1 && err.raw_os_error().is_some_and(is_gso_rejection) {
+                    // F-305: この経路では GSO で送れない。呼び出し側が分けて送り直す
+                    rejected.mark(sent);
+                } else if err.raw_os_error() == Some(libc::EMSGSIZE) {
                     ftlog::debug!("[HTTP/3] sendmmsg entry skipped: {}", err);
                 } else {
                     warn!("[HTTP/3] sendmmsg entry skipped: {}", err);
@@ -812,12 +856,18 @@ impl QuicUdpSocket {
             sent += ret as usize;
         }
 
-        Ok(())
+        Ok(rejected)
     }
 
     /// GSO が有効かどうか
     pub fn gso_enabled(&self) -> bool {
-        self.gso_enabled
+        self.gso_enabled.get()
+    }
+
+    /// GSO を下ろす。下ろしたのがこの呼び出しなら true（ログを 1 回だけ出すため）。
+    /// 送信で GSO の束が拒まれたとき（[`is_gso_rejection`]）に呼ぶ（F-305）
+    pub fn disable_gso(&self) -> bool {
+        self.gso_enabled.replace(false)
     }
 
     /// GRO が有効かどうか
@@ -968,6 +1018,7 @@ impl Default for MmsgRecvScratch {
 /// `data` は呼び出し側スクラッチに連結済みのパケット列（GSO バッチ）を指す。iovec が
 /// そのまま指すためコピーは発生しない。
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
 pub struct SendmmsgEntry<'a> {
     /// 連結済みパケット列（batch のスライス）。
     pub data: &'a [u8],
@@ -1465,7 +1516,7 @@ impl QuicUdpSocket {
 
         Ok(Self {
             socket,
-            gso_enabled: false,
+            gso_enabled: Cell::new(false),
             gro_enabled: false,
             local_addr,
         })
@@ -1597,7 +1648,7 @@ impl QuicUdpSocket {
         &self,
         entries: &[SendmmsgEntry<'_>],
         scratch: &mut MmsgSendScratch,
-    ) -> io::Result<()> {
+    ) -> io::Result<GsoRejected> {
         let fd = self.socket.as_raw_fd();
         for e in entries.iter().take(scratch.batch_size()) {
             let (sockaddr, sockaddr_len) = socket_addr_to_raw(e.dest);
@@ -1639,7 +1690,8 @@ impl QuicUdpSocket {
                 }
             }
         }
-        Ok(())
+        // GSO を使わないので拒まれる束は無い
+        Ok(GsoRejected::default())
     }
 }
 
@@ -1657,7 +1709,7 @@ impl QuicUdpSocket {
 
         Ok(Self {
             socket,
-            gso_enabled: false,
+            gso_enabled: Cell::new(false),
             gro_enabled: false,
             local_addr,
         })
@@ -1732,7 +1784,7 @@ impl QuicUdpSocket {
         &self,
         entries: &[SendmmsgEntry<'_>],
         scratch: &mut MmsgSendScratch,
-    ) -> io::Result<()> {
+    ) -> io::Result<GsoRejected> {
         for e in entries.iter().take(scratch.batch_size()) {
             let seg = if e.segments > 1 {
                 (e.seg_size as usize).max(1)
@@ -1760,7 +1812,8 @@ impl QuicUdpSocket {
                 }
             }
         }
-        Ok(())
+        // GSO を使わないので拒まれる束は無い
+        Ok(GsoRejected::default())
     }
 }
 
@@ -1875,6 +1928,7 @@ impl Default for MmsgRecvScratch {
 
 /// 非 Linux 版 sendmmsg 送信ディスクリプタ（Linux 版と同一フィールド）。
 #[cfg(not(target_os = "linux"))]
+#[derive(Clone, Copy)]
 pub struct SendmmsgEntry<'a> {
     /// 連結済みパケット列（batch のスライス）。
     pub data: &'a [u8],

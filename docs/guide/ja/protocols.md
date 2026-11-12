@@ -192,8 +192,8 @@ listen = "0.0.0.0:443"
 # 最大アイドルタイムアウト（ミリ秒、デフォルト: 30000）
 max_idle_timeout = 30000
 
-# 最大UDPペイロードサイズ（デフォルト: 1350）
-max_udp_payload_size = 1350
+# 最大UDPペイロードサイズ。経路 MTU の探索の上限（デフォルト: 1452）
+max_udp_payload_size = 1452
 
 # 初期最大データサイズ（コネクション全体、デフォルト: 10000000）
 initial_max_data = 10000000
@@ -227,14 +227,16 @@ initial_max_streams_uni = 100
 #   - 本設定と独立に、HTTP/3 データプレーンは recvmmsg(2)/sendmmsg(2) で複数データグラム
 #     （異なる接続宛も含む）を常時 1 システムコールにバッチングする（F-115）。コンテナ実行時は
 #     seccomp 許可リストに recvmmsg/sendmmsg が必要（docker/assets/security/seccomp.json は対応済み）。
+#   - 受け手が GRO で受けるとき（Linux のクライアント等）は受け手の CPU も下がる。
 #
 # 注意:
-#   - Linux 5.0+ でサポート
-#   - 一部の仮想環境やDockerでは期待通りに動作しない場合あり
-#   - 問題が発生した場合は false に設定してください
+#   - Linux 5.0+ でサポート（他の OS では無視）
+#   - 経路のデバイスが GSO で送れない（チェックサムのオフロードが無い・IPsec 等でカーネルが
+#     EIO / EINVAL を返す）ときは、そのソケットの GSO を自動で切り、拒まれた束を 1 パケットずつ
+#     送り直す（warn を 1 回出す）
 #
-# デフォルト: false
-gso_gro_enabled = false
+# デフォルト: true
+gso_gro_enabled = true
 
 # Alt-Svc（HTTP/1.1・HTTP/2 応答での HTTP/3 広告、F-94）
 # 関連キーはすべて [http3] に集約。[http3] enabled = true のときのみ有効。

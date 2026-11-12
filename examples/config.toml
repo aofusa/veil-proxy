@@ -1496,14 +1496,17 @@ watch = false
 #     コンテナ実行時は seccomp 許可リストに recvmmsg/sendmmsg が必要
 #     （docker/assets/security/seccomp.json は対応済み）。
 #
+#   - 受け手が GRO で受けるとき（Linux のクライアント等）は受け手の CPU も下がる。
+#
 # 注意:
-#   - Linux 5.0+ でサポート
-#   - 一部の仮想環境やDockerでは期待通りに動作しない場合あり
-#   - 問題が発生した場合は false に設定してください
+#   - Linux 5.0+ でサポート（他の OS では無視）
+#   - 経路のデバイスが GSO で送れない（チェックサムのオフロードが無い・IPsec 等でカーネルが
+#     EIO / EINVAL を返す）ときは、そのソケットの GSO を自動で切り、拒まれた束を 1 パケットずつ
+#     送り直す（warn を 1 回出す。F-305）
 #
-# デフォルト: false
+# デフォルト: true（F-305。以前は false）
 #
-# gso_gro_enabled = true
+# gso_gro_enabled = false
 
 
 

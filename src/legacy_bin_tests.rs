@@ -798,6 +798,8 @@ mod config_parse_tests {
         assert_eq!(config.initial_max_data, 10_000_000);
         assert_eq!(config.initial_max_streams_bidi, 100);
         assert_eq!(config.initial_max_streams_uni, 100);
+        // F-305: GSO は既定で有効
+        assert!(config.gso_gro_enabled);
     }
 
     #[test]

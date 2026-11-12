@@ -94,6 +94,11 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - HTTP/3 の 1 イテレーションのデータグラム数は `[http3] mmsg_batch_size`（io_uring）/ `recv_drain_max`（reactor）で
   決まる最重要チューニング項目。定数でハードコードし直さない（F-151/F-152）。
 - HTTP/3 のストリーミング経路で本文途中のエラーは fin ではなくストリームリセットにする（切り詰めを成功に見せない。B-86）。
+- HTTP/3 の送信は GSO が既定（`gso_gro_enabled = true`）。ソケット単位の `UDP_SEGMENT` は 0 のままにし、束のセグメント長は
+  cmsg で渡す（ソケットに値を置くと cmsg の無い単発の送信まで分割され、経路 MTU の探索が壊れる。B-361）。カーネルが束を
+  `EIO`・`EINVAL` で拒んだらそのソケットの GSO を下ろして 1 パケットずつ送り直す（F-305）。計測の nginx も `quic_gso on`。
+- HTTP/3 のストリーミングの要求は、見出しと同じ束で届いた本文も取り込む時点で本文の上限を検査する（`take_first_body`。
+  pump の `recv_body` の後だけで見ると `Content-Length` の無い要求が上限を素通りする。B-362）。
 - HTTP/3 の応答本文は `ZcFactory`（`Bytes`）で quiche へコピーせず渡す（`send_h3_body` → `send_body_zc`）。vendoring の quiche の
   `send_body_zc` は送る分に切ったバッファを渡す（全長を渡すと偽の STREAM_DATA_BLOCKED を送り ngtcp2 が FINAL_SIZE_ERROR で
   切断する。E2E の HTTP/3 クライアントは quinn で素通りするので、送出を変えたら h2load でも確かめる）。quiche の

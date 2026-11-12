@@ -28,7 +28,9 @@ use std::task::{Context, Poll};
 
 use ftlog::warn;
 
-use crate::udp::socket::{build_gso_cmsg, socket_addr_to_raw, SendmmsgEntry};
+use crate::udp::socket::{
+    build_gso_cmsg, is_gso_rejection, socket_addr_to_raw, GsoRejected, SendmmsgEntry,
+};
 
 use super::executor::{
     alloc_op, cancel_op, detach_op, poll_completions, remove_op, set_op_waker, submit_sqes,
@@ -176,13 +178,15 @@ impl UringUdpSend {
     /// `entries`（`capacity()` 以下）をまとめて `IORING_OP_SENDMSG` で送出し、全件の完了
     /// （CQE 到着）を待つ。1 回の `submit_sqes()` で複数 SQE をまとめて `io_uring_enter` する。
     /// 個々のエントリが失敗しても他エントリの送信は継続する（skip + warn、既存 sendmmsg
-    /// フォールバックと同じ「恒久エラーは 1 メッセージだけ諦める」方針）。
+    /// フォールバックと同じ「恒久エラーは 1 メッセージだけ諦める」方針）。GSO の束を拒まれたエントリは
+    /// 完了の値に添字を返す（呼び出し側が GSO を下ろして 1 パケットずつ送り直す。F-305）。
     pub fn send_batch<'a>(&'a mut self, entries: &'a [SendmmsgEntry<'a>]) -> SendBatch<'a> {
         SendBatch {
             inner: self,
             entries,
             armed: false,
             remaining: 0,
+            rejected: GsoRejected::default(),
         }
     }
 }
@@ -240,10 +244,12 @@ pub struct SendBatch<'a> {
     entries: &'a [SendmmsgEntry<'a>],
     armed: bool,
     remaining: usize,
+    /// GSO の束を拒まれたエントリ（F-305）
+    rejected: GsoRejected,
 }
 
 impl Future for SendBatch<'_> {
-    type Output = io::Result<()>;
+    type Output = io::Result<GsoRejected>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
@@ -251,7 +257,7 @@ impl Future for SendBatch<'_> {
         if !this.armed {
             let count = this.entries.len().min(this.inner.slots.len());
             if count == 0 {
-                return Poll::Ready(Ok(()));
+                return Poll::Ready(Ok(this.rejected));
             }
             for i in 0..count {
                 if let Err(e) = this.inner.slots[i].configure(&this.entries[i]) {
@@ -271,13 +277,13 @@ impl Future for SendBatch<'_> {
             }
             this.armed = true;
             if this.remaining == 0 {
-                return Poll::Ready(Ok(()));
+                return Poll::Ready(Ok(this.rejected));
             }
         }
 
         loop {
             let mut progressed = false;
-            for slot in this.inner.slots.iter_mut() {
+            for (i, slot) in this.inner.slots.iter_mut().enumerate() {
                 if !slot.submitted {
                     continue;
                 }
@@ -288,8 +294,13 @@ impl Future for SendBatch<'_> {
                     progressed = true;
                     if res < 0 {
                         let err = io::Error::from_raw_os_error(-res);
+                        // F-305: この経路では GSO で送れない。呼び出し側が分けて送り直す
+                        if this.entries.get(i).is_some_and(|e| e.segments > 1)
+                            && is_gso_rejection(-res)
+                        {
+                            this.rejected.mark(i);
                         // EMSGSIZE は DF を立てた経路 MTU の探索で大きすぎた探索のパケット（想定内。quiche が下げる）
-                        if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                        } else if err.raw_os_error() == Some(libc::EMSGSIZE) {
                             ftlog::debug!("[HTTP/3] sendmsg entry skipped: {}", err);
                         } else {
                             warn!("[HTTP/3] sendmsg entry skipped: {}", err);
@@ -298,7 +309,7 @@ impl Future for SendBatch<'_> {
                 }
             }
             if this.remaining == 0 {
-                return Poll::Ready(Ok(()));
+                return Poll::Ready(Ok(this.rejected));
             }
             if !progressed {
                 for slot in this.inner.slots.iter() {
