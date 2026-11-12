@@ -91,6 +91,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   ダーティが残る間は sleep 0（B-12 / F-151）。起床通知はコアレッシングする（F-161）。ただし本文を一部だけ送れた
   （送れる量を使い切った）だけの進捗は再投入しない（続きは ACK・タイマーで再びダーティになる。F-240）。
 - QUIC の輻輳制御の既定は cubic（veil は pacing の送出時刻を守らずに送るので、BBR は受け手で捨てられて再送が増える。F-240）。
+- QUIC のパケット番号を飛ばす（楽観的 ACK の検出）のは、輻輳窓が最後に確かめた窓（確かめるまでの間の最小の窓）の 2 倍に達したときだけ
+  （`[http3] skip_packet_numbers = "on_growth"`。飛ばした番号は ngtcp2 系のクライアントの記録に穴として残り、パケットごとに探される。F-306）。
 - HTTP/3 の 1 イテレーションのデータグラム数は `[http3] mmsg_batch_size`（io_uring）/ `recv_drain_max`（reactor）で
   決まる最重要チューニング項目。定数でハードコードし直さない（F-151/F-152）。
 - HTTP/3 のストリーミング経路で本文途中のエラーは fin ではなくストリームリセットにする（切り詰めを成功に見せない。B-86）。
@@ -254,7 +256,7 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 ### プロトコル準拠・サンドボックス
 
 - HTTP/3 のリクエストは `h3_check_field_section` で RFC 9114 §4.3.1 を検査する（quiche の h3 層は検査しない。B-100）。
-  vendoring 版 quiche の差分（STREAM 詰め合わせ・予約ビット検査・rlib のみ）は `third_party/quiche/README.veil.md`。
+  vendoring 版 quiche の差分（STREAM 詰め合わせ・予約ビット検査・rlib のみ・パケット番号を飛ばす頻度）は `third_party/quiche/README.veil.md`。
 - 不正なプリフェースや拒否する接続は、未読データを残して close しない（RST になり相手は GOAWAY を読めない）。
   送信側を閉じて上限付きで読み捨ててから閉じる（B-102）。
 - seccomp の `ALLOWED_SYSCALLS` に syscall を足すときは番号を `libc::SYS_*` で確かめ、

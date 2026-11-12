@@ -86,6 +86,7 @@
 | `[http3]` | `pacing` | `true` | Packet Pacing を有効化 |
 | `[http3]` | `max_pacing_rate` | （なし） | 最大 pacing レート（バイト/秒）。未指定で制限なし |
 | `[http3]` | `hystart` | `true` | HyStart++ を有効化 |
+| `[http3]` | `skip_packet_numbers` | `"on_growth"` | 楽観的 ACK（届いていないパケットの ACK。RFC 9000 §21.4）を見つけるためにパケット番号を飛ばす頻度。`"on_growth"`: 輻輳窓が最後に確かめた窓（確かめるまでの間の最小の窓）の 2 倍に達したときだけ飛ばす。窓が伸びる間はおよそ 1 往復に 1 回確かめ、損失を隠す相手は次に確かめるまでに窓を 2 倍までしか広げられない。`"every_round"`: 確かめるたびに次を飛ばす（およそ 1 往復に 1 回。quiche の挙動）。`"off"`: 飛ばさない。飛ばした番号はクライアントの記録に接続の終わりまで穴として残り、ngtcp2 系のクライアント（curl・h2load）はパケットごとにその穴を探すので、`"every_round"` では長い接続で 1 要求あたりの CPU を 1〜2 割多く使わせていた |
 | `[http3]` | `mmsg_batch_size` | `64` | UDP mmsg / io_uring パイプライン化 RECVMSG/SENDMSG バッチ幅（1..=128） |
 | `[http3]` | `max_connections` | `10000` | ワーカーごとの QUIC 接続数の上限。達している間は新しい接続の Initial を捨てる。`0` は上限なし |
 | `[http3]` | `retry_threshold` | `1000` | ワーカーでハンドシェイク中の接続がこの数に達したら、トークンの無い Initial にステートレスな Retry を返し、クライアントが送信元のアドレスを持つことを確かめてから接続を作る（1 往復増える）。`0` は常に Retry |

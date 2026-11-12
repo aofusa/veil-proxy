@@ -800,6 +800,29 @@ mod config_parse_tests {
         assert_eq!(config.initial_max_streams_uni, 100);
         // F-305: GSO は既定で有効
         assert!(config.gso_gro_enabled);
+        // F-306: パケット番号は輻輳窓が伸びたときだけ飛ばす
+        assert_eq!(config.skip_packet_numbers, H3PnSkip::OnGrowth);
+    }
+
+    #[test]
+    fn test_http3_skip_packet_numbers_parse() {
+        // F-306: 3 つの値を受け付け、省略は on_growth、それ以外は読み込みの誤り
+        let parse = |v: &str| {
+            toml::from_str::<Http3ConfigSection>(&format!("skip_packet_numbers = \"{v}\""))
+        };
+        assert_eq!(
+            parse("on_growth").unwrap().skip_packet_numbers,
+            H3PnSkip::OnGrowth
+        );
+        assert_eq!(
+            parse("every_round").unwrap().skip_packet_numbers,
+            H3PnSkip::EveryRound
+        );
+        assert_eq!(parse("off").unwrap().skip_packet_numbers, H3PnSkip::Off);
+        assert!(parse("sometimes").is_err());
+        let omitted: Http3ConfigSection = toml::from_str("enabled = true").unwrap();
+        assert_eq!(omitted.skip_packet_numbers, H3PnSkip::OnGrowth);
+        assert_eq!(H3PnSkip::EveryRound.as_str(), "every_round");
     }
 
     #[test]

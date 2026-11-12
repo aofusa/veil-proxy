@@ -149,6 +149,7 @@ Supports HTTP/3 (RFC 9114) based on QUIC/UDP. Uses Cloudflare's [quiche](https:/
 | Connection Migration | Maintains connection during network switches |
 | GSO/GRO Optimization | High-performance UDP processing (UDP_SEGMENT / UDP_GRO) |
 | Congestion control / pacing | Configurable via `[http3]` (`cc_algorithm`, `pacing`, `hystart`, …); default cubic + pacing |
+| Optimistic ACK detection | Skips a packet number whenever the congestion window has doubled since the last check and closes the connection if the client acknowledges it (`[http3] skip_packet_numbers`, default `"on_growth"`) |
 | io_uring pipelined UDP I/O | Receive/send hot path uses pipelined `IORING_OP_RECVMSG`/`IORING_OP_SENDMSG` (batch via `mmsg_batch_size`, default 64); no libc `recvmmsg`/`sendmmsg` on the hot path (F-130) |
 
 ### Enabling

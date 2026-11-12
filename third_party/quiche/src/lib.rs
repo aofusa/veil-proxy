@@ -582,6 +582,9 @@ pub struct Config {
     initial_congestion_window_packets: usize,
     enable_relaxed_loss_threshold: bool,
 
+    // veil: how often packet numbers are skipped (optimistic ACK detection).
+    pn_skip_policy: PnSkipPolicy,
+
     pmtud: bool,
 
     hystart: bool,
@@ -660,6 +663,7 @@ impl Config {
             initial_congestion_window_packets:
                 DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS,
             enable_relaxed_loss_threshold: false,
+            pn_skip_policy: PnSkipPolicy::default(),
             pmtud: false,
             hystart: true,
             pacing: true,
@@ -1114,6 +1118,14 @@ impl Config {
     /// The default value is false.
     pub fn set_enable_relaxed_loss_threshold(&mut self, enable: bool) {
         self.enable_relaxed_loss_threshold = enable;
+    }
+
+    /// veil: sets how often packet numbers are skipped to detect optimistic
+    /// ACKs (see [`PnSkipPolicy`]).
+    ///
+    /// The default value is [`PnSkipPolicy::EveryRound`] (upstream quiche).
+    pub fn set_pn_skip_policy(&mut self, policy: PnSkipPolicy) {
+        self.pn_skip_policy = policy;
     }
 
     /// Configures whether to enable HyStart++.
@@ -1852,7 +1864,9 @@ impl<F: BufFactory> Connection<F> {
 
             next_pkt_num: 0,
 
-            pkt_num_manager: packet::PktNumManager::new(),
+            pkt_num_manager: packet::PktNumManager::with_policy(
+                config.pn_skip_policy,
+            ),
 
             peer_transport_params: TransportParams::default(),
 
@@ -7773,7 +7787,10 @@ impl<F: BufFactory> Connection<F> {
                         largest_acked.zip(skip_pn)
                     {
                         if largest_acked > skip_pn {
-                            self.pkt_num_manager.set_skip_pn(None);
+                            // veil: validate against the window after this
+                            // ACK's losses (see `PnSkipPolicy`).
+                            self.pkt_num_manager
+                                .on_skip_pn_validated(p.recovery.cwnd());
                         }
                     }
 
@@ -8913,6 +8930,7 @@ mod tests;
 
 pub use crate::packet::ConnectionId;
 pub use crate::packet::Header;
+pub use crate::packet::PnSkipPolicy;
 pub use crate::packet::Type;
 
 pub use crate::path::PathEvent;

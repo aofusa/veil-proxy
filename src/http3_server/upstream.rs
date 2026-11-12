@@ -292,10 +292,11 @@ pub async fn run_http3_server_async(
     configure_quic_transport(&mut quic_config, &config)?;
     HTTP3_LOG_ONCE_TRANSPORT.call_once(|| {
         info!(
-            "[HTTP/3] quiche transport: cc={} pacing={} hystart={} mmsg_batch={} recv_drain_max={}",
+            "[HTTP/3] quiche transport: cc={} pacing={} hystart={} skip_packet_numbers={} mmsg_batch={} recv_drain_max={}",
             config.cc_algorithm.trim(),
             config.pacing,
             config.hystart,
+            config.skip_packet_numbers.as_str(),
             config.mmsg_batch_size,
             config.recv_drain_max
         );

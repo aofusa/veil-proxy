@@ -2958,7 +2958,7 @@ dependencies = [
 
 [[package]]
 name = "veil-proxy-quiche"
-version = "0.24.9-veil.4"
+version = "0.24.9-veil.5"
 dependencies = [
  "aws-lc-sys",
  "boring",

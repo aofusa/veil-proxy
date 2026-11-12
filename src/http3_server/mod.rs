@@ -398,6 +398,12 @@ fn configure_quic_transport(
         quic_config.set_max_pacing_rate(rate);
     }
     quic_config.enable_hystart(config.hystart);
+    // F-306: 飛ばした番号は相手の受信の記録に穴として残り続けるので、既定では輻輳窓が伸びたときだけ飛ばす
+    quic_config.set_pn_skip_policy(match config.skip_packet_numbers {
+        crate::config::H3PnSkip::OnGrowth => quiche::PnSkipPolicy::OnCwndGrowth,
+        crate::config::H3PnSkip::EveryRound => quiche::PnSkipPolicy::EveryRound,
+        crate::config::H3PnSkip::Off => quiche::PnSkipPolicy::Off,
+    });
 
     // HTTP/3 用の ALPN を設定
     quic_config
@@ -537,6 +543,8 @@ pub struct Http3ServerConfig {
     pub max_pacing_rate: Option<u64>,
     /// HyStart++ を有効にするか（quiche `enable_hystart`）。デフォルト: true
     pub hystart: bool,
+    /// 楽観的 ACK を見つけるためにパケット番号を飛ばす頻度（F-306）。デフォルト: 輻輳窓が 2 倍に伸びたときだけ
+    pub skip_packet_numbers: crate::config::H3PnSkip,
     /// UDP mmsg / multishot バッチ幅（1..=128）。デフォルト: 64
     pub mmsg_batch_size: usize,
     /// reactor バックエンド専用: 1 イテレーションあたりに掻き出す UDP データグラム数の上限
@@ -595,6 +603,7 @@ impl Default for Http3ServerConfig {
             pacing: true,
             max_pacing_rate: None,
             hystart: true,
+            skip_packet_numbers: crate::config::H3PnSkip::default(),
             mmsg_batch_size: crate::udp::socket::MMSG_BATCH_DEFAULT,
             recv_drain_max: H3_RECV_DRAIN_MAX_DEFAULT,
             max_connections: admission::DEFAULT_MAX_CONNECTIONS,

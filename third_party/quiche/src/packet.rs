@@ -1023,13 +1023,61 @@ pub struct PktNumManager {
     /// None indicates the counter is not armed while Some(0) indicates that the
     /// counter has expired.
     pub skip_pn_counter: Option<u64>,
+
+    /// veil: when to arm the next skip (see [`PnSkipPolicy`]).
+    policy: PnSkipPolicy,
+
+    /// veil: smallest congestion window seen from arming the current skip
+    /// counter until the skipped packet number is validated.
+    armed_cwnd: usize,
+
+    /// veil: the window the peer was last validated against (`armed_cwnd` at
+    /// the last validation, 0 until the first one).
+    validated_cwnd: usize,
+}
+
+/// veil: how often packet numbers are skipped to detect optimistic ACKs.
+///
+/// Every skipped packet number stays a permanent gap in the peer's record of
+/// received packets for the rest of the connection, and some clients search
+/// that record linearly for every packet they receive (ngtcp2 keeps up to 256
+/// gaps). Skipping once per round therefore makes a long download cost the
+/// client noticeably more CPU per packet than a server that never skips.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PnSkipPolicy {
+    /// Arm the next skip as soon as the previous one has been validated
+    /// (roughly once per round trip). This is upstream quiche's behavior.
+    #[default]
+    EveryRound,
+
+    /// Arm the next skip only once the congestion window has reached twice the
+    /// window the peer was last validated against (the smallest window seen
+    /// while that skip was outstanding, including the response to the losses
+    /// reported by the validating ACK). While the window grows quickly (slow
+    /// start) this still checks about once per round; once it stops growing,
+    /// no more gaps are added, and a peer that hides losses can push the window
+    /// to at most twice the validated one before the next check.
+    OnCwndGrowth,
+
+    /// Never skip packet numbers (no optimistic ACK detection).
+    Off,
 }
 
 impl PktNumManager {
+    // veil: connections use `with_policy`; only the tests use the default.
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_policy(PnSkipPolicy::default())
+    }
+
+    /// veil: creates a manager that arms skips according to `policy`.
+    pub fn with_policy(policy: PnSkipPolicy) -> Self {
         PktNumManager {
             skip_pn: None,
             skip_pn_counter: None,
+            policy,
+            armed_cwnd: 0,
+            validated_cwnd: 0,
         }
     }
 
@@ -1040,12 +1088,26 @@ impl PktNumManager {
         // Decrement skip_pn_counter for each packet sent
         if let Some(counter) = &mut self.skip_pn_counter {
             *counter = counter.saturating_sub(1);
-        } else if self.should_arm_skip_counter(handshake_completed) {
+            // veil: track the smallest window while the skip is outstanding.
+            self.armed_cwnd = self.armed_cwnd.min(cwnd);
+        } else if self.skip_pn.is_some() {
+            self.armed_cwnd = self.armed_cwnd.min(cwnd);
+        } else if self.should_arm_skip_counter(handshake_completed, cwnd) {
             self.arm_skip_counter(cwnd, max_datagram_size);
         }
     }
 
-    fn should_arm_skip_counter(&self, handshake_completed: bool) -> bool {
+    /// veil: the peer acknowledged a packet number larger than the skipped one
+    /// without acknowledging it. `cwnd` is the window after processing that
+    /// ACK (including its losses).
+    pub fn on_skip_pn_validated(&mut self, cwnd: usize) {
+        self.armed_cwnd = self.armed_cwnd.min(cwnd);
+        self.set_skip_pn(None);
+    }
+
+    fn should_arm_skip_counter(
+        &self, handshake_completed: bool, cwnd: usize,
+    ) -> bool {
         // Arm if the counter is not set
         let counter_not_set = self.skip_pn_counter.is_none();
         // Don't arm until we have verified the current skip_pn. Rearming the
@@ -1053,8 +1115,20 @@ impl PktNumManager {
         // validating the current skip_pn.
         let no_current_skip_packet = self.skip_pn.is_none();
 
+        // veil: how often to skip (the first skip after the handshake is
+        // armed by every policy except `Off`).
+        let policy_allows = match self.policy {
+            PnSkipPolicy::EveryRound => true,
+            PnSkipPolicy::OnCwndGrowth =>
+                cwnd >= self.validated_cwnd.saturating_mul(2),
+            PnSkipPolicy::Off => false,
+        };
+
         // Skip pn only after the handshake has completed
-        counter_not_set && no_current_skip_packet && handshake_completed
+        counter_not_set &&
+            no_current_skip_packet &&
+            handshake_completed &&
+            policy_allows
     }
 
     pub fn should_skip_pn(&self, handshake_completed: bool) -> bool {
@@ -1083,6 +1157,10 @@ impl PktNumManager {
             debug_assert!(self.skip_pn.is_none());
             // The skip_pn_counter should be expired
             debug_assert_eq!(self.skip_pn_counter.unwrap(), 0);
+        } else if self.skip_pn.is_some() {
+            // veil: the peer acknowledged a larger packet number without the
+            // skipped one, so it has been honest while the skip was outstanding.
+            self.validated_cwnd = self.armed_cwnd;
         }
 
         self.skip_pn = skip_pn;
@@ -1118,6 +1196,7 @@ impl PktNumManager {
         let skip_pn_counter = MIN_SKIP_COUNTER_VALUE + lower + rand_skip_value;
 
         self.skip_pn_counter = Some(skip_pn_counter);
+        self.armed_cwnd = cwnd;
     }
 }
 
@@ -2316,6 +2395,118 @@ mod tests {
             handshake_completed,
         );
         assert!(skip_manager.skip_pn_counter.is_some());
+    }
+    #[test]
+    fn skip_policy_on_cwnd_growth() {
+        let mds = MAX_SEND_UDP_PAYLOAD_SIZE;
+        let mut m = PktNumManager::with_policy(PnSkipPolicy::OnCwndGrowth);
+
+        // The first skip is armed right after the handshake.
+        m.on_packet_sent(10 * mds, mds, true);
+        assert!(m.skip_pn_counter.is_some());
+
+        // Skip, then validate (the peer acknowledged a larger packet number).
+        m.skip_pn_counter = Some(0);
+        assert!(m.should_skip_pn(true));
+        m.set_skip_pn(Some(100));
+        m.set_skip_pn(None);
+
+        // No new skip until the window doubles the validated one.
+        m.on_packet_sent(19 * mds, mds, true);
+        assert!(m.skip_pn_counter.is_none());
+        m.on_packet_sent(20 * mds, mds, true);
+        assert!(m.skip_pn_counter.is_some());
+    }
+
+    #[test]
+    fn skip_policy_on_cwnd_growth_measures_from_the_armed_window() {
+        let mds = MAX_SEND_UDP_PAYLOAD_SIZE;
+        let mut m = PktNumManager::with_policy(PnSkipPolicy::OnCwndGrowth);
+
+        // Armed at 10 packets; the window grows to 40 before validation.
+        m.on_packet_sent(10 * mds, mds, true);
+        m.skip_pn_counter = Some(0);
+        m.set_skip_pn(Some(100));
+        m.on_packet_sent(40 * mds, mds, true);
+        m.set_skip_pn(None);
+
+        // Validated against 10 packets, so 20 packets arm the next skip.
+        m.on_packet_sent(20 * mds, mds, true);
+        assert!(m.skip_pn_counter.is_some());
+    }
+
+    #[test]
+    fn skip_policy_on_cwnd_growth_validates_the_smallest_window() {
+        let mds = MAX_SEND_UDP_PAYLOAD_SIZE;
+
+        // The window shrank while the skip was outstanding.
+        let mut m = PktNumManager::with_policy(PnSkipPolicy::OnCwndGrowth);
+        m.on_packet_sent(40 * mds, mds, true);
+        m.on_packet_sent(30 * mds, mds, true);
+        m.skip_pn_counter = Some(0);
+        m.set_skip_pn(Some(100));
+        m.on_packet_sent(25 * mds, mds, true);
+        m.on_skip_pn_validated(35 * mds);
+        m.on_packet_sent(49 * mds, mds, true);
+        assert!(m.skip_pn_counter.is_none());
+        m.on_packet_sent(50 * mds, mds, true);
+        assert!(m.skip_pn_counter.is_some());
+
+        // The validating ACK reported losses and shrank the window.
+        let mut m = PktNumManager::with_policy(PnSkipPolicy::OnCwndGrowth);
+        m.on_packet_sent(40 * mds, mds, true);
+        m.skip_pn_counter = Some(0);
+        m.set_skip_pn(Some(100));
+        m.on_skip_pn_validated(28 * mds);
+        m.on_packet_sent(55 * mds, mds, true);
+        assert!(m.skip_pn_counter.is_none());
+        m.on_packet_sent(56 * mds, mds, true);
+        assert!(m.skip_pn_counter.is_some());
+    }
+
+    #[test]
+    fn skip_policy_on_cwnd_growth_waits_for_validation_and_handshake() {
+        let mds = MAX_SEND_UDP_PAYLOAD_SIZE;
+        let mut m = PktNumManager::with_policy(PnSkipPolicy::OnCwndGrowth);
+
+        m.on_packet_sent(10 * mds, mds, false);
+        assert!(m.skip_pn_counter.is_none());
+
+        m.on_packet_sent(10 * mds, mds, true);
+        m.skip_pn_counter = Some(0);
+        m.set_skip_pn(Some(100));
+
+        // Not validated yet: never re-arm, whatever the window.
+        m.on_packet_sent(1000 * mds, mds, true);
+        assert!(m.skip_pn_counter.is_none());
+        assert!(!m.should_skip_pn(true));
+    }
+
+    #[test]
+    fn skip_policy_off_never_skips() {
+        let mds = MAX_SEND_UDP_PAYLOAD_SIZE;
+        let mut m = PktNumManager::with_policy(PnSkipPolicy::Off);
+        for cwnd in [10, 100, 10_000] {
+            m.on_packet_sent(cwnd * mds, mds, true);
+            assert!(m.skip_pn_counter.is_none());
+            assert!(!m.should_skip_pn(true));
+        }
+    }
+
+    #[test]
+    fn skip_policy_default_is_every_round() {
+        assert_eq!(PnSkipPolicy::default(), PnSkipPolicy::EveryRound);
+
+        let mds = MAX_SEND_UDP_PAYLOAD_SIZE;
+        let mut m = PktNumManager::new();
+        m.on_packet_sent(10 * mds, mds, true);
+        m.skip_pn_counter = Some(0);
+        m.set_skip_pn(Some(100));
+        m.set_skip_pn(None);
+
+        // Re-armed right after validation, even with a smaller window.
+        m.on_packet_sent(5 * mds, mds, true);
+        assert!(m.skip_pn_counter.is_some());
     }
 
     #[test]

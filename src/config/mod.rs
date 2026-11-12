@@ -1024,6 +1024,30 @@ impl Http3CompressionConfig {
     }
 }
 
+/// `[http3] skip_packet_numbers`: 楽観的 ACK を見つけるためにパケット番号を飛ばす頻度（F-306）
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum H3PnSkip {
+    /// 輻輳窓が最後に確かめた窓の 2 倍に達したときだけ飛ばす（既定）
+    #[default]
+    OnGrowth,
+    /// 確かめ終えるたびに次を飛ばす（およそ 1 往復に 1 回。quiche の既定）
+    EveryRound,
+    /// 飛ばさない
+    Off,
+}
+
+impl H3PnSkip {
+    /// 設定の値の表記（起動時のログ用）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            H3PnSkip::OnGrowth => "on_growth",
+            H3PnSkip::EveryRound => "every_round",
+            H3PnSkip::Off => "off",
+        }
+    }
+}
+
 /// HTTP/3 詳細設定
 ///
 /// HTTP/3 (QUIC) プロトコルのパラメータを設定します。
@@ -1152,6 +1176,23 @@ pub struct Http3ConfigSection {
     /// デフォルト: `true`
     #[serde(default = "default_true")]
     pub hystart: bool,
+
+    /// 楽観的 ACK（受け取っていないパケットの ACK。RFC 9000 §21.4）を見つけるためにパケット番号を飛ばす頻度（F-306）
+    ///
+    /// - `"on_growth"`: 輻輳窓が最後に確かめた窓の 2 倍に達したときだけ飛ばす。確かめた窓は、飛ばしてから
+    ///   確かめるまでの間の最小の窓（確かめた ACK の損失の反映を含む）。窓が伸びる間（スロースタート）は
+    ///   およそ 1 往復ごとに確かめ、窓が伸びなくなった接続には穴を足さない。損失を隠す相手は、次に確かめる
+    ///   までに窓を確かめた窓の 2 倍までしか広げられない
+    /// - `"every_round"`: 確かめ終えるたびに次を飛ばす（およそ 1 往復に 1 回。quiche の既定）
+    /// - `"off"`: 飛ばさない（楽観的 ACK を見つけない）
+    ///
+    /// 飛ばした番号は相手の受信の記録に接続の終わりまで穴として残り、ngtcp2 のクライアント（curl・h2load）は
+    /// 受け取るパケットごとにその穴を線形に探す。`"every_round"` では長い転送で穴が 256 個まで溜まり、
+    /// コンテナ間の 54KB の静的配信で負荷側の CPU を 1〜2 割多く使わせていた。
+    ///
+    /// デフォルト: `"on_growth"`
+    #[serde(default)]
+    pub skip_packet_numbers: H3PnSkip,
 
     /// UDP データグラム送受信バッチ幅（`recvmmsg` / `sendmmsg` / multishot 提供バッファ数）
     ///
@@ -1305,6 +1346,7 @@ impl Default for Http3ConfigSection {
             pacing: true,
             max_pacing_rate: None,
             hystart: true,
+            skip_packet_numbers: H3PnSkip::default(),
             mmsg_batch_size: default_h3_mmsg_batch_size(),
             recv_drain_max: default_h3_recv_drain_max(),
             max_connections: default_h3_max_connections(),
@@ -1346,6 +1388,7 @@ impl Http3ConfigSection {
             pacing: self.pacing,
             max_pacing_rate: self.max_pacing_rate,
             hystart: self.hystart,
+            skip_packet_numbers: self.skip_packet_numbers,
             mmsg_batch_size: self
                 .mmsg_batch_size
                 .clamp(1, crate::udp::socket::MMSG_BATCH_MAX),

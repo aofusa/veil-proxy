@@ -130,9 +130,27 @@ allocate state buffer for large frames）、`439795b00f`（fix: bound PathEvent 
 試すときは upstream の 0.24.9 の `quiche/examples/{cert.crt,cert.key,cert-big.crt,rootca.crt}` を置く。aws-lc で動かすと
 0-RTT などの 75 件が当てる前から失敗する。当てて増えた 19 件はすべて通る）。veil 側は `path_event_next()` を受信のたびに取り出す。
 
+### 8. `src/packet.rs`・`src/lib.rs`: パケット番号を飛ばす頻度（`Config::set_pn_skip_policy`、F-306、0.24.9-veil.5）
+
+upstream は楽観的 ACK（受け取っていないパケットの ACK。RFC 9000 §21.4）を見つけるため、ハンドシェイクの後は飛ばした番号が
+確かめられる（相手がそれより大きい番号を ACK する）たびに次の番号を飛ばす（`PktNumManager`。輻輳窓の 0.5〜2 倍のパケットごと、
+およそ 1 往復に 1 回）。飛ばした番号は相手の受信の記録に接続の終わりまで穴として残り、ngtcp2（h2load・curl）は受け取るパケットごとに
+その穴を線形に探す（`ngtcp2_ksl`。穴は 256 個まで残る）。コンテナ間の 54KB の静的配信（h2load の HTTP/3）で、飛ばさないと
+負荷側の 1 要求の CPU が下がり rps が 1〜2 割上がった。
+
+- `packet.rs`: `pub enum PnSkipPolicy { EveryRound（既定。upstream と同じ）, OnCwndGrowth, Off }` と
+  `PktNumManager::with_policy`。`OnCwndGrowth` は、輻輳窓が「最後に確かめた窓」の 2 倍に達したときだけ次を仕掛ける。確かめた窓は、
+  仕掛けてから確かめるまでの間の最小の窓（送るたびに `min`）と、確かめた ACK の損失を反映した後の窓の小さい方
+  （`on_skip_pn_validated(cwnd)`）。窓が伸びる間（スロースタート）はおよそ 1 往復に 1 回確かめ、伸びなくなった接続には穴を足さない。
+  損失を隠す相手は、次に確かめるまでに窓を確かめた窓の 2 倍までしか広げられない。
+- `lib.rs`: `Config::set_pn_skip_policy`、接続の生成で `PktNumManager::with_policy(config.pn_skip_policy)`、ACK の処理で確かめたら
+  `on_skip_pn_validated(p.recovery.cwnd())`（upstream は `set_skip_pn(None)`）、`pub use crate::packet::PnSkipPolicy`。
+- 既定（`EveryRound`）の挙動は upstream と同じ（`set_skip_pn(None)` と同じく次を仕掛ける）。veil は `[http3] skip_packet_numbers`
+  （既定 `"on_growth"`）で選ぶ。`grep -n 'veil:' src/packet.rs`。
+
 ## 追従手順
 
-quiche を更新するときは、新バージョンを同じ手順でコピーし直して上記 1〜4 を再適用する
+quiche を更新するときは、新バージョンを同じ手順でコピーし直して上記 1〜8 を再適用する
 （`grep -n 'Coalesce STREAM frames when fuzzing' src/lib.rs` と `grep -n 'veil:' src/lib.rs`
 で該当箇所が見つかる）。
 upstream がこの挙動を既定にした場合は vendoring を撤去し `[patch.crates-io]` を消す。
@@ -150,7 +168,7 @@ path 依存になると cargo が lint を抑制しなくなるため veil の�
 
 veil を crates.io に出すため、`[patch.crates-io]` で差し替えるのをやめ、別のパッケージとして公開する。
 
-- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.4`（`[lib] name = "quiche"` はそのまま。veil.2 は上の 5、veil.3 は上の 6、veil.4 は上の 7）。
+- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.5`（`[lib] name = "quiche"` はそのまま。veil.2 は上の 5、veil.3 は上の 6、veil.4 は上の 7、veil.5 は上の 8）。
   既定の feature を空にした（`boringssl-vendored` は取り込んでいない `deps/boringssl` を要るため）。
   `[lints]` で veil の clippy（`-D warnings`）の対象から外す。
 - `rustfmt.toml`: `disable_all_formatting = true`（path 依存になり、veil の `cargo fmt` の対象に入ったため）。
