@@ -253,7 +253,11 @@ pub(super) fn drive_request_pump(
                         ps.req_tx = None; // バックエンドタスクを中断。
                         ps.req_pending.clear();
                         // クライアントの送信を止める。
-                        let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+                        let _ = conn.stream_shutdown(
+                            stream_id,
+                            quiche::Shutdown::Read,
+                            H3_NO_ERROR_CODE,
+                        );
                         return true;
                     }
                     match tx.try_send(buf.freeze()) {

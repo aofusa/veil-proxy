@@ -15,6 +15,15 @@ mod standalone;
 // B-266〜B-277・F-285〜F-287: プロトコル間の機能の差の回帰試験
 #[path = "standalone/parity_tests.rs"]
 mod parity_tests;
+// feat/beat-nginx: 機能 × プロトコルのマトリックス（HTTP/1.1 平文・TLS・h2c・HTTP/2・HTTP/3）
+#[cfg(all(
+    feature = "compression",
+    feature = "cache",
+    feature = "metrics",
+    feature = "wasm"
+))]
+#[path = "standalone/matrix_tests.rs"]
+mod matrix_tests;
 
 use standalone::*;
 use std::time::Duration;

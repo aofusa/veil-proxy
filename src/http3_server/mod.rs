@@ -683,6 +683,33 @@ impl ProxyStream {
         }
     }
 
+    /// 見出しと同じ束で届いていた本文（`stream_bodies`）を取り込む。ルートの本文の上限を超えていたら
+    /// 413 にする印を立てて `false` を返す（呼び出し側はバックエンドを起動しない。応答は
+    /// `drive_response_flush` が 413 を返す）。
+    ///
+    /// B-362: 上限の検査は pump の `recv_body` の後にしかなく、本文の全量が見出しと同じ束で届くと
+    /// Content-Length の無い要求は上限を素通りして上流へ送られていた。
+    fn take_first_body(
+        &mut self,
+        conn: &mut H3Conn,
+        stream_id: u64,
+        body: Option<BytesMut>,
+    ) -> bool {
+        let Some(body) = body.filter(|b| !b.is_empty()) else {
+            return true;
+        };
+        self.req_bytes_total += body.len() as u64;
+        if self.max_request_body > 0 && self.req_bytes_total > self.max_request_body {
+            self.req_too_large = true;
+            self.req_tx = None;
+            // 残りの送信を止めてもらう（RFC 9114 §4.1.1 の H3_NO_ERROR）
+            let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Read, H3_NO_ERROR_CODE);
+            return false;
+        }
+        self.req_pending.push_back(body.freeze());
+        true
+    }
+
     /// B-97: バッファ経路の要求（本文は受信済み）。要求方向は最初から閉じている。
     fn new_buffered(resp_rx: crate::http3_stream::Receiver<crate::http3_stream::RespMsg>) -> Self {
         Self {
@@ -1319,14 +1346,11 @@ impl Http3Handler {
                             self.arm_body_check();
                         }
                     }
-                    // 初回バッチで届いていたボディを取り込む。
-                    if let Some(body) = self.stream_bodies.remove(&stream_id) {
-                        if !body.is_empty() {
-                            ps.req_bytes_total += body.len() as u64;
-                            ps.req_pending.push_back(body.freeze());
-                        }
+                    // 初回バッチで届いていたボディを取り込む（上限を超えていたら上流へ送らずに 413）。
+                    let body = self.stream_bodies.remove(&stream_id);
+                    if ps.take_first_body(&mut self.conn, stream_id, body) {
+                        (self.backend_spawner)(params, req_rx, resp_tx, self.notify.clone());
                     }
-                    (self.backend_spawner)(params, req_rx, resp_tx, self.notify.clone());
                     self.proxy_streams.insert(stream_id, ps);
                 }
                 #[cfg(feature = "handler")]
@@ -1340,18 +1364,15 @@ impl Http3Handler {
                     if ps.recv_watch.is_some() {
                         self.arm_body_check();
                     }
-                    if let Some(body) = self.stream_bodies.remove(&stream_id) {
-                        if !body.is_empty() {
-                            ps.req_bytes_total += body.len() as u64;
-                            ps.req_pending.push_back(body.freeze());
-                        }
+                    let body = self.stream_bodies.remove(&stream_id);
+                    if ps.take_first_body(&mut self.conn, stream_id, body) {
+                        crate::runtime::spawn(h3_api_stream_task(
+                            h,
+                            req_rx,
+                            resp_tx,
+                            self.notify.clone(),
+                        ));
                     }
-                    crate::runtime::spawn(h3_api_stream_task(
-                        h,
-                        req_rx,
-                        resp_tx,
-                        self.notify.clone(),
-                    ));
                     self.proxy_streams.insert(stream_id, ps);
                 }
                 Decision::Buffer => {
