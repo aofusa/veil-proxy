@@ -223,6 +223,7 @@ pub(super) async fn try_splice_proxy(
     content_length: usize,
     is_chunked: bool,
     initial_body: &[u8],
+    close: bool,
     security: &SecurityConfig,
 ) -> Option<(u16, u64, bool, bool)> {
     proxy_http_request_splice(
@@ -232,6 +233,7 @@ pub(super) async fn try_splice_proxy(
         content_length,
         is_chunked,
         initial_body,
+        close,
         security,
     )
     .await
@@ -247,6 +249,7 @@ pub(super) async fn try_splice_proxy(
     _content_length: usize,
     _is_chunked: bool,
     _initial_body: &[u8],
+    _close: bool,
     _security: &SecurityConfig,
 ) -> Option<(u16, u64, bool, bool)> {
     None
@@ -260,6 +263,7 @@ pub(super) async fn proxy_http_request_splice(
     content_length: usize,
     is_chunked: bool,
     initial_body: &[u8],
+    close: bool,
     security: &SecurityConfig,
 ) -> Option<(u16, u64, bool, bool)> {
     // 設定に基づいてパイプを取得または作成
@@ -362,8 +366,15 @@ pub(super) async fn proxy_http_request_splice(
     }
 
     // 4. レスポンスを受信して転送（splice 使用）
-    let result =
-        splice_transfer_response_ktls(backend_stream, client_stream, pipe, is_head, security).await;
+    let result = splice_transfer_response_ktls(
+        backend_stream,
+        client_stream,
+        pipe,
+        is_head,
+        close,
+        security,
+    )
+    .await;
 
     Some(result)
 }
@@ -388,6 +399,8 @@ pub(super) async fn splice_transfer_response_ktls(
     client_stream: &KtlsServerStream,
     pipe: &SplicePipe,
     is_head: bool,
+    // 応答の後にクライアントの接続を閉じる（応答ヘッダに `Connection: close` を付ける。B-360）
+    close: bool,
     security: &SecurityConfig,
 ) -> (u16, u64, bool, bool) {
     let client_tcp = client_stream.get_ref();
@@ -454,8 +467,10 @@ pub(super) async fn splice_transfer_response_ktls(
                 && matches!(kind, ResponseBody::Length(cl) if cl > start.send);
             // 応答ヘッダの方針・Alt-Svc・Server・HTTP/1.1 以外のステータス行があれば、他の経路と同じ
             // `render_response_head` で直してから送る（以前は上流の head をそのまま送っていた。B-275）。
-            // どれも無ければ今までどおり上流の head をそのまま送る（確保しない）
-            let rewrite = security.has_response_header_ops()
+            // どれも無ければ今までどおり上流の head をそのまま送る（確保しない）。閉じる応答は
+            // `Connection: close` を付けるので作り直す（B-360）
+            let rewrite = close
+                || security.has_response_header_ops()
                 || get_alt_svc_guard().is_some()
                 || get_server_header_guard().is_some()
                 || !accumulated.starts_with(b"HTTP/1.1 ");
@@ -470,6 +485,9 @@ pub(super) async fn splice_transfer_response_ktls(
                     security,
                     &mut out,
                 );
+                if close {
+                    super::compress::set_h1_close(&mut out);
+                }
                 out.extend_from_slice(&accumulated[header_len..head_len]);
                 let r = if more {
                     send_head_more(client_tcp, &out).await

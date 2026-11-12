@@ -61,6 +61,8 @@ pub(super) async fn proxy_request_buffered<R>(
     #[cfg(feature = "wasm")] wasm_body: Option<(&CompressionConfig, crate::config::ClientAccept)>,
     // `buffering` の適用を数えるホスト（`mode = "adaptive"` は溜めると決めたときだけ数える。B-296）
     metrics_host: &str,
+    // 応答の後にクライアントの接続を閉じる（応答ヘッダに `Connection: close` を付ける。B-360）
+    close: bool,
 ) -> Option<(u16, u64, bool, bool)>
 where
     R: AsyncReader
@@ -160,6 +162,7 @@ where
             let head = super::compress::finish_h1_upstream_head(
                 &headers_data,
                 status_code,
+                close,
                 security,
                 #[cfg(feature = "wasm")]
                 wasm_modules,

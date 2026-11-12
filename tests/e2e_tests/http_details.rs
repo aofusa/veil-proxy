@@ -286,69 +286,73 @@ pub(super) async fn test_connection_close_header() {
         return;
     }
 
-    // Connection: closeヘッダーのテスト
-    // Connection: closeが指定されている場合、接続が閉じられる
+    // Connection: close の要求には、応答の後に閉じることを `Connection: close` で知らせる（RFC 9112 §9.6）。
+    // B-360: 上流の応答ヘッダを流す経路（`/` は圧縮のあるルート = ユーザー空間の転送、`/api/` は圧縮の無い
+    // ルート = kTLS・平文では splice の経路）でも、上流の `Connection: keep-alive` を流さずに `close` にする
+    for path in ["/", "/api/"] {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-
-    // TLS接続を確立
-    let config = create_client_config();
-    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
-    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
-
-    // TLSハンドシェイクを完了
-    while tls_conn.is_handshaking() {
-        match tls_conn.complete_io(&mut stream) {
-            Ok(_) => {}
-            Err(_) => {
+        let config = create_client_config();
+        let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+        let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+        while tls_conn.is_handshaking() {
+            if tls_conn.complete_io(&mut stream).is_err() {
                 panic!("TLS handshake error");
             }
         }
-    }
+        let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
 
-    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-
-    // Connection: closeヘッダーを含むリクエストを送信
-    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    if let Err(e) = tls_stream.write_all(request) {
-        panic!("Failed to send request: {:?}", e);
-    }
-    tls_stream.flush().unwrap();
-
-    // レスポンスを受信
-    let mut response = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        match tls_stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&buf[..n]),
-            Err(_) => break,
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        if let Err(e) = tls_stream.write_all(request.as_bytes()) {
+            panic!("Failed to send request: {:?}", e);
         }
-    }
+        tls_stream.flush().unwrap();
 
-    let response = String::from_utf8_lossy(&response);
-    let status = get_status_code(&response);
-    assert_eq!(status, Some(200), "Should return 200 OK");
+        // 閉じられるまで読む（閉じなければ読み取りのタイムアウトで抜け、下の検査で失敗する）
+        let mut response = Vec::new();
+        let mut buf = [0u8; 8192];
+        let closed = loop {
+            match tls_stream.read(&mut buf) {
+                Ok(0) => break true,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                // 相手が close_notify を送らずに閉じた（TCP の FIN）のも閉じた扱い
+                Err(e) => break e.kind() == std::io::ErrorKind::UnexpectedEof,
+            }
+        };
 
-    // Connection: closeヘッダーがレスポンスに含まれている可能性がある
-    let connection = get_header_value(&response, "Connection");
-    if let Some(conn_value) = connection {
-        // Connectionヘッダーが存在する場合、値は'close'または'keep-alive'の可能性がある
-        let conn_lower = conn_value.to_lowercase();
-        assert!(
-            conn_lower == "close" || conn_lower == "keep-alive",
-            "Connection header should be 'close' or 'keep-alive': {}",
-            conn_value
+        let response = String::from_utf8_lossy(&response);
+        let status = get_status_code(&response);
+        if path == "/" {
+            assert_eq!(status, Some(200), "Should return 200 OK");
+        } else {
+            assert!(status.is_some(), "{path}: no response");
+        }
+        assert!(closed, "{path}: server should close the connection");
+        let connection: Vec<String> = response
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or("")
+            .lines()
+            .filter_map(|l| l.split_once(':'))
+            .filter(|(n, _)| n.trim().eq_ignore_ascii_case("connection"))
+            .map(|(_, v)| v.trim().to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            connection,
+            vec!["close".to_string()],
+            "{path}: response should carry exactly one `Connection: close`"
         );
-        eprintln!("Connection: close test: Connection header = {}", conn_value);
-    } else {
-        eprintln!("Connection: close test: Connection header not present");
+        assert!(
+            get_header_value(&response, "Keep-Alive").is_none(),
+            "{path}: Keep-Alive must not be forwarded on a closing response"
+        );
     }
 }
 

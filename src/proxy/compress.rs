@@ -34,6 +34,8 @@ pub(super) async fn proxy_http_request_with_compression(
     cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
     wasm_modules: crate::wasm_plugin_config::WasmModules,
+    // 応答の後にクライアントの接続を閉じる（応答ヘッダに `Connection: close` を付ける。B-360）
+    close: bool,
 ) -> Option<(u16, u64, bool, bool)> {
     // HEAD の応答は本文を持たない（Content-Length があっても読まない。B-245）
     let is_head = request_is_head(&request);
@@ -105,6 +107,7 @@ pub(super) async fn proxy_http_request_with_compression(
             security,
             wasm_modules,
             is_head,
+            close,
         )
         .await;
 
@@ -136,6 +139,7 @@ pub(super) async fn transfer_response_with_compression(
     security: &SecurityConfig,
     wasm_modules: crate::wasm_plugin_config::WasmModules,
     is_head: bool,
+    close: bool,
 ) -> (u64, u16, bool, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -244,6 +248,7 @@ pub(super) async fn transfer_response_with_compression(
                     encoding,
                     compression,
                     backend_wants_keep_alive,
+                    close,
                     security,
                     status_code,
                     #[cfg(feature = "wasm")]
@@ -283,6 +288,7 @@ pub(super) async fn transfer_response_with_compression(
                 let modified_headers = match finish_h1_upstream_head(
                     &accumulated[..header_len],
                     status_code,
+                    close,
                     security,
                     #[cfg(feature = "wasm")]
                     &wasm_modules,
@@ -461,6 +467,7 @@ async fn wasm_on_full_head(
 pub(super) async fn finish_h1_upstream_head(
     raw: &[u8],
     status: u16,
+    close: bool,
     security: &SecurityConfig,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
 ) -> Result<Vec<u8>, super::sendfile::HeadLocal> {
@@ -470,7 +477,45 @@ pub(super) async fn finish_h1_upstream_head(
     let mut head = head;
     // `[route.traffic.cors]` の実際の応答のヘッダ（F-273。CORS の無いルートは分岐だけ）
     crate::route_cors::apply_h1(&mut head, security);
+    if close {
+        set_h1_close(&mut head);
+    }
     Ok(head)
+}
+
+/// 応答の後にクライアントの接続を閉じるとき、HTTP/1.1 の応答ヘッダ（空行まで）の `Connection`・`Keep-Alive` の行を
+/// `Connection: close` の 1 行に置き換える（その場で書き換え、確保しない。容量が足りなければ 1 回伸ばす）。
+///
+/// B-360: 上流の head をそのまま返すと、上流の `Connection: keep-alive`（または何も無い）がクライアントに届き、
+/// クライアントは閉じられる接続で次の要求を送って失敗する（接続の集約で動かす接続・`Connection: close` の要求）。
+/// RFC 9112 §9.6: 閉じる側は最後の応答に `close` を付ける。
+pub(super) fn set_h1_close(head: &mut Vec<u8>) {
+    if !head.ends_with(b"\r\n\r\n") {
+        return;
+    }
+    // ステータス行の次から、終端の空行の手前までの行を見る
+    let Some(first_nl) = head.iter().position(|&b| b == b'\n') else {
+        return;
+    };
+    let mut pos = first_nl + 1;
+    while pos + 2 < head.len() {
+        let Some(rel) = head[pos..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let end = pos + rel + 1;
+        let name = head[pos..end]
+            .split(|&b| b == b':')
+            .next()
+            .unwrap_or(b"")
+            .trim_ascii();
+        if name.eq_ignore_ascii_case(b"connection") || name.eq_ignore_ascii_case(b"keep-alive") {
+            head.drain(pos..end);
+        } else {
+            pos = end;
+        }
+    }
+    head.truncate(head.len() - 2);
+    head.extend_from_slice(b"Connection: close\r\n\r\n");
 }
 
 /// 上流の応答のヘッダ（ステータス行から空行まで）を、クライアントへ返す形にする（WASM のフィルタが無いとき）。
@@ -557,6 +602,7 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
     encoding: AcceptedEncoding,
     compression: &CompressionConfig,
     backend_wants_keep_alive: bool,
+    close: bool,
     security: &SecurityConfig,
     status_code: u16,
     #[cfg(feature = "wasm")] wasm_modules: &crate::wasm_plugin_config::WasmModules,
@@ -587,6 +633,7 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
                     client_stream,
                     original_headers,
                     &body_data,
+                    close,
                     security,
                 )
                 .await
@@ -602,6 +649,7 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
                     client_stream,
                     original_headers,
                     &body_data,
+                    close,
                     security,
                 )
                 .await
@@ -614,6 +662,7 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
                         client_stream,
                         original_headers,
                         &body_data,
+                        close,
                         security,
                     )
                     .await
@@ -630,6 +679,7 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
                     client_stream,
                     original_headers,
                     &body_data,
+                    close,
                     security,
                 )
                 .await
@@ -645,6 +695,7 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
                     client_stream,
                     original_headers,
                     &body_data,
+                    close,
                     security,
                 )
                 .await
@@ -657,6 +708,7 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
                         client_stream,
                         original_headers,
                         &body_data,
+                        close,
                         security,
                     )
                     .await
@@ -690,6 +742,10 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
     };
     #[cfg(not(feature = "wasm"))]
     let _ = status_code;
+    let mut new_headers = new_headers;
+    if close {
+        set_h1_close(&mut new_headers);
+    }
 
     // 4. ヘッダー送信（所有権を移動、clone 不要）
     let new_headers_len = new_headers.len();
@@ -724,6 +780,7 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
     _encoding: AcceptedEncoding,
     _compression: &CompressionConfig,
     _backend_wants_keep_alive: bool,
+    _close: bool,
     _security: &SecurityConfig,
     _status_code: u16,
     #[cfg(feature = "wasm")] _wasm_modules: &crate::wasm_plugin_config::WasmModules,
@@ -738,9 +795,13 @@ pub(super) async fn transfer_uncompressed_fallback(
     client_stream: &mut ServerTls,
     original_headers: &[u8],
     body_data: &[u8],
+    close: bool,
     security: &SecurityConfig,
 ) -> Option<u64> {
-    let head = build_compressed_headers(original_headers, None, body_data.len(), security);
+    let mut head = build_compressed_headers(original_headers, None, body_data.len(), security);
+    if close {
+        set_h1_close(&mut head);
+    }
     let total = (head.len() + body_data.len()) as u64;
     let write_result = timeout(
         WRITE_TIMEOUT,
@@ -869,5 +930,62 @@ mod response_head_tests {
             render_response_head(b"garbage", 200, &sec),
             b"garbage".to_vec()
         );
+    }
+
+    /// B-360: 閉じる応答は上流の `Connection`・`Keep-Alive` を `Connection: close` 1 行に置き換える
+    #[test]
+    fn set_h1_close_replaces_connection_headers() {
+        let mut head = b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 3\r\n\
+keep-alive: timeout=5\r\nCONNECTION: Keep-Alive, foo\r\nX-Connection-Id: 7\r\n\r\n"
+            .to_vec();
+        set_h1_close(&mut head);
+        assert_eq!(
+            head,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Connection-Id: 7\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        );
+        // 何も無ければ足すだけ。2 回かけても 1 行
+        let mut head = b"HTTP/1.1 204 No Content\r\n\r\n".to_vec();
+        set_h1_close(&mut head);
+        set_h1_close(&mut head);
+        assert_eq!(
+            head,
+            b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_vec()
+        );
+        // 空行で終わらないものは触らない
+        let mut head = b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n".to_vec();
+        set_h1_close(&mut head);
+        assert_eq!(
+            head,
+            b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n".to_vec()
+        );
+    }
+
+    /// B-360: `buffering = "full"` 等の経路の応答ヘッダも閉じるときだけ `Connection: close` になる
+    #[test]
+    fn finish_h1_upstream_head_marks_close() {
+        let sec = SecurityConfig::default();
+        let raw = b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\n";
+        let run = |close| {
+            // Wasm のモジュールが無ければ await しないので、io_uring の無い環境でも回せる実行器で足りる
+            futures::executor::block_on(async {
+                finish_h1_upstream_head(
+                    raw,
+                    200,
+                    close,
+                    &sec,
+                    #[cfg(feature = "wasm")]
+                    &crate::wasm_plugin_config::WasmModules::default(),
+                )
+                .await
+            })
+        };
+        let open = run(false).ok().unwrap();
+        assert!(open.windows(22).any(|w| w == b"Connection: keep-alive"));
+        let closed = run(true).ok().unwrap();
+        assert!(closed.ends_with(b"Connection: close\r\n\r\n"));
+        assert!(!closed
+            .windows(10)
+            .any(|w| w.eq_ignore_ascii_case(b"keep-alive")));
     }
 }

@@ -935,6 +935,7 @@ pub(super) async fn proxy_http_pooled(
                     content_length,
                     is_chunked,
                     initial_body,
+                    client_wants_close,
                     security,
                 )
                 .await;
@@ -956,6 +957,7 @@ pub(super) async fn proxy_http_pooled(
                         cache_ctx.as_deref_mut(),
                         security,
                         wasm_modules.clone(),
+                        client_wants_close,
                     )
                     .await
                 }
@@ -986,6 +988,7 @@ pub(super) async fn proxy_http_pooled(
                     #[cfg(feature = "wasm")]
                     wasm_body.then_some((compression, client_encoding)),
                     host_str_for_metrics,
+                    client_wants_close,
                 )
                 .await
             } else {
@@ -1005,6 +1008,7 @@ pub(super) async fn proxy_http_pooled(
                     cache_ctx.as_deref_mut(),
                     security,
                     wasm_modules.clone(),
+                    client_wants_close,
                 )
                 .await
             }
@@ -1034,6 +1038,7 @@ pub(super) async fn proxy_http_pooled(
                 #[cfg(feature = "wasm")]
                 wasm_body.then_some((compression, client_encoding)),
                 host_str_for_metrics,
+                client_wants_close,
             )
             .await
         } else {
@@ -1050,6 +1055,7 @@ pub(super) async fn proxy_http_pooled(
                 cache_ctx.as_deref_mut(),
                 security,
                 wasm_modules.clone(),
+                client_wants_close,
             )
             .await
         };

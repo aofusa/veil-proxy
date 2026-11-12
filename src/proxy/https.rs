@@ -186,6 +186,7 @@ pub(super) async fn proxy_https_pooled(
                 #[cfg(feature = "wasm")]
                 wasm_body.then_some((compression, client_encoding)),
                 &target.host,
+                client_wants_close,
             )
             .await
         } else {
@@ -202,6 +203,7 @@ pub(super) async fn proxy_https_pooled(
                 client_encoding,
                 security,
                 wasm_mods,
+                client_wants_close,
             )
             .await
         };
@@ -268,6 +270,8 @@ pub(super) async fn proxy_https_request_with_compression(
     client_encoding: crate::config::ClientAccept,
     security: &SecurityConfig,
     wasm_modules: crate::wasm_plugin_config::WasmModules,
+    // 応答の後にクライアントの接続を閉じる（応答ヘッダに `Connection: close` を付ける。B-360）
+    close: bool,
 ) -> Option<(u16, u64, bool, bool)> {
     // HEAD の応答は本文を持たない（B-245）
     let is_head = request_is_head(&request);
@@ -336,6 +340,7 @@ pub(super) async fn proxy_https_request_with_compression(
             security,
             wasm_modules,
             is_head,
+            close,
         )
         .await;
 
@@ -357,6 +362,7 @@ pub(super) async fn transfer_https_response_with_compression(
     security: &SecurityConfig,
     wasm_modules: crate::wasm_plugin_config::WasmModules,
     is_head: bool,
+    close: bool,
 ) -> (u64, u16, bool, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -452,6 +458,7 @@ pub(super) async fn transfer_https_response_with_compression(
                     encoding,
                     compression,
                     backend_wants_keep_alive,
+                    close,
                     security,
                     status_code,
                     #[cfg(feature = "wasm")]
@@ -468,6 +475,7 @@ pub(super) async fn transfer_https_response_with_compression(
                 let modified_headers = match finish_h1_upstream_head(
                     &accumulated[..header_len],
                     status_code,
+                    close,
                     security,
                     #[cfg(feature = "wasm")]
                     &wasm_modules,

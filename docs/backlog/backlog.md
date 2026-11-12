@@ -713,6 +713,7 @@
 | B-357 | P2 | 修正済み（feat/v0120-perf） | [bugs/B-357-wrk-rps-wall-clock-jump.md](bugs/B-357-wrk-rps-wall-clock-jump.md) | 計測ツールが wrk の `Requests/sec`（壁時計の差で割る）を使っていて、WSL2 の壁時計の戻りで HTTP/1.1 の行が最大 1.7 倍に見える。要求数を設定の秒数で割る |
 | B-358 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-358-vds-server-aws-lc-openbsd-xonly.md](bugs/B-358-vds-server-aws-lc-openbsd-xonly.md) | 試験用の制御プレーン（`tools/vds/server`）が全 OS で AWS-LC を使っていて、OpenBSD x86_64 では最初の TLS のハンドシェイクで SIGSEGV になる（`.text` の実行専用のマップと s2n-bignum の定数表）。OpenBSD・NetBSD は `ring` にして本体・試験用クレートと揃えた |
 | B-359 | P3 | 修正済み（feat/v0120-perf） | [bugs/B-359-standalone-e2e-nofile-limit.md](bugs/B-359-standalone-e2e-nofile-limit.md) | 自己完結型 E2E が fd の上限を上げず、OpenBSD の ssh の既定（ソフト 128）で試験のランタイムの作成が `EMFILE` になる。試験のプロセスの入口でソフトの上限をハードの上限（65536 まで）へ上げる |
+| B-360 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-360-h1-proxy-close-without-connection-close.md](bugs/B-360-h1-proxy-close-without-connection-close.md) | HTTP/1.1 の中継で応答の後に閉じるとき（要求の `Connection: close`・F-303 の接続の移動）、上流の応答ヘッダをそのまま返して `Connection: close` を付けていなかった（クライアントは閉じられる接続で次の要求を送って失敗する。wrk の read のエラー）。閉じる応答は `Connection`・`Keep-Alive` を `Connection: close` に置き換える |
 
 ---
 
