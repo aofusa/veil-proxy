@@ -721,6 +721,7 @@
 | B-361 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-361-h3-gso-socket-default-splits-single-packets.md](bugs/B-361-h3-gso-socket-default-splits-single-packets.md) | HTTP/3 の GSO を有効にすると、ソケット単位の `UDP_SEGMENT = 1200` のせいで cmsg の無い単発の送信のうち 1200 バイトを超えるもの（経路 MTU の探索のパケット等）がカーネルで分割されて壊れ、パケットが 1200 バイトに留まっていた。対応の確認を `UDP_SEGMENT = 0` で行う |
 | B-362 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-362-h3-first-batch-body-skips-size-limit.md](bugs/B-362-h3-first-batch-body-skips-size-limit.md) | HTTP/3 のストリーミングの中継・ハンドラで、見出しと同じ受信の束で届いた要求本文が `max_request_body_size` の検査を通らずに上流へ送られていた（`Content-Length` を省いた要求だけ）。最初の束を取り込む時点で上限を検査し、超えていれば上流へ送らずに 413 |
 | B-363 | P3 | 修正済み（feat/beat-nginx） | [bugs/B-363-concentrate-dead-code-non-linux.md](bugs/B-363-concentrate-dead-code-non-linux.md) | 接続の集約（F-303）の park の計測・メトリクス・ワーカーの設定が Linux 以外で使われず、macOS・BSD・Windows の clippy `-D warnings` が失敗する。Linux でしか使わないものを `cfg(target_os = "linux")` に限る |
+| B-364 | P3 | 修正済み（feat/beat-nginx） | [bugs/B-364-netbsd-aarch64-vm-vioif-ctrl-hang.md](bugs/B-364-netbsd-aarch64-vm-vioif-ctrl-hang.md) | 検証用の NetBSD aarch64 の VM（`tools/qemu/bsd-vm.sh`、HVF）で vioif の制御キューの完了待ちのままネットワークの設定（`ifconfig`・dhcpcd）が止まり、SSH が上がらない。NetBSD のときだけ `virtio-net-pci` に `ctrl_vq=off` を付ける |
 
 ---
 

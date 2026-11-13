@@ -556,6 +556,16 @@ _native_fw_x86_64_vars() {
 # IPv6 UDP を slirp が転送する `sendto(2)` がブロックしたまま戻らず、QEMU のメインスレッドごと
 # 止まってゲストが起動途中で固まった（`sample` で `udp6_input → sosendto → __sendto` を確認。F-176）。
 # ゲストは IPv4 の SSH ポート転送しか使わない。
+# aarch64 の virtio-net-pci に足すオプション（先頭の `,` 込み。無ければ空）。
+# B-364: NetBSD の vioif は制御キュー（ctrl_vq）の応答を待ったままカーネルの中で止まることがある（HVF で 2 回続けて起きた。
+# ifconfig・netstat・dhcpcd が止まり、SSH が上がらない）。制御キューを使わせない（受信フィルタを設定しなくなるだけで、
+# slirp の通信は変わらない）。
+_aarch64_nic_extra() {
+    if [[ "${OS_NAME}" == "netbsd" ]]; then
+        printf ',ctrl_vq=off'
+    fi
+}
+
 _write_boot_native() {
     local drives="$1" seed_drive="$2" console_args="$3"
     # macOS の /bin/bash（3.2）でも動く 64MiB ゼロ埋めパディング（truncate が無い
@@ -627,6 +637,8 @@ EOF
         else
             accel_args="-machine virt -cpu cortex-a72"
         fi
+        local nic_extra
+        nic_extra="$(_aarch64_nic_extra)"
         cat > "${WORKDIR}/boot.sh" <<EOF
 #!/bin/bash
 set -e
@@ -639,7 +651,7 @@ exec qemu-system-aarch64 ${accel_args} -smp ${VM_SMP} -m ${VM_MEM_MB} \
   -drive if=pflash,format=raw,file=varstore.img \
   ${drives} \
   ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
-  -device virtio-net-pci,netdev=net0,romfile= \
+  -device virtio-net-pci,netdev=net0,romfile=${nic_extra} \
   ${console_args}
 EOF
     fi
@@ -758,6 +770,8 @@ EOF
         # aarch64 は UEFI(AAVMF)。arm64 の BSD は efiboot がファームウェアの ConOut を
         # 引き継ぐため、シリアルが既定で使える（amd64 と事情が違う）。
         # virtio-net-pci には romfile=（空）が必須（efi-virtio.rom 不足で起動失敗するため）。
+        local nic_extra
+        nic_extra="$(_aarch64_nic_extra)"
         cat > "${WORKDIR}/boot.sh" <<EOF
 #!/bin/bash
 set -e
@@ -769,7 +783,7 @@ exec qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp ${VM_SMP} -m ${VM_ME
   -drive if=pflash,format=raw,file=varstore.img \
   ${drives} \
   ${seed_drive}-netdev user,id=net0,ipv6=off,hostfwd=tcp:${GUEST_BIND}:${SSH_PORT}-:22 \
-  -device virtio-net-pci,netdev=net0,romfile= \
+  -device virtio-net-pci,netdev=net0,romfile=${nic_extra} \
   ${console_args}
 EOF
     fi
