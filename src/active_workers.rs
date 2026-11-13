@@ -29,18 +29,13 @@ pub(crate) use imp::{
     note_response, park_begin, park_end, spawn_controller, take_shed, ActiveSet, ConnectionTicket,
 };
 
+// park の計測（`park_begin`・`park_end`）は Linux の実行器（io_uring・epoll）だけが呼ぶので、ここには無い（B-363）
 #[cfg(not(target_os = "linux"))]
-pub(crate) use noop::{note_response, park_begin, park_end, take_shed, ConnectionTicket};
+pub(crate) use noop::{note_response, take_shed, ConnectionTicket};
 
 /// Linux 以外のフック（何もしない）
 #[cfg(not(target_os = "linux"))]
 mod noop {
-    #[inline]
-    pub(crate) fn park_begin() -> u64 {
-        0
-    }
-    #[inline]
-    pub(crate) fn park_end(_started: u64) {}
     #[inline]
     pub(crate) fn note_response() {}
     #[inline]

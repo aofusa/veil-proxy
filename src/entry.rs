@@ -1081,6 +1081,7 @@ pub fn run_server(opts: ServerOptions) {
     let worker_env = crate::listener_workers::WorkerEnv {
         core_ids: core_ids.clone(),
         balancing: reuseport_balancing,
+        #[cfg(target_os = "linux")]
         concentrate_connections: loaded_config.concentrate_connections,
         max_conn: max_connections,
         #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos"))]

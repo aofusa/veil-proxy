@@ -444,8 +444,9 @@ pub(crate) static HTTP3_ACTIVE_STREAMS: Lazy<prometheus::IntGauge> = Lazy::new(|
     gauge
 });
 
-// 接続を集約しているワーカーの数（リスナーごと。F-303）。変わったときだけ書く（要求の経路には載らない）
-#[cfg(feature = "metrics")]
+// 接続を集約しているワーカーの数（リスナーごと。F-303）。変わったときだけ書く（要求の経路には載らない）。
+// 集約は Linux の TCP リスナーだけなので、記録する関数ごと Linux に限る（B-363）
+#[cfg(all(feature = "metrics", target_os = "linux"))]
 static ACTIVE_WORKERS: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new(
         "active_workers",
@@ -458,6 +459,7 @@ static ACTIVE_WORKERS: Lazy<IntGaugeVec> = Lazy::new(|| {
 });
 
 /// リスナーの新しい接続を受けるワーカーの数を記録する（F-303）
+#[cfg(target_os = "linux")]
 #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
 pub(crate) fn set_active_workers(listener: &str, n: usize) {
     #[cfg(feature = "metrics")]

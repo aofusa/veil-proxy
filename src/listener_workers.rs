@@ -110,7 +110,8 @@ pub(crate) struct WorkerEnv {
     /// CPU アフィニティのコア（リスナーごとに先頭のコアから割り当てる。今までと同じ）
     pub core_ids: Option<Vec<core_affinity::CoreId>>,
     pub balancing: ReuseportBalancing,
-    /// 接続を負荷に見合う本数のワーカーへ集約する（Linux の TCP リスナーのみ。F-303）
+    /// 接続を負荷に見合う本数のワーカーへ集約する（Linux の TCP リスナーのみ。F-303・B-363）
+    #[cfg(target_os = "linux")]
     pub concentrate_connections: bool,
     /// 同時接続数の上限（プロセス全体。0 = 無制限）
     pub max_conn: usize,
