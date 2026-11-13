@@ -652,7 +652,9 @@ fn park(timeout: Option<Duration>) {
                 // 通常のイベントではなく `EV_ERROR` フラグ付きの kevent として
                 // eventlist に混ざって返る（`kqueue::KqueuePoller::wait` の doc 参照）。
                 // 実際の read/write readiness ではないため読み飛ばす。
-                if (ev.flags as u32) & (libc::EV_ERROR as u32) != 0 {
+                // `flags` と `EV_ERROR` の型は OS ごとに揃っている（NetBSD は u32、他は u16）。キャストすると
+                // NetBSD で同じ型への変換になる（B-367）
+                if (ev.flags & libc::EV_ERROR) != 0 {
                     continue;
                 }
                 let fd = ev.ident as RawFd;

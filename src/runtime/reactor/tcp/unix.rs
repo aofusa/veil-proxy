@@ -1629,6 +1629,153 @@ pub fn wait_writable_fd(fd: RawFd) -> WritableFd {
 }
 
 // ====================
+// BrokerConnect Future（F-182: capability mode 下の接続ブローカー経由の接続）
+// ====================
+
+/// 接続ブローカーに許可リストの添字で接続を依頼し、受け取った接続中のソケットの完了を待つ Future。
+///
+/// 1. 返信用 socketpair を添えて要求を送る（共有の制御ソケットが一杯なら自分を起こして再試行）
+/// 2. 返信用ソケットの readable を reactor で待ち、接続中のソケットを受け取る
+/// 3. `Connect` と同じく writable を確かめてから `SO_ERROR` で接続結果を見る
+///
+/// 新規の上流接続ごとに 1 回だけ通る（リクエストごとではない）。確保は無い。
+#[cfg(target_os = "freebsd")]
+pub struct BrokerConnect {
+    /// 許可リストの添字（`None` は許可リスト外で、最初の poll で `PermissionDenied`）
+    idx: Option<u32>,
+    started: bool,
+    reply: RawFd,
+    reply_registered: bool,
+    fd: RawFd,
+    fd_registered: bool,
+}
+
+#[cfg(target_os = "freebsd")]
+impl BrokerConnect {
+    fn new(idx: Option<u32>) -> Self {
+        Self {
+            idx,
+            started: false,
+            reply: -1,
+            reply_registered: false,
+            fd: -1,
+            fd_registered: false,
+        }
+    }
+
+    fn close_reply(&mut self) {
+        if self.reply >= 0 {
+            if self.reply_registered {
+                unregister(self.reply);
+                self.reply_registered = false;
+            }
+            // SAFETY: self.reply は本 Future が所有する返信用ソケット（>= 0 を確認済み）で、登録済みなら上で unregister 済み。ここで 1 度だけ閉じて -1 に置き換える。
+            unsafe { libc::close(self.reply) };
+            self.reply = -1;
+        }
+    }
+
+    fn close_fd(&mut self) {
+        if self.fd >= 0 {
+            if self.fd_registered {
+                unregister(self.fd);
+                self.fd_registered = false;
+            }
+            // SAFETY: self.fd は本 Future が所有する受け取った接続ソケット（>= 0 を確認済み）で、登録済みなら上で unregister 済み。ここで 1 度だけ閉じて -1 に置き換える。
+            unsafe { libc::close(self.fd) };
+            self.fd = -1;
+        }
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+impl Future for BrokerConnect {
+    type Output = io::Result<TcpStream>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        if !this.started {
+            let Some(idx) = this.idx else {
+                return Poll::Ready(Err(crate::connect_broker::not_allowed()));
+            };
+            let Some(client) = crate::connect_broker::client() else {
+                return Poll::Ready(Err(crate::connect_broker::not_allowed()));
+            };
+            match client.request(idx) {
+                Ok(reply) => {
+                    this.reply = reply;
+                    this.started = true;
+                }
+                // 制御ソケットの送信バッファが一杯（ブローカーが追いついていない）。他のタスクに
+                // 譲ってから再試行する（呼び出し元の接続タイムアウトはそのまま効く）。
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+
+        if this.reply >= 0 {
+            match crate::connect_broker::Client::recv_reply(this.reply) {
+                Ok(fd) => {
+                    this.close_reply();
+                    this.fd = fd;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    register_read(this.reply, cx.waker().clone());
+                    this.reply_registered = true;
+                    return Poll::Pending;
+                }
+                Err(e) => {
+                    this.close_reply();
+                    return Poll::Ready(Err(e));
+                }
+            }
+        }
+
+        // 接続完了の確認（`Connect` と同じく readiness を見てから SO_ERROR を読む）。
+        let mut pfd = libc::pollfd {
+            fd: this.fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: pfd は生存する pollfd 1 個で、nfds = 1、timeout 0 の非ブロッキング poll。
+        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                this.close_fd();
+                return Poll::Ready(Err(e));
+            }
+        }
+        if ret <= 0 || pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) == 0 {
+            register_write(this.fd, cx.waker().clone());
+            this.fd_registered = true;
+            return Poll::Pending;
+        }
+        if let Err(e) = crate::connect_broker::take_so_error(this.fd) {
+            this.close_fd();
+            return Poll::Ready(Err(e));
+        }
+        // 成功時は `Connect` と同じく登録を残したまま TcpStream へ渡す（以後の I/O が同じ fd の
+        // 記録を使う）。
+        let fd = this.fd;
+        this.fd = -1;
+        this.fd_registered = false;
+        Poll::Ready(Ok(TcpStream { fd }))
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+impl Drop for BrokerConnect {
+    fn drop(&mut self) {
+        self.close_reply();
+        self.close_fd();
+    }
+}
+
+// ====================
 // テスト
 // ====================
 
@@ -1849,152 +1996,5 @@ mod tests {
             Ok(_) => panic!("connect to nonexistent socket must fail"),
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
         }
-    }
-}
-
-// ====================
-// BrokerConnect Future（F-182: capability mode 下の接続ブローカー経由の接続）
-// ====================
-
-/// 接続ブローカーに許可リストの添字で接続を依頼し、受け取った接続中のソケットの完了を待つ Future。
-///
-/// 1. 返信用 socketpair を添えて要求を送る（共有の制御ソケットが一杯なら自分を起こして再試行）
-/// 2. 返信用ソケットの readable を reactor で待ち、接続中のソケットを受け取る
-/// 3. `Connect` と同じく writable を確かめてから `SO_ERROR` で接続結果を見る
-///
-/// 新規の上流接続ごとに 1 回だけ通る（リクエストごとではない）。確保は無い。
-#[cfg(target_os = "freebsd")]
-pub struct BrokerConnect {
-    /// 許可リストの添字（`None` は許可リスト外で、最初の poll で `PermissionDenied`）
-    idx: Option<u32>,
-    started: bool,
-    reply: RawFd,
-    reply_registered: bool,
-    fd: RawFd,
-    fd_registered: bool,
-}
-
-#[cfg(target_os = "freebsd")]
-impl BrokerConnect {
-    fn new(idx: Option<u32>) -> Self {
-        Self {
-            idx,
-            started: false,
-            reply: -1,
-            reply_registered: false,
-            fd: -1,
-            fd_registered: false,
-        }
-    }
-
-    fn close_reply(&mut self) {
-        if self.reply >= 0 {
-            if self.reply_registered {
-                unregister(self.reply);
-                self.reply_registered = false;
-            }
-            // SAFETY: self.reply は本 Future が所有する返信用ソケット（>= 0 を確認済み）で、登録済みなら上で unregister 済み。ここで 1 度だけ閉じて -1 に置き換える。
-            unsafe { libc::close(self.reply) };
-            self.reply = -1;
-        }
-    }
-
-    fn close_fd(&mut self) {
-        if self.fd >= 0 {
-            if self.fd_registered {
-                unregister(self.fd);
-                self.fd_registered = false;
-            }
-            // SAFETY: self.fd は本 Future が所有する受け取った接続ソケット（>= 0 を確認済み）で、登録済みなら上で unregister 済み。ここで 1 度だけ閉じて -1 に置き換える。
-            unsafe { libc::close(self.fd) };
-            self.fd = -1;
-        }
-    }
-}
-
-#[cfg(target_os = "freebsd")]
-impl Future for BrokerConnect {
-    type Output = io::Result<TcpStream>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = &mut *self;
-        if !this.started {
-            let Some(idx) = this.idx else {
-                return Poll::Ready(Err(crate::connect_broker::not_allowed()));
-            };
-            let Some(client) = crate::connect_broker::client() else {
-                return Poll::Ready(Err(crate::connect_broker::not_allowed()));
-            };
-            match client.request(idx) {
-                Ok(reply) => {
-                    this.reply = reply;
-                    this.started = true;
-                }
-                // 制御ソケットの送信バッファが一杯（ブローカーが追いついていない）。他のタスクに
-                // 譲ってから再試行する（呼び出し元の接続タイムアウトはそのまま効く）。
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-        }
-
-        if this.reply >= 0 {
-            match crate::connect_broker::Client::recv_reply(this.reply) {
-                Ok(fd) => {
-                    this.close_reply();
-                    this.fd = fd;
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    register_read(this.reply, cx.waker().clone());
-                    this.reply_registered = true;
-                    return Poll::Pending;
-                }
-                Err(e) => {
-                    this.close_reply();
-                    return Poll::Ready(Err(e));
-                }
-            }
-        }
-
-        // 接続完了の確認（`Connect` と同じく readiness を見てから SO_ERROR を読む）。
-        let mut pfd = libc::pollfd {
-            fd: this.fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        // SAFETY: pfd は生存する pollfd 1 個で、nfds = 1、timeout 0 の非ブロッキング poll。
-        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-        if ret < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() != io::ErrorKind::Interrupted {
-                this.close_fd();
-                return Poll::Ready(Err(e));
-            }
-        }
-        if ret <= 0 || pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) == 0 {
-            register_write(this.fd, cx.waker().clone());
-            this.fd_registered = true;
-            return Poll::Pending;
-        }
-        if let Err(e) = crate::connect_broker::take_so_error(this.fd) {
-            this.close_fd();
-            return Poll::Ready(Err(e));
-        }
-        // 成功時は `Connect` と同じく登録を残したまま TcpStream へ渡す（以後の I/O が同じ fd の
-        // 記録を使う）。
-        let fd = this.fd;
-        this.fd = -1;
-        this.fd_registered = false;
-        Poll::Ready(Ok(TcpStream { fd }))
-    }
-}
-
-#[cfg(target_os = "freebsd")]
-impl Drop for BrokerConnect {
-    fn drop(&mut self) {
-        self.close_reply();
-        self.close_fd();
     }
 }

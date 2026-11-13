@@ -1530,10 +1530,11 @@ pub(super) async fn proxy_h2c(
 
     // F-285: Wasm の応答本文のフェーズ（受けるモジュールのあるルートだけ。圧縮の前。gRPC・本文の無い応答は除く）
     #[cfg(feature = "wasm")]
-    if !(method.eq_ignore_ascii_case(b"HEAD") || matches!(status_code, 100..=199 | 204 | 304))
-        && !response.headers.iter().any(|(n, v)| {
+    if !(method.eq_ignore_ascii_case(b"HEAD")
+        || matches!(status_code, 100..=199 | 204 | 304)
+        || response.headers.iter().any(|(n, v)| {
             n.eq_ignore_ascii_case(b"content-type") && v.starts_with(b"application/grpc")
-        })
+        }))
         && super::compress::wasm_wants_response_body(wasm_modules)
     {
         let body = std::mem::take(&mut response.body);

@@ -252,8 +252,7 @@ pub async fn sendfile_all_with_header(
         // 到達しないはずだが、万一到達すると Content-Length を超えるバイト列を
         // 送ってレスポンスを破壊する。不変条件が破れたことを検出して打ち切る。
         if nbytes == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "sendfile: header remains after body was fully sent (sf_hdtr invariant violated)",
             ));
         }

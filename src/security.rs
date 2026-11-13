@@ -3729,6 +3729,79 @@ pub mod capsicum {
         }
     }
 
+    /// jail 名から jid を解決し `jail_attach(2)` する（root 前提）。
+    ///
+    /// `jail_get(2)`（`<sys/jail.h>`）へ `{"name", jail_name}` の iovec ペアを渡して jid を
+    /// 引かせ、続けて `jail_attach(jid)` する。libjail（`-ljail`）へのリンクを避けるため
+    /// 生の `jail_get`/`jail_attach` syscall ラッパを直接 FFI 宣言する。
+    ///
+    /// # 不変条件
+    /// - `iovec` 配列は `jail_get` 呼び出し中のみ有効な借用（`name`/`nameval` の
+    ///   `CString`/バッファは呼び出しが完了するまでスコープ内で生存させる）。
+    /// - 失敗（jail 未存在・権限不足等）は呼び出し元に明確なエラーとして伝播する
+    ///   （設計ドキュメント 4.2 節: 「失敗時は明確なエラー」）。
+    pub fn attach_jail(jail_name: &str) -> io::Result<()> {
+        unsafe extern "C" {
+            fn jail_get(
+                iov: *mut libc::iovec,
+                niov: libc::c_uint,
+                flags: libc::c_int,
+            ) -> libc::c_int;
+            fn jail_attach(jid: libc::c_int) -> libc::c_int;
+        }
+
+        let name_key = std::ffi::CString::new("name").expect("no interior NUL");
+        let name_val = std::ffi::CString::new(jail_name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "jail_name has NUL byte"))?;
+        let errmsg_key = std::ffi::CString::new("errmsg").expect("no interior NUL");
+        let mut errbuf = vec![0u8; 256];
+
+        let mut iov = [
+            libc::iovec {
+                iov_base: name_key.as_ptr() as *mut libc::c_void,
+                iov_len: name_key.as_bytes_with_nul().len(),
+            },
+            libc::iovec {
+                iov_base: name_val.as_ptr() as *mut libc::c_void,
+                iov_len: name_val.as_bytes_with_nul().len(),
+            },
+            libc::iovec {
+                iov_base: errmsg_key.as_ptr() as *mut libc::c_void,
+                iov_len: errmsg_key.as_bytes_with_nul().len(),
+            },
+            libc::iovec {
+                iov_base: errbuf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: errbuf.len(),
+            },
+        ];
+
+        // SAFETY: iov の各 iov_base は上記ローカル変数（CString/Vec）を指し、この
+        // unsafe ブロック内で jail_get 呼び出しが完了するまで生存している。
+        let jid = unsafe { jail_get(iov.as_mut_ptr(), iov.len() as libc::c_uint, 0) };
+        if jid < 0 {
+            let errmsg = std::ffi::CStr::from_bytes_until_nul(&errbuf)
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Err(io::Error::other(format!(
+                "jail_get(\"{}\") failed: {} ({})",
+                jail_name,
+                io::Error::last_os_error(),
+                errmsg
+            )));
+        }
+
+        // SAFETY: jid は直前の jail_get が返した有効な jail ID。
+        let ret = unsafe { jail_attach(jid) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        info!(
+            "capsicum/jail: attached to jail \"{}\" (jid={})",
+            jail_name, jid
+        );
+        Ok(())
+    }
+
     /// F-178: 名前付きファイルの dirfd 登録（cap_enter はしない。登録表の OnceLock も触らない）。
     #[cfg(test)]
     mod named_file_dir_tests {
@@ -3845,6 +3918,7 @@ pub mod capsicum {
 
         /// rename による置き換えでも、名前で引き直すので新しい内容が読める。
         #[test]
+        #[allow(clippy::disallowed_methods)] // 理由: 試験（一時ディレクトリにファイルを置く・読み戻す）
         fn follows_rename_replacement() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("veil.toml");
@@ -3860,6 +3934,7 @@ pub mod capsicum {
 
         /// ディレクトリ内の相対シンボリックリンク（ConfigMap の `..data` 方式）は差し替えに追従する。
         #[test]
+        #[allow(clippy::disallowed_methods)] // 理由: 試験（一時ディレクトリにファイルを置く・読み戻す）
         fn follows_relative_symlink_swap() {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir(dir.path().join("rev1")).unwrap();
@@ -3879,6 +3954,7 @@ pub mod capsicum {
 
         /// ディレクトリ外を指す絶対シンボリックリンクは、登録時点の実体の親ディレクトリを開く。
         #[test]
+        #[allow(clippy::disallowed_methods)] // 理由: 試験（一時ディレクトリにファイルを置く・読み戻す）
         fn absolute_symlink_falls_back_to_target_dir() {
             let real = tempfile::tempdir().unwrap();
             let link_dir = tempfile::tempdir().unwrap();
@@ -3893,6 +3969,7 @@ pub mod capsicum {
 
         /// probe しない登録（アクセスログ）は、ファイルがまだ無くても親ディレクトリで登録できる。
         #[test]
+        #[allow(clippy::disallowed_methods)] // 理由: 試験（一時ディレクトリにファイルを置く・読み戻す）
         fn log_dir_registration_does_not_require_the_file() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("access.log");
@@ -3924,79 +4001,6 @@ pub mod capsicum {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "line\n");
             unsafe { libc::close(fd) };
         }
-    }
-
-    /// jail 名から jid を解決し `jail_attach(2)` する（root 前提）。
-    ///
-    /// `jail_get(2)`（`<sys/jail.h>`）へ `{"name", jail_name}` の iovec ペアを渡して jid を
-    /// 引かせ、続けて `jail_attach(jid)` する。libjail（`-ljail`）へのリンクを避けるため
-    /// 生の `jail_get`/`jail_attach` syscall ラッパを直接 FFI 宣言する。
-    ///
-    /// # 不変条件
-    /// - `iovec` 配列は `jail_get` 呼び出し中のみ有効な借用（`name`/`nameval` の
-    ///   `CString`/バッファは呼び出しが完了するまでスコープ内で生存させる）。
-    /// - 失敗（jail 未存在・権限不足等）は呼び出し元に明確なエラーとして伝播する
-    ///   （設計ドキュメント 4.2 節: 「失敗時は明確なエラー」）。
-    pub fn attach_jail(jail_name: &str) -> io::Result<()> {
-        unsafe extern "C" {
-            fn jail_get(
-                iov: *mut libc::iovec,
-                niov: libc::c_uint,
-                flags: libc::c_int,
-            ) -> libc::c_int;
-            fn jail_attach(jid: libc::c_int) -> libc::c_int;
-        }
-
-        let name_key = std::ffi::CString::new("name").expect("no interior NUL");
-        let name_val = std::ffi::CString::new(jail_name)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "jail_name has NUL byte"))?;
-        let errmsg_key = std::ffi::CString::new("errmsg").expect("no interior NUL");
-        let mut errbuf = vec![0u8; 256];
-
-        let mut iov = [
-            libc::iovec {
-                iov_base: name_key.as_ptr() as *mut libc::c_void,
-                iov_len: name_key.as_bytes_with_nul().len(),
-            },
-            libc::iovec {
-                iov_base: name_val.as_ptr() as *mut libc::c_void,
-                iov_len: name_val.as_bytes_with_nul().len(),
-            },
-            libc::iovec {
-                iov_base: errmsg_key.as_ptr() as *mut libc::c_void,
-                iov_len: errmsg_key.as_bytes_with_nul().len(),
-            },
-            libc::iovec {
-                iov_base: errbuf.as_mut_ptr() as *mut libc::c_void,
-                iov_len: errbuf.len(),
-            },
-        ];
-
-        // SAFETY: iov の各 iov_base は上記ローカル変数（CString/Vec）を指し、この
-        // unsafe ブロック内で jail_get 呼び出しが完了するまで生存している。
-        let jid = unsafe { jail_get(iov.as_mut_ptr(), iov.len() as libc::c_uint, 0) };
-        if jid < 0 {
-            let errmsg = std::ffi::CStr::from_bytes_until_nul(&errbuf)
-                .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            return Err(io::Error::other(format!(
-                "jail_get(\"{}\") failed: {} ({})",
-                jail_name,
-                io::Error::last_os_error(),
-                errmsg
-            )));
-        }
-
-        // SAFETY: jid は直前の jail_get が返した有効な jail ID。
-        let ret = unsafe { jail_attach(jid) };
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        info!(
-            "capsicum/jail: attached to jail \"{}\" (jid={})",
-            jail_name, jid
-        );
-        Ok(())
     }
 }
 

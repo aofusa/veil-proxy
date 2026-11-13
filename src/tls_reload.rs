@@ -67,9 +67,9 @@ pub fn pem_mtime(path: &Path) -> std::io::Result<SystemTime> {
     {
         if let Some(result) = crate::security::capsicum::stat_tls_pem(path) {
             let st = result?;
-            return st.mtime.ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::Other, "fstatat: mtime unavailable")
-            });
+            return st
+                .mtime
+                .ok_or_else(|| std::io::Error::other("fstatat: mtime unavailable"));
         }
     }
     std::fs::metadata(path)?.modified()
