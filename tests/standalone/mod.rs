@@ -12,7 +12,28 @@ pub mod parity;
 
 /// cargo がビルドした veil バイナリ。
 pub fn veil_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_veil"))
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_veil"));
+    #[cfg(target_os = "netbsd")]
+    allow_mprotect_once(&bin);
+    bin
+}
+
+/// NetBSD は PaX MPROTECT がシステム全体で有効で、veil の WASM（wasmtime）の起動が EACCES で失敗する（B-60）。
+/// E2E（`tests/e2e_setup.sh`）と同じくバイナリに `paxctl +m` を掛ける（自己完結型 E2E は掛けておらず、WASM を使う試験が
+/// 落ちていた。B-365）。最初の 1 回だけ働く。
+#[cfg(target_os = "netbsd")]
+fn allow_mprotect_once(bin: &Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(
+        || match Command::new("/usr/sbin/paxctl").arg("+m").arg(bin).status() {
+            Ok(s) if s.success() => {}
+            r => eprintln!(
+                "paxctl +m {} failed ({:?}); tests that run WASM modules may fail",
+                bin.display(),
+                r
+            ),
+        },
+    );
 }
 
 /// 設定（TOML の基本文字列）に埋め込むパス。Windows の `\\` はエスケープとして読まれるので `/` にする。
