@@ -1,4 +1,4 @@
-//! 機能 × プロトコルのマトリックス（feat/beat-nginx の設計変更の確認。F-303〜F-305・B-360・B-361）。
+//! 機能 × プロトコルのマトリックス（feat/beat-nginx の設計変更の確認。F-303〜F-305・B-360・B-361・B-385・B-387）。
 //!
 //! 1 つの veil に機能ごとのルートを並べ、HTTP/1.1（平文・TLS）・h2c・HTTP/2（TLS）・HTTP/3 の全部で同じ要求を
 //! 送って、機能ごとの期待を確かめる。失敗は全部集めて表にしてから落とす（どの組み合わせが壊れたかが一度に分かる）。
@@ -502,6 +502,15 @@ body = "never"
 [route.traffic.fault]
 abort_status = 503
 abort_percent = 100.0
+
+[[route]]
+[route.conditions]
+path = "/rd/*"
+[route.action]
+type = "Redirect"
+redirect_url = "/"
+redirect_status = 302
+preserve_path = true
 {per_proto_routes}"#,
         listeners = listeners_toml(ports, &cert, &key),
         access_log = tp(&access_log),
@@ -788,6 +797,45 @@ abort_percent = 100.0
                     r.header("location") == Some("https://example.com/new"),
                     "location {:?}",
                     r.header("location")
+                );
+                Ok(())
+            }),
+        ),
+        (
+            // B-387: 接頭辞を除いた残りが `//evil.example` でもプロトコル相対（別のホスト）にしない
+            "redirect stays on this host",
+            Box::new(|p| {
+                let r = get(p, "/rd//evil.example/x", &[])?;
+                status_is(&r, 302)?;
+                check!(
+                    r.header("location") == Some("/evil.example/x"),
+                    "location {:?}",
+                    r.header("location")
+                );
+                Ok(())
+            }),
+        ),
+        (
+            // B-385: エスケープされたスラッシュがドットのセグメントを作るパスは上流へ送らない
+            "escaped slash dot segment (400)",
+            Box::new(|p| {
+                let tag = format!("/esc-{}", p.name());
+                match get(p, &format!("/proxy{tag}/..%2Fadmin"), &[]) {
+                    Ok(r) => status_is(&r, 400)?,
+                    // HTTP/2・HTTP/3 はストリームのエラー（PROTOCOL_ERROR・H3_MESSAGE_ERROR）
+                    Err(_) if !p.is_h1() => {}
+                    Err(e) => return Err(e),
+                }
+                check!(
+                    seen_count(&seen, &tag) == 0,
+                    "upstream saw the rejected request"
+                );
+                // ドットのセグメントを作らないものはエスケープしたまま送る
+                let r = get(p, &format!("/proxy{tag}/a%2Fb"), &[])?;
+                status_is(&r, 200)?;
+                check!(
+                    seen_count(&seen, &format!("{tag}/a%2Fb ")) == 1,
+                    "upstream did not see {tag}/a%2Fb"
                 );
                 Ok(())
             }),
