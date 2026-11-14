@@ -562,7 +562,10 @@ pub fn run_server(opts: ServerOptions) {
     }
     crate::l7::set_max_buffered_request_body(&runtime_config.route);
     crate::metrics::set_host_labels(&runtime_config.route);
-    crate::path_norm::set_request_mode(runtime_config.global_security.path_normalization);
+    crate::path_norm::set_request_mode(
+        runtime_config.global_security.path_normalization,
+        runtime_config.global_security.escaped_slashes,
+    );
     #[cfg(feature = "access-log")]
     crate::logging::set_access_log_enabled(runtime_config.access_log_config.enabled);
     CURRENT_CONFIG.store(Arc::new(runtime_config));

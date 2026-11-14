@@ -277,6 +277,12 @@ At startup and on reload veil runs each module's `_start`, `proxy_on_vm_start` a
 traps or returns `false` (for example the plugin rejects its configuration), the configuration is rejected: startup
 fails, and a reload keeps the previous configuration.
 
+A reload loads the modules again from the new `[wasm]` section, so modules (and `data_files`) that the reload adds or
+changes take effect from the next request; requests already in progress finish with the previous modules. Routes
+and `[[l4]]` listeners may list only modules defined in an enabled `[wasm]` section; any other name rejects the
+configuration. On FreeBSD in capability mode veil cannot open `.wasm` files after startup, so it rejects a reload
+that changes `[wasm]` (restart to apply such changes).
+
 Versions before 0.11.0 always continued after a failure (as `fail_open` does now, without the metric). Set
 `failure_policy = "fail_open"` in `[wasm.defaults]` to keep that behavior.
 
@@ -296,7 +302,7 @@ The `[wasm.defaults.pooling]` section configures the pooling allocator for high-
 |-----------|-------------|---------|
 | `allow_logging` | Log output | false |
 | `allow_metrics` | Metrics operations | false |
-| `allow_shared_data` | Shared data access (`proxy_set_shared_data`/`proxy_get_shared_data`). One table per module name, shared by every request and worker and kept across config reloads (Envoy shares it per `vm_id`) | false |
+| `allow_shared_data` | Shared data access (`proxy_set_shared_data`/`proxy_get_shared_data`). One table per module name, shared by every request and worker and kept across config reloads (Envoy shares it per `vm_id`). Also required for shared queues: a queue belongs to the module that registered it and only that module dequeues from it; another module enqueues only after resolving the queue by the owner's module name (`vm_id`) | false |
 | `allow_request_headers_read` | Read request headers | false |
 | `allow_request_headers_write` | Modify request headers | false |
 | `allow_request_body_read` | Read request body | false |

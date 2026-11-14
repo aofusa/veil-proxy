@@ -1031,6 +1031,9 @@ pub(crate) fn parse_content_length(value: &[u8]) -> Option<u64> {
 /// - B-322: `$path` は空でなければ必ず `/` で始める。接頭辞が `/` で終わる（`path = "/"` のルート等）と残りが
 ///   `/` で始まらず、`/@evil.com` が `https://new.example.com@evil.com`（別のホスト）になっていた（F56）。
 /// - `preserve_path` なら残りを後ろに足す（`/` を 1 つにまとめる）。
+/// - B-387: 要求から取った値の先頭の `/`・`\` の並びは 1 つの `/` にし、設定がプロトコル相対（`//` で始まる）で
+///   なければ結果も `//`・`/\` で始めない。`/legacy//evil.com` の残り `//evil.com` が `Location: //evil.com`
+///   （別のホスト）になっていた。変数は 1 回の走査で置き換える（差し込んだ値の中の `$path` を置き換え直さない）。
 pub(crate) fn build_redirect_url(
     redirect_url: &str,
     path_str: &str,
@@ -1042,16 +1045,41 @@ pub(crate) fn build_redirect_url(
     } else {
         path_str
     };
-    let slashed;
-    let sub_path = if stripped.is_empty() || stripped.starts_with('/') {
+    let sub_buf;
+    let sub_path = if stripped.is_empty() {
         stripped
+    } else if let Some(s) = single_leading_slash(stripped) {
+        s
     } else {
-        slashed = format!("/{stripped}");
-        &slashed
+        sub_buf = format!("/{}", stripped.trim_start_matches(['/', '\\']));
+        &sub_buf
     };
-    let mut final_url = redirect_url
-        .replace("$request_uri", path_str)
-        .replace("$path", sub_path);
+    let uri_buf;
+    let request_uri = match single_leading_slash(path_str) {
+        Some(s) => s,
+        None if path_str.is_empty() => path_str,
+        None => {
+            uri_buf = format!("/{}", path_str.trim_start_matches(['/', '\\']));
+            &uri_buf
+        }
+    };
+    let mut final_url = String::with_capacity(redirect_url.len() + request_uri.len());
+    let mut rest = redirect_url;
+    while let Some(i) = rest.find('$') {
+        final_url.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        if let Some(r) = tail.strip_prefix("$request_uri") {
+            final_url.push_str(request_uri);
+            rest = r;
+        } else if let Some(r) = tail.strip_prefix("$path") {
+            final_url.push_str(sub_path);
+            rest = r;
+        } else {
+            final_url.push('$');
+            rest = &tail[1..];
+        }
+    }
+    final_url.push_str(rest);
     if preserve_path && !sub_path.is_empty() {
         if final_url.ends_with('/') {
             final_url.push_str(&sub_path[1..]);
@@ -1059,7 +1087,47 @@ pub(crate) fn build_redirect_url(
             final_url.push_str(sub_path);
         }
     }
+    // 設定そのものがプロトコル相対でなければ、結果の先頭の `/`・`\` の並び（`/$path` 等で値と重なったもの）も
+    // 1 つにする
+    let template_protocol_relative =
+        matches!(redirect_url.as_bytes(), [b'/' | b'\\', b'/' | b'\\', ..]);
+    if !template_protocol_relative && single_leading_slash(&final_url).is_none() {
+        let body = final_url.trim_start_matches(['/', '\\']);
+        if body.len() + 1 < final_url.len() {
+            final_url = format!("/{body}");
+        }
+    }
     final_url
+}
+
+/// `s` が `/` 1 つで始まり、その後ろが `/`・`\` でなければ `Some(s)`（B-387）。
+fn single_leading_slash(s: &str) -> Option<&str> {
+    match s.as_bytes() {
+        [b'/', b'/' | b'\\', ..] => None,
+        [b'/', ..] => Some(s),
+        _ => None,
+    }
+}
+
+/// 静的配信の要求のサブパス（先頭の `/` を外したもの）を、ドキュメントルートへそのまま足してよいか（B-396）。
+///
+/// Windows では `C:/...`・`C:\\...` が `PathBuf::push` でドキュメントルートを丸ごと置き換え、ルートの外のファイルの
+/// 有無が 403 と 404 の違いで見えた。Windows ではドライブ・代替データストリームの `:` と `\\` を含むものを断る
+/// （`/` で始まらず `:`・`\\` を含まなければ接頭辞・ルートの無い相対パスになる）。unix は `/` で始まらなければ相対。
+/// `..` は呼び出し側が先に断っている。
+#[inline]
+pub(crate) fn is_plain_relative_subpath(sub: &str) -> bool {
+    if cfg!(windows) {
+        windows_plain_relative(sub)
+    } else {
+        !sub.starts_with('/')
+    }
+}
+
+/// Windows のパスとして接頭辞（ドライブ・UNC）もルートも無い相対パスか（B-396）
+#[inline]
+fn windows_plain_relative(sub: &str) -> bool {
+    !sub.starts_with('/') && !sub.bytes().any(|b| b == b':' || b == b'\\')
 }
 
 /// HTTP/1.1 の要求先を origin 形式の範囲にする（RFC 9112 §3.2）。
@@ -2300,6 +2368,56 @@ mod idempotent_method_tests {
             b("https://n.example/", "/a", "/", true),
             "https://n.example/a"
         );
+    }
+
+    /// B-387: 要求から取った値の先頭の `/`・`\` の並びで別のホストを指す `Location` を作らない
+    #[test]
+    fn redirect_never_becomes_protocol_relative() {
+        use super::build_redirect_url as b;
+        assert_eq!(b("/", "/legacy//evil.com", "/legacy", true), "/evil.com");
+        assert_eq!(b("/", "/legacy/\\evil.com", "/legacy/", true), "/evil.com");
+        assert_eq!(
+            b("$path", "/legacy//evil.com", "/legacy", false),
+            "/evil.com"
+        );
+        assert_eq!(
+            b("/$path", "/legacy/evil.com", "/legacy", false),
+            "/evil.com"
+        );
+        assert_eq!(b("$request_uri", "//evil.com", "/", false), "/evil.com");
+        assert_eq!(b("$request_uri", "/\\evil.com", "/", false), "/evil.com");
+        // 差し込んだ値の中の変数は置き換え直さない
+        assert_eq!(
+            b("https://n.example$request_uri", "/a$path", "/zzz", false),
+            "https://n.example/a$path"
+        );
+        // 設定のプロトコル相対・絶対 URL は保つ
+        assert_eq!(
+            b("//cdn.example$path", "/old/a", "/old", false),
+            "//cdn.example/a"
+        );
+        assert_eq!(
+            b("https://n.example$path", "/old//a", "/old", false),
+            "https://n.example/a"
+        );
+        // `$` だけ・未知の変数はそのまま
+        assert_eq!(b("/a$b$", "/x", "/", false), "/a$b$");
+    }
+
+    /// B-396: Windows ではドライブ・UNC・代替データストリームのサブパスをドキュメントルートへ足さない
+    #[test]
+    fn static_subpaths_must_be_plain_relative() {
+        use super::windows_plain_relative as w;
+        assert!(w("css/style.css"));
+        assert!(w("a/./b.txt"));
+        assert!(!w("C:/Windows/win.ini"));
+        assert!(!w("C:Windows"));
+        assert!(!w("a\\b"));
+        assert!(!w("\\\\server\\share"));
+        assert!(!w("file.txt::$DATA"));
+        assert!(!w("/abs"));
+        assert!(super::is_plain_relative_subpath("css/style.css"));
+        assert!(!super::is_plain_relative_subpath("/abs"));
     }
 
     /// B-317: CONNECT の authority 形式は通さない（origin 形式・絶対形式・`OPTIONS *` だけ）

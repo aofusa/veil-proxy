@@ -125,7 +125,7 @@ idle_timeout_secs = 30          # evict a client session after 30s of no traffic
 | `max_connections` | Max simultaneous connections/sessions (0 = unlimited) | `0` |
 | `connect_timeout_secs` | Upstream connect timeout in seconds (TCP only) | `10` |
 | `idle_timeout_secs` | Idle timeout in seconds before closing a connection/session | `600` |
-| `wasm_modules` | WASM network filter module names (requires `wasm` feature, F-133). Empty (default) = WASM disabled and the zero-copy `splice` path (Linux; other platforms copy) is used unchanged. When non-empty, `splice` is bypassed and data is routed through a userspace buffer so WASM modules can inspect/rewrite it (`proxy_on_downstream_data`/`proxy_on_upstream_data`); this switch is decided once per connection. | `[]` |
+| `wasm_modules` | WASM network filter module names (requires `wasm` feature, F-133). Empty (default) = WASM disabled and the zero-copy `splice` path (Linux; other platforms copy) is used unchanged. When non-empty, `splice` is bypassed and data is routed through a userspace buffer so WASM modules can inspect/rewrite it (`proxy_on_downstream_data`/`proxy_on_upstream_data`); this switch is decided once per connection. TCP only: a `protocol = "udp"` listener with `wasm_modules` or `module_configuration` is rejected, and every name must be defined in an enabled `[wasm]` section. | `[]` |
 | `module_configuration` | Per-listener Proxy-Wasm plugin configuration override (module name → string or TOML table, F-148). Same merge rules as `[[route]]`; only names listed in `wasm_modules` are accepted. | (none) |
 | `upstreams[].addr` | Upstream address (`"host:port"`) | required |
 | `upstreams[].weight` | Weight (reserved for weighted RR) | `1` |

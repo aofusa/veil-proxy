@@ -96,6 +96,10 @@ If something else already serves port 80 (a load balancer, another proxy, a Kube
   the staging `cert_path` and `key_path` files, and start it again (a temporary certificate is written and the
   production certificate is issued).
 - Back up `storage_dir/account.key` if you want to keep the same account.
+- With an `https://` `directory_url`, every URL the CA returns (nonce, account, order, authorization, finalize,
+  certificate) must also be `https://`; an `http://` URL fails the attempt. URLs and headers that contain whitespace
+  or control characters are refused. Temporary files in `storage_dir` and the certificate directories are created
+  under fresh names and never through an existing file or symbolic link.
 - Logs use the `[ACME]` prefix: `wrote a temporary self-signed certificate`, `managing a certificate for ...`,
   `certificate installed`, `issuance failed (retry in ...)`.
 

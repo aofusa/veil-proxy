@@ -81,8 +81,10 @@ pub(super) async fn handle_sendfile(
         path_str
     };
 
-    // パストラバーサル防止（簡易チェック）
-    if remainder.contains("..") {
+    // パストラバーサル防止（簡易チェック）。B-396: Windows のドライブ等でルートを置き換えるサブパスも断る
+    if remainder.contains("..")
+        || !crate::http_utils::is_plain_relative_subpath(remainder.trim_start_matches('/'))
+    {
         let err_buf = ERR_MSG_FORBIDDEN.to_vec();
         let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
         return Some((tls_stream, 403, 0, true));

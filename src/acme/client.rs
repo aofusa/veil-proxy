@@ -16,6 +16,8 @@ pub struct AcmeClient<'a> {
     dir: Value,
     kid: Option<String>,
     nonce: Option<String>,
+    /// ディレクトリを https で取ったか（サーバが返す URL も https に限る。B-397）
+    https_only: bool,
 }
 
 impl<'a> AcmeClient<'a> {
@@ -37,7 +39,12 @@ impl<'a> AcmeClient<'a> {
             dir,
             kid: None,
             nonce: None,
+            https_only: directory_url.starts_with("https://"),
         })
+    }
+
+    fn check_url(&self, url: &str) -> Result<(), String> {
+        check_server_url(self.https_only, url)
     }
 
     fn dir_url(&self, name: &str) -> Result<String, String> {
@@ -52,6 +59,7 @@ impl<'a> AcmeClient<'a> {
             return Ok(n);
         }
         let url = self.dir_url("newNonce")?;
+        self.check_url(&url)?;
         let r = self.http.request("HEAD", &url, &[], b"", LIMIT)?;
         r.header("replay-nonce")
             .map(|s| s.to_string())
@@ -60,6 +68,7 @@ impl<'a> AcmeClient<'a> {
 
     /// JWS で POST する（`payload` が `None` なら POST-as-GET）。badNonce は 1 回だけ再試行。
     fn post(&mut self, url: &str, payload: Option<&Value>) -> Result<HttpResponse, String> {
+        self.check_url(url)?;
         for attempt in 0..2 {
             let nonce = self.fresh_nonce()?;
             let body = self.key.sign(url, &nonce, self.kid.as_deref(), payload)?;
@@ -215,4 +224,29 @@ fn wait(deadline: Instant) -> Result<(), String> {
     }
     crate::server::cap_safe_sleep(Duration::from_millis(1000));
     Ok(())
+}
+
+/// サーバが返した URL を使ってよいか（B-397: ディレクトリを https で取ったら http へ落とさない。
+/// 空白・制御文字は `ctrl_http::parse_url` が断る）
+fn check_server_url(https_only: bool, url: &str) -> Result<(), String> {
+    if https_only && !url.starts_with("https://") {
+        return Err(format!(
+            "ACME server returned a non-https URL ({})",
+            url.escape_debug()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B-397: https のディレクトリが返した http の URL は使わない
+    #[test]
+    fn server_urls_do_not_downgrade() {
+        assert!(check_server_url(true, "https://acme.example/order/1").is_ok());
+        assert!(check_server_url(true, "http://127.0.0.1:6379/x").is_err());
+        assert!(check_server_url(false, "http://pebble:14000/order/1").is_ok());
+    }
 }

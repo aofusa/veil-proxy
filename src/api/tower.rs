@@ -63,7 +63,13 @@ fn build_http_request(req: &Request) -> http::Request<VeilBody> {
         t.extend_from_slice(&req.query);
         t.freeze()
     };
-    if let Ok(u) = http::Uri::from_maybe_shared(target) {
+    // B-391: `http` クレートが要求先に受け付けないバイト（`<`・`>`・`` ` ``・0x80 以上等。veil の受け付けより狭い）を
+    // 含む要求先は、百分率符号化してから渡す。以前は解析に失敗すると既定の `/` のままにしたので、層（認可等）は
+    // `DELETE /` と見ていた（ルータは元のパスでハンドラを選んでいる）。符号化した要求先は `http` が受け付ける
+    // バイトだけでできている
+    let uri = http::Uri::from_maybe_shared(target.clone())
+        .or_else(|_| http::Uri::from_maybe_shared(encode_target(&target)));
+    if let Ok(u) = uri {
         *out.uri_mut() = u;
     }
     *out.version_mut() = match req.version {
@@ -82,6 +88,31 @@ fn build_http_request(req: &Request) -> http::Request<VeilBody> {
         }
     }
     out
+}
+
+/// Percent-encodes the bytes of a request target that the `http` crate does not accept in a URI (space,
+/// control characters, `"`, `<`, `>`, `\`, `^`, `` ` ``, `{`, `|`, `}`, `#` and bytes from 0x80). The result
+/// always starts with `/` (or is `*`).
+fn encode_target(target: &[u8]) -> Bytes {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = bytes::BytesMut::with_capacity(target.len() + 16);
+    if target != b"*" && target.first() != Some(&b'/') {
+        out.extend_from_slice(b"/");
+    }
+    for &b in target {
+        if b <= 0x20
+            || b >= 0x7F
+            || matches!(
+                b,
+                b'"' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}' | b'#'
+            )
+        {
+            out.extend_from_slice(&[b'%', HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]);
+        } else {
+            out.extend_from_slice(&[b]);
+        }
+    }
+    out.freeze()
 }
 
 /// Names of commonly used headers become static `Bytes`. `http` 1.x has no way to move a `HeaderName` into
@@ -388,6 +419,36 @@ mod tests {
     use super::*;
     use crate::api::stream::BodyChunk;
     use futures::StreamExt;
+
+    // B-391: `http` クレートが受け付けないバイトを含む要求先も、層は元のパス（百分率符号化したもの）を見る
+    #[test]
+    fn tower_layers_see_the_real_path_for_unusual_targets() {
+        let uri = |path: &'static [u8], query: &'static [u8]| {
+            let mut r = Request::new(
+                "DELETE".to_string(),
+                "/".to_string(),
+                Vec::new(),
+                Bytes::new(),
+            );
+            r.path = Bytes::from_static(path);
+            r.query = Bytes::from_static(query);
+            build_http_request(&r).uri().clone()
+        };
+        let u = uri(b"/admin/users/42", b"x=<");
+        assert_eq!(u.path(), "/admin/users/42");
+        assert_eq!(u.query(), Some("x=%3C"));
+        let u = uri(b"/admin/<b>/`c`", b"");
+        assert_eq!(u.path(), "/admin/%3Cb%3E/%60c%60");
+        let u = uri(b"/admin/\xff", b"q=\"1\"");
+        assert_eq!(u.path(), "/admin/%FF");
+        assert_eq!(u.query(), Some("q=%221%22"));
+        // 受け付けるものは変えない
+        let u = uri(b"/a/b", b"c=d&e=%20");
+        assert_eq!(u.path(), "/a/b");
+        assert_eq!(u.query(), Some("c=d&e=%20"));
+        assert_eq!(&encode_target(b"x<")[..], b"/x%3C");
+        assert_eq!(&encode_target(b"*")[..], b"*");
+    }
 
     #[test]
     fn streaming_response_survives_tower_conversion() {

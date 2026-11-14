@@ -146,6 +146,12 @@ pub struct CacheConfig {
     /// （source_ip・ヘッダ・クエリ）の違うルートの応答を別のルートの要求へ返していた（F23）
     #[serde(skip)]
     pub route_ns: u64,
+
+    /// ルートの JWT を読むヘッダ（`authorization` 以外のとき。小文字。設定ロード時に `build_backend` が
+    /// `[route.jwt] header` から決める）。B-390: `Authorization` と同じく、`key_headers` に無ければこのヘッダの
+    /// 付いた要求でキャッシュを使わない（独自のヘッダで認証するルートで、利用者ごとの応答を別の利用者へ返していた）
+    #[serde(skip)]
+    pub credential_header: Option<Box<str>>,
 }
 
 /// use_async_ioのデフォルト値（true）
@@ -177,6 +183,7 @@ impl Default for CacheConfig {
             key_headers: Vec::new(),
             use_async_io: default_use_async_io(),
             route_ns: 0,
+            credential_header: None,
         }
     }
 }
@@ -190,15 +197,22 @@ impl CacheConfig {
             .any(|m| m.as_bytes().eq_ignore_ascii_case(method))
     }
 
-    /// `Authorization` の付いた要求でキャッシュを使わないか。`key_headers` に `authorization` があれば
-    /// 利用者ごとのキーになるので使う（RFC 9111 §3.5。F-236 の F7）
+    /// `Authorization`（とルートの JWT のヘッダ。B-390）の付いた要求でキャッシュを使わないか。`key_headers` に
+    /// そのヘッダがあれば利用者ごとのキーになるので使う（RFC 9111 §3.5。F-236 の F7）
     #[inline]
     pub fn bypass_for_authorization(&self, headers: &[(bytes::Bytes, bytes::Bytes)]) -> bool {
-        super::policy::CachePolicy::request_has_authorization(headers)
-            && !self
-                .key_headers
+        let keyed = |name: &str| {
+            self.key_headers
                 .iter()
-                .any(|k| k.eq_ignore_ascii_case("authorization"))
+                .any(|k| k.eq_ignore_ascii_case(name))
+        };
+        (super::policy::CachePolicy::request_has_authorization(headers) && !keyed("authorization"))
+            || self.credential_header.as_deref().is_some_and(|h| {
+                headers
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(h.as_bytes()))
+                    && !keyed(h)
+            })
     }
 
     /// ステータスコードがキャッシュ対象かチェック
@@ -250,6 +264,28 @@ pub enum StorageType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // B-390: ルートの JWT のヘッダも Authorization と同じく扱う（key_headers にあればキャッシュを使う）
+    #[test]
+    fn bypass_for_route_credential_header() {
+        use bytes::Bytes;
+        let h = |n: &'static str, v: &'static str| {
+            (
+                Bytes::from_static(n.as_bytes()),
+                Bytes::from_static(v.as_bytes()),
+            )
+        };
+        let mut c = CacheConfig::default();
+        assert!(c.bypass_for_authorization(&[h("Authorization", "Bearer a")]));
+        assert!(!c.bypass_for_authorization(&[h("X-Access-Token", "a")]));
+        c.credential_header = Some("x-access-token".into());
+        assert!(c.bypass_for_authorization(&[h("X-Access-Token", "a")]));
+        assert!(c.bypass_for_authorization(&[h("authorization", "Bearer a")]));
+        assert!(!c.bypass_for_authorization(&[h("accept", "*/*")]));
+        c.key_headers = vec!["X-Access-Token".into()];
+        assert!(!c.bypass_for_authorization(&[h("x-access-token", "a")]));
+        assert!(c.bypass_for_authorization(&[h("authorization", "Bearer a")]));
+    }
 
     #[test]
     fn test_default_config() {

@@ -28,7 +28,7 @@ use bytes::{Bytes, BytesMut};
 use ftlog::{debug, warn};
 
 use crate::http2::frame::{Frame, FrameDecoder, FrameEncoder, FrameHeader};
-use crate::http2::hpack::{HpackDecoder, HpackEncoder};
+use crate::http2::hpack::{HeaderField, HpackDecoder, HpackEncoder};
 use crate::http2::settings::defaults;
 use crate::http2::NameSlot;
 use crate::runtime::handle::AsRawFd;
@@ -816,6 +816,29 @@ fn handle_frame(g: &mut Inner, rs: &mut RecvState, frame: Frame) -> Result<(), C
     Ok(())
 }
 
+/// 上流の応答の 1 つのヘッダブロックが不正か（[`on_headers`] の検査。B-318・B-388）。
+/// `trailer` は最終応答のヘッダを受けた後のブロック（トレーラ）か。
+fn malformed_response_fields(fields: &[HeaderField], trailer: bool, end_stream: bool) -> bool {
+    if trailer && !end_stream {
+        return true;
+    }
+    let mut regular_seen = false;
+    let mut statuses = 0u32;
+    fields.iter().any(|f| {
+        if f.name.starts_with(b":") {
+            if trailer || regular_seen || f.name.as_ref() != b":status" {
+                return true;
+            }
+            statuses += 1;
+            statuses > 1
+        } else {
+            regular_seen = true;
+            !crate::http_utils::is_valid_header_name(&f.name)
+                || !crate::http_utils::is_valid_header_value(&f.value)
+        }
+    })
+}
+
 /// 応答 HEADERS（head / 1xx / トレーラー）を処理する。HPACK の状態を保つため、閉じた
 /// ストリーム宛てでも必ずデコードする。
 fn on_headers(
@@ -837,11 +860,10 @@ fn on_headers(
     }
     // B-318: 上流の応答のフィールドは名前が token、値に CR・LF・NUL が無いものだけ受ける（RFC 9113 §8.2.1。
     // HPACK は任意のバイトを運べるので、HTTP/1.1 のクライアントへそのまま書くと応答を分割できた。F15）
-    if fields.iter().any(|f| {
-        !f.name.starts_with(b":")
-            && (!crate::http_utils::is_valid_header_name(&f.name)
-                || !crate::http_utils::is_valid_header_value(&f.value))
-    }) {
+    // B-388: 疑似ヘッダは応答のヘッダの先頭の `:status` 1 つだけ（RFC 9113 §8.3.2）。トレーラには置けず、
+    // トレーラは END_STREAM で終わる（§8.1）。以前は `:` で始まるフィールドを検査せず、トレーラではそのまま
+    // HTTP/1.1 のクライアントへ書いていた（CR・LF を含む名前・値で応答を分割できた）
+    if malformed_response_fields(&fields, st.head_seen, end_stream) {
         st.reset = true;
         st.remote_closed = true;
         st.resp_queue.push_back(UpResp::Reset { retryable: false });
@@ -1607,6 +1629,51 @@ mod tests {
     /// B-106: ストリームの初期ウィンドウ（16KB）を超える本文を 2 ストリーム並行で送っても、
     /// 各ストリームがウィンドウを超えて送らず、WINDOW_UPDATE で再開し、両方とも
     /// 1 本の接続上で完了する（F-174 の多重化）。
+    // B-388: 疑似ヘッダは応答のヘッダの先頭の `:status` 1 つだけ。トレーラには置けず、END_STREAM で終わる
+    #[test]
+    fn response_pseudo_headers_and_trailers_are_validated() {
+        let f = |n: &'static [u8], v: &'static [u8]| HeaderField::new(n, v);
+        let head = [f(b":status", b"200"), f(b"content-type", b"text/plain")];
+        assert!(!malformed_response_fields(&head, false, false));
+        assert!(!malformed_response_fields(&head, false, true));
+        // 未定義の疑似ヘッダ・重複・通常のフィールドの後ろの疑似ヘッダ
+        assert!(malformed_response_fields(
+            &[f(b":status", b"200"), f(b":x", b"a")],
+            false,
+            false
+        ));
+        assert!(malformed_response_fields(
+            &[f(b":status", b"200"), f(b":status", b"204")],
+            false,
+            false
+        ));
+        assert!(malformed_response_fields(
+            &[f(b"a", b"b"), f(b":status", b"200")],
+            false,
+            false
+        ));
+        // トレーラ: 疑似ヘッダ（名前・値に CR・LF があっても検査されていなかった）・END_STREAM の無いもの
+        let evil = [f(b":x", b"a\r\nSet-Cookie: s=evil\r\n\r\n")];
+        assert!(malformed_response_fields(&evil, true, true));
+        assert!(malformed_response_fields(
+            &[f(b"grpc-status", b"0")],
+            true,
+            false
+        ));
+        assert!(!malformed_response_fields(
+            &[f(b"grpc-status", b"0")],
+            true,
+            true
+        ));
+        // 通常のフィールドの名前・値（B-318）
+        assert!(malformed_response_fields(&[f(b"x", b"a\r\nb")], true, true));
+        assert!(malformed_response_fields(
+            &[f(b":status", b"200"), f(b"x y", b"a")],
+            false,
+            false
+        ));
+    }
+
     #[test]
     // 理由付き allow: テスト用の同期サーバスレッド（データプレーン非経由）。
     #[allow(clippy::disallowed_methods)]

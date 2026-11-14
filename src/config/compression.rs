@@ -822,6 +822,29 @@ pub struct GlobalSecurityConfig {
     /// - `"off"`: 正規化しない（以前の動作。照合と上流の解釈がずれ得る）
     #[serde(default)]
     pub path_normalization: PathNormalizationMode,
+
+    /// パスの `%2F`・`%5C`（エスケープされたスラッシュ）の扱い（HTTP/1.1・HTTP/2・HTTP/3。Envoy の
+    /// `path_with_escaped_slashes_action`。B-385）。
+    ///
+    /// - `"keep"`（既定）: そのまま上流へ送る。ただし、エスケープされたスラッシュがドットのセグメントを作るパス
+    ///   （`/public/..%2Fadmin`。`%2F` を戻してからドットのセグメントを取り除く上流ではルートの照合と違うパスになる）は 400
+    /// - `"reject"`: `%2F`・`%5C` を含む要求をすべて 400 にする
+    /// - `"unescape"`: `/`・`\` に戻してから正規化する（ルートの照合と上流へ送るパスが同じになる）
+    #[serde(default)]
+    pub escaped_slashes: EscapedSlashesMode,
+}
+
+/// `[security] escaped_slashes` の値（B-385）
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EscapedSlashesMode {
+    /// そのまま送る（ドットのセグメントを作るものだけ拒否）
+    #[default]
+    Keep,
+    /// 400 で拒否する
+    Reject,
+    /// `/`・`\` に戻してから正規化する
+    Unescape,
 }
 
 /// `[security] path_normalization` の値

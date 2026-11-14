@@ -67,41 +67,27 @@ async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>, peer: std::net::IpAddr) 
                 Ok(n) => acc.extend_from_slice(&buf[..n]),
             }
         };
-        let (method, target, close, body_len) = {
-            let mut hb = [httparse::EMPTY_HEADER; 64];
-            let mut req = httparse::Request::new(&mut hb);
-            if !matches!(
-                req.parse(&acc[..head_end]),
-                Ok(httparse::Status::Complete(_))
-            ) {
+        let (method, target, close, body_len) = match parse_admin_head(&acc[..head_end]) {
+            Ok(h) => h,
+            Err(None) => return,
+            Err(Some(status)) => {
+                let head = format!(
+                    "HTTP/1.1 {} {}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    status,
+                    crate::mesh::httpcore::reason(status),
+                );
+                let _ = ds.write_all(head.into_bytes()).await;
                 return;
             }
-            let close = req.headers.iter().any(|h| {
-                h.name.eq_ignore_ascii_case("connection") && h.value.eq_ignore_ascii_case(b"close")
-            });
-            let len = req
-                .headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("content-length"))
-                .and_then(|h| {
-                    std::str::from_utf8(h.value)
-                        .ok()?
-                        .trim()
-                        .parse::<usize>()
-                        .ok()
-                })
-                .unwrap_or(0);
-            (
-                req.method.unwrap_or("GET").to_string(),
-                req.path.unwrap_or("/").to_string(),
-                close,
-                len,
-            )
         };
-        // 本文は読み捨てる（POST /shutdown 等）
+        // 本文は読み捨てる（POST /shutdown 等）。B-393: 長さは parse_admin_head が上限で抑え、読み取りにも期限を付ける
         while acc.len() < head_end + body_len {
             let buf: Vec<u8> = Vec::with_capacity(4096);
-            let (r, buf) = ds.read(buf).await;
+            let (r, buf) =
+                match crate::runtime::timeout(Duration::from_secs(60), ds.read(buf)).await {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
             match r {
                 Ok(0) | Err(_) => return,
                 Ok(n) => acc.extend_from_slice(&buf[..n]),
@@ -124,6 +110,54 @@ async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>, peer: std::net::IpAddr) 
             return;
         }
     }
+}
+
+/// 管理ポートの要求の本文の上限（管理用の要求に本文は要らない。B-393）
+const MAX_ADMIN_BODY: u64 = 64 * 1024;
+
+/// 管理ポートの HTTP/1.1 の要求のヘッダを読む: (メソッド, 要求先, `Connection: close` か, 本文の長さ)。
+/// 読めない要求は `Err(None)`（閉じる）、断る要求は `Err(Some(ステータス))`。
+///
+/// B-393: 本文の長さは厳格に読み（数字だけ）、上限を超えるものは 413、`Transfer-Encoding` の付いたもの・
+/// 不正な長さは 400 にする。以前はクライアントの Content-Length の分を上限・期限なしに溜め、`head_end + 長さ`
+/// が折り返すと同じ要求を際限なく処理し直していた。
+fn parse_admin_head(head: &[u8]) -> Result<(String, String, bool, usize), Option<u16>> {
+    let mut hb = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut hb);
+    if !matches!(req.parse(head), Ok(httparse::Status::Complete(_))) {
+        return Err(None);
+    }
+    let close = req.headers.iter().any(|h| {
+        h.name.eq_ignore_ascii_case("connection") && h.value.eq_ignore_ascii_case(b"close")
+    });
+    if req
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        return Err(Some(400));
+    }
+    let mut len: Option<u64> = None;
+    for h in req
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
+    {
+        match crate::http_utils::parse_content_length(h.value) {
+            Some(n) if len.is_none_or(|l| l == n) => len = Some(n),
+            _ => return Err(Some(400)),
+        }
+    }
+    let len = len.unwrap_or(0);
+    if len > MAX_ADMIN_BODY {
+        return Err(Some(413));
+    }
+    Ok((
+        req.method.unwrap_or("GET").to_string(),
+        req.path.unwrap_or("/").to_string(),
+        close,
+        len as usize,
+    ))
 }
 
 /// HTTP/2 の管理ポートの要求の処理（`/shutdown`・`/env.json` の判定に接続の相手を使う）
@@ -275,6 +309,42 @@ pub fn route(
 #[cfg(test)]
 mod admin_access_tests {
     use super::*;
+
+    /// B-393: 本文の長さは上限付きで厳格に読む（溜め続けない・足し算を溢れさせない）
+    #[test]
+    fn admin_head_bounds_the_body() {
+        let ok = parse_admin_head(b"POST /shutdown HTTP/1.1\r\nContent-Length: 3\r\n\r\n").unwrap();
+        assert_eq!(
+            (ok.0.as_str(), ok.1.as_str(), ok.2, ok.3),
+            ("POST", "/shutdown", false, 3)
+        );
+        let ok = parse_admin_head(b"GET /ready HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        assert!(ok.2);
+        assert_eq!(ok.3, 0);
+        assert_eq!(
+            parse_admin_head(b"POST /ready HTTP/1.1\r\nContent-Length: 100000000000\r\n\r\n"),
+            Err(Some(413))
+        );
+        assert_eq!(
+            parse_admin_head(
+                b"GET /metrics HTTP/1.1\r\nContent-Length: 18446744073709551556\r\n\r\n"
+            ),
+            Err(Some(413))
+        );
+        assert_eq!(
+            parse_admin_head(b"GET / HTTP/1.1\r\nContent-Length: +1\r\n\r\n"),
+            Err(Some(400))
+        );
+        assert_eq!(
+            parse_admin_head(b"GET / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"),
+            Err(Some(400))
+        );
+        assert_eq!(
+            parse_admin_head(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"),
+            Err(Some(400))
+        );
+        assert_eq!(parse_admin_head(b"\x00\r\n\r\n"), Err(None));
+    }
 
     /// F-236 の再走査の F8: `/shutdown`・`/env.json` はループバックからだけ受ける
     #[test]

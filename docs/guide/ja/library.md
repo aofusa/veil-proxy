@@ -682,7 +682,9 @@ App::new()
     .run()?;
 ```
 
-- `layer` / `layer_on`（`api-core`）は veil のイベントループの中でハンドラを包みます。
+- `layer` / `layer_on`（`api-core`）は veil のイベントループの中でハンドラを包みます。層が見るのはルータが照合したパスです。
+  veil は要求先に受け付けても `http` クレートが受け付けないバイト（`<`・`>`・`` ` ``・0x80 以上のバイト等）は、層に渡す
+  `Uri` で百分率符号化します。
 - `tokio_service`（`tokio-compat` または `tokio-compat-bridge`）は tower のサービスをマウントします。`tokio-compat` では
   ほかのハンドラと同じくリクエストを受け付けたワーカーで動きます。`tokio-compat-bridge` では同梱の tokio ランタイムで動き、
   結果は `offload` と同じ「結果スロット + 通知 fd」でワーカーへ返ります。

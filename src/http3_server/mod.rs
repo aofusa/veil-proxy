@@ -1229,10 +1229,28 @@ impl Http3Handler {
                                     let mut list = list;
                                     if let Some(i) = list.iter().position(|h| h.name() == b":path")
                                     {
-                                        if let Some(n) = crate::path_norm::normalize_request_path(
+                                        match crate::path_norm::normalize_request_path(
                                             list[i].value(),
                                         ) {
-                                            list[i] = quiche::h3::Header::new(b":path", &n);
+                                            Ok(Some(n)) => {
+                                                list[i] = quiche::h3::Header::new(b":path", &n);
+                                            }
+                                            Ok(None) => {}
+                                            // B-385: `[security] escaped_slashes` で断るパス（このストリームだけを
+                                            // H3_MESSAGE_ERROR で閉じる）
+                                            Err(_) => {
+                                                let _ = self.conn.stream_shutdown(
+                                                    stream_id,
+                                                    quiche::Shutdown::Read,
+                                                    H3_MESSAGE_ERROR,
+                                                );
+                                                let _ = self.conn.stream_shutdown(
+                                                    stream_id,
+                                                    quiche::Shutdown::Write,
+                                                    H3_MESSAGE_ERROR,
+                                                );
+                                                continue;
+                                            }
                                         }
                                     }
                                     new_headers.push((stream_id, list, more_frames));

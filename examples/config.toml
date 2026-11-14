@@ -745,6 +745,15 @@ watch = false
 # "#" を含む要求先・UTF-8 でないバイトを含む要求先も 400 にする（"off" を含むどのモードでも）。
 # path_normalization = "base"
 
+# パスのエスケープされたスラッシュ（%2F・%5C）の扱い（HTTP/1.1・HTTP/2・HTTP/3。Envoy の
+# path_with_escaped_slashes_action に相当）
+# "keep"（既定）: エスケープしたまま上流へ送る。ただし、エスケープされたスラッシュがドットのセグメントを作るパスは
+#   400 にする（/public/..%2Fadmin は /public/* のルートに合うが、%2F を戻してからドットのセグメントを取り除く
+#   上流（nginx 等）は /admin を返す。path_normalization が "off" のときは検査しない）
+# "reject": %2F・%5C を含むパスをすべて 400 にする
+# "unescape": "/"（%5C は "/"）に戻してから正規化する（ルートの照合と上流へ送るパスが同じになる）
+# escaped_slashes = "keep"
+
 # セキュリティ機能の有効化に失敗した場合の動作
 # false: 有効化に失敗した場合はサーバーの起動を失敗させる（デフォルト、推奨）
 # true: 有効化に失敗しても警告を出して起動を続行する（開発・デバッグ用）
@@ -1733,7 +1742,9 @@ watch = false
 #   # メトリクス操作（proxy_define_metric 等）
 #   # allow_metrics = false
 #
-#   # 共有データアクセス（proxy_get/set_shared_data）
+#   # 共有データアクセス（proxy_get/set_shared_data）と共有キュー（proxy_*_shared_queue）。
+#   # キューは登録したモジュールのもので、取り出せるのはそのモジュールだけ。他のモジュールは
+#   # 持ち主のモジュール名（vm_id）でキューを引いてから積む
 #   # allow_shared_data = false
 #
 #   # 共有データの最大サイズ（バイト、allow_shared_data = true 時）
@@ -2772,7 +2783,8 @@ watch = false
 # # 省略時・空リストの場合は WASM 無効で splice/ゼロコピー転送のまま
 # # （ホットパス絶対規則: コスト増なし）。指定すると splice を使わず
 # # ユーザー空間バッファ経由の転送へ切り替わる。参照するモジュール名は
-# # [wasm] の modules で定義済みであること。
+# # 有効な [wasm] の modules で定義済みであること。TCP のみ（protocol = "udp"
+# # のリスナーに書くと設定を拒否する）。
 # wasm_modules = ["network_filter"]
 # # F-148: L4 リスナー単位のモジュール設定上書き（HTTP route と同じ合成規則）。
 # # ここに書けるのは上の wasm_modules に列挙したモジュール名のみ。

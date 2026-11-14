@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_HEADERS: usize = 100;
-const MAX_HEAD_BYTES: usize = 60 * 1024;
+pub(super) const MAX_HEAD_BYTES: usize = 60 * 1024;
 const READ_CHUNK: usize = 16 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 /// リトライのために手元に置ける本文の上限（Envoy の per_request_buffer_limit の既定に近い）
@@ -128,57 +128,15 @@ where
                 }
             };
         let http10 = req.version == Some(0);
-        let mut headers: Vec<(Bytes, Bytes)> = Vec::with_capacity(req.headers.len() + 8);
-        let mut authority = Bytes::new();
-        let mut framing = Framing::None;
-        let mut te_chunked = false;
-        let mut keep_alive = !http10;
-        let mut upgrade = false;
-        let mut expect_continue = false;
-        let mut bad_framing = false;
-        for h in req.headers.iter() {
-            let name = Bytes::from(h.name.to_ascii_lowercase());
-            let value = sub(&head, h.value);
-            match name.as_ref() {
-                b"host" => authority = value.clone(),
-                b"content-length" => match crate::http_utils::parse_content_length(&value) {
-                    // B-315: 数字だけを受ける（`+5` 等を上流と違う長さで読まない）
-                    Some(n) => framing = Framing::Length(n),
-                    None => bad_framing = true,
-                },
-                b"transfer-encoding" => {
-                    if value.windows(7).any(|w| w.eq_ignore_ascii_case(b"chunked")) {
-                        te_chunked = true;
-                    }
-                }
-                b"connection" => {
-                    if value.windows(5).any(|w| w.eq_ignore_ascii_case(b"close")) {
-                        keep_alive = false;
-                    }
-                    if value
-                        .windows(10)
-                        .any(|w| w.eq_ignore_ascii_case(b"keep-alive"))
-                        && http10
-                    {
-                        keep_alive = true;
-                    }
-                    if value.windows(7).any(|w| w.eq_ignore_ascii_case(b"upgrade")) {
-                        upgrade = true;
-                    }
-                }
-                b"expect" => expect_continue = value.eq_ignore_ascii_case(b"100-continue"),
-                _ => {}
-            }
-            headers.push((name, value));
-        }
-        // B-315: 本文の区切りが曖昧な要求（CL と TE の両方・複数の CL・最後が chunked でない TE・不正な CL）は
-        // 400 にする。接続を使い回す上流へそのまま送ると、veil と上流で要求の切れ目が食い違う（F13）
-        if bad_framing
-            || crate::http_utils::classify_request_framing(
-                headers.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
-            )
-            .is_err()
-        {
+        let Some(ReqHeadScan {
+            mut headers,
+            mut authority,
+            framing,
+            mut keep_alive,
+            upgrade,
+            expect_continue,
+        }) = scan_request_headers(&head, req.headers, http10)
+        else {
             let _ = write_local(
                 &mut io,
                 &LocalReply::new(400, ResponseFlag::None),
@@ -188,10 +146,7 @@ where
             )
             .await;
             return;
-        }
-        if te_chunked {
-            framing = Framing::Chunked;
-        }
+        };
         if let Some(a) = target_authority {
             for (k, v) in headers.iter_mut() {
                 if k.as_ref() == b"host" {
@@ -368,6 +323,96 @@ fn sub(head: &Bytes, part: &[u8]) -> Bytes {
     }
     let start = part.as_ptr() as usize - head.as_ptr() as usize;
     head.slice(start..start + part.len())
+}
+
+/// 要求のヘッダを走査した結果。
+struct ReqHeadScan {
+    headers: Vec<(Bytes, Bytes)>,
+    authority: Bytes,
+    framing: Framing,
+    keep_alive: bool,
+    upgrade: bool,
+    expect_continue: bool,
+}
+
+/// 要求のヘッダを走査する（名前は小文字にして `head` の切り出しで持つ）。400 にする要求は `None`。
+///
+/// B-315: 本文の区切りが曖昧な要求（CL と TE の両方・複数の CL・最後が chunked でない TE・不正な CL）は
+/// 400 にする。接続を使い回す上流へそのまま送ると、veil と上流で要求の切れ目が食い違う（F13）。
+/// B-384: Host が複数ある要求も 400（RFC 9112 §3.2）。最後の Host で経路・RBAC を決めて全部を上流へ
+/// 送ると、最初の Host を使う上流では許可していない仮想ホストに届く。
+fn scan_request_headers(
+    head: &Bytes,
+    fields: &[httparse::Header<'_>],
+    http10: bool,
+) -> Option<ReqHeadScan> {
+    let mut headers: Vec<(Bytes, Bytes)> = Vec::with_capacity(fields.len() + 8);
+    let mut authority = Bytes::new();
+    let mut framing = Framing::None;
+    let mut te_chunked = false;
+    let mut keep_alive = !http10;
+    let mut upgrade = false;
+    let mut expect_continue = false;
+    let mut bad_framing = false;
+    let mut hosts = 0u32;
+    for h in fields.iter() {
+        let name = Bytes::from(h.name.to_ascii_lowercase());
+        let value = sub(head, h.value);
+        match name.as_ref() {
+            b"host" => {
+                hosts += 1;
+                authority = value.clone();
+            }
+            b"content-length" => match crate::http_utils::parse_content_length(&value) {
+                // B-315: 数字だけを受ける（`+5` 等を上流と違う長さで読まない）
+                Some(n) => framing = Framing::Length(n),
+                None => bad_framing = true,
+            },
+            b"transfer-encoding" => {
+                if value.windows(7).any(|w| w.eq_ignore_ascii_case(b"chunked")) {
+                    te_chunked = true;
+                }
+            }
+            b"connection" => {
+                if value.windows(5).any(|w| w.eq_ignore_ascii_case(b"close")) {
+                    keep_alive = false;
+                }
+                if value
+                    .windows(10)
+                    .any(|w| w.eq_ignore_ascii_case(b"keep-alive"))
+                    && http10
+                {
+                    keep_alive = true;
+                }
+                if value.windows(7).any(|w| w.eq_ignore_ascii_case(b"upgrade")) {
+                    upgrade = true;
+                }
+            }
+            b"expect" => expect_continue = value.eq_ignore_ascii_case(b"100-continue"),
+            _ => {}
+        }
+        headers.push((name, value));
+    }
+    if bad_framing
+        || hosts > 1
+        || crate::http_utils::classify_request_framing(
+            headers.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
+        )
+        .is_err()
+    {
+        return None;
+    }
+    if te_chunked {
+        framing = Framing::Chunked;
+    }
+    Some(ReqHeadScan {
+        headers,
+        authority,
+        framing,
+        keep_alive,
+        upgrade,
+        expect_continue,
+    })
 }
 
 /// 読めたら true、EOF・エラー・期限切れは false。
@@ -1514,83 +1559,160 @@ enum H2Result {
     Retry(Outcome),
 }
 
+/// `acc` の先頭の chunked のフレーミングを読み進め、中身があれば切り出す（読んだ分は `acc` から捨てる）。
+/// 戻り値は（中身, 終端に達したか）。終端より後ろ（次の要求）は `acc` に残す。
+fn take_chunk_data(
+    dec: &mut ChunkedDecoder,
+    acc: &mut BytesMut,
+) -> io::Result<(Option<Bytes>, bool)> {
+    let span = dec.next_data_span(acc);
+    if span.limit_exceeded {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, BadChunked));
+    }
+    if span.data_len == 0 {
+        acc.advance(span.consumed);
+        return Ok((None, span.complete));
+    }
+    // 中身はデコーダが返した直後に止まる
+    debug_assert_eq!(span.consumed, span.data_start + span.data_len);
+    acc.advance(span.data_start);
+    Ok((Some(acc.split_to(span.data_len).freeze()), false))
+}
+
 /// chunked の本文から中身だけを取り出して HTTP/2 のストリームへ送る。
+///
+/// B-392: フレーミングは厳格なデコーダで少しずつ読み、読み終えた分は `acc` から捨てる（サイズの行・拡張・
+/// トレーラの量はデコーダの上限で抑える）。以前は CRLF が見つかるまで `acc` へ溜めて毎回先頭から探していたので、
+/// 改行を送らない相手 1 つでメモリを使い切れた（探す費用も二乗で増えた）。
 async fn dechunk_into<S: AsyncReadRent>(
     io: &mut S,
     acc: &mut BytesMut,
     st: &crate::http2::upstream_mux::UpStream,
     total: &mut u64,
 ) -> bool {
+    let mut dec = ChunkedDecoder::new_request(0);
     loop {
-        // サイズ行
-        let line_end = loop {
-            if let Some(i) = memchr::memmem::find(acc, b"\r\n") {
-                break i;
-            }
-            if !read_more(io, acc, Duration::from_secs(300))
+        if acc.is_empty()
+            && !read_more(io, acc, Duration::from_secs(300))
                 .await
                 .unwrap_or(false)
-            {
-                return false;
-            }
-        };
-        let line = acc.split_to(line_end + 2);
-        let size_str = std::str::from_utf8(&line[..line_end]).unwrap_or("");
-        let size_str = size_str.split(';').next().unwrap_or("").trim();
-        let Ok(mut size) = usize::from_str_radix(size_str, 16) else {
+        {
+            return false;
+        }
+        let Ok((data, complete)) = take_chunk_data(&mut dec, acc) else {
             return false;
         };
-        if size == 0 {
-            // trailer を読み捨てる
-            loop {
-                if let Some(i) = memchr::memmem::find(acc, b"\r\n") {
-                    let l = acc.split_to(i + 2);
-                    if l.len() == 2 {
-                        return true;
-                    }
-                    continue;
-                }
-                if !read_more(io, acc, Duration::from_secs(300))
-                    .await
-                    .unwrap_or(false)
-                {
-                    return false;
-                }
-            }
-        }
-        while size > 0 {
-            if acc.is_empty()
-                && !read_more(io, acc, Duration::from_secs(300))
-                    .await
-                    .unwrap_or(false)
-            {
-                return false;
-            }
-            let take = acc.len().min(size);
-            let chunk = acc.split_to(take).freeze();
-            size -= take;
-            *total += take as u64;
+        if let Some(chunk) = data {
+            *total += chunk.len() as u64;
             if let Some(tx) = &st.req_tx {
                 if tx.send(chunk).await.is_err() {
                     return false;
                 }
             }
         }
-        while acc.len() < 2 {
-            if !read_more(io, acc, Duration::from_secs(300))
-                .await
-                .unwrap_or(false)
-            {
-                return false;
-            }
+        if complete {
+            return true;
         }
-        let _ = acc.split_to(2);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // B-392: HTTP/2 の上流へ送る chunked の本文は、読んだ分を捨てながら中身だけを取り出し、改行の無い
+    // フレーミングは上限で打ち切る（溜め続けない）
+    #[test]
+    fn take_chunk_data_streams_and_bounds_framing() {
+        let mut dec = ChunkedDecoder::new_request(0);
+        let mut acc =
+            BytesMut::from(&b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\nGET /next"[..]);
+        let mut got = Vec::new();
+        loop {
+            let (data, complete) = take_chunk_data(&mut dec, &mut acc).unwrap();
+            if let Some(d) = data {
+                got.extend_from_slice(&d);
+            }
+            if complete {
+                break;
+            }
+            assert!(!acc.is_empty());
+        }
+        assert_eq!(got, b"Wikipedia");
+        assert_eq!(&acc[..], b"GET /next");
+
+        // 分割して届いても同じ中身になり、読んだフレーミングは手元に残らない
+        let whole = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        let mut dec = ChunkedDecoder::new_request(0);
+        let mut acc = BytesMut::new();
+        let mut got = Vec::new();
+        let mut done = false;
+        for b in whole.iter() {
+            acc.extend_from_slice(&[*b]);
+            while !acc.is_empty() && !done {
+                let (data, complete) = take_chunk_data(&mut dec, &mut acc).unwrap();
+                if let Some(d) = data {
+                    got.extend_from_slice(&d);
+                }
+                done = complete;
+            }
+            assert!(acc.is_empty());
+        }
+        assert!(done);
+        assert_eq!(got, b"Wikipedia");
+
+        // 改行の無いサイズの行・トレーラは上限で不正になる
+        let mut dec = ChunkedDecoder::new_request(0);
+        let mut acc = BytesMut::from(&[b'a'; 4096][..]);
+        assert!(take_chunk_data(&mut dec, &mut acc).is_err());
+        let mut dec = ChunkedDecoder::new_request(0);
+        let mut acc = BytesMut::from(&b"0\r\n"[..]);
+        assert!(!take_chunk_data(&mut dec, &mut acc).unwrap().1);
+        let mut failed = false;
+        for _ in 0..1024 {
+            acc.extend_from_slice(&[b'x'; 1024]);
+            match take_chunk_data(&mut dec, &mut acc) {
+                Ok((None, false)) => assert!(acc.is_empty()),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(failed);
+    }
+
+    // B-384: Host が複数ある要求・本文の区切りが曖昧な要求は 400（走査が None）
+    #[test]
+    fn scan_request_headers_rejects_duplicate_host() {
+        fn scan(raw: &'static [u8]) -> Option<ReqHeadScan> {
+            let head = Bytes::from_static(raw);
+            let mut hbuf = [httparse::EMPTY_HEADER; MAX_HEADERS];
+            let mut req = httparse::Request::new(&mut hbuf);
+            assert!(matches!(
+                req.parse(&head),
+                Ok(httparse::Status::Complete(_))
+            ));
+            scan_request_headers(&head, req.headers, req.version == Some(0))
+        }
+        let ok = scan(b"GET / HTTP/1.1\r\nHost: public.example\r\n\r\n").unwrap();
+        assert_eq!(&ok.authority[..], b"public.example");
+        assert_eq!(ok.framing, Framing::None);
+        assert!(ok.keep_alive);
+        assert!(
+            scan(b"GET / HTTP/1.1\r\nHost: admin.internal\r\nHost: public.example\r\n\r\n")
+                .is_none()
+        );
+        assert!(scan(b"GET / HTTP/1.1\r\nhost: a\r\nHOST: a\r\n\r\n").is_none());
+        let c = scan(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+        assert_eq!(c.framing, Framing::Chunked);
+        assert!(scan(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .is_none());
+        assert!(scan(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: +1\r\n\r\n").is_none());
+    }
 
     #[test]
     fn chunked_end_finds_end_and_rejects_smuggling() {

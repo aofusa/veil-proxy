@@ -1149,8 +1149,17 @@ where
         // :path を正規化する（ルートの照合・検査・上流への要求に同じパスを使う。F-236 の再走査の F7）
         if !is_trailer {
             if let Some(h) = headers.iter_mut().find(|h| h.name.as_ref() == b":path") {
-                if let Some(n) = crate::path_norm::normalize_request_path(&h.value) {
-                    h.value = bytes::Bytes::from(n);
+                match crate::path_norm::normalize_request_path(&h.value) {
+                    Ok(Some(n)) => h.value = bytes::Bytes::from(n),
+                    Ok(None) => {}
+                    // B-385: `[security] escaped_slashes` で断るパス
+                    Err(_) => {
+                        return Err(Http2Error::stream_error(
+                            stream_id,
+                            Http2ErrorCode::ProtocolError,
+                            "Invalid :path",
+                        ))
+                    }
                 }
             }
         }

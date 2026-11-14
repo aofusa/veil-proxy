@@ -83,6 +83,9 @@ storage_dir = "/var/lib/veil/acme"
   staging の証明書はブラウザに信頼されません。veil は証明書が仮のもの・期限間近のときしか再発行しないので、`directory_url` を本番へ切り替えるときは、
   veil を止めて staging の `cert_path`・`key_path` のファイルを削除してから起動し直してください（仮証明書が書かれ、本番の証明書が発行されます）。
 - 同じアカウントを使い続けたいなら `storage_dir/account.key` をバックアップしてください。
+- `directory_url` が `https://` なら、CA が返す URL（nonce・アカウント・注文・認可・finalize・証明書）もすべて `https://` で
+  なければなりません（`http://` の URL はその試行を失敗にします）。空白・制御文字を含む URL・ヘッダは断ります。`storage_dir` と
+  証明書のディレクトリの一時ファイルは、新しい名前で作り、既存のファイル・シンボリックリンクを通して書くことはありません。
 - ログは `[ACME]` で始まります: `wrote a temporary self-signed certificate`・`managing a certificate for ...`・`certificate installed`・
   `issuance failed (retry in ...)`。
 

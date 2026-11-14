@@ -722,7 +722,9 @@ App::new()
     .run()?;
 ```
 
-- `layer` / `layer_on` (`api-core`) wrap handlers inside veil's event loop.
+- `layer` / `layer_on` (`api-core`) wrap handlers inside veil's event loop. A layer sees the path the router
+  matched: bytes that veil accepts in a request target but the `http` crate does not (for example `<`, `>`,
+  `` ` `` or bytes from 0x80) are percent-encoded in the `Uri` the layer gets.
 - `tokio_service` (`tokio-compat` or `tokio-compat-bridge`) mounts a tower service. With `tokio-compat` it runs on
   the worker that accepted the request, like any handler; with `tokio-compat-bridge` it runs on the bundled tokio
   runtime and the result comes back through the same result-slot-plus-notification-fd mechanism as `offload`.

@@ -360,8 +360,15 @@ pub(super) async fn handle_requests(
                         Some(r) => {
                             let p = path_bytes.slice(r);
                             match crate::path_norm::normalize_request_path(&p) {
-                                Some(n) => Bytes::from(n),
-                                None => p,
+                                Ok(Some(n)) => Bytes::from(n),
+                                Ok(None) => p,
+                                // B-385: `[security] escaped_slashes` で断るパス
+                                Err(_) => {
+                                    let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
+                                    let _ =
+                                        timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                                    return;
+                                }
                             }
                         }
                         None => {

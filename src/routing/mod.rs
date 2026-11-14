@@ -559,11 +559,15 @@ impl RouteCacheKey {
 // ランタイムは Thread-per-Core モデルのため、各ワーカースレッドが
 // 独自の LRU キャッシュを持つことで Mutex 競合を完全に排除する。
 //
-// キャッシュ無効化: AtomicU64 の世代カウンターを bump すると
-// 各スレッドが次回アクセス時に自動でキャッシュをクリアする。
+// キャッシュ無効化: スレッドのキャッシュは、どの `RouteCache`（どのルートの表）の世代で作ったかを覚え、
+// 違う世代の `RouteCache` から引かれたら空にする。
+//
+// B-386: 以前は全体で 1 つの世代カウンターをリロードの途中（新しい設定を公開する前）に進めていたので、古い表で
+// 照合していた要求が古い表の添字を新しい世代で保存し、公開の後に新しい表のその添字のルート（前にある制限の
+// 掛かったルートを飛ばしたもの）として使われ得た。世代を表ごとにして、古い表の結果を新しい表で引かない。
 
-/// キャッシュ世代カウンター（コンフィグリロード時にインクリメント）
-static CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// `RouteCache` の世代の払い出し（0 はスレッドのキャッシュの初期値で、どの `RouteCache` にも使わない）
+static CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// キャッシュ容量（設定値から反映）
 static CACHE_CAPACITY: AtomicUsize = AtomicUsize::new(10000);
 
@@ -593,6 +597,8 @@ thread_local! {
 /// 実際のキャッシュデータはスレッドローカルに格納されるため
 /// ロック競合が発生しない。
 pub struct RouteCache {
+    /// この表のキャッシュの世代（`clear` で新しい値にする。B-386）
+    generation: AtomicU64,
     /// キャッシュヒット数（Atomic、全スレッド合算）
     hits: AtomicU64,
     /// キャッシュミス数（Atomic、全スレッド合算）
@@ -604,6 +610,7 @@ impl RouteCache {
     pub fn new(capacity: usize) -> Self {
         CACHE_CAPACITY.store(capacity.max(1), Ordering::Relaxed);
         Self {
+            generation: AtomicU64::new(CACHE_GENERATION.fetch_add(1, Ordering::Relaxed)),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -611,7 +618,7 @@ impl RouteCache {
 
     /// キャッシュからルートインデックスを取得（ロックフリー）
     pub fn get(&self, key: &RouteCacheKey) -> Option<Option<usize>> {
-        let gen = CACHE_GENERATION.load(Ordering::Relaxed);
+        let gen = self.generation.load(Ordering::Relaxed);
         TL_ROUTE_CACHE.with(|cell| {
             let mut borrow = cell.borrow_mut();
             // 世代が変わっていたらキャッシュをクリア
@@ -633,7 +640,7 @@ impl RouteCache {
 
     /// ルートマッチング結果をキャッシュに格納（ロックフリー）
     pub fn put(&self, key: RouteCacheKey, route_idx: Option<usize>) {
-        let gen = CACHE_GENERATION.load(Ordering::Relaxed);
+        let gen = self.generation.load(Ordering::Relaxed);
         TL_ROUTE_CACHE.with(|cell| {
             let mut borrow = cell.borrow_mut();
             if borrow.0 != gen {
@@ -654,9 +661,12 @@ impl RouteCache {
         )
     }
 
-    /// 全スレッドのキャッシュを無効化（世代カウンターをインクリメント）
+    /// 全スレッドのこの表のキャッシュを無効化（新しい世代にする）
     pub fn clear(&self) {
-        CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+        self.generation.store(
+            CACHE_GENERATION.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -1025,6 +1035,28 @@ mod tests {
         let (hits, misses) = cache.stats();
         assert_eq!(hits, 1);
         assert_eq!(misses, 1);
+    }
+
+    // B-386: 古い表（リロード前のルート）の結果を新しい表のキャッシュで引かない
+    #[test]
+    fn route_cache_entries_belong_to_their_table() {
+        let old = RouteCache::new(100);
+        let new = RouteCache::new(100);
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let key = RouteCacheKey::new(b"h", b"/admin/x", b"GET", &addr);
+        // リロードの途中で古い表が照合して保存した結果
+        new.clear();
+        old.put(key, Some(1));
+        assert_eq!(new.get(&key), None);
+        assert_eq!(
+            old.get(&key),
+            None,
+            "switching tables empties the thread's cache"
+        );
+        new.put(key, Some(0));
+        assert_eq!(new.get(&key), Some(Some(0)));
+        new.clear();
+        assert_eq!(new.get(&key), None);
     }
 
     #[test]

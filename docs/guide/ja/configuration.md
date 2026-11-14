@@ -169,6 +169,12 @@ max_concurrent_connections = 10000
 # それ以外の origin 形式でない要求先（CONNECT と OPTIONS の * を除く）は 400。"#" を含む要求先・
 # UTF-8 でないバイトを含む要求先も 400（"off" を含むどのモードでも）。
 # path_normalization = "base"
+# パスのエスケープされたスラッシュ（%2F・%5C）の扱い（Envoy の path_with_escaped_slashes_action）
+# "keep"（既定）: エスケープしたまま送る。ただしエスケープされたスラッシュがドットのセグメントを作るパスは 400
+#   （/public/..%2Fadmin は /public/* に合うが、%2F を戻してから処理する上流は /admin を返す）
+# "reject": %2F・%5C を含むパスをすべて 400 にする
+# "unescape": "/" に戻してから正規化する（ルートの照合と上流が同じパスを見る）
+# escaped_slashes = "keep"
 
 # seccomp システムコール制限（Linux専用）
 # まずログモードで動作確認後、filterモードに変更推奨

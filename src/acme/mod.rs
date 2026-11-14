@@ -151,10 +151,18 @@ pub fn spawn() {
 #[allow(clippy::disallowed_methods)]
 fn create_dir(p: &Path) -> Result<(), String> {
     std::fs::create_dir_all(p).map_err(|e| format!("create {}: {}", p.display(), e))?;
+    // B-398: 権限は O_NOFOLLOW で開いたディレクトリへ付ける（パスで chmod するとシンボリックリンクを辿り、置き換えた
+    // 先のファイルの権限を root が変えた）。シンボリックリンクのディレクトリ（運用で置いたもの）はそのまま使う
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Ok(d) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(p)
+        {
+            let _ = d.set_permissions(std::fs::Permissions::from_mode(0o700));
+        }
     }
     // B-325: Windows は親の DACL を継承して Users が読めることがあるので、SYSTEM・Administrators・所有者だけにする
     #[cfg(windows)]
@@ -244,32 +252,61 @@ fn write_atomic(path: &Path, data: &[u8], secret: bool) -> Result<(), String> {
     if !dir.as_os_str().is_empty() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
     }
-    let tmp = dir.join(format!(
-        ".{}.tmp{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("veil"),
-        std::process::id()
-    ));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(if secret { 0o600 } else { 0o644 });
-    }
-    let mut f = opts
-        .open(&tmp)
-        .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
-    // B-325: 秘密は書く前に所有者だけの DACL にする（unix は上の 0600）
+    let (tmp, mut f) = create_temp(dir, path, secret)?;
+    // B-325: 秘密は書く前に所有者だけの DACL にする（unix は create_temp の 0600）
     #[cfg(windows)]
     if secret {
         restrict_to_owner(&tmp)?;
     }
-    #[cfg(not(any(unix, windows)))]
-    let _ = secret;
     f.write_all(data)
         .and_then(|_| f.sync_all())
         .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {}", path.display(), e))
+}
+
+/// `path` の隣に一時ファイルを新しく作る。
+///
+/// B-398: 毎回新しい名前で O_EXCL（既にあれば作らない。シンボリックリンクも辿らない。unix は O_NOFOLLOW も）で
+/// 作る。以前は `.<名前>.tmp<pid>` を O_TRUNC で開いていたので、ディレクトリに書き込める特権の無い利用者が置いた
+/// シンボリックリンクを、権限を落とす前の root が辿って任意のファイルを書き換えた。名前が埋まっていれば別の名前で
+/// やり直す。
+// 理由付き allow: ACME 専用スレッド・起動時のファイル操作（データプレーン外）。
+#[allow(clippy::disallowed_methods)]
+fn create_temp(dir: &Path, path: &Path, secret: bool) -> Result<(PathBuf, std::fs::File), String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("veil");
+    let mut last = String::new();
+    for _ in 0..16 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let tmp = dir.join(format!(
+            ".{}.tmp{}.{}.{:08x}",
+            name,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            nanos
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(if secret { 0o600 } else { 0o644 })
+                .custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        let _ = secret;
+        match opts.open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last = format!("write {}: {}", tmp.display(), e);
+            }
+            Err(e) => return Err(format!("write {}: {}", tmp.display(), e)),
+        }
+    }
+    Err(last)
 }
 
 // 理由付き allow: ACME 専用スレッドのファイル読み込み（データプレーン外）。
@@ -397,6 +434,50 @@ mod tests {
         // 書き直せる（所有者が DACL で締め出されない）
         write_atomic(&key, b"secret2", true).unwrap();
         assert_eq!(read(&key).as_deref(), Some(&b"secret2"[..]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B-398: 一時ファイルの名前に置いたシンボリックリンクを辿らない（毎回新しい名前を O_EXCL で作る）
+    // 理由付き allow: 試験でファイルを作る（データプレーン外）
+    #[cfg(unix)]
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn temp_files_do_not_follow_planted_symlinks() {
+        let dir = std::env::temp_dir().join(format!("veil-acme-b398-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_dir(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        // 以前の名前（.<名前>.tmp<pid>）に置いた罠
+        let planted = dir.join(format!(".cert.pem.tmp{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let cert = dir.join("cert.pem");
+        write_atomic(&cert, b"new cert", false).unwrap();
+        assert_eq!(read(&cert).as_deref(), Some(&b"new cert"[..]));
+        assert_eq!(read(&victim).as_deref(), Some(&b"keep"[..]));
+        // 一時ファイルは残らない（罠のリンクだけが残る）
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert_eq!(
+            left,
+            vec![planted.file_name().unwrap().to_string_lossy().into_owned()]
+        );
+        // ディレクトリへのシンボリックリンクの権限は変えない（辿らない）
+        let other = dir.join("other");
+        std::fs::create_dir(&other).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&other, &link).unwrap();
+            create_dir(&link).unwrap();
+            let mode = std::fs::metadata(&other).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

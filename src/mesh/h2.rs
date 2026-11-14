@@ -11,7 +11,7 @@ use crate::http2::upstream_mux::UpResp;
 use crate::proxy::{H2RequestCtx, H2RespMsg, H2Service};
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
 use crate::stream_channel::{Notify, Receiver, Sender};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::future::{poll_fn, Future};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -941,6 +941,20 @@ async fn to_h1(
         if let Some(i) = memchr::memmem::find(&rbuf, b"\r\n\r\n") {
             break rbuf.split_to(i + 4).freeze();
         }
+        // B-392: 応答のヘッダは HTTP/1.1 の中継と同じ大きさまで（終わらないヘッダを溜め続けない）
+        if rbuf.len() > super::http1::MAX_HEAD_BYTES {
+            picked.end(false, true);
+            out.status = 502;
+            local(
+                tx,
+                notify,
+                &LocalReply::new(502, ResponseFlag::None),
+                is_grpc,
+                &c.hcm,
+            )
+            .await;
+            return out;
+        }
         let b: Vec<u8> = Vec::with_capacity(16 * 1024);
         let (r, b) = up.read(b).await;
         match r {
@@ -1038,7 +1052,10 @@ async fn to_h1(
     if !no_body {
         // 本文（Content-Length / chunked / 接続が閉じるまで）
         let mut remaining = len;
-        let mut sc_buf = BytesMut::new();
+        // B-392: chunked は厳格なデコーダで少しずつほどき、届いた中身から送る（以前は 1 つのチャンクが全部
+        // 揃うまで溜めたので、巨大なサイズを宣言した上流の本文を際限なく抱えた）。不正な chunked は
+        // ストリームのリセットにする（B-315）
+        let mut dec = chunked.then(|| crate::http_utils::ChunkedDecoder::new_request(0));
         loop {
             if rbuf.is_empty() {
                 if remaining == Some(0) {
@@ -1050,54 +1067,33 @@ async fn to_h1(
                     Ok(n) if n > 0 => rbuf.extend_from_slice(&b[..n]),
                     _ => {
                         keep = false;
+                        // 長さ・chunked で区切った本文が途中で切れたら、切り詰めを正常な終わりに見せない
+                        if dec.is_some() || remaining.is_some() {
+                            let _ = send(tx, notify, H2RespMsg::Reset(2)).await;
+                        }
                         break;
                     }
                 }
             }
-            if chunked {
-                sc_buf.extend_from_slice(&rbuf.split());
-                // chunked をほどいて中身だけ送る
-                while let Some(i) = memchr::memmem::find(&sc_buf, b"\r\n") {
-                    // B-315: 不正な長さを 0（本文の終わり）として扱わず、長さの足し算も溢れないようにする。
-                    // 以前は `ffffffffffffffff` で `i + 2 + size + 2` が折り返して長さの検査を通り、範囲外を
-                    // 切り出して panic していた（F12）。不正な chunked はストリームのリセットにする
-                    let size = usize::from_str_radix(
-                        std::str::from_utf8(&sc_buf[..i])
-                            .unwrap_or("")
-                            .split(';')
-                            .next()
-                            .unwrap_or("")
-                            .trim(),
-                        16,
-                    )
-                    .ok();
-                    let need = size.and_then(|n| n.checked_add(i + 4));
-                    let (Some(size), Some(need)) = (size, need) else {
-                        keep = false;
-                        remaining = Some(0);
-                        let _ = send(tx, notify, H2RespMsg::Reset(2)).await;
-                        break;
-                    };
-                    if size == 0 {
-                        remaining = Some(0);
-                        rbuf.clear();
-                        sc_buf.clear();
-                        break;
-                    }
-                    if sc_buf.len() < need {
-                        break;
-                    }
-                    let _ = sc_buf.split_to(i + 2);
-                    let data = sc_buf.split_to(size).freeze();
-                    let _ = sc_buf.split_to(2);
+            if let Some(dec) = dec.as_mut() {
+                let span = dec.next_data_span(&rbuf);
+                if span.limit_exceeded {
+                    keep = false;
+                    let _ = send(tx, notify, H2RespMsg::Reset(2)).await;
+                    break;
+                }
+                if span.data_len == 0 {
+                    rbuf.advance(span.consumed);
+                } else {
+                    rbuf.advance(span.data_start);
+                    let data = rbuf.split_to(span.data_len).freeze();
                     out.resp_bytes += data.len() as u64;
                     if !send(tx, notify, H2RespMsg::Body(data)).await {
                         keep = false;
-                        remaining = Some(0);
                         break;
                     }
                 }
-                if remaining == Some(0) {
+                if span.complete {
                     break;
                 }
                 continue;

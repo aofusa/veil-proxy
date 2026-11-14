@@ -200,35 +200,130 @@ pub fn normalize(path: &[u8], cfg: &PathNormalization) -> Result<Option<Vec<u8>>
     Ok(Some(out))
 }
 
-/// TOML の設定（`[security] path_normalization`）のモード。0 = off、1 = base、2 = merge_slashes
+/// TOML の設定（`[security] path_normalization`・`escaped_slashes`）。下位 2 ビットは 0 = off、1 = base、
+/// 2 = merge_slashes。その上の 2 ビットは 0 = keep、1 = reject、2 = unescape（B-385）
 static REQUEST_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
 
 /// 設定のロード・リロードで TOML の経路のモードを決める
-pub fn set_request_mode(mode: crate::config::PathNormalizationMode) {
+pub fn set_request_mode(
+    mode: crate::config::PathNormalizationMode,
+    escaped: crate::config::EscapedSlashesMode,
+) {
+    use crate::config::EscapedSlashesMode as E;
     use crate::config::PathNormalizationMode as M;
-    let v = match mode {
+    let path = match mode {
         M::Off => 0,
         M::Base => 1,
         M::MergeSlashes => 2,
     };
-    REQUEST_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
+    let esc = match escaped {
+        E::Keep => 0,
+        E::Reject => 1,
+        E::Unescape => 2,
+    };
+    REQUEST_MODE.store(path | (esc << 2), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// TOML の経路（HTTP/1.1・HTTP/2・HTTP/3）の要求のパスを正規化する。変わらなければ `None`。
+/// TOML の経路（HTTP/1.1・HTTP/2・HTTP/3）の要求のパスを正規化する。変わらなければ `Ok(None)`、断る要求は
+/// `Err(Rejected)`（呼び出し側が 400・ストリームのエラーにする）。
 ///
-/// 正規化の要らないパスは 1 回の走査だけで、確保しない（ホットパス）。`%2F`・`%5C` はそのまま残す。
+/// 正規化の要らないパスは 1 回の走査だけで、確保しない（ホットパス）。
 #[inline]
-pub fn normalize_request_path(path: &[u8]) -> Option<Vec<u8>> {
-    let cfg = match REQUEST_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => return None,
-        1 => PathNormalization::default(),
+pub fn normalize_request_path(path: &[u8]) -> Result<Option<Vec<u8>>, Rejected> {
+    normalize_request_path_in(
+        path,
+        REQUEST_MODE.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+#[inline]
+fn normalize_request_path_in(path: &[u8], mode: u8) -> Result<Option<Vec<u8>>, Rejected> {
+    let escaped_slashes = match mode >> 2 {
+        1 => EscapedSlashes::Reject,
+        2 => EscapedSlashes::Unescape,
+        _ => EscapedSlashes::Keep,
+    };
+    let cfg = match mode & 3 {
+        0 => PathNormalization {
+            normalize: false,
+            merge_slashes: false,
+            escaped_slashes,
+        },
+        1 => PathNormalization {
+            escaped_slashes,
+            ..PathNormalization::default()
+        },
         _ => PathNormalization {
             merge_slashes: true,
+            escaped_slashes,
             ..PathNormalization::default()
         },
     };
-    // Keep のときは拒否しない
-    normalize(path, &cfg).ok().flatten()
+    // B-385: `keep` でも、エスケープされたスラッシュがドットのセグメントを作るパスは断る（`/public/..%2Fadmin` は
+    // `/public/*` に合うが、`%2F` を戻してからドットのセグメントを取り除く上流（nginx 等）は `/admin` を返す）
+    if escaped_slashes == EscapedSlashes::Keep && cfg.normalize && escaped_slash_dot_segment(path) {
+        return Err(Rejected);
+    }
+    normalize(path, &cfg)
+}
+
+/// パス（クエリの前まで）に、エスケープされたスラッシュ（`%2F`・`%5C`）と隣り合うドットのセグメント（`.`・`..`。
+/// `%2E` も `.` と数える）があるか（B-385）。`%` の無いパス（ほとんど全部）は `memchr` 1 回で終わる
+fn escaped_slash_dot_segment(path: &[u8]) -> bool {
+    let p = match memchr::memchr(b'?', path) {
+        Some(i) => &path[..i],
+        None => path,
+    };
+    if memchr::memchr(b'%', p).is_none() {
+        return false;
+    }
+    // 区切り（`/`・`\`・`%2F`・`%5C`）の間のセグメントを見る。区切りがエスケープかどうかを前後で覚える
+    let mut prev_escaped = false;
+    let mut dots = 0usize;
+    let mut other = false;
+    let mut i = 0;
+    loop {
+        // この位置の区切り（長さ, エスケープか）。終端は通常の区切りとして扱う
+        let sep = if i >= p.len() {
+            Some((0, false))
+        } else if p[i] == b'/' || p[i] == b'\\' {
+            Some((1, false))
+        } else if p[i] == b'%' && i + 2 < p.len() {
+            match (hex(p[i + 1]), hex(p[i + 2])) {
+                (Some(h), Some(l)) if matches!((h << 4) | l, b'/' | b'\\') => Some((3, true)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((len, escaped)) = sep {
+            if !other && (dots == 1 || dots == 2) && (prev_escaped || escaped) {
+                return true;
+            }
+            if i >= p.len() {
+                return false;
+            }
+            prev_escaped = escaped;
+            dots = 0;
+            other = false;
+            i += len;
+            continue;
+        }
+        // セグメントの中身: `.` か `%2E` だけならドットを数える
+        if p[i] == b'.' {
+            dots += 1;
+            i += 1;
+        } else if p[i] == b'%'
+            && i + 2 < p.len()
+            && matches!((hex(p[i + 1]), hex(p[i + 2])), (Some(2), Some(0xE)))
+        {
+            dots += 1;
+            i += 3;
+        } else {
+            other = true;
+            i += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +377,60 @@ mod tests {
             escaped_slashes: EscapedSlashes::Keep,
         };
         assert_eq!(n("/./a/../b", off), "/./a/../b");
+    }
+
+    // B-385: エスケープされたスラッシュと隣り合うドットのセグメント
+    #[test]
+    fn escaped_slash_dot_segments_are_found() {
+        for bad in [
+            "/public/..%2Fadmin",
+            "/public/..%2fadmin",
+            "/public%2F..%2Fadmin",
+            "/public%2F../admin",
+            "/a/%2e%2e%2fadmin",
+            "/a/.%2Fb",
+            "/a%5C..%5Cadmin",
+            "/a/..%5c",
+            "/x%2F..",
+        ] {
+            assert!(escaped_slash_dot_segment(bad.as_bytes()), "{bad}");
+        }
+        for ok in [
+            "/a/b",
+            "/group%2Fproject/x",
+            "/a/../b",
+            "/.well-known%2Fx",
+            "/a/...%2Fb",
+            "/a/..b%2Fc",
+            "/a%2F.x",
+            "/q?x=..%2F",
+            "/bad%2",
+        ] {
+            assert!(!escaped_slash_dot_segment(ok.as_bytes()), "{ok}");
+        }
+    }
+
+    // B-385: `[security] path_normalization`・`escaped_slashes` の組み合わせ（モードのビットは `set_request_mode` と同じ）
+    #[test]
+    fn request_path_modes() {
+        const BASE_KEEP: u8 = 1;
+        const BASE_REJECT: u8 = 1 | (1 << 2);
+        const BASE_UNESCAPE: u8 = 1 | (2 << 2);
+        const OFF_KEEP: u8 = 0;
+        let r = |p: &str, m: u8| normalize_request_path_in(p.as_bytes(), m);
+        assert_eq!(r("/a/b", BASE_KEEP), Ok(None));
+        assert_eq!(
+            r("/group%2fproject", BASE_KEEP),
+            Ok(Some(b"/group%2Fproject".to_vec()))
+        );
+        assert_eq!(r("/public/..%2Fadmin", BASE_KEEP), Err(Rejected));
+        assert_eq!(r("/a%2Fb", BASE_REJECT), Err(Rejected));
+        assert_eq!(r("/a/b", BASE_REJECT), Ok(None));
+        assert_eq!(
+            r("/public/..%2Fadmin", BASE_UNESCAPE),
+            Ok(Some(b"/admin".to_vec()))
+        );
+        // `off` は何もしない（以前の動作）
+        assert_eq!(r("/public/..%2Fadmin", OFF_KEEP), Ok(None));
     }
 }

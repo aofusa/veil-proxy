@@ -263,6 +263,11 @@ L4 のネットワークフィルタ（`[[l4]] wasm_modules`）も同じ `failur
 起動時とリロード時に、各モジュールの `_start`・`proxy_on_vm_start`・`proxy_on_configure` を 1 回走らせる。トラップしたり `false` を
 返したり（プラグインが設定を拒否した等）したら設定を拒否する（起動は失敗し、リロードは前の設定のまま）。
 
+リロードは新しい `[wasm]` からモジュールを読み直すので、リロードで足した・変えたモジュール（と `data_files`）は次の要求から効く
+（処理中の要求は前のモジュールのまま終わる）。ルートと `[[l4]]` のリスナーが挙げられるのは、有効な `[wasm]` で定義したモジュール
+だけで、それ以外の名前は設定を拒否する。FreeBSD の capability mode では起動後に `.wasm` を開けないので、`[wasm]` を変える
+リロードは拒否する（変更は再起動で反映する）。
+
 0.11.0 より前は失敗しても常に続けていた（今の `fail_open` と同じ。メトリクスは無かった）。`[wasm.defaults]` に
 `failure_policy = "fail_open"` を書くと以前と同じになる。
 
@@ -282,7 +287,7 @@ L4 のネットワークフィルタ（`[[l4]] wasm_modules`）も同じ `failur
 |-----------|------|----------|
 | `allow_logging` | ログ出力 | false |
 | `allow_metrics` | メトリクス操作 | false |
-| `allow_shared_data` | 共有データ（`proxy_set_shared_data`・`proxy_get_shared_data`）。モジュール名ごとに 1 つの表を全要求・全ワーカーで共有し、設定のリロードでも引き継ぐ（Envoy の `vm_id` ごとの共有に当たる） | false |
+| `allow_shared_data` | 共有データ（`proxy_set_shared_data`・`proxy_get_shared_data`）。モジュール名ごとに 1 つの表を全要求・全ワーカーで共有し、設定のリロードでも引き継ぐ（Envoy の `vm_id` ごとの共有に当たる）。共有キューにも要る: キューは登録したモジュールのもので、取り出せるのはそのモジュールだけ。他のモジュールは持ち主のモジュール名（`vm_id`）でキューを引いてから積む | false |
 | `allow_request_headers_read` | リクエストヘッダー読み取り | false |
 | `allow_request_headers_write` | リクエストヘッダー書き換え | false |
 | `allow_request_body_read` | リクエストボディ読み取り | false |

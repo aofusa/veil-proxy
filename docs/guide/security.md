@@ -473,12 +473,16 @@ Request-level hardening that came out of the audit:
   (`forwarded_headers = "passthrough"` restores the old pass-through).
 - The response cache does not store `Set-Cookie` responses, responses that `Vary` on headers outside `key_headers`,
   `no-cache` responses, or responses to `Authorization` requests (unless `key_headers` includes `Authorization`);
-  responses to `Cookie` requests are stored only when marked `public` or `s-maxage`. Entries are kept per route.
+  the header a route's `[route.jwt]` reads the token from counts the same way. Responses to `Cookie` requests are
+  stored only when marked `public` or `s-maxage`. Entries are kept per route.
 - IP allow/deny lists match IPv4-mapped IPv6 addresses as IPv4.
 - Request paths are normalized before routing and `[route.security]` checks and forwarded normalized
   (`[security] path_normalization`); absolute-form targets become origin-form, other non-origin targets get 400.
   Targets that contain `#` (a fragment) or bytes that are not UTF-8 get 400 (HTTP/2 and HTTP/3: a stream error),
   because backends that drop the fragment would serve a path the routes and checks did not see.
+  Encoded slashes (`%2F`, `%5C`) stay encoded by default, but a path where one forms a dot segment
+  (`/public/..%2Fadmin`) gets 400; `[security] escaped_slashes = "reject"` refuses every encoded slash and
+  `"unescape"` decodes them before routing.
 - Chunked request bodies are parsed strictly (RFC 9112 §7.1; malformed framing is rejected) and nothing after
   the terminating chunk is forwarded upstream as part of that request. A chunk-size line may be at most 64 bytes,
   and chunk extensions and trailers at most 16 KiB each per request.
@@ -495,3 +499,21 @@ Request-level hardening that came out of the audit:
   `max_request_body_size` of any route, at least 10 MB); the stream is reset beyond it.
 - The Linkerd admin endpoints `/shutdown` and `/env.json` answer only loopback clients.
 - The mesh normalizes paths before routing/RBAC/JWT and derives `remoteIpBlocks` from Envoy's original client address.
+- The mesh answers an HTTP/1.1 request with more than one `Host` header with 400, and processes the headers of request
+  mirrors like those of the main request (client-supplied `X-Forwarded-Client-Cert`, peer metadata and
+  `l5d-client-id`, tokens of JWT providers with `forward = false`, and the route's header removals). It parses chunked
+  request and response bodies strictly with bounded framing, and caps upstream HTTP/1.1 response heads. The Linkerd
+  admin port accepts request bodies only up to 64 KiB and only with a valid `Content-Length`.
+- HTTP/2 upstream responses must carry exactly one leading `:status` and no pseudo-headers in trailers, and
+  trailers must end the stream; anything else resets the stream.
+- Redirect targets (`type = "Redirect"`) built from `$request_uri` / `$path` never become protocol-relative
+  (`//host`): leading `/` and `\` runs in the substituted path are collapsed to one `/`.
+- Proxy-Wasm: a route or L4 listener may list only modules from an enabled `[wasm]` section, and a reload rebuilds the
+  engine, so filters added or changed by a reload run on the next request (a reload that cannot load them is
+  rejected). Shared queues belong to the module that registered them; other modules need `allow_shared_data` and may
+  only enqueue to a queue they resolved by its `vm_id`. UDP L4 listeners reject `wasm_modules`.
+- On Windows, static file paths that contain `:` or `\` get 403 before the file system sees them (alternate data
+  streams, drive-relative paths).
+- ACME: directory and API URLs must not contain whitespace or control characters, and an `https://` directory may
+  not send the client to `http://` URLs. Temporary files under the storage directory are created with unique names
+  without following symbolic links.

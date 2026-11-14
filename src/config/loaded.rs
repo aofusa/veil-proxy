@@ -307,8 +307,9 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         http2_config: loaded.http2_config,
         #[cfg(feature = "http3")]
         http3_config: loaded.http3_config,
+        // B-383: リロードで作り直したエンジン（以前は起動時のものを使い続け、足した・変えたフィルタが黙って効かなかった）
         #[cfg(feature = "wasm")]
-        wasm_filter_engine: current.wasm_filter_engine.clone(),
+        wasm_filter_engine: loaded.wasm_filter_engine,
         performance: loaded.performance.clone(),
         // L4 リスナーはホットリロード対象外（再起動が必要）
         #[cfg(feature = "l4-proxy")]
@@ -326,7 +327,10 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
     }
     crate::l7::set_max_buffered_request_body(&runtime_config.route);
     crate::metrics::set_host_labels(&runtime_config.route);
-    crate::path_norm::set_request_mode(runtime_config.global_security.path_normalization);
+    crate::path_norm::set_request_mode(
+        runtime_config.global_security.path_normalization,
+        runtime_config.global_security.escaped_slashes,
+    );
     #[cfg(feature = "access-log")]
     crate::logging::set_access_log_enabled(runtime_config.access_log_config.enabled);
     crate::trust_store::commit_default(loaded.default_ca);
@@ -364,6 +368,9 @@ pub struct LoadedConfigWithoutTls {
     /// 正規化した待ち受けの列（平文の方針の表の元。F-260）
     pub listeners: Vec<ListenerSpec>,
     pub performance: PerformanceConfigSection,
+    /// リロードで作り直した WASM のエンジン（B-383）
+    #[cfg(feature = "wasm")]
+    pub wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
 }
 
 /// リロード時に設定ファイルを読む唯一の入口（F-178）。
@@ -640,6 +647,11 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
     // OptimizedRouter を構築（Phase 1-4 最適化）
     let optimized_router = build_optimized_router(&routes);
 
+    // B-383: WASM のエンジンを新しい設定で作り直す（モジュールの `_start`・`proxy_on_configure` を走らせ、`data_files` も
+    // 読み直す）。失敗したらリロードを断る（前の設定のまま）。プロセス全体の値を書き換える処理より前に置く
+    #[cfg(feature = "wasm")]
+    let wasm_filter_engine = reload_wasm_engine(config.wasm.as_ref())?;
+
     // グローバルの open_file_cache・静的コンテンツキャッシュの設定を適用する（F-146・F-272）。B-185: この後に
     // 失敗する処理は無い（リロードで拒否された設定の値がプロセス全体に効かないよう、ルートの解決より後に置く）
     apply_global_cache_settings(
@@ -680,7 +692,60 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
         http3_config,
         listeners,
         performance: config.performance.clone(),
+        #[cfg(feature = "wasm")]
+        wasm_filter_engine,
     })
+}
+
+/// リロードの WASM のエンジン（B-383）。
+///
+/// FreeBSD の capability mode では `.wasm`・`data_files` を開けないので起動時のエンジンを使い続ける
+/// （`[wasm]` が起動時と違うリロードは `check_capability_mode_reload` が先に断っている）。
+#[cfg(feature = "wasm")]
+fn reload_wasm_engine(
+    wasm: Option<&crate::wasm::WasmConfig>,
+) -> io::Result<Option<Arc<crate::wasm::FilterEngine>>> {
+    #[cfg(target_os = "freebsd")]
+    if crate::security::capsicum::is_capability_mode() {
+        return Ok(CURRENT_CONFIG.load().wasm_filter_engine.clone());
+    }
+    build_wasm_engine(wasm)
+}
+
+/// `[wasm]` からフィルタのエンジンを作る（起動時とリロード。B-383）。無効なら `None`
+#[cfg(feature = "wasm")]
+fn build_wasm_engine(
+    wasm: Option<&crate::wasm::WasmConfig>,
+) -> io::Result<Option<Arc<crate::wasm::FilterEngine>>> {
+    let Some(wasm_config) = wasm.filter(|w| w.enabled) else {
+        return Ok(None);
+    };
+    // バリデーション（validate_config で既に実行されているが、念のため）
+    wasm_config.validate().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("WASM config validation failed: {}", e),
+        )
+    })?;
+    info!("Initializing WASM Filter Engine...");
+    let engine = crate::wasm::init(wasm_config).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to initialize WASM Filter Engine: {}", e),
+        )
+    })?;
+    info!("WASM Filter Engine initialized successfully");
+    Ok(Some(Arc::new(engine)))
+}
+
+/// FreeBSD の capability mode のリロードで比べる、起動時の `[wasm]`（B-383）
+#[cfg(all(feature = "wasm", target_os = "freebsd"))]
+static STARTUP_WASM_SECTION: std::sync::OnceLock<Option<toml::Value>> = std::sync::OnceLock::new();
+
+/// `[wasm]` を比べられる形にする（B-383）。書けない値は `None`（別物として扱う）。試験は全 OS で回す
+#[cfg(all(feature = "wasm", any(test, target_os = "freebsd")))]
+fn wasm_section_value(wasm: Option<&crate::wasm::WasmConfig>) -> Option<toml::Value> {
+    wasm.and_then(|w| toml::Value::try_from(w).ok())
 }
 
 /// ルート配列から OptimizedRouter を構築
@@ -933,37 +998,14 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 
     // WASM Filter Engineの初期化
     #[cfg(feature = "wasm")]
-    let wasm_filter_engine = if let Some(wasm_config) = &config.wasm {
-        if wasm_config.enabled {
-            // バリデーション（validate_configで既に実行されているが、念のため）
-            if let Err(e) = wasm_config.validate() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("WASM config validation failed: {}", e),
-                ));
-            }
-
-            // FilterEngine初期化
-            info!("Initializing WASM Filter Engine...");
-            match crate::wasm::init(wasm_config) {
-                Ok(engine) => {
-                    info!("WASM Filter Engine initialized successfully");
-                    Some(Arc::new(engine))
-                }
-                Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Failed to initialize WASM Filter Engine: {}", e),
-                    ));
-                }
-            }
-        } else {
-            info!("WASM extensions disabled");
-            None
-        }
-    } else {
-        None
-    };
+    let wasm_filter_engine = build_wasm_engine(config.wasm.as_ref())?;
+    #[cfg(feature = "wasm")]
+    if config.wasm.as_ref().is_some_and(|w| !w.enabled) {
+        info!("WASM extensions disabled");
+    }
+    // B-383: capability mode のリロードは `[wasm]` が起動時と同じときだけ受ける（モジュールを読み直せない）
+    #[cfg(all(feature = "wasm", target_os = "freebsd"))]
+    let _ = STARTUP_WASM_SECTION.set(wasm_section_value(config.wasm.as_ref()));
 
     Ok(LoadedConfig {
         listeners,
@@ -1403,6 +1445,14 @@ pub(super) fn check_capability_mode_reload(config: &Config) -> io::Result<()> {
             }
         }
     }
+    // B-383: `.wasm`・`data_files` は cap_enter の後に開けないので、`[wasm]` を変えたリロードは断る
+    #[cfg(feature = "wasm")]
+    if STARTUP_WASM_SECTION
+        .get()
+        .is_some_and(|start| *start != wasm_section_value(config.wasm.as_ref()))
+    {
+        return reject("the [wasm] section changed".to_string());
+    }
     #[cfg(feature = "access-log")]
     {
         let current = CURRENT_CONFIG.load();
@@ -1559,19 +1609,14 @@ fn attach_static_watch(backend: Backend, defaults: WatchDefaults) -> Backend {
     )
 }
 
-/// `load_backend` の実体。ログ出力・エラーメッセージ・メモ化を含め従来の
-/// `load_backend` と同一の処理を行う。
-///
-/// F-159 以降、**通常は設定ロード時（`load_config` / `load_config_without_tls` の
-/// ルート読み込みループ）から 1 回だけ呼ばれる**。ホットパスから呼ばれるのは
-/// `resolved_backend` の解決に失敗したルート（存在しないファイル等）の安全網のみで、
-/// その場合は従来と同じエラーを毎回返す。
-///
-/// 理由付き allow: `fs::metadata`（is_dir 判定）と `fs::read`（MemoryFile モードの
-/// 事前読み込み）を使う。上記のとおり設定ロード時のコールドパスであり、安全網経路でも
-/// B-64 で判明したコストの大きい `canonicalize`/`metadata` は `canonical_base_memoized` /
-/// `is_dir_memoized` で設定パスごとに 1 回だけ実行するようメモ化してある（2 回目以降は
-/// syscall なし）。
+/// ルートの JWT を `authorization` 以外のヘッダで読むなら、そのヘッダ（小文字。キャッシュはこのヘッダの付いた要求を
+/// 共有しない。B-390）
+fn route_credential_header(route: &Route) -> Option<Box<str>> {
+    let h = route.jwt.as_ref()?.header.trim();
+    (!h.is_empty() && !h.eq_ignore_ascii_case("authorization"))
+        .then(|| h.to_ascii_lowercase().into_boxed_str())
+}
+
 /// ルートのキャッシュの名前空間（B-321）。条件とアクションから決める（再読み込み・再起動で同じルートなら同じ値。
 /// HashMap の条件は並べ替えて書く）
 fn route_cache_namespace(route: &Route) -> u64 {
@@ -1598,6 +1643,19 @@ fn route_cache_namespace(route: &Route) -> u64 {
     xxhash_rust::xxh3::xxh3_64(s.as_bytes()).max(1)
 }
 
+/// `load_backend` の実体。ログ出力・エラーメッセージ・メモ化を含め従来の
+/// `load_backend` と同一の処理を行う。
+///
+/// F-159 以降、**通常は設定ロード時（`load_config` / `load_config_without_tls` の
+/// ルート読み込みループ）から 1 回だけ呼ばれる**。ホットパスから呼ばれるのは
+/// `resolved_backend` の解決に失敗したルート（存在しないファイル等）の安全網のみで、
+/// その場合は従来と同じエラーを毎回返す。
+///
+/// 理由付き allow: `fs::metadata`（is_dir 判定）と `fs::read`（MemoryFile モードの
+/// 事前読み込み）を使う。上記のとおり設定ロード時のコールドパスであり、安全網経路でも
+/// B-64 で判明したコストの大きい `canonicalize`/`metadata` は `canonical_base_memoized` /
+/// `is_dir_memoized` で設定パスごとに 1 回だけ実行するようメモ化してある（2 回目以降は
+/// syscall なし）。
 #[allow(clippy::disallowed_methods)]
 pub(super) fn build_backend(
     route: &Route,
@@ -1609,6 +1667,7 @@ pub(super) fn build_backend(
     let buffering = route.buffering.clone().unwrap_or_default();
     let mut cache = route.cache.clone().unwrap_or_default();
     cache.route_ns = route_cache_namespace(route);
+    cache.credential_header = route_credential_header(route);
     // F-148: 設定ロード時に解決済みの `resolved_modules` を Arc clone するだけ
     // （従来あった `Arc::new(m.clone())` = リクエストごとの `Vec<String>` ディープコピーを排除）。
     // `resolved_modules` が未設定（安全網）の場合のみ、名前のみの `ModuleRef` を都度組み立てる。
@@ -1740,6 +1799,7 @@ pub(super) fn build_backend(
             let security = route.security.clone().unwrap_or_default();
             let mut cache = route.cache.clone().unwrap_or_default();
             cache.route_ns = route_cache_namespace(route);
+            cache.credential_header = route_credential_header(route);
             let access_err = |e: io::Error| {
                 let error_msg = format!(
                     "Failed to access file '{}': {} (error code: {})",
@@ -2156,5 +2216,29 @@ mod macos_file_root_tests {
         let mut r = file_route("/srv/www/");
         absolutize_file_root(&mut r);
         assert_eq!(root_of(&r), "/srv/www/");
+    }
+}
+
+// B-383: capability mode のリロードで `[wasm]` の変更を見つける比較
+#[cfg(all(test, feature = "wasm"))]
+mod b383_wasm_section_tests {
+    use super::*;
+
+    #[test]
+    fn wasm_section_value_detects_changes() {
+        let a: crate::wasm::WasmConfig =
+            toml::from_str("enabled = true\n[[modules]]\nname = \"m\"\npath = \"/a.wasm\"\n")
+                .unwrap();
+        let mut b = a.clone();
+        assert!(wasm_section_value(Some(&a)).is_some());
+        assert_eq!(wasm_section_value(Some(&a)), wasm_section_value(Some(&b)));
+        b.modules[0].path = "/b.wasm".to_string();
+        assert_ne!(wasm_section_value(Some(&a)), wasm_section_value(Some(&b)));
+        let mut c = a.clone();
+        c.modules[0]
+            .data_files
+            .insert("deny".to_string(), "/deny.txt".to_string());
+        assert_ne!(wasm_section_value(Some(&a)), wasm_section_value(Some(&c)));
+        assert_ne!(wasm_section_value(Some(&a)), wasm_section_value(None));
     }
 }

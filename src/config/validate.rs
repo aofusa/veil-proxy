@@ -427,6 +427,18 @@ pub(super) fn validate_config(config: &Config) -> io::Result<()> {
         }
         // F-170: UDP 上流は UDS 非対応（QUIC/UDP は AF_UNIX に載らない）。
         if l4.protocol == L4Protocol::Udp {
+            // B-399: Proxy-Wasm のネットワークフィルタは TCP だけで走る。UDP のリスナーに並べたものは黙って
+            // 素通りしていた（送信元の許可リスト等が効かない）ので、設定の段階で断る
+            #[cfg(feature = "wasm")]
+            if !l4.wasm_modules.is_empty() || l4.module_configuration.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "L4 listener '{}': wasm_modules are not supported for UDP (WASM network filters run only on TCP)",
+                        l4.name
+                    ),
+                ));
+            }
             for u in &l4.upstreams {
                 if u.addr.starts_with("unix:") {
                     return Err(io::Error::new(
@@ -464,6 +476,25 @@ pub(super) fn validate_config(config: &Config) -> io::Result<()> {
                     format!("WASM config validation failed: {}", e),
                 )
             })?;
+        }
+    }
+
+    // B-383: `[wasm]` が無い・無効なのに `wasm_modules` を並べた L4 リスナーは断る（フィルタが黙って走らない）
+    #[cfg(all(feature = "wasm", feature = "l4-proxy"))]
+    if !config.wasm.as_ref().is_some_and(|w| w.enabled) {
+        if let Some(l4) = config
+            .l4
+            .iter()
+            .flatten()
+            .find(|l| !l.wasm_modules.is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "L4 listener '{}' lists WASM modules but [wasm] is not enabled",
+                    l4.name
+                ),
+            ));
         }
     }
 
@@ -609,6 +640,20 @@ pub(super) fn validate_route_config(
         }
     }
 
+    // B-383: `[wasm]` が無い・無効なのにモジュールを並べたルートは断る（エンジンが無くフィルタが黙って走らない）
+    #[cfg(feature = "wasm")]
+    if route.modules.as_ref().is_some_and(|m| !m.is_empty())
+        && !wasm_config.is_some_and(|w| w.enabled)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Route '{}' lists WASM modules but [wasm] is not enabled",
+                route_name
+            ),
+        ));
+    }
+
     // WASMモジュールの参照チェック（route直下のmodulesを使用）
     #[cfg(feature = "wasm")]
     if let Some(wasm_cfg) = wasm_config {
@@ -689,4 +734,58 @@ pub(super) fn resolve_route_modules(
     let resolved: Vec<ModuleRef> = names.iter().map(|n| ModuleRef::from_name(n)).collect();
 
     route.resolved_modules = Some(Arc::new(resolved));
+}
+
+// B-383: `[wasm]` が無い・無効なのにモジュールを並べたルートは断る
+#[cfg(all(test, feature = "wasm"))]
+mod b383_tests {
+    use super::*;
+
+    fn config(extra: &str) -> Config {
+        toml::from_str(&format!(
+            "[server]\nlisten_cleartext = \"127.0.0.1:18080\"\nenable_secure_redirect = false\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    const ROUTE: &str = "[[route]]\nmodules = [\"m\"]\n[route.conditions]\npath = \"/\"\n[route.action]\ntype = \"Respond\"\nstatus = 200\nbody = \"ok\"\n";
+
+    #[test]
+    fn route_modules_require_enabled_wasm() {
+        let e = validate_config(&config(ROUTE)).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("lists WASM modules but [wasm] is not enabled"),
+            "{e}"
+        );
+        let disabled = format!(
+            "[wasm]\nenabled = false\n[[wasm.modules]]\nname = \"m\"\npath = \"/nonexistent.wasm\"\n{ROUTE}"
+        );
+        let e = validate_config(&config(&disabled)).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("lists WASM modules but [wasm] is not enabled"),
+            "{e}"
+        );
+        // モジュールを並べないルートは [wasm] が無くても通る
+        validate_config(&config(&ROUTE.replace("modules = [\"m\"]\n", ""))).unwrap();
+    }
+
+    // B-399: UDP の L4 リスナーには WASM のネットワークフィルタを並べられない（TCP だけで走る）
+    #[cfg(feature = "l4-proxy")]
+    #[test]
+    fn udp_l4_rejects_wasm_modules() {
+        let l4 = |extra: &str| {
+            format!(
+                "[[l4]]\nname = \"dns\"\nlisten = \"127.0.0.1:15353\"\nprotocol = \"udp\"\n{extra}[[l4.upstreams]]\naddr = \"127.0.0.1:53\"\n"
+            )
+        };
+        validate_config(&config(&l4(""))).unwrap();
+        let e = validate_config(&config(&l4("wasm_modules = [\"m\"]\n"))).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("wasm_modules are not supported for UDP"),
+            "{e}"
+        );
+    }
 }

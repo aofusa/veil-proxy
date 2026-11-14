@@ -688,6 +688,7 @@ landlock_write_paths = ["/var/log/veil"]
 | `max_concurrent_connections` | Maximum concurrent connections | 0 (unlimited) |
 | `blocked_ips` | Front-line IP/CIDR blocklist; matching connections are dropped right after `accept` (before the TLS handshake / handler spawn), avoiding expensive work for known-bad IPs. Applies to every listener: HTTP (TLS and cleartext), L4 TCP, the Initial packet of a new HTTP/3 connection (no Retry is sent), and new L4 UDP sessions. CIDRs are parsed once at startup (zero-alloc check on the accept hot path) and hot-reloadable via SIGHUP. Evaluated earlier than per-route `denied_ips`. | `[]` |
 | `path_normalization` | Request path normalization before routing and `[route.security]` checks; the normalized path is forwarded upstream. `"base"`: decode `%XX` of unreserved characters, `\` → `/`, remove dot segments. `"merge_slashes"`: base + collapse repeated `/`. `"off"`: raw path (pre-v0.8.0). Absolute-form targets become origin-form; other non-origin targets (except `CONNECT`, `OPTIONS *`) and targets with `#` or non-UTF-8 bytes get 400 | `"base"` |
+| `escaped_slashes` | Encoded slashes (`%2F`, `%5C`) in the path. `"keep"`: forwarded encoded, but a path where an encoded slash forms a dot segment (`/public/..%2Fadmin`) gets 400 while `path_normalization` is on. `"reject"`: every path with `%2F` / `%5C` gets 400. `"unescape"`: decoded to `/` before normalization | `"keep"` |
 | `allow_security_failures` | Behavior when security feature activation fails | false |
 
 #### Security Feature Failure Handling
@@ -1066,6 +1067,10 @@ The following variables can be used in `redirect_url`:
 |----------|-------------|
 | `$request_uri` | Original request URI |
 | `$path` | Path portion after prefix removal |
+
+Both are substituted once (a variable name inside the request path is not expanded again), and a run of leading
+`/` or `\` in the substituted path is collapsed to a single `/`, so a request for `//evil.example` cannot turn
+`redirect_url = "$request_uri"` into a protocol-relative redirect to another host.
 
 ## Header Manipulation
 

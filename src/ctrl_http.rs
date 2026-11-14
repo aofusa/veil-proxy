@@ -19,7 +19,16 @@ pub struct Url {
 }
 
 /// `http(s)://host[:port][/path]` を解析する。
+///
+/// B-397: 空白・制御文字（CR・LF を含む）の入った URL は断る。パスはそのまま要求行に書くので、ACME の
+/// サーバが返した URL（JSON の `\r\n`・Location の裸の LF）で任意の行を足した要求を任意の宛先へ送れた。
 pub fn parse_url(url: &str) -> Result<Url, String> {
+    if url.bytes().any(|b| b <= b' ' || b == 0x7F) {
+        return Err(format!(
+            "URL contains whitespace or control characters ({})",
+            url.escape_debug()
+        ));
+    }
     let (tls, rest) = if let Some(r) = url.strip_prefix("https://") {
         (true, r)
     } else if let Some(r) = url.strip_prefix("http://") {
@@ -215,6 +224,13 @@ impl HttpClient {
             req.push_str(&format!("Content-Length: {}\r\n", body.len()));
         }
         for (n, v) in headers {
+            // B-397: ヘッダの名前・値にも CR・LF・NUL を通さない
+            if n.bytes()
+                .chain(v.bytes())
+                .any(|b| matches!(b, b'\r' | b'\n' | 0))
+            {
+                return Err(format!("invalid request header {}", n.escape_debug()));
+            }
             req.push_str(n);
             req.push_str(": ");
             req.push_str(v);
@@ -328,6 +344,11 @@ mod tests {
         let u = parse_url("http://[::1]:9/a").unwrap();
         assert_eq!((u.host.as_str(), u.port), ("::1", 9));
         assert!(parse_url("ftp://x").is_err());
+        // B-397: 空白・制御文字は断る（要求行へ任意の行を足せない）
+        assert!(parse_url("http://127.0.0.1:6379/x HTTP/1.1\r\nSET k v\r\n").is_err());
+        assert!(parse_url("https://acme.example/a\nb").is_err());
+        assert!(parse_url("https://acme.example/a\tb").is_err());
+        assert!(parse_url("https://acme.example/a\u{7f}").is_err());
         assert!(parse_url("http://x:bad").is_err());
     }
 

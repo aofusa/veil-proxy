@@ -173,6 +173,12 @@ max_concurrent_connections = 10000
 # other non-origin targets (except CONNECT and OPTIONS *) get 400, and so do targets that contain "#"
 # or bytes that are not UTF-8 (in every mode, "off" included).
 # path_normalization = "base"
+# Encoded slashes (%2F / %5C) in the path (Envoy's path_with_escaped_slashes_action):
+# "keep" (default): forward them encoded, but answer 400 when an encoded slash forms a dot segment
+#   (/public/..%2Fadmin matches /public/* while a backend that decodes %2F first serves /admin)
+# "reject": answer 400 to every path with %2F / %5C
+# "unescape": decode them to "/" before normalizing (routing and the upstream see the same path)
+# escaped_slashes = "keep"
 
 # seccomp system call restriction (Linux only)
 # Recommended to verify with log mode first, then switch to filter mode

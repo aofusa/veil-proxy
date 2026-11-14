@@ -65,12 +65,17 @@ struct Harness {
 
 impl Harness {
     async fn new(capabilities: ModuleCapabilities) -> Self {
+        Self::named(capabilities, "conformance_harness").await
+    }
+
+    /// プラグイン名（共有キューの持ち主）を指定してハーネスを作る。
+    async fn named(capabilities: ModuleCapabilities, plugin_name: &str) -> Self {
         let engine = build_conformance_test_engine().expect("engine should build");
         let linker = build_conformance_test_linker(&engine).expect("linker should build");
         let module = Module::new(&engine, HARNESS_WAT).expect("abi_harness.wat should compile");
 
         let mut http_ctx = HttpContext::new(1, capabilities);
-        http_ctx.plugin_name = "conformance_harness".into();
+        http_ctx.plugin_name = plugin_name.into();
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(&engine, host_state);
 
@@ -84,7 +89,11 @@ impl Harness {
 
     /// 全許可（`ModuleCapabilities` 全フィールド true 相当）のハーネスを作る。
     async fn permissive() -> Self {
-        let caps = ModuleCapabilities {
+        Self::new(Self::all_caps()).await
+    }
+
+    fn all_caps() -> ModuleCapabilities {
+        ModuleCapabilities {
             allow_logging: true,
             allow_metrics: true,
             allow_shared_data: true,
@@ -106,8 +115,7 @@ impl Harness {
             allowed_properties: vec!["*".to_string()],
             allow_property_write: true,
             ..ModuleCapabilities::default()
-        };
-        Self::new(caps).await
+        }
     }
 
     fn memory(&mut self) -> wasmtime::Memory {
@@ -776,6 +784,135 @@ async fn item4_shared_queue_dequeue_returns_allocated_pointer() {
         status, PROXY_RESULT_EMPTY,
         "an empty queue must report Empty"
     );
+}
+
+/// B-395: 共有キューは `allow_shared_data` が要り、登録したモジュールだけが取り出せる。別のモジュールは
+/// 持ち主の名前（vm_id）で開いたキューにだけ入れられる（番号を順に試して読み取り・偽造できない）
+#[tokio::test]
+async fn shared_queues_are_scoped_to_their_owner() {
+    let mut owner = Harness::named(Harness::all_caps(), "b395_owner").await;
+    let mut other = Harness::named(Harness::all_caps(), "b395_other").await;
+    let mut none = Harness::named(ModuleCapabilities::default(), "b395_none").await;
+
+    owner.write(scratch::KEY, b"b395-queue");
+    assert_eq!(
+        owner
+            .call(
+                "test_proxy_register_shared_queue",
+                &[scratch::KEY, 10, scratch::OUT_PTR]
+            )
+            .await,
+        PROXY_RESULT_OK
+    );
+    let queue_id = owner.read_i32(scratch::OUT_PTR);
+    owner.write(scratch::VALUE, b"secret");
+    assert_eq!(
+        owner
+            .call(
+                "test_proxy_enqueue_shared_queue",
+                &[queue_id, scratch::VALUE, 6]
+            )
+            .await,
+        PROXY_RESULT_OK
+    );
+
+    // 権限の無いモジュールは何もできない
+    none.write(scratch::KEY, b"b395-queue");
+    assert_eq!(
+        none.call(
+            "test_proxy_register_shared_queue",
+            &[scratch::KEY, 10, scratch::OUT_PTR]
+        )
+        .await,
+        PROXY_RESULT_NOT_ALLOWED
+    );
+    assert_eq!(
+        none.call(
+            "test_proxy_dequeue_shared_queue",
+            &[queue_id, scratch::OUT_PTR, scratch::OUT_SIZE]
+        )
+        .await,
+        PROXY_RESULT_NOT_ALLOWED
+    );
+    none.write(scratch::VALUE, b"forged");
+    assert_eq!(
+        none.call(
+            "test_proxy_enqueue_shared_queue",
+            &[queue_id, scratch::VALUE, 6]
+        )
+        .await,
+        PROXY_RESULT_NOT_ALLOWED
+    );
+
+    // 別のモジュールは番号だけでは取り出せず、開いていないキューへは入れられない
+    assert_eq!(
+        other
+            .call(
+                "test_proxy_dequeue_shared_queue",
+                &[queue_id, scratch::OUT_PTR, scratch::OUT_SIZE]
+            )
+            .await,
+        PROXY_RESULT_EMPTY
+    );
+    other.write(scratch::VALUE, b"forged");
+    assert_eq!(
+        other
+            .call(
+                "test_proxy_enqueue_shared_queue",
+                &[queue_id, scratch::VALUE, 6]
+            )
+            .await,
+        PROXY_RESULT_NOT_FOUND
+    );
+    // 自分の名前空間には無い（vm_id が空 = 自分）
+    other.write(scratch::KEY, b"b395-queue");
+    assert_eq!(
+        other
+            .call(
+                "test_proxy_resolve_shared_queue",
+                &[0, 0, scratch::KEY, 10, scratch::OUT_PTR]
+            )
+            .await,
+        PROXY_RESULT_NOT_FOUND
+    );
+    // 持ち主の名前（vm_id）で開けば入れられる
+    other.write(scratch::MSG, b"b395_owner");
+    assert_eq!(
+        other
+            .call(
+                "test_proxy_resolve_shared_queue",
+                &[scratch::MSG, 10, scratch::KEY, 10, scratch::OUT_PTR]
+            )
+            .await,
+        PROXY_RESULT_OK
+    );
+    assert_eq!(other.read_i32(scratch::OUT_PTR), queue_id);
+    other.write(scratch::VALUE, b"hello");
+    assert_eq!(
+        other
+            .call(
+                "test_proxy_enqueue_shared_queue",
+                &[queue_id, scratch::VALUE, 5]
+            )
+            .await,
+        PROXY_RESULT_OK
+    );
+
+    // 持ち主は順に取り出せる
+    for want in [&b"secret"[..], &b"hello"[..]] {
+        assert_eq!(
+            owner
+                .call(
+                    "test_proxy_dequeue_shared_queue",
+                    &[queue_id, scratch::OUT_PTR, scratch::OUT_SIZE]
+                )
+                .await,
+            PROXY_RESULT_OK
+        );
+        let ptr = owner.read_i32(scratch::OUT_PTR);
+        let size = owner.read_i32(scratch::OUT_SIZE);
+        assert_eq!(owner.read_bytes(ptr, size as usize), want);
+    }
 }
 
 /// B-248: WASI の `random_get` は OS の CSPRNG で埋める（以前は壁時計をシードにした LCG）。

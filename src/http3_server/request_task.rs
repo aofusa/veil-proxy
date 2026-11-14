@@ -1220,26 +1220,24 @@ impl H3BufferedTask {
             #[cfg(feature = "handler")]
             Backend::Handler(entry, _, _, comp) => {
                 // ネイティブハンドラ（API ライブラリ、F-188）
-                let mut hdrs: Vec<(Bytes, Bytes)> = Vec::with_capacity(headers.len() + 1);
-                let mut has_host = false;
-                for h in headers.iter().filter(|h| !h.name().starts_with(b":")) {
-                    has_host |= h.name().eq_ignore_ascii_case(b"host");
-                    hdrs.push((
-                        Bytes::copy_from_slice(h.name()),
-                        Bytes::copy_from_slice(h.value()),
-                    ));
-                }
-                if !has_host && !authority.is_empty() {
-                    hdrs.push((
-                        Bytes::from_static(b"host"),
-                        Bytes::copy_from_slice(authority),
-                    ));
-                }
+                let (hdrs, body) = handler_request_parts(
+                    headers,
+                    #[cfg(feature = "wasm")]
+                    wasm_request_headers.as_deref(),
+                    #[cfg(not(feature = "wasm"))]
+                    None,
+                    #[cfg(feature = "wasm")]
+                    wasm_request_body_override.as_ref(),
+                    #[cfg(not(feature = "wasm"))]
+                    None,
+                    request_body,
+                    authority,
+                );
                 let req = crate::api::dispatch::build_request(
                     Bytes::copy_from_slice(method),
                     Bytes::copy_from_slice(path),
                     hdrs,
-                    request_body.clone(),
+                    body,
                     self.client_ip.as_str(),
                     crate::api::request::HttpVersion::Http3,
                 );
@@ -1787,8 +1785,8 @@ impl H3BufferedTask {
 
         let clean_sub = sub_path.trim_start_matches('/');
 
-        // パストラバーサル防止
-        if clean_sub.contains("..") {
+        // パストラバーサル防止。B-396: Windows のドライブ等でルートを置き換えるサブパスも断る
+        if clean_sub.contains("..") || !crate::http_utils::is_plain_relative_subpath(clean_sub) {
             self.send_error_response(403, b"Forbidden").await?;
             return Ok((403, 9));
         }
@@ -2042,5 +2040,96 @@ impl H3BufferedTask {
             .await?;
 
         Ok((status_code, 0))
+    }
+}
+
+/// ネイティブハンドラへ渡す要求のヘッダと本文。
+///
+/// B-389: Proxy-Wasm が書き換えた要求のヘッダ・本文があればそれを渡し、本文を差し替えたら content-length も
+/// 合わせる（HTTP/1.1・HTTP/2 と同じ。F-271）。以前は元のヘッダ・本文を渡していたので、フィルタが上書き・削除した
+/// 識別のヘッダ（`x-user-role` 等）をクライアントが HTTP/3 で偽れた。
+#[cfg(feature = "handler")]
+fn handler_request_parts(
+    headers: &[h3::Header],
+    wasm_headers: Option<&[(Vec<u8>, Vec<u8>)]>,
+    wasm_body: Option<&Bytes>,
+    request_body: &Bytes,
+    authority: &[u8],
+) -> (Vec<(Bytes, Bytes)>, Bytes) {
+    let mut hdrs: Vec<(Bytes, Bytes)> = Vec::with_capacity(headers.len() + 2);
+    let mut has_host = false;
+    let mut push = |n: &[u8], v: &[u8]| {
+        if n.starts_with(b":") {
+            return;
+        }
+        has_host |= n.eq_ignore_ascii_case(b"host");
+        hdrs.push((Bytes::copy_from_slice(n), Bytes::copy_from_slice(v)));
+    };
+    match wasm_headers {
+        Some(ov) => ov.iter().for_each(|(n, v)| push(n, v)),
+        None => headers.iter().for_each(|h| push(h.name(), h.value())),
+    }
+    let body = match wasm_body {
+        Some(b) => {
+            hdrs.retain(|(n, _)| !n.eq_ignore_ascii_case(b"content-length"));
+            hdrs.push((
+                Bytes::from_static(b"content-length"),
+                Bytes::from(b.len().to_string()),
+            ));
+            b.clone()
+        }
+        None => request_body.clone(),
+    };
+    if !has_host && !authority.is_empty() {
+        hdrs.push((
+            Bytes::from_static(b"host"),
+            Bytes::copy_from_slice(authority),
+        ));
+    }
+    (hdrs, body)
+}
+
+#[cfg(all(test, feature = "handler"))]
+mod tests {
+    use super::*;
+
+    // B-389: Proxy-Wasm が書き換えたヘッダ・本文がハンドラに届き、クライアントの偽の値は届かない
+    #[test]
+    fn handler_request_parts_use_wasm_changes() {
+        let client = [
+            h3::Header::new(b":method", b"POST"),
+            h3::Header::new(b"x-user-role", b"admin"),
+            h3::Header::new(b"content-length", b"5"),
+        ];
+        let body = Bytes::from_static(b"hello");
+        let (h, b) = handler_request_parts(&client, None, None, &body, b"a.example");
+        assert!(h
+            .iter()
+            .any(|(n, v)| &n[..] == b"x-user-role" && &v[..] == b"admin"));
+        assert!(h
+            .iter()
+            .any(|(n, v)| &n[..] == b"host" && &v[..] == b"a.example"));
+        assert!(!h.iter().any(|(n, _)| n.starts_with(b":")));
+        assert_eq!(b, body);
+
+        let wasm = vec![
+            (b"x-user-role".to_vec(), b"user".to_vec()),
+            (b"content-length".to_vec(), b"5".to_vec()),
+            (b"host".to_vec(), b"b.example".to_vec()),
+        ];
+        let new_body = Bytes::from_static(b"redacted");
+        let (h, b) =
+            handler_request_parts(&client, Some(&wasm), Some(&new_body), &body, b"a.example");
+        let roles: Vec<_> = h.iter().filter(|(n, _)| &n[..] == b"x-user-role").collect();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(&roles[0].1[..], b"user");
+        let lens: Vec<_> = h
+            .iter()
+            .filter(|(n, _)| &n[..] == b"content-length")
+            .collect();
+        assert_eq!(lens.len(), 1);
+        assert_eq!(&lens[0].1[..], b"8");
+        assert_eq!(h.iter().filter(|(n, _)| &n[..] == b"host").count(), 1);
+        assert_eq!(b, new_body);
     }
 }

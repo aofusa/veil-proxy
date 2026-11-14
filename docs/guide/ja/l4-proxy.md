@@ -111,7 +111,7 @@ idle_timeout_secs = 30          # 30秒無通信でクライアントセッシ�
 | `max_connections` | 最大同時接続数/セッション数（0 = 無制限） | `0` |
 | `connect_timeout_secs` | upstream接続タイムアウト（秒、TCPのみ） | `10` |
 | `idle_timeout_secs` | アイドルタイムアウト（秒）。この時間通信がなければ接続/セッションを切断 | `600` |
-| `wasm_modules` | WASM network filter モジュール名一覧（`wasm` feature 必須、F-133）。空（既定）なら WASM 無効で従来どおり `splice` のゼロコピー経路（Linux。他の OS はコピー）を使う。指定すると `splice` を使わずユーザー空間バッファ経由の転送へ切り替わり、`proxy_on_downstream_data`/`proxy_on_upstream_data` でデータを検査・書き換えできる（切替判定は接続確立時に1回のみ） | `[]` |
+| `wasm_modules` | WASM network filter モジュール名一覧（`wasm` feature 必須、F-133）。空（既定）なら WASM 無効で従来どおり `splice` のゼロコピー経路（Linux。他の OS はコピー）を使う。指定すると `splice` を使わずユーザー空間バッファ経由の転送へ切り替わり、`proxy_on_downstream_data`/`proxy_on_upstream_data` でデータを検査・書き換えできる（切替判定は接続確立時に1回のみ）。TCP のみ: `protocol = "udp"` のリスナーに `wasm_modules`・`module_configuration` を書くと設定を拒否する。名前はすべて有効な `[wasm]` で定義したものであること | `[]` |
 | `module_configuration` | リスナー単位の Proxy-Wasm プラグイン設定上書き（モジュール名 → 文字列 or TOML テーブル、F-148）。合成規則は `[[route]]` と同じで、`wasm_modules` に列挙した名前のみ指定可 | （なし） |
 | `upstreams[].addr` | upstreamアドレス（`"host:port"` 形式） | 必須 |
 | `upstreams[].weight` | 重み（weighted RR用、現在予約） | `1` |

@@ -3915,7 +3915,10 @@ pub(super) async fn h2_sendfile(
         path_str
     };
 
-    if remainder.contains("..") {
+    // B-396: Windows のドライブ等でルートを置き換えるサブパスも断る
+    if remainder.contains("..")
+        || !crate::http_utils::is_plain_relative_subpath(remainder.trim_start_matches('/'))
+    {
         return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
     }
 

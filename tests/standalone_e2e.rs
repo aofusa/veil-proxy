@@ -109,6 +109,124 @@ fn reload_keeps_env_override(
     assert!(ok, "reload not applied; log:\n{}", veil.log());
 }
 
+// ===================== B-383 =====================
+
+/// 応答ヘッダに `x-b383: 1` を足す Proxy-Wasm モジュール（WAT）
+#[cfg(all(unix, feature = "wasm"))]
+const B383_HEADER_ADDER: &str = r#"
+(module
+  (import "env" "proxy_add_header_map_value"
+    (func $add (param i32 i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (data (i32.const 16) "x-b383")
+  (data (i32.const 32) "1")
+  (global $bump (mut i32) (i32.const 65536))
+  (func (export "proxy_on_memory_allocate") (param $size i32) (result i32)
+    (local $p i32)
+    (local.set $p (global.get $bump))
+    (global.set $bump (i32.add (global.get $bump) (local.get $size)))
+    (local.get $p))
+  (func (export "proxy_on_response_headers") (param $ctx i32) (param $n i32) (param $eos i32) (result i32)
+    (drop (call $add (i32.const 2) (i32.const 16) (i32.const 6) (i32.const 32) (i32.const 1)))
+    (i32.const 0))
+)
+"#;
+
+/// B-383: SIGHUP のリロードで足した WASM のモジュール・ルートのフィルタが走る（以前は起動時のエンジンを使い続け、
+/// 起動時に `[wasm]` が無ければ足したフィルタは黙って飛ばされていた）。モジュールを並べたまま `[wasm]` を消す
+/// リロードは断られ、前の設定（フィルタ有り）のまま動く。
+#[cfg(all(unix, feature = "wasm"))]
+#[test]
+fn b383_wasm_filter_added_by_reload_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let wat = dir.path().join("adder.wat");
+    std::fs::write(&wat, B383_HEADER_ADDER).unwrap();
+    let (up, _seen) =
+        standalone::parity::spawn_recording_upstream(|_| (200, String::new(), b"up".to_vec()));
+    let port = free_port();
+    let base = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+"#
+    );
+    let route = |modules: &str| {
+        format!(
+            r#"
+[[route]]
+{modules}
+[route.conditions]
+path = "/"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}/"
+"#
+        )
+    };
+    let wasm = format!(
+        r#"
+[wasm]
+enabled = true
+[[wasm.modules]]
+name = "adder"
+path = "{wat}"
+[wasm.modules.capabilities]
+allow_response_headers_read = true
+allow_response_headers_write = true
+"#,
+        wat = tp(&wat)
+    );
+    // 起動時は [wasm] も無い
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, format!("{base}{}", route(""))).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+    let r = http1_get(port, "/x").expect("request before reload");
+    assert_eq!(r.status, 200, "{:?}", r);
+    assert_eq!(r.header("x-b383"), None);
+
+    // [wasm] とルートのフィルタを足してリロード
+    std::fs::write(
+        &cfg_path,
+        format!("{base}{wasm}{}", route(r#"modules = ["adder"]"#)),
+    )
+    .unwrap();
+    veil.sighup();
+    let ok = wait_until(Duration::from_secs(10), || {
+        http1_get(port, "/x")
+            .map(|r| r.status == 200 && r.header("x-b383") == Some("1"))
+            .unwrap_or(false)
+    });
+    assert!(
+        ok,
+        "filter added by reload did not run; log:\n{}",
+        veil.log()
+    );
+
+    // フィルタを並べたまま [wasm] を消したリロードは断られ、フィルタは走り続ける
+    std::fs::write(
+        &cfg_path,
+        format!("{base}{}", route(r#"modules = ["adder"]"#)),
+    )
+    .unwrap();
+    veil.sighup();
+    let rejected = wait_until(Duration::from_secs(10), || {
+        veil.log()
+            .contains("lists WASM modules but [wasm] is not enabled")
+    });
+    assert!(rejected, "reload was not rejected; log:\n{}", veil.log());
+    let r = http1_get(port, "/x").expect("request after rejected reload");
+    assert_eq!(r.header("x-b383"), Some("1"), "{:?}", r);
+}
+
 /// 環境変数で `route.0.action.path` のような配列添字つきのパスも上書きできる。
 /// CLI の `--override` は環境変数より優先される。
 #[test]

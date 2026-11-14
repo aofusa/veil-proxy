@@ -677,6 +677,7 @@ landlock_write_paths = ["/var/log/veil"]
 | `max_concurrent_connections` | 同時接続数の上限 | 0（無制限） |
 | `blocked_ips` | 最前線 IP/CIDR ブロックリスト。`accept` 直後（TLS ハンドシェイク・ハンドラ生成の前）にマッチした接続を切断し、既知の不正 IP への高コスト処理を回避する。全部のリスナーに掛かる（HTTP の TLS・平文、L4 の TCP、HTTP/3 の新しい接続の Initial（Retry も返さない）、L4 の UDP の新しいセッション）。CIDR は起動時に一度だけパースされ（accept ホットパスはゼロアロケーション判定）、SIGHUP でホットリロード可能。ルート単位の `denied_ips` より前段で評価される。 | `[]` |
 | `path_normalization` | ルートの照合・`[route.security]` の検査の前の要求のパスの正規化。正規化したパスを上流へ送る。`"base"`: 予約されていない文字の `%XX` を戻し、`\` を `/` に、ドットのセグメントを除く。`"merge_slashes"`: base + 連続する `/` を 1 つに。`"off"`: 生のパス（v0.8.0 より前）。絶対形式の要求先は origin 形式に直し、それ以外の origin 形式でないもの（`CONNECT`・`OPTIONS *` を除く）と `#`・UTF-8 でないバイトを含むものは 400 | `"base"` |
+| `escaped_slashes` | パスのエスケープされたスラッシュ（`%2F`・`%5C`）の扱い。`"keep"`: エスケープしたまま送る。ただし `path_normalization` が有効なとき、エスケープされたスラッシュがドットのセグメントを作るパス（`/public/..%2Fadmin`）は 400。`"reject"`: `%2F`・`%5C` を含むパスはすべて 400。`"unescape"`: `/` に戻してから正規化する | `"keep"` |
 | `allow_security_failures` | セキュリティ機能の有効化に失敗した場合の動作 | false |
 
 #### セキュリティ機能失敗時の動作
@@ -1049,6 +1050,9 @@ redirect_status = 301
 |------|------|
 | `$request_uri` | 元のリクエストURI |
 | `$path` | prefix除去後のパス部分 |
+
+どちらも 1 回だけ差し込み（要求のパスの中の変数名は展開し直さない）、差し込んだパスの先頭に続く `/`・`\` は 1 つの `/` に
+まとめます。`//evil.example` への要求で `redirect_url = "$request_uri"` が別のホストへのプロトコル相対のリダイレクトになることはありません。
 
 ## ヘッダー操作
 
