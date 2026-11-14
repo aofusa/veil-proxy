@@ -364,7 +364,8 @@ pub(super) async fn transfer_https_response_with_compression(
     is_head: bool,
     close: bool,
 ) -> (u64, u16, bool, bool) {
-    let mut accumulated = Vec::with_capacity(BUF_SIZE);
+    // 応答のヘッダの蓄積。最初の読み込みのバッファをそのまま使う（`compress` の平文の経路と同じ）
+    let mut accumulated: Vec<u8> = Vec::new();
     let mut total = 0u64;
     let mut status_code = 502u16;
     // 初期値false: エラー時はKeep-Aliveを無効化
@@ -408,8 +409,16 @@ pub(super) async fn transfer_https_response_with_compression(
         };
 
         returned_buf.set_valid_len(n);
-        accumulated.extend_from_slice(returned_buf.as_valid_slice());
-        buf_put(returned_buf);
+        if accumulated.is_empty() {
+            // 最初の読み込みは読み取りバッファをそのまま蓄積にする（写しを作らない）
+            recycle_read_vec(std::mem::replace(
+                &mut accumulated,
+                returned_buf.into_truncated(),
+            ));
+        } else {
+            accumulated.extend_from_slice(returned_buf.as_valid_slice());
+            buf_put(returned_buf);
+        }
 
         // B-11: バックエンド由来の 1xx 中間応答（100 Continue / 103 Early Hints 等）を
         // 読み捨てる（最終応答と誤認して転送するとクライアントが最終応答を待ち続ける）。
@@ -449,7 +458,7 @@ pub(super) async fn transfer_https_response_with_compression(
 
             if let Some(encoding) = should_compress {
                 // 圧縮有効: ヘッダーを書き換えて圧縮転送
-                return match transfer_compressed_response(
+                let compressed = transfer_compressed_response(
                     client_stream,
                     backend_stream,
                     &accumulated[..header_len],
@@ -464,8 +473,9 @@ pub(super) async fn transfer_https_response_with_compression(
                     #[cfg(feature = "wasm")]
                     &wasm_modules,
                 )
-                .await
-                {
+                .await;
+                recycle_read_vec(accumulated);
+                return match compressed {
                     Some((total, reusable)) => (total, status_code, reusable, false),
                     // 本文が途中で止まった・クライアントへ書けない（B-244）
                     None => (0, 502, false, true),
@@ -500,14 +510,21 @@ pub(super) async fn transfer_https_response_with_compression(
                 // F-59: ヘッダー + 初期ボディを平文接続では 1 回の SENDMSG で送出
                 // B-244: 最初の読み込みのうち本文の終端までだけを送る（後ろは次の応答であり得る）
                 let start = response_body_start(body_kind, body_start);
-                let body_data = body_start[..start.send].to_vec();
+                accumulated.truncate(header_len + start.send);
+                let mut body_data = crate::runtime::buf::SlicedIoBuf::new(accumulated);
+                body_data.advance(header_len);
                 let write_result = timeout(
                     WRITE_TIMEOUT,
                     client_stream.write_all_vectored(modified_headers, body_data),
                 )
                 .await;
-                if !matches!(write_result, Ok((Ok(()), _, _))) {
-                    return (total, status_code, false, true);
+                match write_result {
+                    Ok((Ok(()), _, body_data)) => recycle_read_vec(body_data.into_inner()),
+                    Ok((Err(_), _, body_data)) => {
+                        recycle_read_vec(body_data.into_inner());
+                        return (total, status_code, false, true);
+                    }
+                    Err(_) => return (total, status_code, false, true),
                 }
                 total += header_len as u64;
                 total += start.send as u64;

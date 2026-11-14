@@ -256,13 +256,17 @@ impl TlsBackend {
     }
 
     /// ドレイン済み平文を `buf` 先頭へコピーして返す（無ければ `None`）。
-    fn copy_drained(&self, buf: &mut [u8]) -> Option<usize> {
+    ///
+    /// 読み取りバッファは長さでなく容量まで書いてよい（生ソケットの読み取り（`IoBufMut for Vec`）と同じ。長さは
+    /// 読んだ分になる）。応答の読み取りはゼロで埋めない容量だけのバッファを渡す
+    fn copy_drained(&self, buf: &mut Vec<u8>) -> Option<usize> {
         let mut d = self.drained.borrow_mut();
         if d.is_empty() {
             return None;
         }
-        let n = d.len().min(buf.len());
-        buf[..n].copy_from_slice(&d[..n]);
+        let n = d.len().min(buf.capacity());
+        buf.clear();
+        buf.extend_from_slice(&d[..n]);
         d.drain(..n);
         Some(n)
     }
@@ -1433,9 +1437,10 @@ async fn stream_response(
     before_head: &Cell<bool>,
     resp_status: &Cell<u16>,
 ) -> Result<RespEnd, u16> {
-    // 読み取りバッファ（所有権ベース read のため都度払い出し→受け取り）。
-    let mut read_buf = vec![0u8; RESP_READ_CHUNK];
-    let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
+    // 読み取りバッファ（所有権ベース read のため都度払い出し→受け取り）。ゼロで埋めない（読んだ分だけを見る。
+    // 以前は要求ごとに 32 KiB をゼロで埋めていた）
+    let mut read_buf: Vec<u8> = Vec::with_capacity(RESP_READ_CHUNK);
+    let mut head_buf: Vec<u8> = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
 
     // --- ヘッダ終端まで読む ---
@@ -1444,6 +1449,7 @@ async fn stream_response(
         if std::time::Instant::now() >= deadline {
             return Err(504);
         }
+        ensure_read_capacity(&mut read_buf, RESP_READ_CHUNK);
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         let n = match res {
@@ -1458,7 +1464,7 @@ async fn stream_response(
                 return Err(502);
             }
         };
-        head_buf.extend_from_slice(&read_buf[..n]);
+        take_into_head(&mut head_buf, &mut read_buf, n);
         // B-11: 1xx 中間応答（101 以外）は読み捨てて最終応答を待つ（バッファ内に後続の
         // 最終応答ヘッドが既に届いている場合があるため、読み取りせずに再検査する）。
         if let Some(pos) = drain_interim_and_find_header_end(&mut head_buf) {
@@ -1478,8 +1484,8 @@ async fn stream_response(
         return Err(502);
     }
     resp_status.set(status);
-    // ヘッダ終端（\r\n\r\n）以降は先読みしたボディ断片。
-    let leftover = Bytes::copy_from_slice(&head_buf[header_end + 4..]);
+    // ヘッダ終端（\r\n\r\n）以降は先読みしたボディ断片（多ければ写さずにバッファごと渡す）
+    let leftover = split_read_tail(&mut head_buf, header_end + 4);
 
     // B-104: 本文を持たない応答（HEAD への応答・204・304）は Content-Length があっても本文を
     // 読まない（キープアライブでは上流が閉じないため、読みに行くとタイムアウトまで止まる）。
@@ -1587,6 +1593,8 @@ async fn stream_body_length(
             // 応答を成功と誤認する。Err を返してストリームをリセットさせる。
             return Err(504);
         }
+        // 残りの長さ + 1 の容量で読む（読めた分をそのまま渡せる。+1 は宣言長を超えて届いたバイトを見つけるため）
+        ensure_read_capacity(&mut read_buf, (total - sent).min(RESP_READ_CHUNK - 1) + 1);
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
@@ -1600,7 +1608,7 @@ async fn stream_body_length(
             Ok(n) => {
                 let take = n.min(total - sent);
                 overrun |= n > take;
-                let chunk = bytes_from_read(&read_buf, take);
+                let chunk = take_read_chunk(&mut read_buf, n, take);
                 if send_body_bytes(resp_tx, notify, chunk).await.is_err() {
                     return Ok(RespEnd::Close);
                 }
@@ -1655,6 +1663,7 @@ async fn stream_body_chunked(
         if std::time::Instant::now() >= deadline {
             return Err(504); // head 送出済み → リセット（切り詰めを成功に見せない）
         }
+        ensure_read_capacity(&mut read_buf, RESP_READ_CHUNK);
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
@@ -1665,7 +1674,7 @@ async fn stream_body_chunked(
             }
             Ok(n) => {
                 // read_buf の先頭 n バイトを Bytes 化してデコード（span はこの Bytes のスライス）。
-                let data = bytes_from_read(&read_buf, n);
+                let data = take_read_chunk(&mut read_buf, n, n);
                 match drain_chunked(&mut decoder, &data, resp_tx, notify).await {
                     ChunkedProgress::More => {}
                     ChunkedProgress::Done { exact } => return Ok(reuse_if(exact)),
@@ -1737,6 +1746,7 @@ async fn stream_body_eof(
         if std::time::Instant::now() >= deadline {
             return Err(504); // head 送出済み → リセット
         }
+        ensure_read_capacity(&mut read_buf, RESP_READ_CHUNK);
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
@@ -1750,7 +1760,7 @@ async fn stream_body_eof(
                 return Err(502);
             }
             Ok(n) => {
-                let chunk = bytes_from_read(&read_buf, n);
+                let chunk = take_read_chunk(&mut read_buf, n, n);
                 if send_body_bytes(resp_tx, notify, chunk).await.is_err() {
                     return Ok(RespEnd::Close);
                 }
@@ -1798,6 +1808,7 @@ async fn stream_response_compressed(
             // head 未送出なので 504 をそのまま返せる（欠けた本文を圧縮して返さない）。
             return Err(504);
         }
+        ensure_read_capacity(&mut read_buf, RESP_READ_CHUNK);
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
@@ -1817,8 +1828,7 @@ async fn stream_response_compressed(
                     warn!("[HTTP/3] upstream response body exceeds the buffering limit");
                     return Err(502);
                 }
-                let slice = Bytes::copy_from_slice(&read_buf[..n]);
-                exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &slice);
+                exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &read_buf[..n]);
                 done = decoder.as_ref().map(|d| d.is_complete()).unwrap_or(false)
                     || remaining == Some(0);
             }
@@ -1868,7 +1878,7 @@ fn accumulate_body(
     body: &mut Vec<u8>,
     decoder: &mut Option<crate::http_utils::ChunkedDecoder>,
     remaining: &mut Option<usize>,
-    data: &Bytes,
+    data: &[u8],
 ) -> bool {
     if let Some(dec) = decoder {
         let mut pos = 0;
@@ -2017,12 +2027,14 @@ async fn buffered_round_trip(
         Err(_) => return Err(timed_out()),
     }
 
-    let mut read_buf = vec![0u8; RESP_READ_CHUNK];
-    let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
+    // ゼロで埋めない読み取りバッファ（`stream_response` と同じ）
+    let mut read_buf: Vec<u8> = Vec::with_capacity(RESP_READ_CHUNK);
+    let mut head_buf: Vec<u8> = Vec::new();
     let header_end = loop {
         if std::time::Instant::now() >= deadline {
             return Err(timed_out());
         }
+        ensure_read_capacity(&mut read_buf, RESP_READ_CHUNK);
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         let n = match res {
@@ -2037,7 +2049,7 @@ async fn buffered_round_trip(
             Err(e) => return Err(e),
         };
         *got_response_bytes = true;
-        head_buf.extend_from_slice(&read_buf[..n]);
+        take_into_head(&mut head_buf, &mut read_buf, n);
         if let Some(pos) = drain_interim_and_find_header_end(&mut head_buf) {
             break pos;
         }
@@ -2061,7 +2073,8 @@ async fn buffered_round_trip(
         parsed.framing = Framing::Length(0);
     }
     let reusable_conn = parsed.keep_alive && status != 101;
-    let leftover = Bytes::copy_from_slice(&head_buf[header_end + 4..]);
+    // 見出しの後ろに続けて届いた本文（溜める先へ直接写す。以前は `Bytes` へ写してから写していた）
+    let leftover = &head_buf[header_end + 4..];
 
     let mut decoder = if matches!(parsed.framing, Framing::Chunked) {
         Some(crate::http_utils::ChunkedDecoder::new_unlimited())
@@ -2081,13 +2094,14 @@ async fn buffered_round_trip(
         ));
     }
     let mut body: Vec<u8> = Vec::with_capacity(remaining.unwrap_or(leftover.len()));
-    let mut exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &leftover);
+    let mut exact = accumulate_body(&mut body, &mut decoder, &mut remaining, leftover);
     let mut done =
         decoder.as_ref().map(|d| d.is_complete()).unwrap_or(false) || remaining == Some(0);
     while !done {
         if std::time::Instant::now() >= deadline {
             return Err(timed_out());
         }
+        ensure_read_capacity(&mut read_buf, RESP_READ_CHUNK);
         let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
@@ -2107,8 +2121,7 @@ async fn buffered_round_trip(
                         "upstream response body exceeds the buffering limit",
                     ));
                 }
-                let slice = Bytes::copy_from_slice(&read_buf[..n]);
-                exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &slice);
+                exact = accumulate_body(&mut body, &mut decoder, &mut remaining, &read_buf[..n]);
                 done = decoder.as_ref().map(|d| d.is_complete()).unwrap_or(false)
                     || remaining == Some(0);
             }
@@ -2145,20 +2158,54 @@ async fn buffered_round_trip(
 // ============================================================================
 
 /// レスポンス読み取り 1 回分のサイズ。
-const RESP_READ_CHUNK: usize = 32 * 1024;
+const RESP_READ_CHUNK: usize = 64 * 1024;
 /// レスポンスヘッダの最大許容サイズ。
 const MAX_RESP_HEADER: usize = 256 * 1024;
 
-/// `read_buf` の先頭 `n` バイトをゼロコピー前提の `Bytes` に変換する。
-///
-/// アクター境界を越えて所有権を移すため、1 チャンク = 1 確保が必要（quiche `send_body` が
-/// 内部コピーするのと同様、設計上不可避な確保）。`Vec` を切り詰めて `Bytes` 化することで
-/// **追加のディープコピーは発生しない**（`Vec` → `Bytes` はバッファ移譲）。
+/// 見出しを探す間の読み取りを見出しのバッファへ移す。見出しのバッファが空なら（1 回目の読み取り。ほぼ全部）
+/// 読み取りバッファをそのまま見出しのバッファにして写さない（次の読み取りの前に `ensure_read_capacity` で
+/// 新しいバッファを用意する）。続きなら後ろへ足す
+fn take_into_head(head_buf: &mut Vec<u8>, read_buf: &mut Vec<u8>, n: usize) {
+    if head_buf.is_empty() {
+        *head_buf = std::mem::take(read_buf);
+        head_buf.truncate(n);
+    } else {
+        head_buf.extend_from_slice(&read_buf[..n]);
+    }
+}
+
+/// 読み取りの前に容量を用意する（`take_into_head`・`take_read_chunk` でバッファを渡した後）。容量 0 で読むと
+/// 0 バイト（EOF と区別できない）になる
 #[inline]
-fn bytes_from_read(read_buf: &[u8], n: usize) -> Bytes {
-    let mut v = Vec::with_capacity(n);
-    v.extend_from_slice(&read_buf[..n]);
-    Bytes::from(v)
+fn ensure_read_capacity(read_buf: &mut Vec<u8>, cap: usize) {
+    if read_buf.capacity() == 0 {
+        *read_buf = Vec::with_capacity(cap.max(1));
+    }
+}
+
+/// `buf[start..]`（見出しの後ろに続けて届いた本文）を `Bytes` にする。容量の半分以上あればバッファごと渡して
+/// 写さない（見出しの分と空きは本文を送り終えるまで残るが、多くても 2 倍）。少なければ写す
+fn split_read_tail(buf: &mut Vec<u8>, start: usize) -> Bytes {
+    let tail = buf.len() - start;
+    if tail > 0 && tail * 2 >= buf.capacity() {
+        Bytes::from(std::mem::take(buf)).slice(start..)
+    } else {
+        Bytes::copy_from_slice(&buf[start..])
+    }
+}
+
+/// 読んだ `n` バイトのうち先頭 `take` バイトを本文の断片（`Bytes`）にする。容量の半分以上を読めたらバッファごと
+/// 渡して写さない（quiche は送り終えて ACK を受けるまで断片を持つので、少ない本文で大きな容量を握らない）。
+/// 渡したら `read_buf` は容量 0 になる（次の読み取りの前に `ensure_read_capacity`）。少なければ読んだ分だけを
+/// 写してバッファを使い回す
+fn take_read_chunk(read_buf: &mut Vec<u8>, n: usize, take: usize) -> Bytes {
+    if n * 2 >= read_buf.capacity() {
+        let mut full = std::mem::take(read_buf);
+        full.truncate(take);
+        Bytes::from(full)
+    } else {
+        Bytes::copy_from_slice(&read_buf[..take])
+    }
 }
 
 /// ボディ断片をレスポンスチャネルへ送る（送出後にメインループへ通知）。
@@ -2571,7 +2618,8 @@ mod tests {
         let backend = TlsBackend::new(inner, Some(client), Vec::new());
         let got = crate::runtime::block_on(async move {
             let mut got = Vec::new();
-            let mut buf = vec![0u8; 64 * 1024];
+            // 長さ 0・容量だけのバッファ（応答の読み取りはゼロで埋めないバッファを渡す）
+            let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
             while got.len() < expected.len() {
                 let (res, b) = backend.read_into(buf).await;
                 buf = b;
@@ -2759,6 +2807,158 @@ mod tests {
     }
 
     // F-161: 同一 ConnWaker から複数回 notify() してもキュー長が 1（コアレッシング）。
+    /// 見出しを探す読み取り: 空の見出しのバッファには読み取りバッファをそのまま移し（写さない）、続きは足す
+    #[test]
+    fn take_into_head_moves_first_read_without_copy() {
+        let mut read_buf: Vec<u8> = Vec::with_capacity(64);
+        read_buf.extend_from_slice(b"HTTP/1.1 200");
+        let ptr = read_buf.as_ptr();
+        let mut head: Vec<u8> = Vec::new();
+        take_into_head(&mut head, &mut read_buf, 8);
+        assert_eq!(
+            head.as_ptr(),
+            ptr,
+            "the first read must be moved, not copied"
+        );
+        assert_eq!(head, b"HTTP/1.1");
+        assert_eq!(read_buf.capacity(), 0);
+        ensure_read_capacity(&mut read_buf, 32);
+        assert!(read_buf.capacity() >= 32);
+        read_buf.extend_from_slice(b" 200 OK");
+        take_into_head(&mut head, &mut read_buf, 7);
+        assert_eq!(head, b"HTTP/1.1 200 OK");
+        assert!(read_buf.capacity() >= 32, "a later read keeps its buffer");
+    }
+
+    /// 本文の断片: 容量の半分以上を読めたらバッファごと渡し（写さない）、少なければ写してバッファを使い回す
+    #[test]
+    fn read_chunks_hand_over_large_reads_and_copy_small_ones() {
+        let mut buf: Vec<u8> = Vec::with_capacity(16);
+        buf.extend_from_slice(&[7u8; 10]);
+        let ptr = buf.as_ptr();
+        let chunk = take_read_chunk(&mut buf, 10, 9);
+        assert_eq!(chunk.as_ptr(), ptr);
+        assert_eq!(
+            chunk.len(),
+            9,
+            "bytes past the declared length are not forwarded"
+        );
+        assert_eq!(buf.capacity(), 0);
+
+        let mut buf: Vec<u8> = Vec::with_capacity(16);
+        buf.extend_from_slice(&[7u8; 3]);
+        let ptr = buf.as_ptr();
+        let chunk = take_read_chunk(&mut buf, 3, 3);
+        assert_ne!(chunk.as_ptr(), ptr);
+        assert_eq!(chunk.as_ref(), &[7u8; 3]);
+        assert_eq!(
+            buf.capacity(),
+            16,
+            "a small read keeps the buffer for the next read"
+        );
+
+        let mut head: Vec<u8> = Vec::with_capacity(16);
+        head.extend_from_slice(b"HDR\r\n\r\nbodybody1");
+        let ptr = head.as_ptr();
+        let tail = split_read_tail(&mut head, 7);
+        assert_eq!(tail.as_ref(), b"bodybody1");
+        assert_eq!(tail.as_ptr(), ptr.wrapping_add(7));
+        let mut head: Vec<u8> = Vec::with_capacity(64);
+        head.extend_from_slice(b"HDR\r\n\r\nab");
+        let tail = split_read_tail(&mut head, 7);
+        assert_eq!(tail.as_ref(), b"ab");
+        assert_eq!(head.capacity(), 64);
+    }
+
+    /// `stream_response` はゼロで埋めない読み取りバッファで、1xx を読み飛ばし、宣言長ちょうどの本文を転送して
+    /// 接続を再利用可能と判定する。本文が分かれて届いても（残りの長さで読む経路）同じで、宣言長を超えて届いた
+    /// バイトは転送せずに接続を閉じる
+    #[cfg(unix)]
+    #[test]
+    // 理由付き allow: テストの模擬上流（std の同期ソケット・スレッド・sleep。データプレーン非経由）
+    #[allow(clippy::disallowed_methods)]
+    fn stream_response_forwards_body_from_uninitialized_buffers() {
+        use std::io::Write as _;
+        use std::os::unix::io::FromRawFd as _;
+        if !runtime_available() {
+            eprintln!("skip: async runtime unavailable (io_uring denied in this sandbox)");
+            return;
+        }
+        let body: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        // (宣言長, 1 回目に書く長さ（見出しの後ろの本文）, 書く本文の全長, 期待する再利用可否)
+        for (declared, first, written, reusable) in [
+            (70_000usize, 70_000usize, 70_000usize, true),
+            (70_000, 10, 70_000, true),
+            (5, 0, 8, false),
+        ] {
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: fds は 2 要素の有効な配列。
+            let rc =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+            assert_eq!(rc, 0);
+            // SAFETY: socketpair が返した有効な fd。
+            unsafe {
+                let fl = libc::fcntl(fds[0], libc::F_GETFL);
+                libc::fcntl(fds[0], libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+            // SAFETY: socketpair が返した所有 fd をそれぞれ一度だけ所有権移動する。
+            let mut peer = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fds[1]) };
+            let backend = BackendIo::Plain(unsafe { TcpStream::from_raw_fd(fds[0]) });
+            let head = format!(
+                "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n\r\n"
+            );
+            let payload = body[..written].to_vec();
+            let writer = std::thread::spawn(move || {
+                let mut first_part = head.into_bytes();
+                first_part.extend_from_slice(&payload[..first]);
+                peer.write_all(&first_part).unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+                peer.write_all(&payload[first..]).unwrap();
+                // 読み終えるまで閉じない（宣言長の区切りで終わることを見る）
+                std::thread::sleep(Duration::from_millis(300));
+                peer
+            });
+            let (tx, rx) = channel::<RespMsg>(64);
+            let wake_queue: WakeQueue = Rc::new(RefCell::new(VecDeque::new()));
+            let cid: ConnKey = Rc::new(quiche::ConnectionId::from_ref(&[9]).into_owned());
+            let waker = ConnWaker::new(cid, wake_queue, H3Notify::new());
+            let end = crate::runtime::block_on(async move {
+                let before_head = Cell::new(true);
+                let status = Cell::new(0u16);
+                stream_response(
+                    &backend,
+                    &CompressionConfig::default(),
+                    crate::config::ClientAccept::NONE,
+                    5,
+                    false,
+                    &tx,
+                    &waker,
+                    &before_head,
+                    &status,
+                )
+                .await
+            });
+            drop(writer.join().unwrap());
+            let mut got = Vec::new();
+            let mut head_status = None;
+            while let TryRecv::Item(msg) = rx.try_recv() {
+                match msg {
+                    RespMsg::Head { status, .. } => head_status = Some(status),
+                    RespMsg::Body(b) => got.extend_from_slice(&b),
+                    _ => panic!("unexpected message"),
+                }
+            }
+            assert_eq!(head_status, Some(200));
+            assert_eq!(got.as_slice(), &body[..declared]);
+            let want = if reusable {
+                RespEnd::Reusable
+            } else {
+                RespEnd::Close
+            };
+            assert_eq!(end, Ok(want), "declared={declared} first={first}");
+        }
+    }
+
     #[test]
     fn conn_waker_notify_coalesces_until_drained() {
         let wake_queue: WakeQueue = Rc::new(RefCell::new(VecDeque::new()));

@@ -141,7 +141,8 @@ pub(super) async fn transfer_response_with_compression(
     is_head: bool,
     close: bool,
 ) -> (u64, u16, bool, bool) {
-    let mut accumulated = Vec::with_capacity(BUF_SIZE);
+    // 応答のヘッダの蓄積。最初の読み込みのバッファ（プールの 64KB）をそのまま使う（下の読み込みの箇所）
+    let mut accumulated: Vec<u8> = Vec::new();
     let mut total = 0u64;
     let mut status_code = 502u16;
     // 初期値false: エラー時はKeep-Aliveを無効化
@@ -192,8 +193,18 @@ pub(super) async fn transfer_response_with_compression(
         };
 
         returned_buf.set_valid_len(n);
-        accumulated.extend_from_slice(returned_buf.as_valid_slice());
-        buf_put(returned_buf);
+        if accumulated.is_empty() {
+            // 最初の読み込み（1xx を読み捨てて空になった後も）は、読み取りバッファをそのまま蓄積にする。ヘッダと
+            // 最初の本文が 1 回で届けば、写しを作らずに解析してクライアントへ送れる（以前は 64KB の Vec を確保して
+            // 写し、最初の本文をさらに `to_vec` で写していた。54KB の応答で 1 要求あたり 108KB の写し）
+            recycle_read_vec(std::mem::replace(
+                &mut accumulated,
+                returned_buf.into_truncated(),
+            ));
+        } else {
+            accumulated.extend_from_slice(returned_buf.as_valid_slice());
+            buf_put(returned_buf);
+        }
 
         // B-11: バックエンド由来の 1xx 中間応答（100 Continue / 103 Early Hints 等）を
         // 読み捨てる（最終応答と誤認して転送するとクライアントが最終応答を待ち続ける）。
@@ -239,7 +250,7 @@ pub(super) async fn transfer_response_with_compression(
                     "[Compression] Initializing compressed transfer with {:?}",
                     encoding
                 );
-                return match transfer_compressed_response(
+                let compressed = transfer_compressed_response(
                     client_stream,
                     backend_stream,
                     &accumulated[..header_len],
@@ -254,8 +265,9 @@ pub(super) async fn transfer_response_with_compression(
                     #[cfg(feature = "wasm")]
                     &wasm_modules,
                 )
-                .await
-                {
+                .await;
+                recycle_read_vec(accumulated);
+                return match compressed {
                     Some((total, reusable)) => (total, status_code, reusable, false),
                     // 本文が途中で止まった・クライアントへ書けない: 上流接続は捨て、クライアントも閉じる
                     None => (0, 502, false, true),
@@ -313,14 +325,22 @@ pub(super) async fn transfer_response_with_compression(
 
                 // 修正したヘッダー + 初期ボディを送信
                 // F-59: 平文接続では 1 回の SENDMSG（scatter-gather）で送出
-                let body_data = body_start[..start.send].to_vec();
+                // 本文は読み込みのバッファの中をそのまま渡す（本文の終端より後ろは切り落とす。B-244）
+                accumulated.truncate(header_len + start.send);
+                let mut body_data = crate::runtime::buf::SlicedIoBuf::new(accumulated);
+                body_data.advance(header_len);
                 let write_result = timeout(
                     WRITE_TIMEOUT,
                     client_stream.write_all_vectored(modified_headers, body_data),
                 )
                 .await;
-                if !matches!(write_result, Ok((Ok(()), _, _))) {
-                    return (total, status_code, false, true);
+                match write_result {
+                    Ok((Ok(()), _, body_data)) => recycle_read_vec(body_data.into_inner()),
+                    Ok((Err(_), _, body_data)) => {
+                        recycle_read_vec(body_data.into_inner());
+                        return (total, status_code, false, true);
+                    }
+                    Err(_) => return (total, status_code, false, true),
                 }
                 total += header_len as u64;
                 total += start.send as u64;
@@ -360,6 +380,14 @@ pub(super) async fn transfer_response_with_compression(
             );
             return (0, 502, false, true);
         }
+    }
+}
+
+/// 応答のヘッダの蓄積に使った読み取りバッファをプールへ返す（まだ何も読んでいない空の `Vec` は捨てる）。
+#[inline]
+pub(super) fn recycle_read_vec(buf: Vec<u8>) {
+    if buf.capacity() >= BUF_SIZE {
+        buf_put_vec(buf);
     }
 }
 
