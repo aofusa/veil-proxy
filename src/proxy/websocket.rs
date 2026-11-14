@@ -147,16 +147,14 @@ pub(super) async fn handle_websocket_proxy(
 /// WebSocket の上流へ送るパス（ルートの接頭辞を外して上流の `path_prefix` を前に付ける。HTTP/1.1 と
 /// HTTP/2・HTTP/3 の拡張 CONNECT（F-288）で共有）
 pub(super) fn ws_upstream_path(target: &ProxyTarget, path_str: &str, prefix: &[u8]) -> String {
+    // 接頭辞の末尾の `/` は残す（`compute_upstream_path` と同じ）
     let sub_path = if prefix.is_empty() {
         path_str.to_string()
+    } else if let Some(remaining) = path_str.strip_prefix(route_strip_prefix(prefix)) {
+        let base = target.path_prefix.trim_end_matches('/');
+        build_sub_path(base, remaining)
     } else {
-        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
-            let base = target.path_prefix.trim_end_matches('/');
-            build_sub_path(base, remaining)
-        } else {
-            path_str.to_string()
-        }
+        path_str.to_string()
     };
     if sub_path.is_empty() {
         "/".to_string()

@@ -733,6 +733,8 @@
 | B-373 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-373-request-target-fragment-non-utf8.md](bugs/B-373-request-target-fragment-non-utf8.md) | 要求先の `#`（フラグメント）を通し、ルートの照合・メッシュの RBAC は `/admin#x` を `/admin` と見ないのに上流は `/admin` を返していた。UTF-8 でない要求先は上流・キャッシュのキーで `/` に置き換えていた。どちらも 400（HTTP/2・HTTP/3 はストリームのエラー） |
 | B-374 | P3 | 修正済み（feat/beat-nginx） | [bugs/B-374-mesh-jwt-numeric-date.md](bugs/B-374-mesh-jwt-numeric-date.md) | メッシュの jwt_authn が小数・文字列・負の `exp`・`nbf` を無いものとして扱い、期限の切れたトークンを通していた（B-322 は TOML の経路だけ直していた）。`jwt_verify::times_ok` を共有する |
 | B-375 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-375-mesh-upstream-tls-auto-sni.md](bugs/B-375-mesh-upstream-tls-auto-sni.md) | メッシュの上流の TLS が `auto_sni`・`auto_san_validation`（Istio の DestinationRule の TLS で `sni`・`subjectAltNames` を書かない構成）を読まず、IP を名前にして証明書の名前を検査せずに繋いでいた。要求の Host を SNI にして検査し、プールの鍵にも入れる |
+| B-376 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-376-route-prefix-strip-double-slash.md](bugs/B-376-route-prefix-strip-double-slash.md) | `path = "/"` のルートが接頭辞の `/` を剥がして `//admin/x` を上流へ `/admin/x` として送り、その要求に一致しなかった `/admin/*` のルートの制限を素通りできた。接頭辞の末尾の `/` は剥がさない（HTTP/1.1・HTTP/2・HTTP/3・WebSocket） |
+| B-377 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-377-upstream-h2-max-frame-size-zero.md](bugs/B-377-upstream-h2-max-frame-size-zero.md) | 上流の HTTP/2 の多重化接続が SETTINGS_MAX_FRAME_SIZE を範囲を見ずに使い、0 を受けると HEADERS を分ける繰り返しが進まずワーカーが止まってメモリが尽きた。範囲外は接続エラーにする |
 
 ---
 

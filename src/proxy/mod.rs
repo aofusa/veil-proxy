@@ -320,6 +320,16 @@ fn build_sub_path(base: &str, remaining: &str) -> String {
     }
 }
 
+/// 上流へ送るパスからルートの接頭辞を外すときに剥がす部分。接頭辞の末尾の `/` は残す（残りのパスの先頭の `/` に
+/// なる）。`path = "/"` のルートで `//admin/x` から `/` を剥がすと `/admin/x` になり、`/admin/*` のルートの制限を
+/// 外れて来た要求を上流では守られたパスへ届けていた。`/api/` で `/api//x` を受けたときも同じ
+#[inline]
+fn route_strip_prefix(prefix: &[u8]) -> &str {
+    std::str::from_utf8(prefix)
+        .unwrap_or("")
+        .trim_end_matches('/')
+}
+
 /// 上流へ転送するリクエストパスを構築する。
 ///
 /// - `preserve_full_path = true`（gRPC）: ルート `/*` プレフィックスを除去しない。
@@ -344,14 +354,11 @@ fn compute_upstream_path(
     }
     let sub_path = if prefix.is_empty() {
         path_str.to_string()
+    } else if let Some(remaining) = path_str.strip_prefix(route_strip_prefix(prefix)) {
+        let base = target_path_prefix.trim_end_matches('/');
+        build_sub_path(base, remaining)
     } else {
-        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
-            let base = target_path_prefix.trim_end_matches('/');
-            build_sub_path(base, remaining)
-        } else {
-            path_str.to_string()
-        }
+        path_str.to_string()
     };
     if sub_path.is_empty() {
         "/".to_string()
@@ -763,6 +770,35 @@ mod path_tests {
     #[test]
     fn test_b40_grpc_path_empty_becomes_slash() {
         assert_eq!(compute_upstream_path("", b"", "", true), "/");
+    }
+
+    /// ルートの接頭辞の末尾の `/` は剥がさない。`path = "/"` のルートで `//admin/x` を `/admin/x` にすると、
+    /// `/admin/*` のルートの制限を外れて来た要求を上流では守られたパスへ届けてしまう
+    #[test]
+    fn root_route_keeps_double_slash_upstream() {
+        assert_eq!(
+            compute_upstream_path("//admin/x", b"/", "", false),
+            "//admin/x"
+        );
+        assert_eq!(
+            compute_upstream_path("//admin/x", b"/", "/v1", false),
+            "/v1//admin/x"
+        );
+        assert_eq!(compute_upstream_path("/api//x", b"/api/", "", false), "//x");
+        // 二重の `/` が無い要求は従来どおり
+        assert_eq!(compute_upstream_path("/x", b"/", "", false), "/x");
+        assert_eq!(compute_upstream_path("/x", b"/", "/v1", false), "/v1/x");
+        assert_eq!(compute_upstream_path("/", b"/", "", false), "/");
+        assert_eq!(compute_upstream_path("/", b"/", "/v1", false), "/v1/");
+        assert_eq!(
+            compute_upstream_path("/api/x", b"/api", "/v1", false),
+            "/v1/x"
+        );
+        assert_eq!(
+            compute_upstream_path("/api/x", b"/api/", "/v1", false),
+            "/v1/x"
+        );
+        assert_eq!(compute_upstream_path("/api", b"/api", "", false), "/");
     }
 
     #[test]

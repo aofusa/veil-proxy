@@ -39,7 +39,10 @@ pub(super) fn compute_upstream_request_path(
     let sub_path = if prefix.is_empty() {
         path_str.to_string()
     } else {
-        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+        // 接頭辞の末尾の `/` は残す（`path = "/"` のルートで `//admin/x` を `/admin/x` にしない。HTTP/1.1・HTTP/2 と同じ）
+        let prefix_str = std::str::from_utf8(prefix)
+            .unwrap_or("")
+            .trim_end_matches('/');
         if let Some(remaining) = path_str.strip_prefix(prefix_str) {
             let base = target_path_prefix.trim_end_matches('/');
             if remaining.is_empty() {

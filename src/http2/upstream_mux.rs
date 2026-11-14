@@ -673,6 +673,13 @@ fn handle_frame(g: &mut Inner, rs: &mut RecvState, frame: Frame) -> Result<(), C
                         }
                     }
                     0x5 => {
+                        // RFC 9113 §6.5.2: 16384〜16777215 の外は PROTOCOL_ERROR。0 を受け入れると HEADERS を
+                        // CONTINUATION に分ける繰り返しが進まず、メモリが尽きるまでフレームを積んでいた
+                        if !(defaults::MAX_FRAME_SIZE..=defaults::MAX_FRAME_SIZE_UPPER_LIMIT)
+                            .contains(&value)
+                        {
+                            return Err(ConnError);
+                        }
                         g.fenc.set_max_frame_size(value);
                         g.peer_max_frame = value as usize;
                     }
@@ -1861,5 +1868,43 @@ mod tests {
             wait_dead(&mux).await;
         });
         srv.join().unwrap();
+    }
+
+    /// 上流が SETTINGS_MAX_FRAME_SIZE に範囲外（0・16383・2^24）を送ったら接続エラーで閉じ、
+    /// 進行中のストリームは異常終了する（0 を受け入れると HEADERS を分ける繰り返しが進まなかった）。
+    #[test]
+    // 理由付き allow: テストの模擬上流サーバ（std の同期ソケット・スレッド。データプレーンではない）
+    #[allow(clippy::disallowed_methods)]
+    fn upstream_rejects_out_of_range_max_frame_size() {
+        if !runtime_available() {
+            eprintln!("skip: async runtime unavailable");
+            return;
+        }
+        for value in [0u32, 16_383, 16_777_216] {
+            let (client, server) = pair();
+            let srv = std::thread::spawn(move || {
+                let mut p = Peer::new(server, &[(0x5, value)]);
+                // クライアントが閉じるまで読み捨てる。
+                let mut buf = [0u8; 256];
+                while matches!(p.s.read(&mut buf), Ok(n) if n > 0) {}
+            });
+            run(async move {
+                let mux = H2Mux::start(client, false, Duration::from_millis(200));
+                let s = mux
+                    .open(b"GET", b"/x", b"up", std::iter::empty(), true)
+                    .unwrap();
+                assert_eq!(
+                    collect_response(&s, false, Duration::from_secs(5))
+                        .await
+                        .err(),
+                    Some(CollectError::Reset { retryable: false }),
+                    "SETTINGS_MAX_FRAME_SIZE={} must close the connection",
+                    value
+                );
+                drop(s);
+                wait_dead(&mux).await;
+            });
+            srv.join().unwrap();
+        }
     }
 }

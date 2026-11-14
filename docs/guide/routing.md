@@ -115,6 +115,10 @@ index = "dashboard.html"
 
 The remaining path after removing the prefix is joined to the backend URL.
 **Trailing slash is optional**.
+A trailing `/` of the route's `path` is not removed: it stays as the leading `/` of the remaining path. A request
+for `//admin/x` on a `path = "/"` route reaches the backend as `//admin/x`, not `/admin/x` (the `/admin/*` route,
+which did not match it, would otherwise be bypassed). Use `path_normalization = "merge_slashes"` to collapse
+repeated slashes before routing.
 
 ```toml
 # With trailing slash

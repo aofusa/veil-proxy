@@ -3586,6 +3586,25 @@ mod tests {
         assert_eq!(compute_upstream_request_path("", b"", "", false), "/");
     }
 
+    /// ルートの接頭辞の末尾の `/` は剥がさない（`path = "/"` のルートで `//admin/x` を `/admin/x` にしない。
+    /// HTTP/1.1・HTTP/2 の `compute_upstream_path` と同じ）
+    #[test]
+    fn root_route_keeps_double_slash_upstream() {
+        assert_eq!(
+            compute_upstream_request_path("//admin/x", b"/", "", false),
+            "//admin/x"
+        );
+        assert_eq!(
+            compute_upstream_request_path("//admin/x", b"/", "/v1", false),
+            "/v1//admin/x"
+        );
+        assert_eq!(
+            compute_upstream_request_path("/x", b"/", "/v1", false),
+            "/v1/x"
+        );
+        assert_eq!(compute_upstream_request_path("/", b"/", "", false), "/");
+    }
+
     /// B-39: compute_backend_path は preserve_full=false と同等
     #[test]
     fn test_compute_backend_path_matches_upstream_helper() {
