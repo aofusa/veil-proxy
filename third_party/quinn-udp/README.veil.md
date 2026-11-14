@@ -14,6 +14,12 @@ crates.io の [`quinn-udp` 0.5.16](https://crates.io/crates/quinn-udp/0.5.16) �
 （1 回の `recvmsg` で 1 データグラムを読む target＝OpenBSD・NetBSD・macOS 等で、切り詰められたデータグラムの後の
 `EAGAIN` でも古い `MSG_TRUNC` を見て受信のループが回り続ける）の修正を含む。
 
+上げたら上流の単体テスト（`src/unix.rs` の `tests`）を、このディレクトリを複製して `[workspace]` を足した仮のクレートで
+Linux と macOS で回す（`cargo test --lib`）。macOS ではループバックの配送が非同期なので、0.5.16 の
+`recv_single_skips_truncated_datagrams`（2 つ送った直後に非ブロッキングで受ける）が 2 つ目の到着前に読んで `WouldBlock` で
+落ちることがある（20 回中 9 回。受ける前に 20ms 待たせると 20 回とも通る）。コードの誤りではない。修正そのものを確かめる
+`recv_single_after_truncation_returns_would_block_instead_of_spin` は macOS でも毎回通る。
+
 ルート `Cargo.toml` の `[patch.crates-io]` で差し替える。**veil 本体は quinn-udp を使わない**
 （E2E・単体テスト用の HTTP/3 クライアント `quinn` / `h3-quinn` が依存する dev 専用の依存）。
 

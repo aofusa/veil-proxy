@@ -43,4 +43,7 @@ main の `container-security-nightly` が 2026-11-12 から毎晩落ちていた
 - `vendored_ghsa_audit.py`: 修正前の README（0.5.14）で GHSA-6pp4-4cxf-xf88 を MATCH にし、現在の木は 0 件（quiche の既知の
   ignore 3 件だけ）。wasmtime の上限を先に書いた範囲（GHSA-ff4p-7xrq-q5r8 等）は 36.0.20 に該当しない。
 - vendoring 版の quinn-udp の上流の単体テスト（`recv_single_after_truncation_returns_would_block_instead_of_spin` 等 4 件）が通る。
-  修正前の受信のループに戻すと、このテストが失敗する。
+  修正前の受信のループに戻すと、このテストが失敗する。macOS（llm）では修正を確かめる試験は毎回通り、
+  `recv_single_skips_truncated_datagrams` だけがループバックの非同期の配送で 20 回中 9 回 `WouldBlock` になる（受ける前に 20ms
+  待たせると 20 回とも通る。試験の競合でコードの誤りではない。`README.veil.md` に書いた）。
+- macOS で bindings の job と同じ `library_e2e.sh c c-kit python` が通る。
