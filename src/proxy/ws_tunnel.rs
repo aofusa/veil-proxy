@@ -947,7 +947,7 @@ async fn relay<B: RelayIo>(
                     return (down, up);
                 }
                 // END_STREAM・fin: 上流へ送信の終わりを伝え、上流の残りを返し続ける
-                let _ = backend.relay_tcp().shutdown(std::net::Shutdown::Write);
+                backend.close_write().await;
             }
             Ok(Ev::Upstream) => {
                 let buf = buf_get();

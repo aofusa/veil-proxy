@@ -428,8 +428,9 @@ pub(super) fn apply_session_resumption_mode(
                 .map_err(|e| io::Error::other(format!("TLS ticketer: {e}")))?;
             config.ticketer = Arc::clone(ticketer);
             // TLS 1.3 と、チケットを使う TLS 1.2 クライアントはステートレスに再開する
-            // （キャッシュに触れない）。チケット非対応で session ID を使う TLS 1.2 クライアント
-            // （LibreSSL の wrk 等）向けにキャッシュも持つ。
+            // （キャッシュに触れない）。チケットを使わず session ID で再開する TLS 1.2 クライアント
+            // 向けにキャッシュも持つ（rustls は TLS 1.2 の再開のたびにチケットを送り直すので、それを
+            // 保持しない LibreSSL 2.7 の wrk は 1 回おきにしか再開しない。"cache" なら毎回再開する。B-401）。
             config.session_storage = Arc::clone(session_cache(cache_size));
             config.send_tls13_tickets = tickets;
         }

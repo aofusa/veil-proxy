@@ -726,3 +726,86 @@ pub(super) async fn test_http3_configuration_check() {
         client_result.err()
     );
 }
+
+// ====================
+// B-401: TLS の接続を閉じる前の close_notify
+// ====================
+
+/// TLS で 1 要求を送り、相手が閉じるまで読む。読み終わりが close_notify（rustls の `Ok(0)`）か、close_notify 無しの EOF
+/// （rustls は `UnexpectedEof` にする）かを返す。
+fn tls_request_until_close(
+    config: Arc<ClientConfig>,
+    request: &[u8],
+) -> (String, std::io::Result<()>) {
+    let mut sock = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut conn = ClientConnection::new(config, server_name).unwrap();
+    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+    tls.write_all(request).unwrap();
+    let mut response = Vec::new();
+    let mut buf = [0u8; 16384];
+    let end = loop {
+        match tls.read(&mut buf) {
+            Ok(0) => break Ok(()),
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e) => break Err(e),
+        }
+    };
+    (String::from_utf8_lossy(&response).into_owned(), end)
+}
+
+/// `Connection: close` の応答の後、veil は close_notify を送ってから閉じる（TLS 1.3・TLS 1.2。RFC 8446 §6.1）。
+/// 送らずに閉じると、OpenSSL・LibreSSL のクライアントはその接続のセッションを再開できないものにする（B-401）。
+#[tokio::test]
+#[ntest::timeout(30000)]
+pub(super) async fn test_b401_close_notify_after_connection_close() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let tls13 = create_client_config();
+    let tls12 = Arc::new(
+        ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth(),
+    );
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    for (name, config) in [("TLS 1.3", tls13), ("TLS 1.2", tls12)] {
+        let (response, end) = tls_request_until_close(config, request);
+        assert_eq!(
+            get_status_code(&response),
+            Some(200),
+            "{name}: unexpected response: {response:?}"
+        );
+        assert!(
+            end.is_ok(),
+            "{name}: veil closed the connection without close_notify: {end:?}"
+        );
+    }
+}
+
+/// 不正な要求に誤りを返して閉じるときも close_notify を送る（`Drop` で送るので、どの経路で閉じても通る。B-401）。
+#[tokio::test]
+#[ntest::timeout(30000)]
+pub(super) async fn test_b401_close_notify_after_error_response() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let (response, end) = tls_request_until_close(
+        create_client_config(),
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\n",
+    );
+    assert_eq!(
+        get_status_code(&response),
+        Some(400),
+        "unexpected response: {response:?}"
+    );
+    assert!(
+        end.is_ok(),
+        "veil closed the connection without close_notify: {end:?}"
+    );
+}

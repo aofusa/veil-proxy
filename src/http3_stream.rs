@@ -459,6 +459,24 @@ impl TlsBackend {
     }
 }
 
+/// 上流の接続を閉じるときに close_notify を送る（B-401。`into_parts` で分解したストリームの `Drop` の代わり）。
+/// 待てないので 1 回だけ試す。
+impl Drop for TlsBackend {
+    fn drop(&mut self) {
+        let fd = self.inner.as_raw_fd();
+        match self.session.as_mut() {
+            Some(cell) => crate::tls_writev::send_close_notify_now(fd, cell.get_mut()),
+            // kTLS 移行済み: カーネルにアラートのレコードを作らせる
+            #[cfg(veil_ktls)]
+            None => {
+                let _ = crate::ktls::send_close_notify_alert(fd);
+            }
+            #[cfg(not(veil_ktls))]
+            None => {}
+        }
+    }
+}
+
 /// rustls セッションに滞留する復号済み平文を `dst` の未初期化スペアへ排出する。
 fn drain_plaintext(dst: &mut Vec<u8>, rd: &mut dyn std::io::Read) {
     loop {

@@ -396,8 +396,16 @@ impl SimpleTlsClientStream {
     ///
     /// HTTP/3 ストリーミング経路の全二重 TLS ラッパー（`http3_stream::TlsBackend`）構築用。
     /// 戻り値は `(TCP ストリーム, rustls セッション, 復号済みドレインバッファ)`。
+    ///
+    /// close_notify（B-401）は受け取った側（`TlsBackend`）が閉じるときに送るので、ここでは `Drop` を通さない。
     pub fn into_parts(self) -> (TcpStream, ClientConnection, Vec<u8>) {
-        (self.inner, self.conn, self.drained_buffer)
+        let mut this = std::mem::ManuallyDrop::new(self);
+        let drained = std::mem::take(&mut this.drained_buffer);
+        // SAFETY: `this` は ManuallyDrop で、以後 drop も参照もしない。`inner`・`conn` はここで 1 度だけ読み出して
+        // 所有権を移す（二重に閉じない・二重に解放しない）。所有権を持つ残りのフィールド（drained_buffer）は上で
+        // 取り出し済みで、残りは Copy なので何もリークしない
+        let (inner, conn) = unsafe { (std::ptr::read(&this.inner), std::ptr::read(&this.conn)) };
+        (inner, conn, drained)
     }
 }
 
@@ -721,8 +729,31 @@ impl crate::runtime::io::AsyncWriteRent for SimpleTlsServerStream {
         Ok(())
     }
 
+    /// close_notify を送ってから送信側を閉じる（B-401。HTTP/2 の GOAWAY の後。読み捨ては続けられる）。
     async fn shutdown(&mut self) -> io::Result<()> {
-        Ok(())
+        if self.mode == TlsMode::Rustls {
+            if let Some(conn) = self.conn.as_mut() {
+                crate::tls_writev::send_close_notify(
+                    &self.inner,
+                    conn,
+                    crate::tls_writev::CLOSE_NOTIFY_WAIT,
+                )
+                .await;
+            }
+        }
+        self.inner.shutdown(std::net::Shutdown::Write)
+    }
+}
+
+/// 閉じるときに close_notify を送る（B-401）。HTTP/1.1 の `Connection: close`・キープアライブの満了・graceful shutdown・
+/// 誤りの応答の後など、どの経路で閉じても通るように `Drop` で送る。待てないので 1 回だけ試す。
+impl Drop for SimpleTlsServerStream {
+    fn drop(&mut self) {
+        if self.mode == TlsMode::Rustls {
+            if let Some(conn) = self.conn.as_mut() {
+                crate::tls_writev::send_close_notify_now(self.inner.as_raw_fd(), conn);
+            }
+        }
     }
 }
 
@@ -858,8 +889,23 @@ impl crate::runtime::io::AsyncWriteRent for SimpleTlsClientStream {
         Ok(())
     }
 
+    /// close_notify を送ってから送信側を閉じる（B-401）。
     async fn shutdown(&mut self) -> io::Result<()> {
-        Ok(())
+        crate::tls_writev::send_close_notify(
+            &self.inner,
+            &mut self.conn,
+            crate::tls_writev::CLOSE_NOTIFY_WAIT,
+        )
+        .await;
+        self.inner.shutdown(std::net::Shutdown::Write)
+    }
+}
+
+/// 上流の接続を閉じるときも close_notify を送る（B-401。プールから捨てる・上流の `Connection: close` 等）。
+/// 待てないので 1 回だけ試す。
+impl Drop for SimpleTlsClientStream {
+    fn drop(&mut self) {
+        crate::tls_writev::send_close_notify_now(self.inner.as_raw_fd(), &mut self.conn);
     }
 }
 

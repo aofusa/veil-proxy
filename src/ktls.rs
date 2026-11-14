@@ -791,6 +791,49 @@ pub fn consume_control_record(fd: RawFd, read_err: io::Error) -> io::Result<Cont
     }
 }
 
+/// kTLS で送信している接続に close_notify のアラートを送る（RFC 8446 §6.1。B-401）。カーネルは
+/// `TLS_SET_RECORD_TYPE` の制御メッセージで渡した種別のレコードとして暗号化する（TLS 1.3 では内側の種別）。
+/// 待たない（`MSG_DONTWAIT`。送信バッファが一杯なら `WouldBlock`）。相手が先に閉じていても SIGPIPE を上げない
+/// （`MSG_NOSIGNAL`）。ユーザー空間の rustls で送っている接続は `tls_writev::send_close_notify_now` を使う。
+pub fn send_close_notify_alert(fd: RawFd) -> io::Result<()> {
+    const TLS_SET_RECORD_TYPE: libc::c_int = 1;
+    const CONTENT_ALERT: u8 = 21;
+    // Linux は SOL_TLS、FreeBSD は IPPROTO_TCP の階層で渡す（ktls(4)。OpenSSL の ktls.h と同じ）
+    #[cfg(target_os = "linux")]
+    const LEVEL: libc::c_int = SOL_TLS;
+    #[cfg(target_os = "freebsd")]
+    const LEVEL: libc::c_int = libc::IPPROTO_TCP;
+
+    // level = warning (1), description = close_notify (0)
+    let alert = [1u8, 0u8];
+    // CMSG_SPACE(1) は 8 バイト境界に揃えた値（16）。u64 の配列で整列を保証する
+    let mut cmsg_buf = [0u64; 4];
+    let mut iov = libc::iovec {
+        iov_base: alert.as_ptr() as *mut libc::c_void,
+        iov_len: alert.len(),
+    };
+    // SAFETY: msghdr はゼロ初期化が正しい初期値。ポインタは関数の間だけ生きる局所変数を指す。制御バッファ（32 バイト）は
+    // CMSG_SPACE(1) 以上なので、CMSG_FIRSTHDR は非 null で、ヘッダと 1 バイトのデータはその範囲に収まる
+    let ret = unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = libc::CMSG_SPACE(1) as _;
+        let c = libc::CMSG_FIRSTHDR(&msg);
+        (*c).cmsg_level = LEVEL;
+        (*c).cmsg_type = TLS_SET_RECORD_TYPE;
+        (*c).cmsg_len = libc::CMSG_LEN(1) as _;
+        *libc::CMSG_DATA(c) = CONTENT_ALERT;
+        libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

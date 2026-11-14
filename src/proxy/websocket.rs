@@ -473,12 +473,22 @@ pub(super) trait RelayIo:
     + crate::runtime::io::BufferedReadState
 {
     fn relay_tcp(&self) -> &TcpStream;
+
+    /// 送信の終わりを伝える（送信側だけを閉じ、相手の残りは読み続ける。HTTP/2・HTTP/3 の拡張 CONNECT のトンネル）。
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    fn close_write(&mut self) -> impl std::future::Future<Output = ()>;
 }
 
 impl RelayIo for TcpStream {
     #[inline]
     fn relay_tcp(&self) -> &TcpStream {
         self
+    }
+
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    fn close_write(&mut self) -> impl std::future::Future<Output = ()> {
+        let _ = TcpStream::shutdown(self, std::net::Shutdown::Write);
+        std::future::ready(())
     }
 }
 
@@ -487,12 +497,24 @@ impl RelayIo for ServerTls {
     fn relay_tcp(&self) -> &TcpStream {
         self.get_ref()
     }
+
+    /// close_notify を送ってから送信側を閉じる（TCP だけを閉じると相手には切り詰めに見える。B-401）
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    async fn close_write(&mut self) {
+        let _ = crate::runtime::io::AsyncWriteRent::shutdown(self).await;
+    }
 }
 
 impl RelayIo for ClientTls {
     #[inline]
     fn relay_tcp(&self) -> &TcpStream {
         self.get_ref()
+    }
+
+    /// close_notify を送ってから送信側を閉じる（TCP だけを閉じると相手には切り詰めに見える。B-401）
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    async fn close_write(&mut self) {
+        let _ = crate::runtime::io::AsyncWriteRent::shutdown(self).await;
     }
 }
 

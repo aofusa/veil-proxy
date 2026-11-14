@@ -140,6 +140,13 @@ With TLS (with or without kTLS) veil treats it as complete only if the upstream 
 the body may have been cut off, so it is not cached, a buffered or compressed response and a response to an
 HTTP/2 client become 502, and otherwise the client connection is closed (an HTTP/3 client sees the stream reset).
 
+veil itself sends close_notify before it closes a TLS connection (RFC 8446 §6.1), to clients and to upstreams, with
+or without kTLS: after a `Connection: close` response, when a keep-alive connection times out or the server shuts
+down, after an error response, and before the TCP half-close of a WebSocket tunnel to a TLS upstream. A client
+built on OpenSSL 3 that reads a connection to its end treats an end without close_notify as possibly truncated and
+drops the session, so its next connection would need a full handshake. When the socket's send buffer is full at that
+moment veil does not wait for it, except after an HTTP/2 GOAWAY, where it waits up to 500 ms.
+
 ## TLS Session Resumption (F-183)
 
 `[tls] session_resumption` selects how HTTP/1.1 and HTTP/2 clients resume TLS sessions

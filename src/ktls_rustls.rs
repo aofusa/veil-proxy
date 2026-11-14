@@ -74,6 +74,8 @@ pub struct KtlsServerStream {
     alpn_protocol: Option<Vec<u8>>,
     /// kTLS 有効化前に rustls が復号したデータ（ドレインバッファ）
     drained_buffer: Vec<u8>,
+    /// kTLS で送信しているとき、close_notify を送った（B-401。rustls で送るときは rustls が覚えている）
+    sent_close_notify: bool,
 }
 
 impl crate::runtime::io::BufferedReadState for KtlsServerStream {
@@ -308,6 +310,8 @@ pub struct KtlsClientStream {
     negotiated_h2: bool,
     /// 相手の close_notify を受けた（F-282: EOF で区切る応答の切り詰めを見分ける）
     close_notify: bool,
+    /// kTLS で送信しているとき、close_notify を送った（B-401。rustls で送るときは rustls が覚えている）
+    sent_close_notify: bool,
 }
 
 impl crate::runtime::io::BufferedReadState for KtlsClientStream {
@@ -412,8 +416,17 @@ impl KtlsClientStream {
     /// ための全二重ラッパー（`http3_stream::TlsBackend`）の構築に使う。戻り値は
     /// `(TCP ストリーム, rustls セッション（kTLS 移行済みなら None）, TLS モード,
     /// 復号済みドレインバッファ)`。
+    ///
+    /// close_notify（B-401）は受け取った側（`TlsBackend`）が閉じるときに送るので、ここでは `Drop` を通さない。
     pub fn into_parts(self) -> (TcpStream, Option<ClientConnection>, TlsMode, Vec<u8>) {
-        (self.inner, self.conn, self.mode, self.drained_buffer)
+        let mut this = std::mem::ManuallyDrop::new(self);
+        let conn = this.conn.take();
+        let drained = std::mem::take(&mut this.drained_buffer);
+        // SAFETY: `this` は ManuallyDrop で、以後 drop も参照もしない。`inner` はここで 1 度だけ読み出して所有権を移す
+        // （二重に閉じない）。所有権を持つ他のフィールド（conn・drained_buffer）は上で取り出し済みで、残りは Copy なので
+        // 何もリークしない
+        let inner = unsafe { std::ptr::read(&this.inner) };
+        (inner, conn, this.mode, drained)
     }
 }
 
@@ -933,6 +946,7 @@ pub async fn accept_plain(
         mode: TlsMode::Plain,
         alpn_protocol: None,
         drained_buffer: initial_data.unwrap_or_default(),
+        sent_close_notify: false,
     })
 }
 
@@ -1026,6 +1040,7 @@ pub async fn accept(
         mode,
         alpn_protocol,
         drained_buffer,
+        sent_close_notify: false,
     })
 }
 
@@ -1122,6 +1137,7 @@ pub async fn accept_with_peer_cert(
             mode,
             alpn_protocol,
             drained_buffer,
+            sent_close_notify: false,
         },
         peer_cert,
     ))
@@ -1212,6 +1228,7 @@ pub async fn connect(
         drained_buffer,
         negotiated_h2,
         close_notify: false,
+        sent_close_notify: false,
     })
 }
 
@@ -1388,9 +1405,59 @@ impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
         Ok(())
     }
 
+    /// close_notify を送ってから送信側を閉じる（B-401。HTTP/2 の GOAWAY の後。読み捨ては続けられる）。
     async fn shutdown(&mut self) -> io::Result<()> {
-        Ok(())
+        if self.mode == TlsMode::Plain {
+            return self.inner.shutdown(std::net::Shutdown::Write);
+        }
+        if let Some(conn) = self.conn.as_mut() {
+            crate::tls_writev::send_close_notify(
+                &self.inner,
+                conn,
+                crate::tls_writev::CLOSE_NOTIFY_WAIT,
+            )
+            .await;
+        } else if !self.sent_close_notify {
+            self.sent_close_notify = true;
+            send_ktls_close_notify(&self.inner).await;
+        }
+        self.inner.shutdown(std::net::Shutdown::Write)
     }
+}
+
+/// 閉じるときに close_notify を送る（B-401）。HTTP/1.1 の `Connection: close`・キープアライブの満了・graceful shutdown・
+/// 誤りの応答の後など、どの経路で閉じても通るように `Drop` で送る。待てないので 1 回だけ試す。
+impl Drop for KtlsServerStream {
+    fn drop(&mut self) {
+        let fd = self.inner.as_raw_fd();
+        match (self.mode, self.conn.as_mut()) {
+            (TlsMode::Plain, _) => {}
+            (_, Some(conn)) => crate::tls_writev::send_close_notify_now(fd, conn),
+            (TlsMode::KtlsTxOnly | TlsMode::KtlsFull, None) if !self.sent_close_notify => {
+                self.sent_close_notify = true;
+                let _ = crate::ktls::send_close_notify_alert(fd);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// kTLS で送信している接続に close_notify を送る。送信バッファが空くのを `CLOSE_NOTIFY_WAIT` まで待つ。
+async fn send_ktls_close_notify(inner: &TcpStream) {
+    let fd = inner.as_raw_fd();
+    let _ = crate::runtime::time::timeout(crate::tls_writev::CLOSE_NOTIFY_WAIT, async {
+        loop {
+            match crate::ktls::send_close_notify_alert(fd) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if inner.writable().await.is_err() {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    })
+    .await;
 }
 
 // ====================
@@ -1568,8 +1635,36 @@ impl crate::runtime::io::AsyncWriteRent for KtlsClientStream {
         Ok(())
     }
 
+    /// close_notify を送ってから送信側を閉じる（B-401）。
     async fn shutdown(&mut self) -> io::Result<()> {
-        Ok(())
+        if let Some(conn) = self.conn.as_mut() {
+            crate::tls_writev::send_close_notify(
+                &self.inner,
+                conn,
+                crate::tls_writev::CLOSE_NOTIFY_WAIT,
+            )
+            .await;
+        } else if self.mode != TlsMode::Rustls && !self.sent_close_notify {
+            self.sent_close_notify = true;
+            send_ktls_close_notify(&self.inner).await;
+        }
+        self.inner.shutdown(std::net::Shutdown::Write)
+    }
+}
+
+/// 上流の接続を閉じるときも close_notify を送る（B-401。プールから捨てる・上流の `Connection: close` 等）。
+/// 待てないので 1 回だけ試す。
+impl Drop for KtlsClientStream {
+    fn drop(&mut self) {
+        let fd = self.inner.as_raw_fd();
+        match (self.mode, self.conn.as_mut()) {
+            (_, Some(conn)) => crate::tls_writev::send_close_notify_now(fd, conn),
+            (TlsMode::KtlsTxOnly | TlsMode::KtlsFull, None) if !self.sent_close_notify => {
+                self.sent_close_notify = true;
+                let _ = crate::ktls::send_close_notify_alert(fd);
+            }
+            _ => {}
+        }
     }
 }
 

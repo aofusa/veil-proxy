@@ -195,6 +195,8 @@ impl Write for FdVectoredWriter {
 pub(crate) trait TlsWriteSink {
     fn sink_wants_write(&self) -> bool;
     fn sink_write_tls(&mut self, wr: &mut dyn io::Write) -> io::Result<usize>;
+    /// close_notify のアラートを送信待ちに積む（積み済み・致命的なアラートを送った後なら何もしない）
+    fn sink_send_close_notify(&mut self);
 }
 
 impl TlsWriteSink for rustls::ServerConnection {
@@ -206,6 +208,11 @@ impl TlsWriteSink for rustls::ServerConnection {
     #[inline]
     fn sink_write_tls(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
         self.write_tls(wr)
+    }
+
+    #[inline]
+    fn sink_send_close_notify(&mut self) {
+        self.send_close_notify();
     }
 }
 
@@ -220,6 +227,11 @@ impl<T: TlsWriteSink + ?Sized> TlsWriteSink for Box<T> {
     fn sink_write_tls(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
         (**self).sink_write_tls(wr)
     }
+
+    #[inline]
+    fn sink_send_close_notify(&mut self) {
+        (**self).sink_send_close_notify()
+    }
 }
 
 impl TlsWriteSink for rustls::ClientConnection {
@@ -231,6 +243,11 @@ impl TlsWriteSink for rustls::ClientConnection {
     #[inline]
     fn sink_write_tls(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
         self.write_tls(wr)
+    }
+
+    #[inline]
+    fn sink_send_close_notify(&mut self) {
+        self.send_close_notify();
     }
 }
 
@@ -268,6 +285,118 @@ pub(crate) async fn flush_tls_writev(
     }
     Ok(())
 }
+
+// ====================
+// close_notify（B-401）
+// ====================
+//
+// RFC 8446 §6.1: 誤りのアラートを送っていない限り、書き込み側を閉じる前に close_notify を送る。送らずに閉じると、
+// EOF まで読む OpenSSL 3 のクライアントは切り詰めの攻撃と見分けられないので、その接続のセッションを捨てる（次の接続が
+// 完全なハンドシェイクになる）。veil は TLS の接続を close_notify 無しで閉じていたので、`Connection: close` の応答を
+// EOF まで読むクライアントが毎回完全なハンドシェイクをしていた。
+
+/// 閉じる直前の送出に使う、待たない `io::Write`。`MSG_DONTWAIT` で送信バッファが一杯なら `WouldBlock` を返し
+/// （io_uring の CONNECT で作ったソケットはノンブロッキングとは限らない）、`MSG_NOSIGNAL` で相手が先に閉じていても
+/// SIGPIPE を上げない（veil は SIGPIPE を無視しないプロセスにライブラリとして組み込まれることがある）。
+///
+/// macOS の送信は `MSG_DONTWAIT` を見ない（ブロッキングのソケットでは空きを待つ。`O_NONBLOCK` だけを見る）。macOS の
+/// veil のソケットは reactor が作るので常にノンブロッキング（`create_nonblocking_socket`・accept の `fcntl`）で、待たない。
+#[cfg(unix)]
+struct NoWaitWriter {
+    fd: RawFd,
+}
+
+#[cfg(unix)]
+impl Write for NoWaitWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[IoSlice::new(buf)])
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        if bufs.is_empty() {
+            return Ok(0);
+        }
+        // macOS には `MSG_NOSIGNAL` が無い（reactor の TcpStream と同じく、ソケットの `SO_NOSIGPIPE` で抑える）
+        #[cfg(target_os = "macos")]
+        const FLAGS: libc::c_int = libc::MSG_DONTWAIT;
+        #[cfg(not(target_os = "macos"))]
+        const FLAGS: libc::c_int = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+        // SAFETY: msghdr はゼロ初期化が正しい初期値。`IoSlice` は unix で `iovec` と同じレイアウト
+        // （`FdVectoredWriter::write_vectored` と同じ）で、指す先は呼び出しの間だけ生きる `bufs`。
+        // 本数は `MAX_IOVEC` でクランプし、`bufs` の要素数を超えない。sendmsg は iovec を読むだけ
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = bufs.as_ptr() as *mut libc::iovec;
+        msg.msg_iovlen = bufs.len().min(MAX_IOVEC) as _;
+        let ret = unsafe { libc::sendmsg(self.fd, &msg, FLAGS) };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(ret as usize)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[inline]
+fn no_wait_writer(fd: RawFd) -> NoWaitWriter {
+    NoWaitWriter { fd }
+}
+
+/// Windows のソケットはノンブロッキング（WSAPoll の reactor）で、SIGPIPE も無い。
+#[cfg(windows)]
+#[inline]
+fn no_wait_writer(fd: RawFd) -> FdVectoredWriter {
+    FdVectoredWriter::new(fd)
+}
+
+/// rustls の送信待ちの暗号文を、待たずに書けるだけ書く。
+fn write_tls_now(fd: RawFd, conn: &mut impl TlsWriteSink) -> io::Result<()> {
+    while conn.sink_wants_write() {
+        let mut w = no_wait_writer(fd);
+        if conn.sink_write_tls(&mut w)? == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// close_notify を積んで、待たずに送る。`Drop` で閉じる直前に呼ぶ（待てない）。送信バッファが一杯・相手が閉じた等で
+/// 送れなければ諦める（接続を閉じることに変わりは無い）。接続ごとに 1 回の `sendmsg(2)`。
+pub(crate) fn send_close_notify_now(fd: RawFd, conn: &mut impl TlsWriteSink) {
+    conn.sink_send_close_notify();
+    let _ = write_tls_now(fd, conn);
+}
+
+/// close_notify を積んで送る。送信バッファが空くのを `wait` まで待つ（`AsyncWriteRent::shutdown` から呼ぶ）。
+pub(crate) async fn send_close_notify(
+    stream: &TcpStream,
+    conn: &mut impl TlsWriteSink,
+    wait: std::time::Duration,
+) {
+    conn.sink_send_close_notify();
+    let fd = stream.as_raw_fd();
+    let _ = crate::runtime::time::timeout(wait, async {
+        loop {
+            match write_tls_now(fd, conn) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if stream.writable().await.is_err() {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    })
+    .await;
+}
+
+/// `AsyncWriteRent::shutdown` で close_notify の送出を待つ上限（相手が読まずに送信バッファが空かない接続で
+/// 閉じる処理を止めない。HTTP/2 の GOAWAY の後の読み捨ての上限と同じ）。
+pub(crate) const CLOSE_NOTIFY_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 // ====================
 // テスト
@@ -483,7 +612,8 @@ mod read_tls_all_tests {
     use std::sync::Arc;
 
     /// サーバが Finished 待ちになるところまでメモリ上でハンドシェイクを進める。
-    fn pair_until_client_finished() -> (rustls::ClientConnection, rustls::ServerConnection) {
+    pub(super) fn pair_until_client_finished(
+    ) -> (rustls::ClientConnection, rustls::ServerConnection) {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let provider = Arc::new(crate::tls_provider::provider::default_provider());
         let cert_der = ck.cert.der().clone();
@@ -565,6 +695,132 @@ mod read_tls_all_tests {
             n,
             wire.len()
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod close_notify_tests {
+    use super::read_tls_all;
+    use super::read_tls_all_tests::pair_until_client_finished;
+    use super::send_close_notify_now;
+    use std::io;
+
+    /// メモリ上でハンドシェイクを終わらせる（クライアントの Finished をサーバへ、サーバの残り（TLS 1.3 のチケット）を
+    /// クライアントへ渡す）。
+    fn established_pair() -> (rustls::ClientConnection, rustls::ServerConnection) {
+        let (mut client, mut server) = pair_until_client_finished();
+        let mut wire = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut wire).unwrap();
+        }
+        read_tls_all(&mut server, &wire).unwrap();
+        assert!(!server.is_handshaking());
+        let mut wire = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut wire).unwrap();
+        }
+        read_tls_all(&mut client, &wire).unwrap();
+        (client, server)
+    }
+
+    fn socketpair(nonblocking_rx: bool) -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        let ret =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "socketpair failed: {}", io::Error::last_os_error());
+        if nonblocking_rx {
+            let flags = unsafe { libc::fcntl(fds[1], libc::F_GETFL, 0) };
+            assert_eq!(
+                unsafe { libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+        }
+        (fds[0], fds[1])
+    }
+
+    fn read_available(fd: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+            if n <= 0 {
+                return out;
+            }
+            out.extend_from_slice(&chunk[..n as usize]);
+        }
+    }
+
+    /// 閉じる直前に送った close_notify を相手が「正しく閉じた」と読める。2 回呼んでも 2 つ目は送らない（B-401）。
+    #[test]
+    fn close_notify_reaches_the_peer_once() {
+        let (mut client, mut server) = established_pair();
+        let (tx, rx) = socketpair(true);
+        send_close_notify_now(tx, &mut server);
+        let wire = read_available(rx);
+        assert!(!wire.is_empty(), "no close_notify was written");
+        read_tls_all(&mut client, &wire).unwrap();
+        let state = client.process_new_packets().unwrap();
+        assert!(state.peer_has_closed(), "the peer did not see close_notify");
+
+        send_close_notify_now(tx, &mut server);
+        assert!(read_available(rx).is_empty(), "close_notify was sent twice");
+        unsafe {
+            libc::close(tx);
+            libc::close(rx);
+        }
+    }
+
+    /// 送信バッファが一杯でも待たない（`Drop` から呼ぶ。ブロッキングのソケットでも返る。B-401）。
+    #[test]
+    fn close_notify_does_not_wait_for_a_full_socket() {
+        let (_client, mut server) = established_pair();
+        // tx はブロッキングのまま（io_uring の CONNECT で作ったソケットはノンブロッキングとは限らない）。macOS の送信は
+        // MSG_DONTWAIT を見ないので、veil のソケット（reactor が作るので常にノンブロッキング）と同じくノンブロッキングにする
+        let (tx, rx) = socketpair(false);
+        #[cfg(target_os = "macos")]
+        unsafe {
+            let flags = libc::fcntl(tx, libc::F_GETFL, 0);
+            assert_eq!(libc::fcntl(tx, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+        }
+        let fill = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::send(
+                    tx,
+                    fill.as_ptr() as *const libc::c_void,
+                    fill.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n < 0 {
+                assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+                break;
+            }
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send_close_notify_now(tx, &mut server);
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        // 待ってしまった場合も試験を終わらせる（相手を閉じると書き込みは EPIPE で戻る）
+        unsafe { libc::close(rx) };
+        worker.join().unwrap();
+        unsafe { libc::close(tx) };
+        assert!(
+            result.is_ok(),
+            "send_close_notify_now blocked on a full socket"
+        );
+    }
+
+    /// 相手が先に閉じていても返る（`MSG_NOSIGNAL`。誤りは捨てる）。
+    #[test]
+    fn close_notify_to_a_closed_peer_returns() {
+        let (_client, mut server) = established_pair();
+        let (tx, rx) = socketpair(false);
+        unsafe { libc::close(rx) };
+        send_close_notify_now(tx, &mut server);
+        unsafe { libc::close(tx) };
     }
 }
 
