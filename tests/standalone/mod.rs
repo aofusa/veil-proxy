@@ -72,13 +72,20 @@ fn raise_nofile_limit() {}
 ///
 /// HTTP/3 は TLS と同じ番号の UDP で待ち受ける。Windows では Hyper-V などが UDP だけ予約する範囲があり
 /// （`netsh int ipv4 show excludedportrange protocol=udp`）、TCP で空いていても UDP の bind が `WSAEACCES` で失敗する（B-352）。
+///
+/// このプロセスで一度返した番号は返さない。Windows の `bind(0)` は閉じたばかりの番号をまた返すことがあり、1 つの試験の
+/// 平文と TLS のポートが同じ番号になって設定の検査で落ちた（B-403）。並列に走る別の試験との衝突も避けられる。
 pub fn free_port() -> u16 {
+    static GIVEN: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
     raise_nofile_limit();
     let mut rejected = Vec::new();
     for _ in 0..64 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+            && GIVEN.lock().unwrap_or_else(|e| e.into_inner()).insert(port)
+        {
             return port;
         }
         // 同じ番号を次の周回で引かないように、失敗したものは持ったままにする
