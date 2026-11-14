@@ -153,8 +153,11 @@ Every 100 ms a control thread reads each worker's busy time and request rate and
 (N) receive new connections. It replaces the CBPF program of the listener's SO_REUSEPORT group, so new
 connections go to the first N workers; accepting never stops.
 
-- At start, after 5 seconds without load, and when the number of connections suddenly doubles, all workers receive
-  connections.
+- At start, when the load pauses (no requests for 0.5 seconds, or at once when no connection is left), and when the
+  number of connections suddenly doubles, all workers receive connections, so a burst of HTTP/2 connections after a
+  pause is spread over every worker. When the load comes back after a pause without such a jump, N goes back to its
+  value before the pause at once; if the connections on the other workers do not move (HTTP/2, WebSocket), all
+  workers keep receiving connections.
 - When the active workers are mostly idle, N is reduced (by at most half at a time) and the change is kept only
   if throughput does not drop.
 - When the active workers are saturated, or busy enough that more workers might help (for example a proxy that

@@ -14,11 +14,12 @@
 //!   渡し、HTTP/1.1 の応答の区切りで `Connection: close` を返して閉じる（クライアントは張り直して、新しいプログラムで
 //!   振り分けられる）。HTTP/2 の接続は動かさない（GOAWAY を受けて張り直さないクライアントがある。h2load は残りの
 //!   要求を失敗にする）。
-//! - **N の決め方**（`Policy`）: 起動時・負荷の無い状態が続いた後・接続が急に増えたときは全ワーカー。制御スレッドが
-//!   100ms ごとに各ワーカーの使用率（park していない時間の割合）と応答の数を読み、使用率が低ければ（1 回に半分まで）
-//!   縮めてみて、スループットが落ちなければ残す。飽和したとき、または飽和はしないが忙しいとき（上流を待つ中継）は
+//! - **N の決め方**（`Policy`）: 起動時・負荷の切れ目（0.5 秒。接続が残っていなければすぐ）・接続が急に増えたときは
+//!   全ワーカー。制御スレッドが 100ms ごとに各ワーカーの使用率（park していない時間の割合）と応答の数を読み、
+//!   使用率が低ければ（1 回に半分まで）縮めてみて、スループットが落ちなければ残す。飽和したとき、または飽和はしないが忙しいとき（上流を待つ中継）は
 //!   半分ずつ広げてみて、スループットが増えなければ戻す（失敗が続くほど間を空ける）。接続が動かない変更
-//!   （HTTP/2 の長い接続だけ）は試すのをやめる。本数の下限はワーカーの数の 4 分の 1（2 以上）。
+//!   （HTTP/2 の長い接続だけ）は試すのをやめる。負荷の切れ目の後に同じ規模の負荷が戻ったら、切れ目の前の本数へすぐ
+//!   縮めてみる。本数の下限はワーカーの数の 4 分の 1（2 以上）。
 //!
 //! データプレーンの費用は park の前後の時刻の読み取り 2 回と、応答ごとの単独書き手のカウンタ 1 つだけ。
 //! 対象は Linux の TCP リスナーで、それ以外の環境ではフック（ワーカーの計測値が無い）は何もしない。
@@ -196,8 +197,13 @@ mod imp {
     const SHRINK_TARGET: f64 = 0.85;
     /// これ未満の要求レートでは縮めない（集約して接続を切り替える理由が無い）
     const MIN_RPS: f64 = 1_000.0;
-    /// 負荷の無い状態がこの周回数（5 秒）続いたら全ワーカーへ戻す（次に来る接続の重さが分からない。HTTP/2 の接続は
-    /// 後から動かせないので、重い HTTP/2 の接続が少数のワーカーへ固まらないように広く受ける）
+    /// 負荷の無い状態がこの周回数（0.5 秒）続いたら、新しい接続を全ワーカーで受ける（次に来る接続の重さ・種類が
+    /// 分からない。HTTP/2 の接続は後から動かせないので、負荷の切れ目の後に来た HTTP/2 の接続の束が、前の負荷で縮めた
+    /// 少数のワーカーへ固まらないようにする。B-366）。負荷が戻ったら切れ目の前の本数へすぐ縮めてみる（`resume`）。
+    /// 接続が 1 本も残っていなければ待たずに広げる（負荷の道具の反復の合間等。動かす接続が無く、次の負荷はすぐ来る。
+    /// 道具の起動の 0.5 秒前後の合間では、この周回数だけでは広げ損ねる）
+    const SPREAD_IDLE_TICKS: u32 = 5;
+    /// 負荷の無い状態がこの周回数（5 秒）続いたら、失敗した試しの待ちを捨てる（次の負荷は別の負荷として探す）
     const IDLE_RESET_TICKS: u32 = 50;
     /// 変えた後、接続が動く間は測らない周回数
     const SETTLE_TICKS: u32 = 2;
@@ -264,6 +270,8 @@ mod imp {
         /// 飽和していないが広げてみる（上流を待つ仕事等）
         Explore,
         Shrink,
+        /// 負荷の切れ目の後に、切れ目の前の本数へ縮めてみる
+        Resume,
     }
 
     /// 変えてみた後の測定（[`Policy::observe`]）
@@ -294,9 +302,11 @@ mod imp {
 
     /// N の決め方（入力だけで決まる。時間は周回の番号で持つ）
     ///
-    /// - 起動時・負荷の無い状態が続いた後・接続が急に増えたときは全ワーカー（接続の重さが分からない間は広く受ける）。
+    /// - 起動時・負荷の切れ目・接続が急に増えたときは全ワーカー（接続の重さが分からない間は広く受ける）。
     ///   負荷が変わったら（接続の数の倍増・半減、負荷の無い状態）失敗した試しの待ちを捨てる（前の負荷の結果で次の負荷を
-    ///   妨げない）。
+    ///   妨げない）。切れ目の後に同じ規模（急増でない接続の数）の負荷が戻ったら、切れ目の前の本数へすぐ縮めてみる
+    ///   （HTTP/1.1 は動いて残り、動かない HTTP/2 等は全ワーカーへ戻る）。負荷が止んで測れなくなった試しはやめる
+    ///   （失敗に数えない）。
     /// - 使用率が低ければ、目標の使用率に見合う本数まで縮めてみて、スループットが落ちなければ残す（集めると
     ///   1 要求の費用が下がるので、縮めた後にさらに縮められることがある。縮め続ける間は最初に縮める前と比べ、少しずつ
     ///   落ちていくのを防ぐ）。外したワーカーの接続が動かなければ（HTTP/2 等）元に戻す。
@@ -332,6 +342,8 @@ mod imp {
         conns_dip_max: u32,
         /// 接続の急増が続いている周回数
         surge_ticks: u32,
+        /// 負荷の切れ目で全ワーカーへ広げる前の本数（負荷が戻ったらまずこれへ縮めてみる）
+        resume: Option<usize>,
         /// 最後に N を変えた周回
         last_change: u64,
         tick: u64,
@@ -360,6 +372,7 @@ mod imp {
                 conns_dip_ticks: 0,
                 conns_dip_max: 0,
                 surge_ticks: 0,
+                resume: None,
                 last_change: 0,
                 tick: 0,
             }
@@ -372,10 +385,10 @@ mod imp {
             let rps: f64 = worker_rps.iter().sum();
 
             // 接続が急に増えた（負荷の始まり）: 測定中の変更も捨てて探し直す。少ない本数で受けていれば全ワーカーへ戻す
-            if conns
+            let surging = conns
                 >= (self.base_conns.saturating_mul(SURGE_FACTOR))
-                    .max(self.base_conns.saturating_add(self.workers as u32))
-            {
+                    .max(self.base_conns.saturating_add(self.workers as u32));
+            if surging {
                 self.surge_ticks += 1;
                 if self.surge_ticks >= SURGE_TICKS {
                     self.probing = None;
@@ -396,6 +409,12 @@ mod imp {
             }
 
             if let Some(p) = self.probing.as_mut() {
+                // 負荷が止んだ: 測れないので試しをやめる（失敗に数えない）
+                if rps < MIN_RPS {
+                    let probe = *p;
+                    self.probing = None;
+                    return self.abandon(probe);
+                }
                 p.ticks += 1;
                 if p.ticks <= SETTLE_TICKS {
                     return Action::Hold;
@@ -409,10 +428,6 @@ mod imp {
                 self.probing = None;
                 return self.judge(probe, conns);
             }
-            // 接続を動かしている間（変えた直後）は基準を下げない（閉じた接続が張り直すまで数が減って見える）
-            if self.tick > self.last_change + u64::from(SETTLE_TICKS + SHED_EXPIRE_TICKS) {
-                self.follow_conns(conns);
-            }
 
             if rps < MIN_RPS {
                 self.high_ticks = 0;
@@ -420,6 +435,12 @@ mod imp {
                 self.low_ticks = 0;
                 self.recent_len = 0;
                 self.idle_ticks = self.idle_ticks.saturating_add(1);
+                if n < self.workers && (self.idle_ticks == SPREAD_IDLE_TICKS || conns == 0) {
+                    // 負荷の切れ目: 次の接続を全ワーカーで受け、負荷が戻ったら今の本数へ縮めてみる（接続が残っていなければ
+                    // すぐ。残っていれば 0.5 秒待つ）
+                    self.resume = Some(n);
+                    return self.change_idle(self.workers);
+                }
                 if self.idle_ticks >= IDLE_RESET_TICKS {
                     if n < self.workers {
                         self.restart_search();
@@ -431,12 +452,24 @@ mod imp {
                 return Action::Hold;
             }
             self.idle_ticks = 0;
+            // 接続を動かしている間（変えた直後）は基準を下げない（閉じた接続が張り直すまで数が減って見える）。負荷の無い
+            // 間も下げない（切れ目の後に同じ数で戻った負荷を急増と見誤らない。準備運転の後の重い負荷は急増のまま）
+            if self.tick > self.last_change + u64::from(SETTLE_TICKS + SHED_EXPIRE_TICKS) {
+                self.follow_conns(conns);
+            }
             self.recent_rps = [self.recent_rps[1], self.recent_rps[2], rps];
             self.recent_len = (self.recent_len + 1).min(self.recent_rps.len());
             let before_rps = self.recent_rps[self.recent_rps.len() - self.recent_len..]
                 .iter()
                 .sum::<f64>()
                 / self.recent_len as f64;
+
+            // 負荷の切れ目の後に戻った: 切れ目の前の本数へすぐ縮めてみる（急増なら探し直すので使わない）
+            if let Some(to) = self.resume.take() {
+                if n == self.workers && to < n && !surging {
+                    return self.start_resume(n, to, before_rps, worker_rps, conns);
+                }
+            }
 
             if util >= GROW_UTIL && n < self.workers {
                 self.mid_ticks = 0;
@@ -509,6 +542,59 @@ mod imp {
             Action::Resize { to, shift }
         }
 
+        /// 負荷の無い間に N を変える（接続は動かさない。接続の数の基準は前の負荷のまま残し、負荷が戻ったときの
+        /// 急増の判定に使う）
+        fn change_idle(&mut self, to: usize) -> Action {
+            self.last_change = self.tick;
+            self.surge_ticks = 0;
+            Action::Resize {
+                to,
+                shift: Shift::None,
+            }
+        }
+
+        /// 負荷が止んで測れなくなった試しをやめる（失敗に数えず、待ちも延ばさない）。変える前の本数へ戻す。切れ目の前の
+        /// 本数へ縮めてみていたなら、次に負荷が戻ったときにまた試す（準備運転の後に本番の負荷が来る等）
+        fn abandon(&mut self, p: Probe) -> Action {
+            if p.kind == ProbeKind::Resume {
+                self.resume = Some(p.to);
+            }
+            self.change_idle(p.from)
+        }
+
+        /// 切れ目の前の本数へ縮めてみる（全ワーカーで受けた接続のうち、外すワーカーの HTTP/1.1 の接続を動かす）
+        fn start_resume(
+            &mut self,
+            from: usize,
+            to: usize,
+            before_rps: f64,
+            worker_rps: &[f64],
+            conns: u32,
+        ) -> Action {
+            let removed: f64 = worker_rps[to..from].iter().sum();
+            self.recent_len = 0;
+            self.high_ticks = 0;
+            self.mid_ticks = 0;
+            self.low_ticks = 0;
+            // 前の負荷の基準とは比べない（戻った負荷は軽いかもしれない）
+            self.shrink_ref = None;
+            self.probing = Some(Probe {
+                kind: ProbeKind::Resume,
+                from,
+                to,
+                before_rps,
+                before_moved_rps: removed,
+                ticks: 0,
+                after_rps: 0.0,
+                after_moved_rps: 0.0,
+            });
+            // 接続の数の基準は前の負荷の数を下回らせない（張り終わる前の数を基準にすると、残りを急増と見誤る）
+            let base = self.base_conns.max(conns);
+            let action = self.change(to, Shift::Rebalance, conns);
+            self.base_conns = base;
+            action
+        }
+
         /// 接続の数が基準を下回ったままなら、その間の最大値まで基準を下げる
         fn follow_conns(&mut self, conns: u32) {
             if conns >= self.base_conns {
@@ -538,6 +624,7 @@ mod imp {
             self.mid_ticks = 0;
             self.low_ticks = 0;
             self.idle_ticks = 0;
+            self.resume = None;
             self.forget_failures();
         }
 
@@ -642,6 +729,27 @@ mod imp {
                     // 遅くなった（集めすぎ）: 元に戻す。続けて失敗するほど間を空ける
                     self.shrink_cooldown_until = self.tick + self.shrink_backoff;
                     self.shrink_backoff = (self.shrink_backoff * 2).min(SHRINK_COOLDOWN_MAX_TICKS);
+                    self.change(p.from, Shift::Rebalance, conns)
+                }
+                ProbeKind::Resume => {
+                    // 外したワーカーが公平な割合の半分以上を受けたまま: 接続が動かない（HTTP/2・WebSocket 等）。全ワーカーへ
+                    // 戻して当分は縮めない（切れ目の直前の 1 周回は張りかけで少ないので、変える前とは比べない）
+                    let fair = (p.from - p.to) as f64 / p.from as f64;
+                    if moved >= after * fair * STUCK_SHARE {
+                        self.shrink_cooldown_until =
+                            self.tick + STUCK_COOLDOWN_TICKS.max(self.shrink_backoff);
+                        self.shrink_backoff =
+                            (self.shrink_backoff * 2).min(SHRINK_COOLDOWN_MAX_TICKS);
+                        return self.change(p.from, Shift::None, conns);
+                    }
+                    if after >= p.before_rps * SHRINK_MAX_LOSS {
+                        // 残す（前の負荷と同じ本数で足りる）。すぐに広げてみるのは縮めた直後と同じく間を空ける
+                        self.explore_cooldown_until = self
+                            .explore_cooldown_until
+                            .max(self.tick + self.explore_backoff);
+                        return Action::Hold;
+                    }
+                    // 遅くなった（前の負荷より重い）: 全ワーカーへ戻して探し直す（失敗に数えない）
                     self.change(p.from, Shift::Rebalance, conns)
                 }
             }
@@ -950,6 +1058,11 @@ mod imp {
                     if let Some(staged) = set.apply(n, to, shift, &st.conns) {
                         if shift == Shift::Rebalance {
                             st.shed_age = 1;
+                        } else if st.shed_age > 0 {
+                            // 動かすのをやめた（試しをやめた・戻した）: 残っている割り当てを取り消す（戻したワーカーの
+                            // 接続を閉じない）
+                            st.shed_age = 0;
+                            set.expire_sheds();
                         }
                         st.staged_ticks = if staged { SETTLE_TICKS } else { 0 };
                     }
@@ -1381,19 +1494,150 @@ mod imp {
             assert_eq!(observe_n(&mut p, 40, 10), resize(16));
         }
 
+        const SPREAD_ALL: Action = Action::Resize {
+            to: 16,
+            shift: Shift::None,
+        };
+
         #[test]
-        fn resets_to_all_workers_after_a_quiet_period() {
+        fn a_quiet_period_spreads_and_a_returning_load_resumes_the_previous_width() {
+            // 4 本で受けていた負荷が止んだ（キープアライブの接続は開いたまま）: 0.5 秒待ってから広げる
             let mut p = policy(CONNS);
             let quiet = spread(4, 10.0);
-            for _ in 0..(IDLE_RESET_TICKS - 1) {
+            for _ in 0..(SPREAD_IDLE_TICKS - 1) {
                 assert_eq!(p.observe(4, 0.01, &quiet, CONNS), Action::Hold);
             }
+            assert_eq!(p.observe(4, 0.01, &quiet, CONNS), SPREAD_ALL);
+            assert_eq!(p.resume, Some(4));
+            // 接続の基準を下げる時間（2 秒）より長く止まっていても、基準は前の負荷のまま
+            for _ in 0..(CONNS_FOLLOW_TICKS * 2) {
+                assert_eq!(p.observe(16, 0.0, &spread(16, 0.0), 0), Action::Hold);
+            }
+            assert_eq!(p.base_conns, CONNS);
+            // 同じ規模の負荷が戻った（全ワーカーで受けた）: 4 本へすぐ縮めてみる
+            assert_eq!(p.observe(16, 0.30, &spread(16, 40_000.0), CONNS), resize(4));
+            // HTTP/1.1 の接続は動いて速くなった: 残す
             assert_eq!(
-                p.observe(4, 0.01, &quiet, CONNS),
-                Action::Resize {
-                    to: 16,
-                    shift: Shift::None
-                }
+                settle_and_measure(&mut p, 4, 0.90, &spread(4, 80_000.0)),
+                Action::Hold
+            );
+            assert_eq!(p.resume, None);
+        }
+
+        #[test]
+        fn a_quiet_period_without_connections_spreads_at_once() {
+            // 負荷の道具が終わって接続が全部閉じた（反復の合間）: 待たずに広げる（次の負荷の接続の束が全ワーカーに散る）
+            let mut p = policy(CONNS);
+            assert_eq!(p.observe(4, 0.01, &spread(4, 10.0), 0), SPREAD_ALL);
+            assert_eq!(p.resume, Some(4));
+            // 広げた後は何もしない
+            for _ in 0..SPREAD_IDLE_TICKS {
+                assert_eq!(p.observe(16, 0.0, &spread(16, 0.0), 0), Action::Hold);
+            }
+            assert_eq!(p.resume, Some(4));
+            // 同じ規模の負荷が戻った: 4 本へすぐ縮めてみる
+            assert_eq!(p.observe(16, 0.30, &spread(16, 40_000.0), CONNS), resize(4));
+        }
+
+        #[test]
+        fn a_resumed_load_whose_connections_cannot_move_spreads_again() {
+            // 切れ目の後に来た HTTP/2 の接続（全ワーカーに散って、縮めても動かない）
+            let mut p = policy(CONNS);
+            p.resume = Some(4);
+            assert_eq!(p.observe(16, 0.40, &spread(16, 30_000.0), CONNS), resize(4));
+            assert_eq!(
+                settle_and_measure(&mut p, 4, 0.40, &spread(16, 36_000.0)),
+                SPREAD_ALL
+            );
+            assert!(p.shrink_cooldown_until >= p.tick + STUCK_COOLDOWN_TICKS);
+            assert_eq!(p.resume, None);
+            // 次の切れ目は全ワーカーのまま（戻す先は無い）
+            for _ in 0..SPREAD_IDLE_TICKS {
+                assert_eq!(p.observe(16, 0.0, &spread(16, 0.0), 0), Action::Hold);
+            }
+            assert_eq!(p.resume, None);
+        }
+
+        #[test]
+        fn a_resumed_load_that_slows_down_searches_again_without_penalty() {
+            let mut p = policy(CONNS);
+            p.resume = Some(4);
+            assert_eq!(p.observe(16, 0.60, &spread(16, 60_000.0), CONNS), resize(4));
+            // 前の負荷より重い: 4 本では遅い。全ワーカーへ戻す
+            assert_eq!(
+                settle_and_measure(&mut p, 4, 1.0, &spread(4, 30_000.0)),
+                resize(16)
+            );
+            assert_eq!(p.shrink_cooldown_until, 0);
+            // 失敗に数えないので、いつもどおり探す
+            assert_eq!(
+                drive(&mut p, 16, 0.30, &spread(16, 60_000.0), CONNS, 20),
+                resize(8)
+            );
+        }
+
+        #[test]
+        fn a_probe_is_abandoned_without_penalty_when_the_load_stops() {
+            let mut p = Policy::new(16);
+            assert_eq!(
+                drive(&mut p, 16, 0.26, &spread(16, 44_000.0), CONNS, 20),
+                resize(8)
+            );
+            // 測定の途中で負荷が止んだ: 変える前の本数へ戻すが、失敗に数えない
+            assert_eq!(
+                p.observe(8, 0.50, &spread(8, 60_000.0), CONNS),
+                Action::Hold
+            );
+            assert_eq!(p.observe(8, 0.0, &spread(8, 0.0), 0), SPREAD_ALL);
+            assert!(p.probing.is_none());
+            assert_eq!(p.shrink_cooldown_until, 0);
+            assert_eq!(p.shrink_backoff, SHRINK_COOLDOWN_TICKS);
+            // 負荷が戻ったら、また縮めてみる
+            assert_eq!(
+                drive(&mut p, 16, 0.26, &spread(16, 44_000.0), CONNS, 20),
+                resize(8)
+            );
+        }
+
+        #[test]
+        fn a_short_warm_up_after_a_quiet_period_keeps_the_resume_target() {
+            // HTTP/1.1 の負荷（4 本）の後の、HTTP/2 の短い準備運転（10 接続・1 周回）と本番の 100 接続
+            let mut p = policy(CONNS);
+            p.resume = Some(4);
+            assert_eq!(p.observe(16, 0.05, &spread(16, 8_000.0), 10), resize(4));
+            // 準備運転が終わった: 試しをやめて全ワーカーへ戻し、戻す先は残す
+            assert_eq!(p.observe(4, 0.0, &spread(4, 0.0), 0), SPREAD_ALL);
+            assert_eq!(p.resume, Some(4));
+            for _ in 0..SPREAD_IDLE_TICKS {
+                assert_eq!(p.observe(16, 0.0, &spread(16, 0.0), 0), Action::Hold);
+            }
+            // 本番の接続（全ワーカーに散った HTTP/2）: 縮めてみて、動かないので全ワーカーへ戻す
+            assert_eq!(p.observe(16, 0.40, &spread(16, 30_000.0), CONNS), resize(4));
+            assert_eq!(
+                settle_and_measure(&mut p, 4, 0.40, &spread(16, 36_000.0)),
+                SPREAD_ALL
+            );
+        }
+
+        #[test]
+        fn a_surge_after_a_quiet_period_searches_again_instead_of_resuming() {
+            // 軽い準備運転（10 接続）を 8 本で受けた後の切れ目に、本番の 100 接続が来る
+            let mut p = policy(10);
+            p.resume = Some(8);
+            assert_eq!(
+                p.observe(16, 0.20, &spread(16, 20_000.0), 100),
+                Action::Hold
+            );
+            assert_eq!(p.resume, None);
+            // 急増が続いた: 全ワーカーで受けているので基準だけ取り直して探し直す
+            assert_eq!(
+                p.observe(16, 0.25, &spread(16, 38_000.0), 100),
+                Action::Hold
+            );
+            assert_eq!(p.base_conns, 100);
+            assert_eq!(
+                drive(&mut p, 16, 0.25, &spread(16, 38_000.0), 100, 20),
+                resize(8)
             );
         }
 
@@ -1407,8 +1651,14 @@ mod imp {
             );
             let mut p = policy(CONNS);
             assert_eq!(
-                drive(&mut p, 8, 0.05, &spread(8, 500.0), CONNS, 40),
+                drive(&mut p, 16, 0.05, &spread(16, 500.0), CONNS, 100),
                 Action::Hold
+            );
+            // 縮めた後に要求が減った: それ以上は縮めず、切れ目として全ワーカーへ広げる
+            let mut p = policy(CONNS);
+            assert_eq!(
+                drive(&mut p, 8, 0.05, &spread(8, 500.0), CONNS, 40),
+                SPREAD_ALL
             );
         }
 
