@@ -1080,10 +1080,17 @@ pub(super) fn put_h3_send_scratch(mut scratch: H3SendScratch) {
 /// HTTP/3 サーバーを起動（同期ラッパー）
 ///
 /// 別スレッドで独自ランタイム（`runtime::block_on`）を作成して実行します。
-pub fn run_http3_server(bind_addr: SocketAddr, config: Http3ServerConfig) -> io::Result<()> {
+/// `socket` は bind 済みの SO_REUSEPORT の UDP ソケット（B-402）。
+pub fn run_http3_server(
+    bind_addr: SocketAddr,
+    socket: crate::udp::QuicUdpSocket,
+    config: Http3ServerConfig,
+) -> io::Result<()> {
     // カスタム io_uring ランタイムで非同期 HTTP/3 サーバーを実行
     let r =
-        crate::runtime::block_on(async move { run_http3_server_async(bind_addr, config).await });
+        crate::runtime::block_on(
+            async move { run_http3_server_async(bind_addr, socket, config).await },
+        );
     // B-118: 残った接続タスクをスレッドローカルが生きているうちに破棄する
     crate::runtime::shutdown_thread();
     r

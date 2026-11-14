@@ -207,9 +207,12 @@ pub(super) static HTTP3_LOG_ONCE_RECVMSG: Once = Once::new();
 #[cfg(all(target_os = "linux", veil_rt_uring))]
 pub(super) static HTTP3_LOG_ONCE_SENDMSG: Once = Once::new();
 
+/// `socket` は呼び出し側が bind 済みの SO_REUSEPORT の UDP ソケット（[`QuicUdpSocket::bind_reuseport_with_gso`]）。
+/// リスナーの全ワーカーの分をワーカーを起こす前に続けて bind する（B-402。`listener_workers::spawn_http3_listener`）。
 #[allow(clippy::await_holding_refcell_ref)]
 pub async fn run_http3_server_async(
     bind_addr: SocketAddr,
+    socket: QuicUdpSocket,
     mut config: Http3ServerConfig,
 ) -> io::Result<()> {
     // TLS 証明書を設定した QUIC 設定を作成する（F-136）。
@@ -305,15 +308,10 @@ pub async fn run_http3_server_async(
     // 設定を Rc で共有（quiche::Config は Clone できないため）
     let quic_config = Rc::new(RefCell::new(quic_config));
 
-    // UDP ソケットを作成（独自ランタイム上、`src/runtime/` のバックエンド経由）
-    // SO_REUSEPORT を設定して複数ワーカーで並列処理を可能に
-    // GSO/GRO は config.gso_gro_enabled に基づいて設定
-    let socket = QuicUdpSocket::bind_reuseport_with_gso(bind_addr, config.gso_gro_enabled)?;
-
     // F-105: 証明書ホットリロード。本ワーカーを登録し、現在の配信世代をローカルに控える。
     // 起動直後は上で cert/key をロード済みなので、ローカル世代を現在値に合わせて即時リロードを避ける。
-    // 登録は bind の後（bind に失敗したワーカーを数えると、適用する者のいない分だけ秘密鍵の平文のゼロ化が
-    // 次のリロードまで遅れる。B-351）。
+    // 登録するのは bind できたワーカーだけ（bind に失敗したワーカーを数えると、適用する者のいない分だけ秘密鍵の
+    // 平文のゼロ化が次のリロードまで遅れる。B-351。bind は呼び出し側で済んでいる。B-402）。
     crate::tls_reload::register_http3_worker();
     let mut local_cert_gen = crate::tls_reload::http3_cert_generation();
     HTTP3_LOG_ONCE_GSO_GRO.call_once(|| {

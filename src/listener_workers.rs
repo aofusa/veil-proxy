@@ -554,12 +554,27 @@ pub(crate) fn spawn_http3_listener(
             spec.name, requested
         );
     }
+    let label = format!("{} HTTP/3", spec.name);
+    // B-402: 全ワーカーの UDP ソケットを、ワーカーを起こす前にここで続けて bind する。UDP は SO_REUSEPORT の
+    // 振り分けが受信のたびに掛かり（TCP は確立した接続を振り分け直さない）、グループのソケットの数が変わると
+    // フローの振り先が変わる。以前は各ワーカーが QUIC の設定を組んでから自分で bind していたので、その間に
+    // 始まった QUIC の接続は、後から加わったソケットへ続きのパケットが振り分けられ、接続を知らないワーカーに
+    // 捨てられて止まった（並列の試験の起動直後に応答の待ちが時間切れになった）。
+    let mut sockets = Vec::with_capacity(workers);
+    for thread_id in 0..workers {
+        match crate::udp::QuicUdpSocket::bind_reuseport_with_gso(addr, base.gso_gro_enabled) {
+            Ok(socket) => sockets.push(socket),
+            Err(e) => error!("[{} {}] Server error: {}", label, thread_id, e),
+        }
+    }
     info!(
         "listener \"{}\" HTTP/3 {} (UDP) workers={}",
-        spec.name, addr, workers
+        spec.name,
+        addr,
+        sockets.len()
     );
-    let label = format!("{} HTTP/3", spec.name);
-    for thread_id in 0..workers {
+    let spawned = sockets.len();
+    for (thread_id, socket) in sockets.into_iter().enumerate() {
         let cert_pem = cert_pem.clone();
         let key_pem = key_pem.clone();
         let copied = copied.clone();
@@ -591,7 +606,7 @@ pub(crate) fn spawn_http3_listener(
 
             info!("[{} {}] Starting...", label, thread_id);
 
-            if let Err(e) = crate::http3_server::run_http3_server(addr, worker_h3_config) {
+            if let Err(e) = crate::http3_server::run_http3_server(addr, socket, worker_h3_config) {
                 error!("[{} {}] Server error: {}", label, thread_id, e);
             }
 
@@ -599,7 +614,7 @@ pub(crate) fn spawn_http3_listener(
         });
         handles.push(handle);
     }
-    workers
+    spawned
 }
 
 // B-181: accept の失敗の後の待ち方。
