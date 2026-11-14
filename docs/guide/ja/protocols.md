@@ -158,8 +158,10 @@ HTTP/3（RFC 9114）をQUIC/UDPベースでサポートします。Cloudflare製
 | 1-RTT の接続確立 | QUIC はトランスポートと TLS のハンドシェイクを 1 往復にまとめる。0-RTT のデータは受け取るが、要求はハンドシェイクの完了後に処理する（再送攻撃を受けない） |
 | Head-of-Lineブロッキング解消 | パケットロスが他ストリームに影響しない |
 | 接続マイグレーション | ネットワーク切り替え時も接続維持 |
-| GSO/GRO最適化 | 高パフォーマンスUDP処理 |
+| GSO/GRO最適化 | 高パフォーマンスUDP処理（UDP_SEGMENT / UDP_GRO） |
+| 輻輳制御・ペーシング | `[http3]`（`cc_algorithm`・`pacing`・`hystart` 等）で設定。既定は cubic + ペーシング |
 | 楽観的 ACK の検出 | 輻輳窓が前回確かめた窓の 2 倍になるたびにパケット番号を 1 つ飛ばし、クライアントがその番号を ACK したら接続を閉じる（`[http3] skip_packet_numbers`、既定 `"on_growth"`） |
+| io_uring のパイプライン化した UDP I/O | 受信・送信のホットパスはパイプライン化した `IORING_OP_RECVMSG`/`IORING_OP_SENDMSG`（バッチ幅は `mmsg_batch_size`、既定 64）。ホットパスで libc の `recvmmsg`/`sendmmsg` を使わない（F-130） |
 
 ### 有効化
 
@@ -225,9 +227,14 @@ initial_max_streams_uni = 100
 #   - HTTP/3 受信ループは単一バッファを再利用し、GRO セグメントをスライスのまま quiche へ
 #     渡すため、データグラム毎のヒープ確保とコピーを排除（ゼロコピー受信）。非対応カーネルでは
 #     単発データグラム送受信に自動フォールバック。
-#   - 本設定と独立に、HTTP/3 データプレーンは recvmmsg(2)/sendmmsg(2) で複数データグラム
-#     （異なる接続宛も含む）を常時 1 システムコールにバッチングする（F-115）。コンテナ実行時は
-#     seccomp 許可リストに recvmmsg/sendmmsg が必要（docker/assets/security/seccomp.json は対応済み）。
+#   - 本設定と独立に、HTTP/3 データプレーンは複数データグラム（異なる接続宛も含む）を常にまとめて
+#     送受信する。既定のバックエンドでは io_uring の op をパイプライン化し、受信は空のソケットで待つ
+#     IORING_OP_RECVMSG 1 本と、溜まったデータグラムを掻き出す非ブロッキングの RECVMSG 最大
+#     `mmsg_batch_size` - 1 本、送信は 1 回の io_uring_enter に複数の IORING_OP_SENDMSG を積む
+#     （F-130。バッチ幅 = mmsg_batch_size、既定 64）。reactor ビルドと io_uring のパイプラインを
+#     無効にしたとき（VEIL_H3_MULTISHOT=0）は、1 スイープあたり 1 回の recvmmsg(2)/sendmmsg(2) に
+#     まとめる（F-115）。コンテナ実行時は、このフォールバックと DNS の解決のために seccomp 許可リストに
+#     recvmmsg/sendmmsg が必要（docker/assets/security/seccomp.json は対応済み）。
 #   - 受け手が GRO で受けるとき（Linux のクライアント等）は受け手の CPU も下がる。
 #
 # 注意:
