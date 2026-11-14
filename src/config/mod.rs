@@ -1745,6 +1745,11 @@ pub struct PerformanceConfigSection {
     /// 既定 true（負荷が上がるとワーカーを増やす。false は全ワーカーへ常に振り分ける）
     #[serde(default)]
     pub concentrate_connections: Option<bool>,
+    /// ワーカーを CPU に固定するか（F-310）。
+    /// - "off": 固定しない（OS のスケジューラに任せる。既定）
+    /// - "cores": ワーカー i をプロセスが使える CPU の i 番目に固定する（0.12 までの既定）
+    #[serde(default)]
+    pub cpu_affinity: CpuAffinity,
     /// Huge Pages (Large OS Pages) の使用
     ///
     /// mimallocでHuge Pages（2MB）を優先使用し、TLBミスを削減します。

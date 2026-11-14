@@ -834,6 +834,22 @@ pub struct GlobalSecurityConfig {
     pub escaped_slashes: EscapedSlashesMode,
 }
 
+/// `[performance] cpu_affinity` の値（F-310）
+///
+/// 負荷ツール・上流・他のプロセスと CPU を分け合う配置では、固定するとスケジューラが起こした側の CPU へ
+/// ワーカーを寄せられない。固定しない方が HTTP/2・HTTP/3 で 5〜13% 速かった（lab49）。同じ機械の複数の
+/// インスタンス（サイドカー等）は固定すると全部が先頭のコアに載る。CPU を専有させた配置では差は 6% 以内で、
+/// どちらが速いかもそろわなかった（lab50）
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuAffinity {
+    /// 固定しない
+    #[default]
+    Off,
+    /// ワーカー i をプロセスが使える CPU の i 番目に固定する
+    Cores,
+}
+
 /// `[security] escaped_slashes` の値（B-385）
 #[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

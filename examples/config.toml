@@ -475,6 +475,14 @@ reuseport_balancing = "cbpf"
 # false: 常に全ワーカーへ振り分ける。UDS のリスナー・HTTP/3 は対象外
 # concentrate_connections = true
 
+# ワーカーを CPU に固定するか（F-310）
+# "off"   = 固定しない（OS のスケジューラに任せる）【既定】。負荷ツール・上流・他のプロセスと
+#           CPU を分け合う配置では固定すると HTTP/2・HTTP/3 が遅くなり、同じ機械の複数の
+#           インスタンス（サイドカー等）は全部が先頭のコアに固定される
+# "cores" = ワーカー i をプロセスが使える i 番目の CPU に固定する（以前の版の既定。
+#           isolcpus で隔離したコア等、CPU を専有させる場合）
+# cpu_affinity = "off"
+
 # Huge Pages (Large OS Pages) の使用
 # true: mimallocでHuge Pages（2MB）を優先使用し、TLBミスを削減
 # false: 通常の4KBページを使用

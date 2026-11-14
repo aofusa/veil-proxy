@@ -448,7 +448,7 @@ veil は起動・読み直しの前にファイル全体を検証します。不
 | nginx | veil | |
 |---|---|---|
 | `worker_processes auto;` | `[server] threads = 0` | = CPU ごとに 1 ワーカー |
-| `worker_cpu_affinity` | 既定 | = ワーカーを CPU に固定する |
+| `worker_cpu_affinity auto;` | `[performance] cpu_affinity = "cores"` | = nginx と同じく既定では固定しない |
 | `reuseport` | 既定（`reuseport_balancing = "cbpf"`） | = |
 | `worker_connections` / `worker_rlimit_nofile` | ハードリミットまで自動で上げる | = |
 | `sendfile on; tcp_nopush on;` | 静的ファイルの既定 | = |

@@ -45,7 +45,7 @@
 - **レスポンス圧縮**: Gzip/Brotli/Zstdによる動的圧縮（Accept-Encodingネゴシエーション対応）
 
 ### パフォーマンス
-- **CPUアフィニティ**: ワーカースレッドのCPUコアピン留め
+- **CPUアフィニティ**: ワーカースレッドを CPU コアに固定できる（`[performance] cpu_affinity = "cores"`）
 - **CBPF振り分け**: SO_REUSEPORTのフローハッシュ（4タプル）ベースロードバランシング。同一接続を固定ワーカーへ振り分け（Linux 4.6+）
 - **OpenFileCache**: ファイルメタデータキャッシュ（canonicalize、metadata、mime_guessのシステムコール削減） - 静的ファイル配信で60〜67%のシステムコール削減。キャッシュミス時はブロッキングな canonicalize/metadata/ディスク読込を専用オフロードスレッドプール（完了を eventfd + POLL_ADD で通知）で実行し、io_uring イベントループをブロックしない
 - **静的ファイル本体キャッシュ**（F-146/F-150、既定オフ）: HTTP/2・HTTP/3 の静的配信は DATA フレーム/QUIC ストリームへの再フレーミングが必須で `sendfile(2)` を使えないため、従来はリクエストごとにファイル全体をオフロード経由で読み直していた。kTLS を無効化した HTTP/1.1 のユーザー空間 TLS（rustls）経路も同様に `sendfile(2)` を使えず、リクエストごとに `pread(2)` でファイルを読み直していた（F-150）。FreeBSD の推奨構成は `ktls_enabled = false`（software kTLS はレコード単位ディスパッチのため大きな応答で不利）であり、この経路に該当する。`[static_file_cache]`/`[route.static_file_cache]` で有効化すると、ファイル本体を `bytes::Bytes` としてユーザ空間メモリに保持し、キャッシュヒット時は `DashMap` ルックアップ + `Bytes::clone()`（参照カウント増加。HTTP/1.1 では Range リクエスト向けに `Bytes::slice()` も併用）のみで配信する（syscall・アロケーション・オフロード往復ゼロ）。Linux の平文の HTTP/1.1 もキャッシュにある本体はここから送り、それ以外のファイルは `sendfile(2)` で送る。kTLS 有効時の HTTP/1.1 と FreeBSD の平文の HTTP/1.1 は常に `sendfile(2)` を使うため対象外

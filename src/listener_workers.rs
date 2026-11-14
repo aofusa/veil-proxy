@@ -130,6 +130,43 @@ impl WorkerEnv {
     }
 }
 
+/// `[performance] cpu_affinity` に従って、ワーカーを固定する CPU の一覧を返す（固定しないなら `None`。F-310）。
+/// ワーカー i は `ids[i % ids.len()]` に固定する
+pub(crate) fn worker_core_ids(
+    affinity: crate::config::CpuAffinity,
+) -> Option<Vec<core_affinity::CoreId>> {
+    match affinity {
+        crate::config::CpuAffinity::Off => None,
+        crate::config::CpuAffinity::Cores => {
+            core_affinity::get_core_ids().filter(|ids| !ids.is_empty())
+        }
+    }
+}
+
+/// 起動時に CPU の固定の方針を記録する（F-310）
+pub(crate) fn log_cpu_affinity(
+    label: &str,
+    affinity: crate::config::CpuAffinity,
+    core_ids: Option<&[core_affinity::CoreId]>,
+    workers: usize,
+) {
+    match (core_ids, affinity) {
+        (Some(ids), _) => info!(
+            "{}CPU Affinity: {} cores available, pinning {} worker threads",
+            label,
+            ids.len(),
+            workers
+        ),
+        (None, crate::config::CpuAffinity::Cores) => warn!(
+            "{}CPU Affinity: could not detect core IDs, workers will not be pinned",
+            label
+        ),
+        (None, crate::config::CpuAffinity::Off) => {
+            info!("{}CPU Affinity: workers are not pinned to CPU cores", label)
+        }
+    }
+}
+
 /// スレッド開始直後にCPUアフィニティを設定する。
 /// これによりL1/L2キャッシュミスを削減し、レイテンシのジッターを安定化
 pub(crate) fn pin_to_core(label: &str, thread_id: usize, core: Option<core_affinity::CoreId>) {
@@ -636,6 +673,36 @@ mod http3_worker_tests {
     fn windows_runs_one_http3_worker_per_listener() {
         assert_eq!(http3_worker_count(8), if cfg!(windows) { 1 } else { 8 });
         assert_eq!(http3_worker_count(1), 1);
+    }
+}
+
+// F-310: 既定（"off"）は固定しない。"cores" はプロセスが使える CPU の一覧
+#[cfg(test)]
+mod cpu_affinity_tests {
+    use super::worker_core_ids;
+    use crate::config::{CpuAffinity, PerformanceConfigSection};
+
+    #[test]
+    fn cpu_affinity_off_pins_nothing() {
+        assert_eq!(CpuAffinity::default(), CpuAffinity::Off);
+        assert!(worker_core_ids(CpuAffinity::Off).is_none());
+        // CPU の一覧を取れない環境（macOS 等）では None
+        if let Some(ids) = worker_core_ids(CpuAffinity::Cores) {
+            assert!(!ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn cpu_affinity_values() {
+        let parse = |s: &str| toml::from_str::<PerformanceConfigSection>(s).map(|p| p.cpu_affinity);
+        assert_eq!(parse("").unwrap(), CpuAffinity::Off);
+        assert_eq!(parse(r#"cpu_affinity = "off""#).unwrap(), CpuAffinity::Off);
+        assert_eq!(
+            parse(r#"cpu_affinity = "cores""#).unwrap(),
+            CpuAffinity::Cores
+        );
+        assert!(parse(r#"cpu_affinity = "pin""#).is_err());
+        assert!(parse("cpu_affinity = true").is_err());
     }
 }
 

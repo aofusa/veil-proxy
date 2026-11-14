@@ -42,12 +42,10 @@ pub fn spawn_l4_listeners(
     listeners: &[L4ListenerConfig],
     num_threads: usize,
     balancing: crate::config::ReuseportBalancing,
+    cpu_affinity: crate::config::CpuAffinity,
 ) {
-    // CPU コアピン留め用のコア ID 一覧。`entry.rs` の H2C ワーカーと同じ
-    // `core_affinity::get_core_ids()` + `thread_id % ids.len()` 方式を、`entry.rs` を
-    // 変更せずに済むようここで自前に取得する。
-    let core_ids = core_affinity::get_core_ids();
-    let core_ids_available = core_ids.as_ref().map(|ids| ids.len()).unwrap_or(0);
+    // CPU コアピン留め用のコア ID 一覧（HTTP のワーカーと同じ `[performance] cpu_affinity`。F-310）
+    let core_ids = crate::listener_workers::worker_core_ids(cpu_affinity);
 
     for config in listeners {
         // F-192: ネイティブハンドラのリスナーは上流を使わない（別ループで処理する）。
@@ -159,17 +157,12 @@ pub fn spawn_l4_listeners(
                     num_threads
                 );
 
-                if core_ids_available > 0 {
-                    info!(
-                        "[L4:{}] CPU Affinity: {} cores available, pinning {} worker threads",
-                        config.name, core_ids_available, num_threads
-                    );
-                } else {
-                    warn!(
-                        "[L4:{}] CPU Affinity: could not detect core IDs, workers will not be pinned",
-                        config.name
-                    );
-                }
+                crate::listener_workers::log_cpu_affinity(
+                    &format!("[L4:{}] ", config.name),
+                    cpu_affinity,
+                    core_ids.as_deref(),
+                    num_threads,
+                );
 
                 for thread_id in 0..num_threads {
                     let config = config.clone();

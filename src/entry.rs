@@ -680,18 +680,10 @@ pub fn run_server(opts: ServerOptions) {
 
     let mut handles = Vec::with_capacity(num_threads);
 
-    // CPUアフィニティ設定のためのコアID取得
-    let core_ids = core_affinity::get_core_ids();
-    let core_ids_available = core_ids.as_ref().map(|ids| ids.len()).unwrap_or(0);
-
-    if core_ids.is_some() && core_ids_available > 0 {
-        info!(
-            "CPU Affinity: {} cores available, pinning {} worker threads",
-            core_ids_available, num_threads
-        );
-    } else {
-        warn!("CPU Affinity: Could not detect core IDs, workers will not be pinned");
-    }
+    // CPU アフィニティ（F-310: 既定は固定しない。`[performance] cpu_affinity = "cores"` で固定する）
+    let cpu_affinity = loaded_config.performance.cpu_affinity;
+    let core_ids = crate::listener_workers::worker_core_ids(cpu_affinity);
+    crate::listener_workers::log_cpu_affinity("", cpu_affinity, core_ids.as_deref(), num_threads);
 
     // SO_REUSEPORT振り分け設定
     let reuseport_balancing = loaded_config.reuseport_balancing;
@@ -1442,6 +1434,7 @@ pub fn run_server(opts: ServerOptions) {
                 &loaded_config.l4_listeners,
                 num_threads,
                 loaded_config.reuseport_balancing,
+                loaded_config.performance.cpu_affinity,
             );
         }
     }

@@ -184,6 +184,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   ホットパスに足すのは Relaxed の加算（park の前後・応答・接続の数）と、動かす接続の `take_shed` だけ。N は測って決める
   （使用率だけで決めない。上流を待つ中継は使用率が上がらない）。負荷が変わったら失敗の待ちを捨てる（F-303）。
 - ワーカーを増やすときは共有すべき状態（LB 状態・接続数カウンタ・ヘルスチェッカー）をリスナーにつき 1 個にする（F-156）。
+- ワーカーは既定で CPU に固定しない（`[performance] cpu_affinity = "cores"` で固定。CPU を分け合う配置では固定しない方が
+  HTTP/2・HTTP/3 で 5〜13% 速く、固定すると同じ機械の複数のインスタンスが全部先頭のコアに載る。専有の配置では差は 6% 以内。F-310）。
 - `[server].listen` は TLS 専用（平文は受けない）。平文 HTTP/1.1・h2c の計測・テストは `[server].listen_cleartext` に
   `enable_secure_redirect = false` を付けて使う（既定の `true` は https への 301 だけを返す。F-163/B-80/F-200）。
 - `SO_ATTACH_REUSEPORT_CBPF` は classic BPF。使えるのは ancillary ロードのみ（B-76）。

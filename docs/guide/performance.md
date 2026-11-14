@@ -20,8 +20,7 @@ threads = 0  # If unspecified or 0, uses same number as CPU cores
 | `threads = 0` | Same number of threads as CPU cores |
 | `threads = 4` | Start with 4 threads |
 
-- Each worker thread is pinned to a CPU core (CPU affinity). macOS does not support pinning (Apple silicon), so workers run unpinned there
-- If thread count exceeds core count, assigned round-robin
+- Worker threads are not pinned to CPU cores by default; see [CPU Affinity](#cpu-affinity)
 - Recommend setting lower in memory-constrained environments
 - `0` / unspecified honors the cgroup CPU quota (`cpu.max` / `cpu.cfs_quota_us`): a container started with `--cpus 0.25` gets 1 worker, not one per host core
 
@@ -189,6 +188,31 @@ warning and keeps spreading connections over all workers.
 
 Each change makes the moved HTTP/1.1 clients reconnect (a new TLS handshake). Turn concentration off if the clients
 cannot reconnect cheaply, or if every worker is pinned to a dedicated core that should share the load evenly.
+
+### CPU Affinity
+
+```toml
+[performance]
+# "off" = let the OS scheduler place the workers [default]
+# "cores" = pin worker i to the i-th CPU the process may use
+cpu_affinity = "off"
+```
+
+With `"cores"`, worker *i* of every listener (HTTP, HTTP/3 and L4) is pinned to the *i*-th CPU in the process's
+CPU set (`taskset`, `docker --cpuset-cpus`), wrapping around when there are more workers than CPUs. Earlier
+versions always did this.
+
+Unpinned is the default because pinning hurts whenever the CPUs are shared. In container-to-container benchmarks
+where the load generator and the upstream run on the same machine, unpinned workers were 9–12% faster for HTTP/2,
+5–13% faster for HTTP/3 and had a lower HTTP/1.1 p99 (2.3 ms against 3.0–3.6 ms for static files). Only the
+HTTP/1.1 proxy was about 6% slower. A pinned worker cannot follow the scheduler to the CPU that just received its
+packets, and several veil instances on one machine (sidecars, containers limited with `--cpus`) all pin to the
+same first cores. With CPUs dedicated to veil (`--cpuset-cpus`), the two settings stayed within 6% of each other,
+with no consistent winner.
+
+Use `"cores"` when veil owns its CPUs and nothing else should run there, for example cores removed from the
+scheduler with `isolcpus` (unpinned threads are never placed on isolated cores). macOS (Apple silicon) does not
+support pinning, so workers stay unpinned there.
 
 ### Huge Pages (Large OS Pages)
 

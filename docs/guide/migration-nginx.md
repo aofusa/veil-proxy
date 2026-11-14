@@ -450,7 +450,7 @@ configuration.
 | nginx | veil | |
 |---|---|---|
 | `worker_processes auto;` | `[server] threads = 0` | = one worker per CPU |
-| `worker_cpu_affinity` | default | = workers are pinned |
+| `worker_cpu_affinity auto;` | `[performance] cpu_affinity = "cores"` | = workers are not pinned by default, as in nginx |
 | `reuseport` | default, with `reuseport_balancing = "cbpf"` | = |
 | `worker_connections` / `worker_rlimit_nofile` | raised automatically to the hard limit | = |
 | `sendfile on; tcp_nopush on;` | default for static files | = |

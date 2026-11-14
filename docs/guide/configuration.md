@@ -37,6 +37,7 @@ The following table lists default values for major configuration options:
 | `[prometheus]` | `path` | `"/__metrics"` | Metrics endpoint path |
 | `[performance]` | `reuseport_balancing` | `"kernel"` | SO_REUSEPORT balancing |
 | `[performance]` | `concentrate_connections` | `true` | Linux TCP listeners: send new connections to only as many workers as the load needs, adjusted every 100 ms (see [Performance](performance.md#connection-concentration-linux)). `false` = spread over all workers |
+| `[performance]` | `cpu_affinity` | `"off"` | `"cores"` = pin worker *i* to the *i*-th CPU the process may use (the default of earlier versions); `"off"` = let the OS schedule the workers (see [Performance](performance.md#cpu-affinity)) |
 | `[performance]` | `huge_pages_enabled` | `false` | Enable Huge Pages |
 | `[performance]` | `keepalive_direct_read_ms` | `20` | io_uring, plaintext HTTP/1.1 keep-alive: read the next request directly for this long before waiting without a buffer (`0` = always wait first; F-205) |
 | `[performance]` | `open_file_cache_enabled` | `false` | Enable OpenFileCache |
@@ -198,6 +199,11 @@ landlock_write_paths = ["/var/log/veil"]
 # "cbpf"   = flow hash-based CBPF (4-tuple; pins each connection to a fixed
 #            worker for cache/session-reuse efficiency, requires Linux 4.6+)
 reuseport_balancing = "cbpf"
+
+# Pin workers to CPU cores
+# "off"   = let the OS scheduler place the workers [default]
+# "cores" = pin worker i to the i-th CPU the process may use (dedicated or isolated cores)
+# cpu_affinity = "off"
 
 # Use Huge Pages (Large OS Pages)
 # 5-10% performance improvement by reducing TLB misses

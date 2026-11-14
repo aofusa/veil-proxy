@@ -34,6 +34,7 @@
 | `[prometheus]` | `enabled` | `false` | Prometheusメトリクスを有効化 |
 | `[prometheus]` | `path` | `"/__metrics"` | メトリクスエンドポイントパス |
 | `[performance]` | `reuseport_balancing` | `"kernel"` | SO_REUSEPORT振り分け方式 |
+| `[performance]` | `cpu_affinity` | `"off"` | `"cores"` = ワーカー *i* をプロセスが使える *i* 番目の CPU に固定する（以前の版の既定）。`"off"` = OS のスケジューラに任せる（[パフォーマンス](performance.md#cpu-アフィニティ)） |
 | `[performance]` | `concentrate_connections` | `true` | Linux の TCP リスナー: 新しい接続を、負荷に見合う本数のワーカーへだけ振り分ける（100ms ごとに調整。[パフォーマンス](performance.md#接続の集約linux)）。`false` = 全ワーカーへ振り分ける |
 | `[performance]` | `huge_pages_enabled` | `false` | Huge Pagesを有効化 |
 | `[performance]` | `keepalive_direct_read_ms` | `20` | io_uring・平文 HTTP/1.1 のキープアライブで、次の要求をこの時間だけ直接読みにいき、その後はバッファを持たずに待つ（`0` = 常に先に待つ。F-205） |
@@ -192,6 +193,11 @@ landlock_write_paths = ["/var/log/veil"]
 # "cbpf"   = フローハッシュ（4タプル）ベースのCBPF（同一接続を固定ワーカーへ振り分け、
 #            キャッシュ・セッション再利用効率向上、Linux 4.6+必須）
 reuseport_balancing = "cbpf"
+
+# ワーカーを CPU に固定するか
+# "off"   = 固定しない（OS のスケジューラに任せる）【既定】
+# "cores" = ワーカー i をプロセスが使える i 番目の CPU に固定する（専有・隔離したコア向け）
+# cpu_affinity = "off"
 
 # Huge Pages (Large OS Pages) の使用
 # TLBミス削減により5-10%のパフォーマンス向上
