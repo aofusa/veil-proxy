@@ -990,8 +990,11 @@ pub(super) const H3_SEND_ACCUM_MAX_BYTES: usize = 256 * 1024;
 
 /// 次パケット（`write` バイト）をバッチへ追加する**前に** flush が必要か判定する。
 ///
-/// - 均一サイズ要求: バッチ内の既存セグメントサイズ `seg_size` と異なるサイズは同居不可
-///   （GSO は最終セグメントのみ小さくてよい。大きくなるケースは分割が必要）
+/// - 均一サイズ要求: バッチ内の既存セグメントサイズ `seg_size` より大きいパケットは同居不可
+///   （GSO は最終セグメントだけ小さくてよい）。小さいパケットは最終セグメントとして同じ束に入れ、追加した後で
+///   束を確定する（呼び出し側の `write < seg_size`）。以前は小さいパケットの前でも束を切っていたので、応答の
+///   最後の短いパケットが毎回別のデータグラムになっていた（1 接続 1 ストリームの静的配信で 1 要求あたり
+///   nginx 1.0・veil 2.0 データグラム。F-309）
 /// - B-18: 追加すると合計が `MAX_GSO_BATCH_BYTES` を超える場合は先に flush
 #[inline]
 pub(super) fn gso_batch_must_flush_before_append(
@@ -1003,7 +1006,7 @@ pub(super) fn gso_batch_must_flush_before_append(
     if offsets_len == 0 {
         return false;
     }
-    write != seg_size || batch_len + write > MAX_GSO_BATCH_BYTES
+    write > seg_size || batch_len + write > MAX_GSO_BATCH_BYTES
 }
 
 /// `send_pending_packets` 用の送信スクラッチ（スレッドローカルで再利用）。

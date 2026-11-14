@@ -3377,8 +3377,9 @@ mod tests {
         // 均一サイズ・上限内は追加可能
         assert!(!gso_batch_must_flush_before_append(2, 2700, 1350, 1350));
 
-        // セグメントサイズが変わる場合は flush（GSO の均一サイズ要求）
-        assert!(gso_batch_must_flush_before_append(2, 2700, 800, 1350));
+        // 大きくなる場合は flush（GSO の均一サイズ要求）。小さい場合は最終セグメントとして同じ束に入れる
+        // （追加した後で束を確定する。F-309）
+        assert!(!gso_batch_must_flush_before_append(2, 2700, 800, 1350));
         assert!(gso_batch_must_flush_before_append(2, 2700, 1500, 1350));
 
         // B-18: 合計バイトが sendmsg の UDP ペイロード上限を超える場合は flush。
@@ -3458,6 +3459,54 @@ mod tests {
             }
         }
         assert_eq!(got, vec![(1350, 9), (1300, 4), (1300, 5), (1300, 6)]);
+        assert!(sock.gso_enabled());
+    }
+
+    /// F-309: 最後のセグメントだけが短い束（応答の末尾）を 1 回の送出で送り、カーネルはその大きさのまま届ける
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gso_batch_carries_a_short_last_segment() {
+        let recv = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        recv.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let dest = recv.local_addr().unwrap();
+        let sock = Rc::new(
+            crate::udp::socket::QuicUdpSocket::bind_reuseport_with_gso(
+                "127.0.0.1:0".parse().unwrap(),
+                true,
+            )
+            .unwrap(),
+        );
+        if !sock.gso_enabled() {
+            eprintln!("UDP GSO unsupported by this kernel; skipping");
+            return;
+        }
+        let mut batch = Vec::new();
+        for (b, n) in [(1u8, 1350), (2, 1350), (3, 700)] {
+            batch.resize(batch.len() + n, b);
+        }
+        let sends = vec![event_loop::SendRaw {
+            batch_start: 0,
+            len: batch.len(),
+            seg_size: 1350,
+            segments: 3,
+            dest,
+        }];
+        let s2 = sock.clone();
+        crate::runtime::block_on(async move {
+            let mut scratch = crate::udp::socket::MmsgSendScratch::with_batch(8);
+            event_loop::send_mmsg_flush(&s2, &batch, &sends, &mut scratch).await;
+        });
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        while got.len() < 3 {
+            match recv.recv_from(&mut buf) {
+                Ok((n, _)) => got.push((n, buf[0], buf[n - 1])),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("missing datagram after {got:?}: {e}"),
+            }
+        }
+        assert_eq!(got, vec![(1350, 1, 1), (1350, 2, 2), (700, 3, 3)]);
         assert!(sock.gso_enabled());
     }
 
