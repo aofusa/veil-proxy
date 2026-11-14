@@ -1206,9 +1206,10 @@ pub struct Http3ConfigSection {
     /// 1 イテレーションあたりに掻き出す UDP データグラム数の上限（reactor バックエンド専用、F-152）
     ///
     /// **readiness reactor（FreeBSD / OpenBSD / NetBSD / macOS、および Linux の
-    /// `--features epoll`）だけで使う。** Linux 既定の io_uring バックエンドは
-    /// `mmsg_batch_size` 本の `IORING_OP_RECVMSG` を常時 in-flight に保つ
-    /// パイプライン方式（F-130）なので本設定は参照しない。
+    /// `--features epoll`）だけで使う。** Linux 既定の io_uring バックエンドは、空のソケットで
+    /// 待つ `IORING_OP_RECVMSG` を 1 本と、溜まったデータグラムを掻き出す `MSG_DONTWAIT` の
+    /// `IORING_OP_RECVMSG` を最大 `mmsg_batch_size - 1` 本使うパイプライン方式（F-130・F-311）なので
+    /// 本設定は参照しない。
     ///
     /// reactor 経路は「読み込み可能になったら `recv_mmsg_sync` を繰り返して掻き出す」
     /// 形をとる。本設定はその 1 イテレーションあたりの合計データグラム数の上限で、

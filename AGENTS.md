@@ -95,6 +95,9 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   （`[http3] skip_packet_numbers = "on_growth"`。飛ばした番号は ngtcp2 系のクライアントの記録に穴として残り、パケットごとに探される。F-306）。
 - HTTP/3 の 1 イテレーションのデータグラム数は `[http3] mmsg_batch_size`（io_uring）/ `recv_drain_max`（reactor）で
   決まる最重要チューニング項目。定数でハードコードし直さない（F-151/F-152）。
+- io_uring の HTTP/3 の受信で、空のソケットに並べて待つ RECVMSG は 1 本だけにする。溜まった分は `MSG_DONTWAIT` の RECVMSG で
+  掻き出す（RECVMSG の内部 poll の待ちは排他でないので、並べた全部がデータグラム 1 つごとに起こされ、1 本以外は空振りして積み直す。
+  起こす費用はデータグラムを送った側の CPU が払う。F-311）。
 - HTTP/3 のストリーミング経路で本文途中のエラーは fin ではなくストリームリセットにする（切り詰めを成功に見せない。B-86）。
 - HTTP/3 の送信は GSO が既定（`gso_gro_enabled = true`）。ソケット単位の `UDP_SEGMENT` は 0 のままにし、束のセグメント長は
   cmsg で渡す（ソケットに値を置くと cmsg の無い単発の送信まで分割され、経路 MTU の探索が壊れる。B-361）。カーネルが束を

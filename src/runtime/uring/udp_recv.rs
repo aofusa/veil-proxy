@@ -6,9 +6,10 @@
 //!
 //! ## C1: パイプライン化 RECVMSG（`PipelinedUdpRecv`）
 //!
-//! 継続 drain も含めてホットパスから libc `recvmmsg` を排除し、**常に `batch` 個の
-//! `IORING_OP_RECVMSG` を in-flight に保つソフトウェアパイプライン**（§14.5 フェーズ1a 相当）
-//! に置き換える。データグラム 1 通につき SQE 1 本が必要（真の multishot ではない）。
+//! 継続 drain も含めてホットパスから libc `recvmmsg` を排除し、`IORING_OP_RECVMSG` の
+//! ソフトウェアパイプライン（§14.5 フェーズ1a 相当）に置き換える。データグラム 1 通につき SQE 1 本が
+//! 必要（真の multishot ではない）。空のソケットで待つ op（`IORING_RECVSEND_POLL_FIRST`）は常に 1 本だけで、
+//! 溜まったデータグラムは `MSG_DONTWAIT` の op（掻き出し）でまとめて受ける（F-311）。
 //!
 //! ## C2: 真の Multishot + provided buffer ring（`MultishotUdpRecv`）
 //!
@@ -23,13 +24,19 @@
 //! ## アルゴリズム
 //!
 //! 1. `new()` で `batch` 個のスロット（各々が独立した msghdr/iovec/addr/cmsg/buf を
-//!    ワーカー起動時に 1 回だけ確保）を作り、全スロットへ RECVMSG を **1 回の submit** で
-//!    まとめて投げる。
+//!    ワーカー起動時に 1 回だけ確保）を作り、待ちの RECVMSG を 1 本だけ投げる。
 //! 2. `recv_batch()` は「1 件以上のスロットが完了する」まで待つ Future。完了済みスロットが
 //!    あれば即座に個数を返す（複数同時完了も 1 回の poll でまとめて拾う = drain 相当）。
+//!    掻き出しの空振り（`EAGAIN`）は数えない。
 //! 3. 呼び出し側は `ready_slot(i)` / `take_result(i)` / `payload_mut(i, len)` で各データグラムを
-//!    処理し、処理し終えたら `rearm_ready()` を呼んで消費済みスロットへ新しい RECVMSG を
-//!    **1 回の submit** でまとめて再投入する。
+//!    処理し、処理し終えたら `rearm_ready()` を呼ぶ。待ちが無ければ 1 本、掻き出しを前回の結果で
+//!    決めた本数（全部が受け取れたら倍、空振りがあったら受け取れた本数、上限 `batch - 1`）だけ積み、
+//!    **1 回の submit** でまとめて投入する。掻き出しは提出の中でその場で完了する。
+//!
+//! F-311: 以前は `batch` 本すべてを POLL_FIRST で積んでいた。RECVMSG の内部 poll の待ちは排他でない
+//! （`EPOLLEXCLUSIVE` を付けない）ので、空のソケットに並んだ全部の op がデータグラム 1 つごとに起こされ、
+//! 1 本以外は空振りして積み直していた（既定の 64 本で 63 回。起こす費用はデータグラムを送った側の CPU が
+//! 払う）。lab54 で待ちを減らすと、サーバの CPU/要求が 4〜15% 減った。
 //!
 //! これにより「受信 syscall（recvmmsg）を毎回同期発行する」経路が消え、待ち・データ取得が
 //! すべて io_uring CQE 経由になる。EAGAIN 待ち専用の `POLL_ADD` はフォールバック
@@ -99,6 +106,9 @@ struct RecvSlot {
     user_data: u64,
     /// SQE 提出済みで CQE 未取得か。
     submitted: bool,
+    /// 待ち（`IORING_RECVSEND_POLL_FIRST`）ではなく、溜まっているものだけを受ける掻き出し
+    /// （`MSG_DONTWAIT`）として積んだか（F-311）。
+    drain: bool,
     /// 完了済みで未消費の結果（Ok=メタ情報 / Err=recvmsg エラー）。
     result: Option<io::Result<SlotMeta>>,
 }
@@ -129,12 +139,16 @@ impl RecvSlot {
             iov,
             user_data: 0,
             submitted: false,
+            drain: false,
             result: None,
         }
     }
 
     /// カーネルが書き換えるフィールドをリセットして SQE を積む（submit はしない）。
-    fn arm_no_submit(&mut self, fd: RawFd) -> io::Result<()> {
+    ///
+    /// `drain = false` は空のソケットで待つ op（内部 poll から始める）、`true` は溜まっている
+    /// データグラムだけを受ける op（`MSG_DONTWAIT`。無ければ内部 poll に並ばず `-EAGAIN` で完了する。F-311）。
+    fn arm_no_submit(&mut self, fd: RawFd, drain: bool) -> io::Result<()> {
         debug_assert!(!self.submitted);
         self.msg.msg_namelen = NAME_CAP as libc::socklen_t;
         self.msg.msg_controllen = CMSG_CAP as _;
@@ -153,9 +167,14 @@ impl RecvSlot {
                 sqe.fd = fd;
                 sqe.addr_or_splice_off_in = msg_ptr;
                 sqe.len = 1;
-                // 空ソケット想定で初回同期試行を飛ばし、内部 poll から開始。
-                sqe.ioprio = IORING_RECVSEND_POLL_FIRST;
-                sqe.op_flags = 0;
+                if drain {
+                    sqe.ioprio = 0;
+                    sqe.op_flags = libc::MSG_DONTWAIT as u32;
+                } else {
+                    // 空ソケット想定で初回同期試行を飛ばし、内部 poll から開始。
+                    sqe.ioprio = IORING_RECVSEND_POLL_FIRST;
+                    sqe.op_flags = 0;
+                }
                 sqe.user_data = user_data;
                 true
             } else {
@@ -168,14 +187,16 @@ impl RecvSlot {
         }
         self.user_data = user_data;
         self.submitted = true;
+        self.drain = drain;
         Ok(())
     }
 }
 
 /// パイプライン化 `IORING_OP_RECVMSG` による UDP 受信セッション（1 ソケット / 1 ワーカー）。
 ///
-/// 常に `batch` 個の RECVMSG を in-flight に保つことで、libc `recvmmsg` によるまとめ取りと
-/// 同等のスループットを io_uring CQE 経由で達成する（F-130 C1）。
+/// 空のソケットで待つ RECVMSG は 1 本だけにし、溜まったデータグラムは掻き出し（`MSG_DONTWAIT`）で
+/// 最大 `batch - 1` 本まとめて受ける。libc `recvmmsg` によるまとめ取りと同等のスループットを io_uring
+/// CQE 経由で達成する（F-130 C1・F-311）。
 pub struct PipelinedUdpRecv {
     fd: RawFd,
     slots: Box<[RecvSlot]>,
@@ -183,23 +204,35 @@ pub struct PipelinedUdpRecv {
     /// 起動時に `batch` 容量で確保済み（drain のたびの確保なし）。
     ready: Box<[u32]>,
     ready_len: usize,
+    /// 次の `rearm_ready()` で積む掻き出しの本数（F-311）。
+    drain_target: usize,
+    /// 直近の `rearm_ready()` で積んだ掻き出しの本数と、そのうち受け取った本数・空振りの本数。
+    drain_armed: usize,
+    drain_got: usize,
+    drain_empty: usize,
+    /// 直近の `rearm_ready()` の後に待ちの op がデータグラムを受け取ったか。
+    waiter_got: bool,
 }
 
 impl PipelinedUdpRecv {
-    /// `batch` 個のスロットを確保し、初期 RECVMSG を全スロットへ **1 回の submit** で投入する。
+    /// `batch` 個のスロットを確保し、待ちの RECVMSG を 1 本だけ投入する。
     pub fn new(fd: RawFd, batch: usize) -> io::Result<Self> {
         let batch = batch.clamp(1, 128);
-        let mut slots: Vec<RecvSlot> = (0..batch).map(|_| RecvSlot::new()).collect();
-        for slot in slots.iter_mut() {
-            slot.arm_no_submit(fd)?;
-        }
-        submit_sqes()?;
-        Ok(Self {
+        let slots: Vec<RecvSlot> = (0..batch).map(|_| RecvSlot::new()).collect();
+        let mut this = Self {
             fd,
             slots: slots.into_boxed_slice(),
             ready: vec![0u32; batch].into_boxed_slice(),
             ready_len: 0,
-        })
+            drain_target: 0,
+            drain_armed: 0,
+            drain_got: 0,
+            drain_empty: 0,
+            waiter_got: false,
+        };
+        this.slots[0].arm_no_submit(fd, false)?;
+        submit_sqes()?;
+        Ok(this)
     }
 
     #[inline]
@@ -214,6 +247,8 @@ impl PipelinedUdpRecv {
     }
 
     /// 非ブロッキングでスキャンし、完了済みスロットを `ready` へ積む。件数を返す。
+    ///
+    /// 掻き出しの空振り（`-EAGAIN`）はデータグラムでもエラーでもないので積まず、スロットを空きに戻す（F-311）。
     fn scan(&mut self) -> usize {
         self.ready_len = 0;
         for (i, slot) in self.slots.iter_mut().enumerate() {
@@ -225,6 +260,17 @@ impl PipelinedUdpRecv {
             };
             slot.submitted = false;
             slot.user_data = 0;
+            if slot.drain {
+                if res == -libc::EAGAIN {
+                    self.drain_empty += 1;
+                    continue;
+                }
+                if res >= 0 {
+                    self.drain_got += 1;
+                }
+            } else if res >= 0 {
+                self.waiter_got = true;
+            }
             slot.result = Some(build_slot_result(res, &slot.addr, &slot.msg));
             self.ready[self.ready_len] = i as u32;
             self.ready_len += 1;
@@ -251,23 +297,52 @@ impl PipelinedUdpRecv {
         &mut self.slots[idx].buf[..len.min(PAYLOAD_CAP)]
     }
 
-    /// パイプラインを満杯まで補充する（`recv_batch()` の全件処理後に呼ぶ）。
+    /// 受信を積み直す（`recv_batch()` の全件処理後に呼ぶ）。
     ///
-    /// 「未提出かつ未消費結果を持たない」スロットすべてに RECVMSG を再アームし、**1 回の
-    /// submit** でまとめて投入する。直近で消費した ready スロットに加え、万一 SQ 満杯等で
-    /// 過去に再アームできなかったスロットがあってもここで拾い直すため、in-flight 本数が
-    /// 目減りせず自己修復する（パイプライン不変条件: 常に最大 `batch` 本を in-flight）。
+    /// 待ちの RECVMSG が無ければ 1 本積み、掻き出しを次の本数だけ積んで **1 回の submit** で投入する
+    /// （F-311）。掻き出しの本数は直近の掻き出しの結果で決める: 全部が受け取れたら倍（まだ溜まって
+    /// いるかもしれない）、空振りがあったら受け取れた本数、掻き出しを積んでおらず待ちが受け取ったら
+    /// 1 本だけ試す。上限は `batch - 1`。積めなかったスロット（極めて稀な SQ 満杯）は空きのまま残り、
+    /// 次回ここで拾い直す。
     ///
     /// 呼び出し側は `ready` の全件を `take_result` で処理し終えた後に呼ぶこと。
     pub fn rearm_ready(&mut self) -> io::Result<()> {
         let fd = self.fd;
+        if self.drain_armed > 0 {
+            if self.drain_empty > 0 {
+                self.drain_target = self.drain_got;
+            } else if self.drain_got >= self.drain_armed {
+                self.drain_target = self.drain_armed * 2;
+            }
+            // どちらでもない（掻き出しの結果がまだ揃っていない）ときは前回の本数のまま
+        } else {
+            self.drain_target = usize::from(self.waiter_got);
+        }
+        self.drain_target = self.drain_target.min(self.slots.len() - 1);
+        self.drain_armed = 0;
+        self.drain_got = 0;
+        self.drain_empty = 0;
+        self.waiter_got = false;
+
+        let mut need_waiter = !self.slots.iter().any(|s| s.submitted && !s.drain);
+        let mut drains = self.drain_target;
         let mut armed_any = false;
         for slot in self.slots.iter_mut() {
-            if !slot.submitted && slot.result.is_none() {
-                // arm 失敗（極めて稀な SQ 満杯）は当該スロットのみ諦め、次回 rearm で再挑戦する。
-                if slot.arm_no_submit(fd).is_ok() {
+            if !need_waiter && drains == 0 {
+                break;
+            }
+            if slot.submitted || slot.result.is_some() {
+                continue;
+            }
+            if need_waiter {
+                if slot.arm_no_submit(fd, false).is_ok() {
+                    need_waiter = false;
                     armed_any = true;
                 }
+            } else if slot.arm_no_submit(fd, true).is_ok() {
+                drains -= 1;
+                self.drain_armed += 1;
+                armed_any = true;
             }
         }
         self.ready_len = 0;
@@ -362,6 +437,18 @@ impl Future for RecvBatch<'_> {
             }
         }
         if !any_in_flight {
+            // 待ちの RECVMSG が無い（積み直しに失敗した等）。ここで 1 本積み直してから待つ（F-311）。
+            let fd = this.fd;
+            if let Some(slot) = this
+                .slots
+                .iter_mut()
+                .find(|s| !s.submitted && s.result.is_none())
+            {
+                if slot.arm_no_submit(fd, false).is_ok() && submit_sqes().is_ok() {
+                    set_op_waker(slot.user_data, cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
             // 呼び出し側の不変条件違反（rearm し忘れ）。runtime バグとして検出できるよう
             // エラーを返す（無限 Pending でハングさせない）。
             return Poll::Ready(Err(io::Error::other(
@@ -1043,6 +1130,88 @@ impl Future for RecvBatchAny<'_> {
             RecvBatchAny::Multishot(f) => Pin::new(f).poll(cx),
             RecvBatchAny::Pipelined(f) => Pin::new(f).poll(cx),
         }
+    }
+}
+
+// F-311: 空のソケットで待つ RECVMSG は 1 本だけ。溜まったデータグラムは掻き出しでまとめて受け、取りこぼさない
+#[cfg(test)]
+mod f311_tests {
+    use super::*;
+    use std::net::UdpSocket;
+    use std::os::unix::io::AsRawFd;
+    use std::time::Duration;
+
+    fn io_uring_available() -> bool {
+        crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
+    fn waiters(r: &PipelinedUdpRecv) -> usize {
+        r.slots.iter().filter(|s| s.submitted && !s.drain).count()
+    }
+
+    /// 1 回の `recv_batch` で受けたデータグラムの中身を `out` へ足し、件数を返す
+    async fn recv_round(r: &mut PipelinedUdpRecv, out: &mut Vec<Vec<u8>>) -> usize {
+        let n = super::super::timer::timeout(Duration::from_secs(5), r.recv_batch())
+            .await
+            .expect("recv_batch timed out")
+            .expect("recv_batch");
+        let mut got = 0;
+        for i in 0..n {
+            let idx = r.ready_slot(i);
+            let meta = r.take_result(idx).expect("datagram");
+            out.push(r.payload_mut(idx, meta.payload_len).to_vec());
+            got += 1;
+        }
+        r.rearm_ready().expect("rearm");
+        got
+    }
+
+    #[test]
+    fn f311_one_waiter_and_burst_is_drained() {
+        if !io_uring_available() {
+            eprintln!("io_uring unavailable; skipping f311_one_waiter_and_burst_is_drained");
+            return;
+        }
+        let rx = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        rx.set_nonblocking(true).expect("nonblocking");
+        let tx = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let dst = rx.local_addr().expect("addr");
+        crate::runtime::block_on(async move {
+            let mut r = PipelinedUdpRecv::new(rx.as_raw_fd(), 64).expect("new");
+            assert_eq!(waiters(&r), 1);
+            assert_eq!(r.slots.iter().filter(|s| s.submitted).count(), 1);
+
+            // 1 つずつ: 毎回受け取れて、待ちは常に 1 本
+            let mut out = Vec::new();
+            for k in 0..5u8 {
+                tx.send_to(&[k], dst).expect("send");
+                while out.len() < usize::from(k) + 1 {
+                    recv_round(&mut r, &mut out).await;
+                    assert_eq!(waiters(&r), 1);
+                }
+            }
+            assert_eq!(out, (0..5u8).map(|k| vec![k]).collect::<Vec<_>>());
+
+            // まとめて届いた 100 個: 全部を受け取り、掻き出しの本数が増える
+            out.clear();
+            for k in 0..100u16 {
+                tx.send_to(&k.to_be_bytes(), dst).expect("send");
+            }
+            let mut max_drain = 0;
+            while out.len() < 100 {
+                recv_round(&mut r, &mut out).await;
+                assert_eq!(waiters(&r), 1);
+                max_drain = max_drain.max(r.drain_armed);
+            }
+            let mut seen: Vec<u16> = out
+                .iter()
+                .map(|b| u16::from_be_bytes([b[0], b[1]]))
+                .collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..100u16).collect::<Vec<_>>());
+            assert!(max_drain >= 16, "drain never grew: {max_drain}");
+            assert!(r.drain_armed < 64);
+        });
     }
 }
 

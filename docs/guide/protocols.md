@@ -219,8 +219,9 @@ initial_max_streams_uni = 100
 #     (zero-copy receive). Falls back to single-datagram I/O on unsupported kernels.
 #   - Independent of this setting, the HTTP/3 data plane always batches multiple
 #     datagrams (across different connections) via pipelined io_uring ops on the
-#     default backend: `mmsg_batch_size` IORING_OP_RECVMSG ops kept in flight for
-#     receive, and multiple IORING_OP_SENDMSG SQEs per io_uring_enter for send
+#     default backend: one IORING_OP_RECVMSG waiting on the empty socket plus up to
+#     `mmsg_batch_size` - 1 non-blocking ones draining queued datagrams for receive,
+#     and multiple IORING_OP_SENDMSG SQEs per io_uring_enter for send
 #     (F-130; batch size = mmsg_batch_size, default 64). Falls back to a single
 #     recvmmsg(2)/sendmmsg(2) syscall per sweep (F-115) on reactor builds or when
 #     the io_uring pipeline is disabled (VEIL_H3_MULTISHOT=0).
