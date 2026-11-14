@@ -25,6 +25,7 @@ v0.11.0-rc.2 の release（run 42193808705）で、配布物そのものでは�
    veil は gettext を呼ばない、ロケールは POSIX だけ（`LANGUAGE` は LC_MESSAGES が C/POSIX 以外でしか使われない）、
    シェルも環境変数を外から渡す経路も無い。Wolfi に直った版が出たら除外を消す。あわせて glibc-dynamic の
    ダイジェストを最新（glibc 2.44-r13）にした（`Dockerfile.glibc`・`.glibc.aarch64`・`.vds-server`）。
+   2026-11-14: Wolfi が 2.44-r16 で直したので、ダイジェストを 2.44-r19 のものへ上げて除外を消した（B-400）。
 2. Docker が動いていない runner では Nano Server の確認を notice を出して飛ばす（`check-pe-imports.py` が必ず見る）。
 3. `tools/release/test-msi.ps1` は `ProductIcon` を見る。
 4. `tools/release/bsd-port-test.sh` の OpenBSD の `pkg_add` に `PKG_PATH`（ミラー）を渡す。

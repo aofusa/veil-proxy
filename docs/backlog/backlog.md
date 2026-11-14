@@ -762,6 +762,7 @@
 | B-397 | P3 | 修正済み（feat/beat-nginx） | [bugs/B-397-acme-url-crlf-downgrade.md](bugs/B-397-acme-url-crlf-downgrade.md) | ACME のサーバが返す URL（nonce・アカウント・注文・認可・finalize・証明書・`Location`）を検査せず、`ctrl_http` が要求行へそのまま書いていたので、CR・LF で別の要求を足せ、`http://` の内部の宛先へも送れた。空白・制御文字を含む URL・ヘッダを断り、`https://` のディレクトリからは `https://` 以外の URL を使わない |
 | B-398 | P3 | 修正済み（feat/beat-nginx） | [bugs/B-398-acme-temp-file-symlink.md](bugs/B-398-acme-temp-file-symlink.md) | 権限を落とす前の root が、降格後の利用者が書けるディレクトリの `.<名前>.tmp<pid>` を `O_TRUNC` で開いていたので、置かれたシンボリックリンクを辿って任意のファイルを書き換え得た。一時ファイルは毎回新しい名前で `O_EXCL`・`O_NOFOLLOW` で作り、ディレクトリの権限は `O_NOFOLLOW` で開いたものへ付ける |
 | B-399 | P3 | 修正済み（feat/beat-nginx） | [bugs/B-399-udp-l4-wasm-ignored.md](bugs/B-399-udp-l4-wasm-ignored.md) | Proxy-Wasm のネットワークフィルタは TCP の L4 だけで走るのに、UDP のリスナーの `wasm_modules` を受け付けて何も記録しなかったので、アクセス制御のフィルタを書いた UDP のリスナーは誰の datagram も上流へ送っていた。設定を拒否する |
+| B-400 | P1 | 修正済み（feat/beat-nginx） | [bugs/B-400-nightly-security-rustix-glibc-quinn-udp.md](bugs/B-400-nightly-security-rustix-glibc-quinn-udp.md) | main の nightly の container_security が 2026-11-12 から落ちていた: rustix 1.1.4 の RUSTSEC-2026-0486（12 個の Cargo.lock を 1.1.6 へ）、Wolfi の glibc の CVE-2026-84243 が除外の外のサブパッケージにも付いた（直った 2.44-r19 のダイジェストへ上げて除外を消す）。最初の失敗で止まる照合の奥に quinn-udp の RUSTSEC-2026-0538（vendoring 版と h3load を 0.5.16 へ）があり、vendoring 版の GitHub の勧告の照合は系列ごとに並べた範囲を読み違えて見逃していた（範囲の解釈を直し、試験を CI で回す） |
 
 ---
 

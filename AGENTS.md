@@ -381,7 +381,7 @@ cargo test --test standalone_e2e --features full                   # 自己完�
 | `docs/artifacts/` | AI 成果物・一時ファイル（git 管理外） |
 | `third_party/wasmtime/` | wasmtime 36.0.20（LTS）の vendoring（B-55 / B-79 / B-155 / B-157 / B-263。`profiling` は外した。B-158） |
 | `third_party/quiche/` | quiche 0.24.9 の vendoring（F-172、STREAM フレーム coalescing） |
-| `third_party/quinn-udp/` | テスト用 HTTP/3 クライアントの quinn-udp 0.5.14 の vendoring（NetBSD/aarch64 の CMSG アラインメント。B-62/F-176） |
+| `third_party/quinn-udp/` | テスト用 HTTP/3 クライアントの quinn-udp 0.5.16 の vendoring（NetBSD/aarch64 の CMSG アラインメント。B-62/F-176/B-400） |
 | `docker/` | コンテナイメージ・Windows/macOS クロスビルド用 Dockerfile・共有アセット |
 | `packaging/` | 配布物のビルド（[packaging/README.md](packaging/README.md)） |
 | `tools/perf/` | nginx 比較の性能計測ハーネス、API 経路の交互 A/B（`api_ab.py`・`veil-load/`・`api-app/`） |

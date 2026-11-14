@@ -273,6 +273,7 @@ tools/container_security/
 │   ├── run_cargo_audit.sh
 │   ├── run_cargo_deny.sh
 │   ├── vendored_ghsa_audit.py   # vendoring 版を GitHub の勧告と照合（F-277）
+│   ├── test_vendored_ghsa_audit.py  # 上の照合の版の範囲の解釈の試験（B-400。ci.yml で回す）
 │   └── run_testssl.sh
 ├── lib/
 │   ├── common.sh          # 起動・cleanup・run_harness

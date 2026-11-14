@@ -79,26 +79,70 @@ def _get(url):
 
 
 def _ver(v):
-    return tuple(int(x) for x in re.findall(r"\d+", v.split("-")[0])[:3])
+    # "1.2" と "1.2.0" を同じ版として比べる（足りない桁は 0）
+    t = tuple(int(x) for x in re.findall(r"\d+", v.split("-")[0])[:3])
+    return (t + (0, 0, 0))[:3]
+
+
+# 範囲の中の 1 つの制約（`>= 0.6.0`・`<0.5.16`・`0.15.0+`・裸の `0.20.0`）
+_CONSTRAINT = re.compile(r"(>=|<=|>|<|=)?\s*v?(\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.]+)?)(\+)?")
+_UPPER = ("<", "<=", "=")
+
+
+def _satisfiable(constraints):
+    """Whether some version meets every (op, version) constraint at once."""
+    lo = hi = None  # (版, 端を含むか)
+    for op, r in constraints:
+        if op in (">=", ">", "="):
+            c = (r, op != ">")
+            if lo is None or c[0] > lo[0] or (c[0] == lo[0] and not c[1]):
+                lo = c
+        if op in ("<=", "<", "="):
+            c = (r, op != "<")
+            if hi is None or c[0] < hi[0] or (c[0] == hi[0] and not c[1]):
+                hi = c
+    return lo is None or hi is None or lo[0] < hi[0] or (lo[0] == hi[0] and lo[1] and hi[1])
+
+
+def range_alternatives(spec):
+    """Split a GitHub range into alternatives (any may match), each a list of (op, version)
+    constraints that must all hold. Raises ValueError when no constraint can be read or the
+    range contradicts itself."""
+    alts = []
+    for chunk in spec.split("||"):
+        # "0.11.0 - 0.11.6" は両端を含む範囲
+        chunk = re.sub(r"(\d[0-9A-Za-z.]*)\s+-\s+(\d[0-9A-Za-z.]*)", r">= \1, <= \2", chunk)
+        cons = [(">=" if m.group(3) else (m.group(1) or "="), _ver(m.group(2)))
+                for m in _CONSTRAINT.finditer(chunk.replace("&&", ","))]
+        if not cons:
+            continue
+        # 並べた制約は全部を満たす（「<= 6.0.0, >= 1.0.0」）。ただし上流は「< 0.5.16, >= 0.6.0 < 0.6.3」と
+        # 系列ごとの範囲を並べて書くことがあり、全部を満たす版は無い。そのときだけ、上限（か一致）の後に
+        # 来た下限・一致を別の範囲の始まりとして読む（読んだままだと誰も該当せず、勧告を見逃す。B-400）
+        if _satisfiable(cons):
+            alts.append(cons)
+            continue
+        cur = []
+        for op, r in cons:
+            if cur and op in (">=", ">", "=") and any(o in _UPPER for o, _ in cur):
+                alts.append(cur)
+                cur = []
+            cur.append((op, r))
+        alts.append(cur)
+    if not alts or not all(_satisfiable(a) for a in alts):
+        raise ValueError(f"unreadable version range {spec!r}")
+    return alts
 
 
 def in_range(version, spec):
     """Whether `version` is in a GitHub range such as ">= 0.15.0", "< 0.24.4", "0.15.0+",
-    "<0.19.1", ">= 0.1.0, < 0.29.3", ">= 0.26.0 && <= 0.29.0" or a bare "0.20.0"."""
+    "<0.19.1", ">= 0.1.0, < 0.29.3", ">= 0.26.0 && <= 0.29.0", "0.11.0 - 0.11.6", a bare
+    "0.20.0", or ranges of several release series written one after another
+    ("< 0.5.16, >= 0.6.0 < 0.6.3"). Raises ValueError for a range it cannot read."""
     v = _ver(version)
-    for part in re.split(r",|&&", spec):
-        part = part.strip()
-        if not part:
-            continue
-        if part.endswith("+"):
-            op, ref = ">=", part[:-1]
-        else:
-            m = re.match(r"(>=|<=|>|<|=)?\s*(.+)", part)
-            op, ref = m.group(1) or "=", m.group(2)
-        r = _ver(ref)
-        if not {"<": v < r, "<=": v <= r, ">": v > r, ">=": v >= r, "=": v == r}[op]:
-            return False
-    return True
+    cmp = {"<": lambda r: v < r, "<=": lambda r: v <= r, ">": lambda r: v > r,
+           ">=": lambda r: v >= r, "=": lambda r: v == r}
+    return any(all(cmp[op](r) for op, r in alt) for alt in range_alternatives(spec))
 
 
 def patched_in_series(version, patched):
@@ -135,7 +179,14 @@ def repo_advisories(repo, name, version):
             # （`38.0.4, 37.0.3, 36.0.3`）ので、同じ系列で直した版以上なら該当しない
             if patched_in_series(version, vuln.get("patched_versions") or ""):
                 continue
-            if in_range(version, vuln.get("vulnerable_version_range") or ""):
+            spec = vuln.get("vulnerable_version_range") or ""
+            try:
+                hit = in_range(version, spec)
+            except ValueError:
+                # 読めない範囲を「該当しない」と見なさない（人が見て直した版を確かめる）
+                a = dict(a, summary=f"{a.get('summary')} [unreadable range {spec!r}]")
+                hit = True
+            if hit:
                 found.append(a)
                 break
     return found

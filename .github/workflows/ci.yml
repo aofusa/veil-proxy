@@ -44,6 +44,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: python3 tools/lint/test_check_messages.py
       - run: python3 tools/lint/check-messages.py
+      # B-400: vendoring 版の勧告の照合が版の範囲を読み違えて該当を見逃さないこと
+      - run: python3 tools/container_security/security/test_vendored_ghsa_audit.py
       # B-208: 公開の状態の判定（API の失敗を「無い」と見なさない）
       - run: tools/release/release-state.sh --self-test
 

@@ -2,11 +2,17 @@
 
 ## 由来
 
-crates.io の [`quinn-udp` 0.5.14](https://crates.io/crates/quinn-udp/0.5.14) をコピー
-（`~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quinn-udp-0.5.14/` から）。
+crates.io の [`quinn-udp` 0.5.16](https://crates.io/crates/quinn-udp/0.5.16) をコピー
+（0.5.14 を `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quinn-udp-0.5.14/` から取り込み、
+0.5.14 → 0.5.16 の上流の差分を当てた。B-400）。
 取り込んだのは `Cargo.toml` / `build.rs` / `src/` / ライセンス。`benches/`・`tests/`・
 `Cargo.lock`・`Cargo.toml.orig` は取り込まず、`Cargo.toml` から `[[test]]`・`[[bench]]`・
 `[dev-dependencies]` を削除した。
+
+上流の版を上げるときは、crates.io の旧版と新版の差分（上の除外を除く）をこのディレクトリへ `patch` で当て、
+上流の新版とこのディレクトリの差分が下の「差分」だけであることを確かめる。0.5.16 は RUSTSEC-2026-0538
+（1 回の `recvmsg` で 1 データグラムを読む target＝OpenBSD・NetBSD・macOS 等で、切り詰められたデータグラムの後の
+`EAGAIN` でも古い `MSG_TRUNC` を見て受信のループが回り続ける）の修正を含む。
 
 ルート `Cargo.toml` の `[patch.crates-io]` で差し替える。**veil 本体は quinn-udp を使わない**
 （E2E・単体テスト用の HTTP/3 クライアント `quinn` / `h3-quinn` が依存する dev 専用の依存）。
