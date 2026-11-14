@@ -1,37 +1,93 @@
 measure	target	workload	connections	round	rps	syscalls_per_req	p50_ms	p90_ms	p99_ms
-syscalls	nginx	static_54KB	100	1	54575	15.037			
-syscalls	veil	static_54KB	100	1	81220	3.520			
-syscalls	nginx	proxy	100	1	33962	22.354			
-syscalls	veil	proxy	100	1	44570	4.098			
-syscalls	nginx	static_54KB	100	2	48342	14.776			
-syscalls	veil	static_54KB	100	2	79651	3.537			
-syscalls	nginx	proxy	100	2	29792	22.658			
-syscalls	veil	proxy	100	2	43758	3.931			
-syscalls	nginx	static_54KB	100	3	49770	15.063			
-syscalls	veil	static_54KB	100	3	55114	3.726			
-syscalls	nginx	proxy	100	3	32039	22.599			
-syscalls	veil	proxy	100	3	42903	3.929			
-latency	nginx	static_54KB	1	1	4614		0.200	0.343	0.644
-latency	nginx	static_54KB	10	1	12596		0.826	1.160	1.480
-latency	veil	static_54KB	1	1	5177		0.163	0.280	0.418
-latency	veil	static_54KB	10	1	33549		0.267	0.430	0.716
-latency	nginx	proxy	1	1	2776		0.314	0.507	0.834
-latency	nginx	proxy	10	1	9868		0.990	1.450	2.040
-latency	veil	proxy	1	1	2691		0.334	0.506	0.693
-latency	veil	proxy	10	1	17041		0.561	0.735	0.990
-latency	nginx	static_54KB	1	2	4878		0.199	0.298	0.583
-latency	nginx	static_54KB	10	2	15164		0.625	1.090	1.640
-latency	veil	static_54KB	1	2	5469		0.161	0.253	0.416
-latency	veil	static_54KB	10	2	34678		0.261	0.402	0.622
-latency	nginx	proxy	1	2	2770		0.314	0.513	0.842
-latency	nginx	proxy	10	2	8110		1.290	1.680	2.240
-latency	veil	proxy	1	2	2643		0.334	0.532	0.823
-latency	veil	proxy	10	2	16513		0.577	0.753	0.980
-latency	nginx	static_54KB	1	3	4795		0.199	0.309	0.593
-latency	nginx	static_54KB	10	3	18135		0.510	0.846	1.290
-latency	veil	static_54KB	1	3	5692		0.159	0.236	0.416
-latency	veil	static_54KB	10	3	33853		0.268	0.407	0.631
-latency	nginx	proxy	1	3	2627		0.320	0.565	0.930
-latency	nginx	proxy	10	3	11634		0.814	1.220	1.650
-latency	veil	proxy	1	3	2672		0.336	0.513	0.743
-latency	veil	proxy	10	3	16095		0.586	0.768	1.200
+syscalls	nginx	static_54KB	100	1	54536	14.901			
+syscalls	veil	static_54KB	100	1	80513	3.563			
+syscalls	nginx	proxy	100	1	34192	22.368			
+syscalls	veil	proxy	100	1	44679	3.891			
+syscalls	nginx	static_54KB	100	2	49998	14.962			
+syscalls	veil	static_54KB	100	2	79158	3.459			
+syscalls	nginx	proxy	100	2	32565	22.689			
+syscalls	veil	proxy	100	2	44908	3.839			
+syscalls	nginx	static_54KB	100	3	48744	15.392			
+syscalls	veil	static_54KB	100	3	80780	3.464			
+syscalls	nginx	proxy	100	3	32517	22.155			
+syscalls	veil	proxy	100	3	44240	4.628			
+latency	nginx	proxy	1	1	2784		0.308	0.518	0.827
+latency	nginx	proxy	10	1	15097		0.627	0.828	1.110
+latency	veil_v0.12.0	proxy	1	1	2696		0.325	0.518	0.807
+latency	veil_v0.12.0	proxy	10	1	16546		0.572	0.724	0.980
+latency	veil	proxy	1	1	2743		0.323	0.510	0.690
+latency	veil	proxy	10	1	17371		0.545	0.735	0.990
+latency	veil_cpu_affinity_cores	proxy	1	1	2764		0.321	0.509	0.692
+latency	veil_cpu_affinity_cores	proxy	10	1	16367		0.568	0.750	1.310
+latency	nginx	static_54KB	1	1	5314		0.151	0.299	0.554
+latency	nginx	static_54KB	10	1	24882		0.365	0.514	0.747
+latency	veil_v0.12.0	static_54KB	1	1	4120		0.207	0.333	0.512
+latency	veil_v0.12.0	static_54KB	10	1	25864		0.354	0.453	0.640
+latency	veil	static_54KB	1	1	5562		0.160	0.251	0.382
+latency	veil	static_54KB	10	1	35284		0.257	0.406	0.662
+latency	veil_cpu_affinity_cores	static_54KB	1	1	5628		0.160	0.246	0.355
+latency	veil_cpu_affinity_cores	static_54KB	10	1	34218		0.262	0.409	0.631
+latency	veil_v0.12.0	proxy	1	2	2794		0.322	0.494	0.675
+latency	veil_v0.12.0	proxy	10	2	16145		0.583	0.769	1.450
+latency	veil	proxy	1	2	2731		0.323	0.511	0.691
+latency	veil	proxy	10	2	17570		0.541	0.748	1.000
+latency	veil_cpu_affinity_cores	proxy	1	2	2800		0.320	0.487	0.670
+latency	veil_cpu_affinity_cores	proxy	10	2	17325		0.546	0.727	0.980
+latency	nginx	proxy	1	2	2713		0.318	0.524	0.834
+latency	nginx	proxy	10	2	14964		0.627	0.818	1.100
+latency	veil_v0.12.0	static_54KB	1	2	4518		0.203	0.288	0.422
+latency	veil_v0.12.0	static_54KB	10	2	25868		0.355	0.450	0.593
+latency	veil	static_54KB	1	2	5630		0.159	0.246	0.359
+latency	veil	static_54KB	10	2	33709		0.268	0.404	0.622
+latency	veil_cpu_affinity_cores	static_54KB	1	2	5586		0.159	0.245	0.367
+latency	veil_cpu_affinity_cores	static_54KB	10	2	34624		0.261	0.402	0.620
+latency	nginx	static_54KB	1	2	5161		0.152	0.310	0.604
+latency	nginx	static_54KB	10	2	24884		0.364	0.517	0.780
+latency	veil	proxy	1	3	2687		0.324	0.531	0.769
+latency	veil	proxy	10	3	17555		0.542	0.713	0.930
+latency	veil_cpu_affinity_cores	proxy	1	3	2794		0.319	0.493	0.684
+latency	veil_cpu_affinity_cores	proxy	10	3	16491		0.577	0.734	1.040
+latency	nginx	proxy	1	3	2668		0.315	0.548	0.890
+latency	nginx	proxy	10	3	15286		0.613	0.818	1.120
+latency	veil_v0.12.0	proxy	1	3	2766		0.321	0.497	0.676
+latency	veil_v0.12.0	proxy	10	3	16121		0.591	0.747	1.130
+latency	veil	static_54KB	1	3	5627		0.159	0.246	0.361
+latency	veil	static_54KB	10	3	34364		0.264	0.415	0.667
+latency	veil_cpu_affinity_cores	static_54KB	1	3	5625		0.159	0.246	0.365
+latency	veil_cpu_affinity_cores	static_54KB	10	3	27441		0.341	0.421	0.553
+latency	nginx	static_54KB	1	3	4298		0.172	0.448	0.850
+latency	nginx	static_54KB	10	3	24347		0.377	0.493	0.696
+latency	veil_v0.12.0	static_54KB	1	3	4369		0.203	0.319	0.498
+latency	veil_v0.12.0	static_54KB	10	3	26699		0.342	0.437	0.565
+latency	veil	proxy	1	4	2754		0.320	0.517	0.722
+latency	veil	proxy	10	4	16590		0.575	0.716	0.910
+latency	veil_cpu_affinity_cores	proxy	1	4	2788		0.321	0.498	0.682
+latency	veil_cpu_affinity_cores	proxy	10	4	16105		0.591	0.757	1.220
+latency	nginx	proxy	1	4	2720		0.317	0.525	0.850
+latency	nginx	proxy	10	4	14759		0.635	0.843	1.170
+latency	veil_v0.12.0	proxy	1	4	2775		0.323	0.498	0.692
+latency	veil_v0.12.0	proxy	10	4	16309		0.584	0.771	1.070
+latency	veil	static_54KB	1	4	5405		0.160	0.263	0.387
+latency	veil	static_54KB	10	4	34929		0.260	0.398	0.621
+latency	veil_cpu_affinity_cores	static_54KB	1	4	5565		0.159	0.251	0.384
+latency	veil_cpu_affinity_cores	static_54KB	10	4	35358		0.248	0.445	0.693
+latency	nginx	static_54KB	1	4	5172		0.152	0.308	0.587
+latency	nginx	static_54KB	10	4	23863		0.385	0.494	0.693
+latency	veil_v0.12.0	static_54KB	1	4	4341		0.205	0.311	0.500
+latency	veil_v0.12.0	static_54KB	10	4	30356		0.298	0.423	0.621
+latency	veil	proxy	1	5	2535		0.331	0.579	0.772
+latency	veil	proxy	10	5	16691		0.565	0.751	1.070
+latency	veil_cpu_affinity_cores	proxy	1	5	2730		0.326	0.510	0.696
+latency	veil_cpu_affinity_cores	proxy	10	5	17737		0.540	0.712	0.960
+latency	nginx	proxy	1	5	2729		0.317	0.526	0.842
+latency	nginx	proxy	10	5	13736		0.675	0.910	1.500
+latency	veil_v0.12.0	proxy	1	5	2804		0.321	0.491	0.669
+latency	veil_v0.12.0	proxy	10	5	15887		0.592	0.764	1.240
+latency	veil	static_54KB	1	5	5579		0.160	0.248	0.416
+latency	veil	static_54KB	10	5	26599		0.354	0.433	0.513
+latency	veil_cpu_affinity_cores	static_54KB	1	5	5457		0.160	0.262	0.439
+latency	veil_cpu_affinity_cores	static_54KB	10	5	27150		0.344	0.428	0.545
+latency	nginx	static_54KB	1	5	5528		0.153	0.306	0.584
+latency	nginx	static_54KB	10	5	25593		0.360	0.504	0.741
+latency	veil_v0.12.0	static_54KB	1	5	4420		0.203	0.306	0.456
+latency	veil_v0.12.0	static_54KB	10	5	25921		0.352	0.449	0.794

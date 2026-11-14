@@ -1,6 +1,6 @@
 # F-304: 静的配信のファイルの open・読み取りを、カーネルのキャッシュにあればワーカーの上で行う
 
-**状態: 実装中（feat/beat-nginx）**
+**状態: 完了（feat/beat-nginx、2026-11-14）**
 
 ## 問題
 
@@ -48,6 +48,9 @@ aofish のコンテナ間（[F-303](F-303-concentrate-connections.md) と同じ�
 
 1 要求あたりのサーバの CPU は 77〜86 µs（lab10）。HTTP/3 の静的配信（キャッシュ無し）は、応答が 1 周回遅れる
 offload の待ちが無くなった。
+
+- 最終のビルド（F-311 まで）のフルスイート（lab51）と、syscall・応答時間・HTTP/3・接続の張り直しの計測（lab56・lab59・lab60・lab62）は
+  [docs/perf/README.md](../../perf/README.md) の「feat/beat-nginx」に記録した。
 
 ## 範囲外・制限
 

@@ -1,6 +1,6 @@
 # F-305: HTTP/3 の送信の GSO を既定で有効にし、送れない経路では自動で下ろす
 
-**状態: 実装中（feat/beat-nginx、2026-11-12）**
+**状態: 完了（feat/beat-nginx、2026-11-14）**
 
 ## 背景
 
@@ -59,3 +59,5 @@ aofish（Docker Desktop・WSL2、16 論理 CPU）のコンテナ間で、h2load 
 - 両方 GSO 有りで、中継は nginx と同程度、静的配信は veil が 1〜2 割低い。サーバの CPU は veil の方が少なく、負荷側も
   veil に対しては飽和していない（1 スレッド 89% 対 nginx 99%）。1 接続の速さ（同時 10 本 ÷ 応答時間）が律速で、
   残りの差は別に調べる。
+- 最終のビルド（F-311 まで）のフルスイート（lab51）と、syscall・応答時間・HTTP/3・接続の張り直しの計測（lab56・lab59・lab60・lab62）は
+  [docs/perf/README.md](../../perf/README.md) の「feat/beat-nginx」に記録した。

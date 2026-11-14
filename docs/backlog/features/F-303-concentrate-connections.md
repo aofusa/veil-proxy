@@ -1,6 +1,6 @@
 # F-303: 接続を負荷に見合う本数のワーカーへ集める（コンテナ間の HTTP/1.1 で nginx に劣る）
 
-**状態: 実装中（feat/beat-nginx）**
+**状態: 完了（feat/beat-nginx、2026-11-14）**
 
 ## 問題
 
@@ -78,6 +78,8 @@ nginx は `tools/perf/nginx/nginx.conf`（`worker_processes auto`）。値は 3 
   78.6k〜97.9k。
 - 動かす接続の応答に `Connection: close` を付けていなかった（[B-360](../bugs/B-360-h1-proxy-close-without-connection-close.md)）
   ので lab7 の中継の 1 回目に wrk の read のエラーが 171 出た。lab10 は 0。
+- 最終のビルド（F-311 まで）のフルスイート（lab51）と、syscall・応答時間・HTTP/3・接続の張り直しの計測（lab56・lab59・lab60・lab62）は
+  [docs/perf/README.md](../../perf/README.md) の「feat/beat-nginx」に記録した。
 
 ## 範囲外・制限
 

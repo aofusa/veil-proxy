@@ -1,6 +1,6 @@
 # F-306: HTTP/3 でパケット番号を飛ばすのを輻輳窓が伸びたときだけにする
 
-**状態: 実装中（feat/beat-nginx、2026-11-12）**
+**状態: 完了（feat/beat-nginx、2026-11-14）**
 
 ## 背景
 
@@ -79,3 +79,5 @@ aofish（Docker Desktop・WSL2、16 論理 CPU）のコンテナ間、h2load の
 - 1 回ごとのばらつき（標準偏差 2k 前後）が大きい。7 回の平均では `on_growth` 37.0k・`off` 38.5k・nginx 38.8k で、`on_growth` は
   `every_round` との差の大半を詰めたが、`off`・nginx より 4〜5% 低い。各ワーカーの CPU（最も忙しいスレッドで 7〜9 割）を見る限り、
   特定のワーカーの飽和ではない。
+- 最終のビルド（F-311 まで）のフルスイート（lab51）と、syscall・応答時間・HTTP/3・接続の張り直しの計測（lab56・lab59・lab60・lab62）は
+  [docs/perf/README.md](../../perf/README.md) の「feat/beat-nginx」に記録した。
