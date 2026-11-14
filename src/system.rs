@@ -473,12 +473,12 @@ pub(crate) fn spawn_pooled_with_panic_catch<F>(
 //   sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 // ====================
 
-/// ユーザー名からUIDを取得
+/// ユーザー名から UID と主グループの GID を取得
 ///
 /// `getpwnam(3)` は POSIX のため Linux/FreeBSD/OpenBSD 共通で使える（F-120 Phase 4 で
 /// Linux 限定 cfg を撤去）。
 #[cfg(unix)]
-pub(crate) fn get_uid_by_name(username: &str) -> Option<u32> {
+pub(crate) fn get_user_ids_by_name(username: &str) -> Option<(libc::uid_t, libc::gid_t)> {
     use std::ffi::CString;
 
     let username_cstr = CString::new(username).ok()?;
@@ -488,7 +488,7 @@ pub(crate) fn get_uid_by_name(username: &str) -> Option<u32> {
         if pwd.is_null() {
             None
         } else {
-            Some((*pwd).pw_uid)
+            Some(((*pwd).pw_uid, (*pwd).pw_gid))
         }
     }
 }
@@ -531,7 +531,15 @@ pub(crate) fn resolve_privilege_ids(
     if unsafe { libc::getuid() } != 0 {
         return Ok(PrivilegeIds::default());
     }
-    let group = match security.drop_privileges_group.as_deref() {
+    resolve_privilege_ids_as_root(security)
+}
+
+/// [`resolve_privilege_ids`] の root で起動したときの本体（root でない試験からも呼べるように分けた）
+#[cfg(unix)]
+fn resolve_privilege_ids_as_root(
+    security: &crate::GlobalSecurityConfig,
+) -> io::Result<PrivilegeIds> {
+    let mut group = match security.drop_privileges_group.as_deref() {
         Some(name) => Some((
             name.to_string(),
             get_gid_by_name(name).ok_or_else(|| {
@@ -544,15 +552,20 @@ pub(crate) fn resolve_privilege_ids(
         None => None,
     };
     let user = match security.drop_privileges_user.as_deref() {
-        Some(name) => Some((
-            name.to_string(),
-            get_uid_by_name(name).ok_or_else(|| {
+        Some(name) => {
+            let (uid, primary_gid) = get_user_ids_by_name(name).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("User '{}' not found", name),
                 )
-            })?,
-        )),
+            })?;
+            // グループを指定せず利用者だけを指定したときは、その利用者の主グループへ下ろす
+            // （setuid だけでは gid 0 のまま残り、root のグループで読めるものが読める。B-382）
+            if group.is_none() {
+                group = Some((format!("primary group of {}", name), primary_gid));
+            }
+            Some((name.to_string(), uid))
+        }
         None => None,
     };
     Ok(PrivilegeIds { group, user })
@@ -571,20 +584,26 @@ pub(crate) fn drop_privileges(ids: &PrivilegeIds) -> io::Result<()> {
         return Ok(());
     }
 
-    // グループ降格（先に行う）
+    if ids.user.is_none() && ids.group.is_none() {
+        return Ok(());
+    }
+
+    // 補助グループ（root の wheel・operator 等）を先に外す。外せないまま降格すると root のグループの
+    // 権限が残るので、外せなければ降格の失敗にする（以前は警告だけで、利用者だけを指定したときは
+    // 外していなかった。B-382）
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(
+            e.kind(),
+            format!("failed to clear supplementary groups: {}", e),
+        ));
+    }
+
+    // グループ降格（ユーザーより先に行う）
     if let Some((ref group_name, gid)) = ids.group {
         if unsafe { libc::setgid(gid) } != 0 {
             return Err(io::Error::last_os_error());
         }
-
-        // 補助グループをクリア
-        if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
-            warn!(
-                "Failed to clear supplementary groups: {}",
-                io::Error::last_os_error()
-            );
-        }
-
         info!("Dropped group privileges to '{}' (gid={})", group_name, gid);
     }
 
@@ -598,17 +617,20 @@ pub(crate) fn drop_privileges(ids: &PrivilegeIds) -> io::Result<()> {
     }
 
     // 降格成功の確認
-    if ids.user.is_some() || ids.group.is_some() {
-        let current_uid = unsafe { libc::getuid() };
-        let current_gid = unsafe { libc::getgid() };
-        info!(
-            "Current privileges: uid={}, gid={}",
-            current_uid, current_gid
-        );
+    let current_uid = unsafe { libc::getuid() };
+    let current_gid = unsafe { libc::getgid() };
+    info!(
+        "Current privileges: uid={}, gid={}",
+        current_uid, current_gid
+    );
 
-        // rootに戻れないことを確認
-        if ids.user.is_some() && unsafe { libc::setuid(0) } == 0 {
-            warn!("WARNING: Process can still regain root privileges!");
+    // root に戻れないことを確かめる。戻れるなら降格の失敗にする（以前は警告だけで続けていた。B-382）
+    if let Some((_, uid)) = ids.user {
+        if uid != 0 && unsafe { libc::setuid(0) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "privilege drop failed: the process can still regain root privileges",
+            ));
         }
     }
 
@@ -947,6 +969,29 @@ fn attach_cbpf_program(fd: i32, program: &[libc::sock_filter]) -> io::Result<()>
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// 利用者だけを指定したときは、その利用者の主グループへ下ろす（gid 0 のまま残さない。B-382）。
+    /// グループを指定したときはそちらを使う
+    #[test]
+    fn user_only_privilege_drop_uses_the_users_primary_group() {
+        let (uid, gid) = get_user_ids_by_name("root").expect("root user");
+        let security = crate::GlobalSecurityConfig {
+            drop_privileges_user: Some("root".to_string()),
+            ..Default::default()
+        };
+        let ids = resolve_privilege_ids_as_root(&security).unwrap();
+        assert_eq!(ids.user.as_ref().map(|u| u.1), Some(uid));
+        assert_eq!(ids.group.as_ref().map(|g| g.1), Some(gid));
+
+        let missing = crate::GlobalSecurityConfig {
+            drop_privileges_user: Some("veil-no-such-user-b382".to_string()),
+            ..Default::default()
+        };
+        assert!(resolve_privilege_ids_as_root(&missing).is_err());
+
+        let none = resolve_privilege_ids_as_root(&crate::GlobalSecurityConfig::default()).unwrap();
+        assert!(none.user.is_none() && none.group.is_none());
+    }
 
     /// raise_nofile_limit が panic せず、soft limit が呼び出し前以上・hard 以下に
     /// なること（B-44 第4段）。到達値は環境（コンテナ/権限）依存のため、

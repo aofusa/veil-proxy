@@ -342,5 +342,5 @@ impl PrometheusConfig {
     }
 }
 
-// 権限降格（get_uid_by_name, get_gid_by_name, drop_privileges）と
+// 権限降格（get_user_ids_by_name, get_gid_by_name, drop_privileges）と
 // build_sandbox_config は crate::system モジュールに移動しました。

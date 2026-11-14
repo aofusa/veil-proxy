@@ -683,7 +683,7 @@ landlock_write_paths = ["/var/log/veil"]
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `drop_privileges_user` | Username to drop to after startup | none |
+| `drop_privileges_user` | Username to drop to after startup (when veil starts as root). Without `drop_privileges_group`, the group becomes the user's primary group. Supplementary groups are always cleared; veil stops if it cannot clear them or could still switch back to root | none |
 | `drop_privileges_group` | Group name to drop to after startup | none |
 | `max_concurrent_connections` | Maximum concurrent connections | 0 (unlimited) |
 | `blocked_ips` | Front-line IP/CIDR blocklist; matching connections are dropped right after `accept` (before the TLS handshake / handler spawn), avoiding expensive work for known-bad IPs. Applies to every listener: HTTP (TLS and cleartext), L4 TCP, the Initial packet of a new HTTP/3 connection (no Retry is sent), and new L4 UDP sessions. CIDRs are parsed once at startup (zero-alloc check on the accept hot path) and hot-reloadable via SIGHUP. Evaluated earlier than per-route `denied_ips`. | `[]` |

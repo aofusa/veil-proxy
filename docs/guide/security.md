@@ -116,6 +116,10 @@ drop_privileges_user = "veil"
 drop_privileges_group = "veil"
 ```
 
+Without `drop_privileges_group`, veil switches to the user's primary group. Supplementary groups (root's `wheel`,
+`operator` and so on) are always cleared. veil does not start if it cannot clear them or if it could still switch
+back to root after the drop.
+
 #### 4. macOS Seatbelt (`sandbox_init`)
 
 On macOS, `enable_sandbox_macos = true` applies a Seatbelt profile once every listener is bound (it cannot be

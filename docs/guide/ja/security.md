@@ -114,6 +114,9 @@ drop_privileges_user = "veil"
 drop_privileges_group = "veil"
 ```
 
+`drop_privileges_group` を指定しなければ、その利用者の主グループへ下ろします。補助グループ（root の `wheel`・
+`operator` 等）は常に外します。外せないときや、降格の後も root に戻れるときは起動しません。
+
 #### 4. macOS の Seatbelt（`sandbox_init`）
 
 macOS では `enable_sandbox_macos = true` で、全リスナーの bind が済んだ後に Seatbelt のプロファイルを掛けます

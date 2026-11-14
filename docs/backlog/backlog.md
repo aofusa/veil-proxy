@@ -739,6 +739,7 @@
 | B-379 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-379-source-ip-ipv4-mapped.md](bugs/B-379-source-ip-ipv4-mapped.md) | ルートの `source_ip` がデュアルスタックのリスナーで受けた IPv4 のクライアント（`::ffff:a.b.c.d`）に一致せず、キャッシュに当たったときの再確認は IPv6 の CIDR を見ず `/0` で桁あふれした。IPv4 射影を IPv4 として比べ、長すぎる接頭辞は無視する |
 | B-380 | P3 | 修正済み（feat/beat-nginx） | [bugs/B-380-cidr-ipv6-parse-overflow.md](bugs/B-380-cidr-ipv6-parse-overflow.md) | IP の CIDR の解析が std で読めない IPv6 を簡易の解析へ回し、区切りの多すぎる表記（`1:2:3:4:5:6:7::8:9`）で桁あふれして別のアドレスとして読んでいた（設定だけから届く）。std の解析だけにする |
 | B-381 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-381-wasm-http-call-request-injection.md](bugs/B-381-wasm-http-call-request-injection.md) | Proxy-Wasm の `http_call` が `:method`・`:path`・ヘッダを検査せずに連結し、CR・LF を含む値で呼び出し先へ別の要求を足せた。枠組みのヘッダが二重になり、UTF-8 でない本文は置き換わって `Content-Length` と食い違った。値を検査し、枠組みは veil が決め、本文はバイト列のまま送る |
+| B-382 | P3 | 修正済み（feat/beat-nginx） | [bugs/B-382-privilege-drop-keeps-root-groups.md](bugs/B-382-privilege-drop-keeps-root-groups.md) | `drop_privileges_user` だけの権限降格が gid 0 と root の補助グループを残し、補助グループを外せないとき・root に戻れるときも警告だけで続けていた。利用者の主グループへ下ろし、補助グループは常に外し、失敗は起動を止める |
 
 ---
 
