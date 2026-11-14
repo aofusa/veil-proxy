@@ -17,6 +17,103 @@ v0.12.0 は、API ライブラリの経路の 4 領域（JSON + 圧縮・コア�
 | [`freebsd_v0110_ab_raw.tsv`](freebsd_v0110_ab_raw.tsv) | FreeBSD の v0.11.0 との交互 A/B（rps・CPU/要求）の生データ |
 | [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv) | FreeBSD 14.3 aarch64 の `run_perf_bsd.sh`（標準・サーバ律速 × 54KB・3B、nginx と）の生データ |
 | [`platform_verification.md`](platform_verification.md) | 全プラットフォームの試験（v0.12.0） |
+| [`linux_beat_suite_raw.tsv`](linux_beat_suite_raw.tsv) | feat/beat-nginx のフルスイート（v0.12.0 と交互、nginx の同じ仕事の相手を含む。下の「feat/beat-nginx」）の生データ |
+| [`linux_beat_remeasure_raw.tsv`](linux_beat_remeasure_raw.tsv) | 上で v0.12.0 との比が 0.95 を下回った組の測り直し（lab26・lab35）の生データ |
+| [`linux_beat_syscall_latency_raw.tsv`](linux_beat_syscall_latency_raw.tsv) | 1 要求あたりの syscall の数と低い並列度（1・10 接続）の応答時間（nginx と）の生データ |
+| [`linux_beat_h3_raw.tsv`](linux_beat_h3_raw.tsv) | HTTP/3 のサーバ律速・負荷側 8 スレッド・低い並列度の nginx との比較の生データ |
+
+---
+
+## feat/beat-nginx（v0.12.0 の後、2026-11-11〜14）
+
+コンテナ間の HTTP/1.1 で nginx を下回っていた原因（負荷の少ない接続が全ワーカーへ散って、ワーカーごとの起床・
+`io_uring_enter` が要求の数に近くなる）を、接続の集約（[F-303](../backlog/features/F-303-concentrate-connections.md)。
+SO_REUSEPORT のグループの CBPF を制御スレッドが差し替えて、新しい接続を先頭の N 本のワーカーへ振り分ける）で直した。
+あわせて静的配信のキャッシュに載ったファイルの I/O をワーカーの上で行い（[F-304](../backlog/features/F-304-inline-cached-file-io.md)）、
+HTTP/3 の GSO を既定にし（[F-305](../backlog/features/F-305-h3-gso-default.md)・[B-361](../backlog/bugs/B-361-h3-gso-socket-default-splits-single-packets.md)）、
+QUIC のパケット番号を飛ばす頻度を下げた（[F-306](../backlog/features/F-306-h3-pn-skip-policy.md)）。途中で見つけた
+[B-360](../backlog/bugs/B-360-h1-proxy-close-without-connection-close.md)・[B-362](../backlog/bugs/B-362-h3-first-batch-body-skips-size-limit.md)・
+[B-366](../backlog/bugs/B-366-concentrate-h2-burst-after-pause.md) も直した。
+
+計測は aofish の Docker Desktop のコンテナ間（下の「計測条件」と同じ）。フルスイートは feat/beat-nginx の `945e6d73`（`veil:beat8`。
+B-366 の前）を v0.12.0（`veil:v0120-uring`）と交互に、`nginx:alpine`（`quic_gso on`）と 69 構成 × 3 反復（lab24）。全 834 計測で Non-2xx = 0。
+
+### nginx との比較（同じ仕事の相手、Req/s 中央値の比。同じ回の v0.12.0 と並べる）
+
+| プロトコル | 構成数 | v0.12.0 | feat/beat-nginx | 最小 | nginx 未満 |
+|---|---|---|---|---|---|
+| HTTP/1.1 | 54 | 0.71（未満 31） | **1.30** | 0.96 | 6（すべて 0.96〜0.99） |
+| HTTP/2 | 45 | 1.31（未満 19） | **1.39** | 1.08 | 0 |
+| HTTP/3 | 19 | 0.54（未満 19） | **1.00** | 0.85 | 11 |
+| h2c | 2 | 1.85 | **1.78** | 1.54 | 0 |
+
+代表的な構成（feat/beat-nginx）:
+
+| 構成 | プロトコル | nginx | veil | 対 nginx |
+|---|---|---|---|---|
+| `h2_1_ktls_0_lb_kernel_ofc_1`（静的） | HTTP/1.1 | 57,469 | 85,994 | **1.50×**（v0.12.0 は 0.77×） |
+| `h2_0_ktls_0_lb_cbpf_ofc_0`（静的、ファイルキャッシュ無し） | HTTP/1.1 | 57,469 | 77,515 | **1.35×**（v0.12.0 は 0.44×） |
+| `h2_1_feat_proxy`（中継） | HTTP/1.1 | 36,453 | 46,388 | **1.27×** |
+| `h2_1_feat_proxy`（中継） | HTTP/2 | 20,910 | 37,104 | **1.77×** |
+| `h2_1_ktls_0_lb_cbpf_ofc_1`（静的） | HTTP/2 | 35,088 | 45,440 | **1.30×** |
+| `h2_1_proxy_compression`（中継 + 圧縮） | HTTP/2 | 7,005 | 23,035 | **3.29×** |
+| `h2_1_feat_compression`（毎回圧縮） | HTTP/1.1 | 9,886 | 33,235 | **3.36×** |
+| `h3_proxy_cache`（中継 + キャッシュ） | HTTP/1.1 | 36,453 | 83,750 | **2.30×** |
+| `h2_0_feat_l4`（L4 平文） | HTTP/1.1 | 57,469 | 74,636 | **1.30×** |
+| `h2c_file` / `h2c_proxy` | h2c | 61,526 / 38,758 | 124,560 / 59,663 | **2.02× / 1.54×** |
+| `h3_file_metrics`（静的） | HTTP/3 | 38,677 | 39,366 | 1.02×（v0.12.0 は 0.54×） |
+| `h3_proxy`（中継） | HTTP/3 | 31,298 | 31,661 | 1.01×（v0.12.0 は 0.58×） |
+
+- HTTP/1.1 で nginx を下回った 6 構成は、kTLS 有りでファイルキャッシュ無しの静的配信 4 構成（0.96〜0.99）と `h3_proxy_otel`（0.99）等で、
+  nginx の `base` の反復ごとの揺れ（53,794〜58,302）の内側。
+- HTTP/3 のスイートの行は負荷側（h2load、既定の 4 スレッド）が律速で、両者とも負荷側の上限に近い（下の「HTTP/3」でサーバ律速にすると
+  veil が 1.33〜1.45 倍）。nginx を下回った 11 行は、機能を足した中継（`h3_proxy_otel` 0.85・`_buffering` 0.88・`_wasm` 0.92・
+  `_access_log` 0.93・`_compression` 0.93・`_metrics` 0.96。nginx の相手 `base_proxy` はこれらの機能を持たない）と、0.99 の 5 行。
+
+### v0.12.0 との退行確認（交互 A/B）
+
+lab24 の 133 組の比の中央値は **1.389**（HTTP/1.1 1.880、HTTP/2 1.067、HTTP/3 1.852、gRPC 0.971、gRPC over HTTP/3 1.025、h2c 0.961、
+WebSocket 1.156）。比が 0.95 を下回った 9 組は、構成ごとに 2 つを続けて測り、ラウンドごとに順を入れ替えて測り直した（lab26、4 ラウンド）。
+
+| 構成 | プロトコル | lab24 | lab26 | その後 |
+|---|---|---|---|---|
+| `h2_1_proxy_cache` | HTTP/2 | 0.897 | 0.790 | 原因は負荷の切れ目の後の HTTP/2 の接続の束を縮めた本数のワーカーで受けていたこと（B-366 で直した。1 回目 +25%・中央値 +5〜9%） |
+| `h3_proxy_compression` | HTTP/1.1 | 0.903（HTTP/2） | 0.857 | lab35（3 ラウンド × 3 反復）で 1.028（HTTP/1.1）・1.019（HTTP/2）。再現しない |
+| `h3_proxy_otel` | HTTP/2 | 0.941（HTTP/1.1） | 0.871 | lab35 で 0.983（集約を切ると 1.037）・HTTP/1.1 1.106。再現しない |
+| `grpc_h2_access_log`・`h2_1_feat_grpc` | gRPC | 0.836・0.903 | 0.975・1.042 | ラウンドごとの比が 0.87〜1.27 と揺れる（どちらにも偏らない） |
+| `h2c_proxy` | h2c | 0.921 | 0.971 | |
+| その他 3 組 | | 0.938〜0.950 | 1.049〜1.218 | |
+
+### 1 要求あたりの syscall と応答時間（lab25、HTTP/1.1 + TLS、3 回の中央値）
+
+syscall の数は perf のトレースポイント（`raw_syscalls:sys_enter`）をサーバのプロセスで数えた（`wrk -t4 -c100`）。応答時間は
+`wrk --latency` の 1 接続・10 接続（`-t1 -c1`・`-t2 -c10`）。静的配信は 54KB（`h2_1_ktls_0_lb_kernel_ofc_1`）、中継は `h2_1_feat_proxy`。
+
+| 測るもの | 静的配信 nginx | 静的配信 veil | 中継 nginx | 中継 veil |
+|---|---:|---:|---:|---:|
+| syscall / 要求（100 接続） | 15.04 | **3.54** | 22.60 | **3.93** |
+| Req/s（同じ回、100 接続） | 49,770 | **79,651** | 32,039 | **43,758** |
+| 1 接続の p50 / p99（ms） | 0.199 / 0.593 | **0.161 / 0.416** | 0.314 / 0.842 | 0.334 / **0.743** |
+| 1 接続の Req/s | 4,795 | **5,469** | 2,770 | 2,672 |
+| 10 接続の p50 / p99（ms） | 0.625 / 1.480 | **0.267 / 0.631** | 0.990 / 2.040 | **0.577 / 0.990** |
+| 10 接続の Req/s | 15,164 | **33,853** | 9,868 | **16,513** |
+
+- 中継の 1 接続だけは veil の p50 が 20 µs 遅く、Req/s が 0.96 倍（p99 は veil が低い）。
+- veil は要求ごとの読み書き・上流への送受信を io_uring の SQE にまとめて、提出を実行器の park でまとめて行う（AGENTS.md の
+  io_uring の規則）ので、syscall の数は nginx（epoll + `read`・`write`・`writev`）の 4 分の 1〜6 分の 1。
+
+### HTTP/3（lab25、3 回の中央値）
+
+| 配置 | nginx | veil | 対 nginx | サーバの CPU / 要求（nginx → veil） |
+|---|---:|---:|---:|---|
+| サーバ律速・静的配信（サーバ 4 CPU・4 ワーカー、h2load 12 CPU・8 スレッド） | 26,659 | 35,461 | **1.33×** | 166 → 125 µs |
+| サーバ律速・中継 | 15,214 | 22,132 | **1.45×** | 250 → 168 µs |
+| 標準の配置・h2load 8 スレッド・静的配信 | 45,547 | 49,495 | **1.09×** | |
+| 1 接続 × 1 ストリーム | 3,071 | 3,225 | **1.05×** | |
+| 10 接続 × 1 ストリーム | 17,034 | 16,487 | 0.97× | |
+
+- スイートと同じ h2load の 4 スレッドでは負荷側が律速。パケット番号を飛ばす頻度（F-306）は負荷側（ngtcp2）の費用に効く。
+  既定の `on_growth` で負荷側の 1 要求の CPU は nginx と同じになった（lab22・lab23 の結果は F-306 のチケット）。
 
 ---
 
@@ -324,8 +421,9 @@ kTLS の有無でも同じ（`h1tls_file` の kTLS 有り、ファイルキャ�
 | `h3_proxy`（中継） | HTTP/3 | 18,136 | 18,997 | 1.05× |
 
 nginx の HTTP/1.1 の基準（`base`）は反復ごとに 53,635・57,529・58,302 と揺れている（中央値の 57,529 を使った）。HTTP/1.1 の比の読み方は v0.11.0 の
-切り分けと同じで、`wrk -t4 -c100` のこのスイートは負荷生成の側で決まる行が多く、`*_ofc_0`（ファイルキャッシュ無し）は nginx の `base` が
-`open_file_cache` を有効にしているので条件が揃っていない。v0.12.0 ではこの切り分けの計測はやり直していない。サーバが律速の条件での比較は上の「プロキシ本体」。
+切り分けと同じで、`wrk -t4 -c100` のこのスイートは負荷生成の側で決まる行が多い。nginx の `base`（443）は `open_file_cache` を使っていない
+（nginx の `open_file_cache` は h2c の 8080 だけ）ので、`*_ofc_0`（veil もファイルキャッシュ無し）が `base` と同じ条件、`*_ofc_1` は veil だけが
+キャッシュを使う条件になる。v0.12.0 ではこの切り分けの計測はやり直していない。サーバが律速の条件での比較は上の「プロキシ本体」。
 
 ---
 
