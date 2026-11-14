@@ -156,7 +156,7 @@ fn execute_http_request(
 
     // Send request
     stream
-        .write_all(request.as_bytes())
+        .write_all(&request)
         .map_err(|e| format!("Write failed: {}", e))?;
 
     // Read response
@@ -190,7 +190,7 @@ fn execute_https_request(
     // Build and send request
     let request = build_http_request(host, pending)?;
     tls_stream
-        .write_all(request.as_bytes())
+        .write_all(&request)
         .map_err(|e| format!("TLS write failed: {}", e))?;
 
     // Read response
@@ -237,58 +237,68 @@ fn execute_https_request(
     parse_http_response_from_bytes(&response_data)
 }
 
-/// Build HTTP/1.1 request string
-fn build_http_request(host: &str, pending: &GlobalPendingCall) -> Result<String, String> {
-    let mut request = String::new();
+/// HTTP/1.1 の要求を組み立てる。
+///
+/// モジュールが渡した `:method`・`:path`・ヘッダは検査し、CR・LF 等で要求を分けられる値は断る（モジュールが
+/// クライアントの要求の値をそのまま渡すと、呼び出し先へ別の要求を足せた）。本文の長さと接続の扱い
+/// （`Host`・`Content-Length`・`Transfer-Encoding`・`Connection`）は veil が決め、モジュールの値は使わない。
+/// 本文はバイト列のまま付ける（以前は UTF-8 として読み直していて、バイナリの本文が変わり `Content-Length` と
+/// 食い違っていた）
+fn build_http_request(host: &str, pending: &GlobalPendingCall) -> Result<Vec<u8>, String> {
+    let headers = &pending.call.headers;
+    let pseudo = |name: &[u8]| {
+        headers
+            .iter()
+            .find(|(k, _)| k.as_slice() == name)
+            .map(|(_, v)| v.as_slice())
+    };
+    let method = pseudo(b":method").unwrap_or(b"GET");
+    let path = pseudo(b":path").unwrap_or(b"/");
+    if !crate::http_utils::is_valid_header_name(method) {
+        return Err("invalid :method in http_call".to_string());
+    }
+    if path.is_empty() || path.iter().any(|&b| b <= 0x20 || b == 0x7f) {
+        return Err("invalid :path in http_call".to_string());
+    }
+    let body = &pending.call.body;
 
-    // Determine method and path from headers
-    let method = pending
-        .call
-        .headers
-        .iter()
-        .find(|(k, _)| k.as_slice() == b":method")
-        .and_then(|(_, v)| std::str::from_utf8(v).ok())
-        .unwrap_or("GET");
-
-    let path = pending
-        .call
-        .headers
-        .iter()
-        .find(|(k, _)| k.as_slice() == b":path")
-        .and_then(|(_, v)| std::str::from_utf8(v).ok())
-        .unwrap_or("/");
-
-    // Request line
-    request.push_str(&format!("{} {} HTTP/1.1\r\n", method, path));
-
-    // Host header
-    request.push_str(&format!("Host: {}\r\n", host));
-
-    // Add other headers (skip pseudo-headers)
-    for (key, value) in &pending.call.headers {
-        if key.first().copied() != Some(b':') {
-            let k = std::str::from_utf8(key).unwrap_or("");
-            let v = std::str::from_utf8(value).unwrap_or("");
-            request.push_str(&format!("{}: {}\r\n", k, v));
+    let mut request = Vec::with_capacity(256 + body.len());
+    request.extend_from_slice(method);
+    request.push(b' ');
+    request.extend_from_slice(path);
+    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    request.extend_from_slice(host.as_bytes());
+    request.extend_from_slice(b"\r\n");
+    for (key, value) in headers {
+        if key.first().copied() == Some(b':') {
+            continue;
         }
+        if !crate::http_utils::is_valid_header_name(key)
+            || !crate::http_utils::is_valid_header_value(value)
+        {
+            return Err("invalid header in http_call".to_string());
+        }
+        if [
+            b"host".as_slice(),
+            b"content-length",
+            b"transfer-encoding",
+            b"connection",
+        ]
+        .iter()
+        .any(|n| key.eq_ignore_ascii_case(n))
+        {
+            continue;
+        }
+        request.extend_from_slice(key);
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(value);
+        request.extend_from_slice(b"\r\n");
     }
-
-    // Content-Length if body exists
-    if !pending.call.body.is_empty() {
-        request.push_str(&format!("Content-Length: {}\r\n", pending.call.body.len()));
+    if !body.is_empty() {
+        request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
-
-    // Connection header
-    request.push_str("Connection: close\r\n");
-
-    // End headers
-    request.push_str("\r\n");
-
-    // Body
-    if !pending.call.body.is_empty() {
-        request.push_str(&String::from_utf8_lossy(&pending.call.body));
-    }
-
+    request.extend_from_slice(b"Connection: close\r\n\r\n");
+    request.extend_from_slice(body);
     Ok(request)
 }
 
@@ -438,12 +448,69 @@ mod tests {
             },
         };
 
-        let request = build_http_request("example.com", &pending).unwrap();
+        let request =
+            String::from_utf8(build_http_request("example.com", &pending).unwrap()).unwrap();
 
         assert!(request.starts_with("GET /api/test HTTP/1.1\r\n"));
         assert!(request.contains("Host: example.com\r\n"));
         assert!(request.contains("user-agent: wasm-client\r\n"));
         assert!(request.ends_with("\r\n\r\n"));
+    }
+
+    /// モジュールが渡した値で要求を分けられない（CR・LF を含む値・token でない名前・空白を含む `:path` は断る）。
+    /// 枠組みのヘッダはモジュールの値を使わず、本文はバイト列のまま長さどおりに付く
+    #[test]
+    fn build_http_request_rejects_injection_and_keeps_binary_body() {
+        let call = |headers: Vec<(&[u8], &[u8])>, body: &[u8]| GlobalPendingCall {
+            module_name: "test".to_string(),
+            token: 1,
+            call: PendingHttpCall {
+                token: 1,
+                upstream: "backend".to_string(),
+                timeout_ms: 5000,
+                headers: headers
+                    .into_iter()
+                    .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                    .collect(),
+                body: body.to_vec(),
+                trailers: vec![],
+            },
+        };
+        for bad in [
+            vec![(b":path".as_slice(), b"/a HTTP/1.1\r\nX: y".as_slice())],
+            vec![(b":method".as_slice(), b"GET /x".as_slice())],
+            vec![(
+                b"x-user".as_slice(),
+                b"a\r\n\r\nGET /admin HTTP/1.1".as_slice(),
+            )],
+            vec![(b"x-user".as_slice(), b"a\nb".as_slice())],
+            vec![(b"bad name".as_slice(), b"v".as_slice())],
+        ] {
+            assert!(build_http_request("example.com", &call(bad, b"")).is_err());
+        }
+        let body = [0xffu8, 0xfe, b'\r', b'\n', 0x00, 0x80];
+        let req = build_http_request(
+            "example.com",
+            &call(
+                vec![
+                    (b":method".as_slice(), b"POST".as_slice()),
+                    (b":path", b"/upload"),
+                    (b"Content-Length", b"1"),
+                    (b"transfer-encoding", b"chunked"),
+                    (b"Host", b"evil.example"),
+                    (b"x-ok", b"1"),
+                ],
+                &body,
+            ),
+        )
+        .unwrap();
+        let head_end = req.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = std::str::from_utf8(&req[..head_end]).unwrap();
+        assert_eq!(
+            head,
+            "POST /upload HTTP/1.1\r\nHost: example.com\r\nx-ok: 1\r\nContent-Length: 6\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(&req[head_end..], &body);
     }
 
     #[test]

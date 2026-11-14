@@ -460,3 +460,9 @@ fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize
     self.resume_http_request();
 }
 ```
+
+Veil sends the call as HTTP/1.1 and sets `Host`, `Content-Length` and `Connection` itself; `host`,
+`content-length`, `transfer-encoding` and `connection` headers passed by the filter are dropped. A call whose
+`:method`, `:path` or header names and values could split the request (CR, LF, NUL, a space in `:path`, a name that
+is not a token) is not sent: the filter receives a `504` response with `x-wasm-error: http_call_failed`. The body
+is sent byte for byte.

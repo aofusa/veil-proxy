@@ -444,3 +444,8 @@ fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize
     self.resume_http_request();
 }
 ```
+
+Veil は呼び出しを HTTP/1.1 で送り、`Host`・`Content-Length`・`Connection` は Veil が付けます（フィルタが渡した
+`host`・`content-length`・`transfer-encoding`・`connection` は捨てます）。`:method`・`:path`・ヘッダの名前と値に
+要求を分けられる文字（CR・LF・NUL、`:path` の空白、token でない名前）があると送らず、フィルタには
+`x-wasm-error: http_call_failed` 付きの `504` が返ります。本文はバイト列のまま送ります。
