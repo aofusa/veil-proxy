@@ -1,6 +1,6 @@
 # B-110: NetBSD x86_64 の E2E で WAF の WASM テストが負荷時だけ失敗する
 
-**状態: 未修正**
+**状態: 修正済み（feat/beat-nginx、2026-11-14）**
 
 ## 事象
 
@@ -19,12 +19,38 @@ feat/v0100 の io_uring の E2E（この端末の 4 コア、同時にビルド�
 nightly の io_uring・epoll の E2E では通った。Pulley でない Linux でも、並列の試験の負荷の下で初回要求の正規表現の
 構築が予算を超え得る（同じ現象）。
 
-## 影響
+## 追記（2026-11-14、Linux x86_64）
 
-本番機能の不具合ではなく、Pulley で動く環境でのテストの安定性の問題。ただし同じ条件の本番でも、WAF の
-初回要求が実行予算を超えると fail-open になる（設定どおりの挙動）。
+feat/beat-nginx の最終確認の io_uring の E2E で 1 回だけ `status=503`・本文無し（既定が `fail_closed` になった F-293 の
+後の同じ現象。503 はモジュールの失敗の応答）。同じ回の epoll の E2E では通った。
 
-## 改修案（未着手）
+## 原因
 
-- テスト側: WAF モジュールを起動後に 1 回暖機してから判定する、または Pulley 環境で予算を広げる。
-- 本体側: 正規表現の構築を `proxy_on_configure`（設定時）へ寄せ、要求処理の予算から外せないか調べる。
+WAF モジュール（`examples/wasm-filters/waf-filter`）は CRS の正規表現を、ルートコンテキストを作るとき
+（`proxy_on_context_create`。インスタンスの起動時のコールバック）に組み立てる。veil は新しいインスタンスの起動時の
+コールバックにも、1 回のコールバックと同じ実時間の締切（エポック 10 ティック、約 1〜1.1 秒）を掛けていた。起動時の
+コールバックも燃料の `yield_interval_us`（既定 1ms）ごとに同じワーカーの他の要求へ譲るので、並列の試験の負荷の下では
+CPU の量（燃料）は足りていても実時間が 1 秒を超え、`interrupt` でトラップする。Pulley は 1 命令が遅いので頻繁に起きた。
+
+作りかけのインスタンスは捨てられ、次の要求がまた最初から組み立て直す。本番でも、負荷が続く間は起動の重いモジュールの
+付いたルートがインスタンスを作れず、`fail_closed` の 503（`fail_open` ならフィルタを飛ばした応答）を返し続け得た。
+
+起動時の検査（`validate`）は B-336 で実時間の締切を約 60 秒にしてあったが、要求の経路でインスタンスを作るときは
+1 回のコールバックの締切のままだった。
+
+## 修正
+
+- 新しいインスタンスの起動時のコールバック（`_start` → root コンテキスト → `on_vm_start` → `on_configure`）の実時間の締切を、
+  起動時の検査と同じ約 60 秒（`LIFECYCLE_EPOCH_DEADLINE`）にした（`FilterEngine::new_configured_instance`）。CPU は同じ燃料
+  （`max_execution_time_ms`）で縛るので、暴走するモジュールは従来どおり止まる。インスタンスができたら、要求のコールバックには
+  1 回のコールバックの締切（約 1 秒）を戻す（従来どおり）。
+- `docs/guide/wasm.md`・`docs/guide/ja/wasm.md` の「失敗の扱い」に、起動時のコールバックの実時間の締切を書いた。
+
+## 確認
+
+- 単体試験 `b110_new_instance_lifecycle_survives_yielding_past_the_callback_deadline`: 燃料 1,000 ごとに譲らせ、最初に譲った
+  ところでエポックを 1 回のコールバックの締切の 2 倍だけ進めても、`new_configured_instance` がトラップしない。できたインスタンスの
+  要求のコールバックは、締切を超えてエポックを進めると `interrupt` でトラップする。修正前のコードでは起動時のコールバックの
+  `proxy_on_context_create` が `wasm trap: interrupt` で落ちる。
+- clippy（`full`・`full,epoll`、`-D warnings`）、WASM の単体試験 173 件。
+- E2E: io_uring を 2 回・epoll を 1 回回して、594 件がすべて通った。

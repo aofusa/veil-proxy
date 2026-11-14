@@ -229,9 +229,10 @@ data_files = { dataset = "/etc/veil/data/dataset.json" }
 ### 失敗の扱い
 
 次のときフィルタは失敗する: コールバックがトラップした（SDK の panic・`proc_exit`・`unreachable`）、CPU の量（`max_execution_time_ms`）を
-使い切った、他の要求へ譲っていた時間を含めて約 1 秒の実時間を超えた、インスタンスを作れない（`total_memories` の枠が約 130ms 埋まったまま）、
-新しいインスタンスの起動時のコールバックが失敗した、Pause した要求を再開する `proxy_on_http_call_response` がトラップした、待てるものの無い
-`Pause` を返した（下記）。要求の扱いは `failure_policy` で決まる:
+使い切った、他の要求へ譲っていた時間を含めて約 1 秒の実時間を超えた（新しいインスタンスの起動時のコールバックは約 60 秒。インスタンスごとに
+1 度だけ走り、CPU は同じ量で縛るので、起動時に大きな表を組み立てるモジュールがサーバの混雑だけで拒否されない）、インスタンスを作れない
+（`total_memories` の枠が約 130ms 埋まったまま）、新しいインスタンスの起動時のコールバックが失敗した、Pause した要求を再開する
+`proxy_on_http_call_response` がトラップした、待てるものの無い `Pause` を返した（下記）。要求の扱いは `failure_policy` で決まる:
 
 | `failure_policy` | 要求 | インスタンス |
 |---|---|---|

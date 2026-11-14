@@ -86,9 +86,15 @@ enum Settled {
 /// インスタンス枠が尽きたときに待つ上限（1+2+…+64 ≒ 127ms。B-299）
 const INSTANTIATE_RETRY_MAX_MS: u64 = 64;
 
-/// 起動時の検査（[`FilterEngine::validate`]）の実時間の締切（エポックのティック数。`EPOCH_TICK` ごとに進むので約 60 秒）。
-/// 1 回のコールバックの締切と違い、データプレーンの外で 1 度だけ走る（暴走は燃料が止める）。
-const VALIDATE_EPOCH_DEADLINE: u64 = 600;
+/// 起動時のコールバック（`_start` → root コンテキスト → `on_vm_start` → `on_configure`）の実時間の締切（エポックのティック数。
+/// `EPOCH_TICK` ごとに進むので約 60 秒）。起動時の検査（[`FilterEngine::validate`]）と、新しいインスタンスを作るとき
+/// （[`FilterEngine::new_configured_instance`]）の両方で使う。1 回のコールバックの締切（約 1 秒）と違い、インスタンスごとに
+/// 1 度だけ走る（暴走は燃料が止める）。
+///
+/// B-110: 以前は新しいインスタンスの起動時のコールバックにも 1 回のコールバックの締切を掛けていた。正規表現を起動時に組み立てる
+/// WAF のような重いモジュールは、燃料ごとに他の要求へ譲る間に負荷の下で 1 秒を超えて `interrupt` でトラップし、作りかけの
+/// インスタンスを捨てて次の要求がまた最初から作り直す（負荷が続く間は `fail_closed` の 503 が続き得る）。
+const LIFECYCLE_EPOCH_DEADLINE: u64 = 600;
 
 /// Filter engine for executing WASM modules
 pub struct FilterEngine {
@@ -286,16 +292,29 @@ impl FilterEngine {
             self.registry.engine(),
             HostState::new(HttpContext::for_module(1, module)),
         );
-        self.arm_store(&mut store)?;
-        store.set_epoch_deadline(VALIDATE_EPOCH_DEADLINE);
+        self.arm_lifecycle_store(&mut store)?;
         Ok(store)
     }
 
     /// Store に 1 回のコールバックの燃料と締切を入れる
     fn arm_store(&self, store: &mut Store<HostState>) -> anyhow::Result<()> {
+        self.arm_store_until(store, self.epoch_deadline)
+    }
+
+    /// 起動時のコールバックを走らせる Store に燃料と締切を入れる。CPU の上限は 1 回のコールバックと同じ燃料で、実時間の締切
+    /// だけを長くする（[`LIFECYCLE_EPOCH_DEADLINE`]。B-336・B-110）
+    fn arm_lifecycle_store(&self, store: &mut Store<HostState>) -> anyhow::Result<()> {
+        self.arm_store_until(store, LIFECYCLE_EPOCH_DEADLINE)
+    }
+
+    fn arm_store_until(
+        &self,
+        store: &mut Store<HostState>,
+        epoch_deadline: u64,
+    ) -> anyhow::Result<()> {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(self.fuel_yield_interval))?;
-        store.set_epoch_deadline(self.epoch_deadline);
+        store.set_epoch_deadline(epoch_deadline);
         Ok(())
     }
 
@@ -305,6 +324,7 @@ impl FilterEngine {
     /// - インスタンス枠（`total_memories`）が尽きていたら、上限付きで空きを待つ（B-299。fail closed で
     ///   一時的な枠切れをすぐ 503 にしない）。
     /// - ライフサイクルのトラップ・`on_vm_start`/`on_configure` の false は失敗（`lifecycle`。B-301）。
+    /// - ライフサイクルの実時間の締切は [`LIFECYCLE_EPOCH_DEADLINE`]（B-110）。要求のコールバックには戻す。
     async fn new_configured_instance(
         &self,
         module: &LoadedModule,
@@ -312,7 +332,7 @@ impl FilterEngine {
         http_ctx: HttpContext,
     ) -> Result<(Store<HostState>, wasmtime::Instance), (anyhow::Error, Box<HttpContext>)> {
         let mut store = Store::new(self.registry.engine(), HostState::new(http_ctx));
-        if let Err(e) = self.arm_store(&mut store) {
+        if let Err(e) = self.arm_lifecycle_store(&mut store) {
             return Err((e, Box::new(store.into_data().http_ctx)));
         }
         let mut backoff_ms = 1u64;
@@ -344,7 +364,8 @@ impl FilterEngine {
                 Box::new(store.into_data().http_ctx),
             ));
         }
-        // 起動時のコールバックの燃料を要求のコールバックの予算に含めない（B-301）
+        // 起動時のコールバックの燃料を要求のコールバックの予算に含めない（B-301）。実時間の締切も 1 回のコールバックの
+        // ものに戻す（B-110）
         if let Err(e) = self.arm_store(&mut store) {
             return Err((e, Box::new(store.into_data().http_ctx)));
         }
@@ -3012,6 +3033,94 @@ mod exec_smoke_tests {
                 .await
         });
         assert!(r.is_ok(), "validation must not trap on a stall: {:?}", r);
+    }
+
+    /// B-110 回帰テスト: 新しいインスタンスの起動時のコールバックが燃料ごとに他の要求へ譲っている間に、1 回のコールバックの
+    /// 締切を超える時間が過ぎても（負荷の下で正規表現を組み立てる WAF の初回の要求）、インスタンスの作成はトラップしない。
+    /// 最初に譲ったところでエポックを時間の経過の代わりに直接進める（修正前の締切ではトラップする）。できたインスタンスの
+    /// 要求のコールバックには 1 回のコールバックの締切が戻っている。
+    #[test]
+    fn b110_new_instance_lifecycle_survives_yielding_past_the_callback_deadline() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        let path = "tests/fixtures/wasm/header_filter.wasm";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        }
+        let config = WasmConfig {
+            enabled: true,
+            // 燃料 1,000 ごとに譲らせ、起動時のコールバックの途中で必ず止まるようにする
+            defaults: WasmDefaults {
+                yield_interval_us: 1,
+                ..WasmDefaults::default()
+            },
+            modules: vec![ModuleConfig {
+                name: "header_filter".to_string(),
+                path: path.to_string(),
+                configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
+                capabilities: ModuleCapabilities {
+                    allow_logging: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+        };
+        let engine = FilterEngine::new(&config).expect("engine");
+        let module = engine
+            .get_module("header_filter")
+            .expect("module must be loaded");
+        let configuration = module.configuration.clone();
+        let created = {
+            let fut = engine.new_configured_instance(
+                &module,
+                &configuration,
+                HttpContext::for_module(1, &module),
+            );
+            let mut fut = std::pin::pin!(fut);
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut yields = 0u32;
+            let r = loop {
+                match fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(r) => break r,
+                    Poll::Pending => {
+                        if yields == 0 {
+                            for _ in 0..engine.epoch_deadline * 2 {
+                                engine.registry.engine().increment_epoch();
+                            }
+                        }
+                        yields += 1;
+                    }
+                }
+            };
+            assert!(yields > 0, "the lifecycle must yield on the fuel interval");
+            r
+        };
+        let (mut store, instance) = match created {
+            Ok(v) => v,
+            Err((e, _)) => panic!("creating an instance must not trap while yielding: {e:#}"),
+        };
+
+        // 要求のコールバックの締切は 1 回のコールバックのもの: それを超えてエポックを進めると、次の呼び出しはトラップする
+        for _ in 0..engine.epoch_deadline + 1 {
+            engine.registry.engine().increment_epoch();
+        }
+        let create = instance
+            .get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+            .expect("proxy_on_context_create");
+        let r = futures::executor::block_on(create.call_async(&mut store, (2, 1)));
+        let trap = r.expect_err("a request callback past its deadline must trap");
+        assert_eq!(
+            trap.downcast_ref::<wasmtime::Trap>(),
+            Some(&wasmtime::Trap::Interrupt),
+            "{trap:#}"
+        );
     }
 
     /// B-173 回帰テスト: 他の要求の WASM 呼び出しは、すでに締切を入れた store の締切を減らさない。

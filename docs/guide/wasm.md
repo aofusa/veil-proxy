@@ -238,7 +238,9 @@ The `[wasm.defaults]` section allows you to configure global WASM runtime settin
 ### Failure Handling
 
 A filter fails when a callback traps (a panic in the SDK, `proc_exit`, `unreachable`), runs out of its CPU budget
-(`max_execution_time_ms`), runs past about one second of wall time including the time it yielded to other requests,
+(`max_execution_time_ms`), runs past about one second of wall time including the time it yielded to other requests
+(about 60 seconds for the startup callbacks of a new instance, which run once per instance and are still bounded by
+the same CPU budget, so a module that builds large tables at startup is not rejected just because the server is busy),
 when no instance can be created (all `total_memories` slots stay busy for about 130 ms), when the startup callbacks
 of a new instance fail, when the `proxy_on_http_call_response` that resumes a paused request traps, or when a
 callback returns `Pause` with nothing veil can wait for (see below). `failure_policy` decides what happens to the
