@@ -9,6 +9,7 @@
 use super::httpcore::{self, ResponseFlag};
 use super::l7::{self, ConnCtx, Decision, Forward, LocalReply, ReqView};
 use super::upstream::{self, Alpn, UpIo};
+use crate::http_utils::{ChunkedDecoder, ChunkedFeedResult};
 use crate::runtime::handle::AsRawFd;
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt, BufferedReadState};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -494,117 +495,35 @@ pub fn httpdate_now() -> String {
     })
 }
 
-/// chunked の終端の走査（中身はそのまま転送する）。
-#[derive(Default)]
-struct ChunkScanner {
-    state: CState,
-    size: u64,
-    /// trailer の行が空だったか
-    line_empty: bool,
+/// chunked の本文のフレーミングが不正（下流の要求なら 400 で閉じる。B-369）。
+#[derive(Debug)]
+struct BadChunked;
+
+impl std::fmt::Display for BadChunked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("bad chunked body")
+    }
 }
 
-#[derive(Default, PartialEq, Eq, Clone, Copy)]
-enum CState {
-    #[default]
-    Size,
-    SizeExt,
-    SizeLf,
-    Data,
-    DataCr,
-    DataLf,
-    TrailerStart,
-    Trailer,
-    TrailerLf,
-    Done,
+impl std::error::Error for BadChunked {}
+
+fn is_bad_chunked(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|x| x.is::<BadChunked>())
 }
 
-impl ChunkScanner {
-    /// `data` を走査し、本文の終わりが含まれていればその直後の位置を返す。
-    fn feed(&mut self, data: &[u8]) -> Result<Option<usize>, ()> {
-        let mut i = 0;
-        while i < data.len() {
-            let c = data[i];
-            match self.state {
-                CState::Size => match c {
-                    b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => {
-                        let d = (c as char).to_digit(16).unwrap_or(0) as u64;
-                        self.size = self
-                            .size
-                            .checked_mul(16)
-                            .ok_or(())?
-                            .checked_add(d)
-                            .ok_or(())?;
-                    }
-                    b';' | b' ' | b'\t' => self.state = CState::SizeExt,
-                    b'\r' => self.state = CState::SizeLf,
-                    _ => return Err(()),
-                },
-                CState::SizeExt => {
-                    if c == b'\r' {
-                        self.state = CState::SizeLf;
-                    }
-                }
-                CState::SizeLf => {
-                    if c != b'\n' {
-                        return Err(());
-                    }
-                    self.state = if self.size == 0 {
-                        CState::TrailerStart
-                    } else {
-                        CState::Data
-                    };
-                }
-                CState::Data => {
-                    let take = (self.size as usize).min(data.len() - i);
-                    self.size -= take as u64;
-                    i += take;
-                    if self.size == 0 {
-                        self.state = CState::DataCr;
-                    }
-                    continue;
-                }
-                CState::DataCr => {
-                    if c != b'\r' {
-                        return Err(());
-                    }
-                    self.state = CState::DataLf;
-                }
-                CState::DataLf => {
-                    if c != b'\n' {
-                        return Err(());
-                    }
-                    self.state = CState::Size;
-                    self.size = 0;
-                }
-                CState::TrailerStart => {
-                    if c == b'\r' {
-                        self.line_empty = true;
-                        self.state = CState::TrailerLf;
-                    } else {
-                        self.line_empty = false;
-                        self.state = CState::Trailer;
-                    }
-                }
-                CState::Trailer => {
-                    if c == b'\r' {
-                        self.state = CState::TrailerLf;
-                    }
-                }
-                CState::TrailerLf => {
-                    if c != b'\n' {
-                        return Err(());
-                    }
-                    if self.line_empty {
-                        self.state = CState::Done;
-                        return Ok(Some(i + 1));
-                    }
-                    self.state = CState::TrailerStart;
-                }
-                CState::Done => return Ok(Some(i)),
-            }
-            i += 1;
+/// chunked の本文の終端を探す（中身はそのまま転送する）。終端が `data` の中にあればその直後の位置を返す。
+///
+/// B-369: 要求・応答とも厳格に読む（RFC 9112 §7.1。行末は CRLF だけ・サイズの無い行やチャンク拡張・トレーラの中の
+/// LF は不正・フレーミングの量に上限）。フレーミングをそのまま相手へ送るので、緩く読むと相手と本文の終わりの
+/// 解釈がずれ、後ろのバイトが相手の側で veil の通していない別の要求（応答）になる（以前の走査は拡張・トレーラの
+/// 中の裸の LF と空のサイズの行を受け入れていた）。
+fn chunked_end(dec: &mut ChunkedDecoder, data: &[u8]) -> io::Result<Option<usize>> {
+    match dec.feed_counted(data) {
+        (ChunkedFeedResult::Complete, end) => Ok(Some(end)),
+        (ChunkedFeedResult::Continue, _) => Ok(None),
+        (ChunkedFeedResult::Invalid | ChunkedFeedResult::SizeLimitExceeded, _) => {
+            Err(io::Error::new(io::ErrorKind::InvalidData, BadChunked))
         }
-        Ok(None)
     }
 }
 
@@ -631,9 +550,10 @@ async fn discard_body<S: AsyncReadRent>(
             }
         },
         Framing::Chunked => {
-            let mut sc = ChunkScanner::default();
+            // 読み捨てる本文は Content-Length と同じく 1MiB まで
+            let mut dec = ChunkedDecoder::new_request(1024 * 1024);
             loop {
-                match sc.feed(acc).map_err(|_| io::Error::other("bad chunked"))? {
+                match chunked_end(&mut dec, acc)? {
                     Some(end) => {
                         let _ = acc.split_to(end);
                         return Ok(());
@@ -677,14 +597,12 @@ where
             Ok(total)
         }
         Framing::Chunked => {
-            let mut sc = ChunkScanner::default();
+            let mut dec = ChunkedDecoder::new_request(0);
             loop {
                 if acc.is_empty() && !read_more(r, acc, Duration::from_secs(300)).await? {
                     return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
                 }
-                let end = sc
-                    .feed(acc)
-                    .map_err(|_| io::Error::other("bad chunked body"))?;
+                let end = chunked_end(&mut dec, acc)?;
                 let take = end.unwrap_or(acc.len());
                 let chunk = acc.split_to(take).freeze();
                 total += take as u64;
@@ -706,8 +624,8 @@ fn buffered_body(acc: &BytesMut, framing: Framing) -> Option<usize> {
             (n as usize <= acc.len() && n as usize <= RETRY_BODY_LIMIT).then_some(n as usize)
         }
         Framing::Chunked => {
-            let mut sc = ChunkScanner::default();
-            match sc.feed(acc) {
+            let mut dec = ChunkedDecoder::new_request(0);
+            match chunked_end(&mut dec, acc) {
                 Ok(Some(end)) if end <= RETRY_BODY_LIMIT => Some(end),
                 _ => None,
             }
@@ -908,7 +826,8 @@ where
     loop {
         attempt += 1;
         let picked = match upstream::pick(&f.cluster, ctx.orig_dst, f.hash, &tried) {
-            Ok(p) => p,
+            // B-375: auto_sni のクラスタは上流へ送る Host を TLS の名前にする
+            Ok(p) => p.with_request_host(host_rw.as_ref().unwrap_or(authority)),
             Err(flag) => {
                 let lr = fail(503, flag);
                 out.status = 503;
@@ -1048,6 +967,16 @@ where
             None => send.await,
         };
         if let Err(e) = sent {
+            if is_bad_chunked(&e) {
+                // B-369: 下流の本文のフレーミングが不正。途中まで送った上流の接続は捨て、400 で閉じる
+                // （上流の失敗には数えない）
+                picked.end(false, false);
+                out.status = 400;
+                out.flag = ResponseFlag::DownstreamProtocolError;
+                out.keep_alive = false;
+                let _ = write_local(io, &fail(400, out.flag), is_grpc, ctx, true).await;
+                return out;
+            }
             picked.end(false, true);
             tried.push(picked.addr);
             // 再利用した接続が既に切れていた（送信前に気付けない）なら本文を再送できるときだけやり直す
@@ -1664,23 +1593,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunk_scanner_finds_end() {
+    fn chunked_end_finds_end_and_rejects_smuggling() {
         let body = b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\nGET /next";
-        let mut sc = ChunkScanner::default();
-        let end = sc.feed(body).unwrap().unwrap();
+        let mut dec = ChunkedDecoder::new_request(0);
+        let end = chunked_end(&mut dec, body).unwrap().unwrap();
         assert_eq!(&body[end..], b"GET /next");
         // 1 バイトずつでも同じ
-        let mut sc = ChunkScanner::default();
+        let mut dec = ChunkedDecoder::new_request(0);
         let mut found = None;
         for (i, b) in body.iter().enumerate() {
-            if let Some(e) = sc.feed(std::slice::from_ref(b)).unwrap() {
+            if let Some(e) = chunked_end(&mut dec, std::slice::from_ref(b)).unwrap() {
                 found = Some(i + e);
                 break;
             }
         }
         assert_eq!(found, Some(end));
-        let mut bad = ChunkScanner::default();
-        assert!(bad.feed(b"zz\r\n").is_err());
+        // B-369: 上流が裸の LF を行末と読むと後ろが別の要求になる形・空のサイズの行は不正にする
+        // （以前の走査はトレーラ・拡張の中の LF を内容として読み、後ろの GET /admin までを本文にしていた）
+        for bad in [
+            &b"zz\r\n"[..],
+            b"0\r\n\nGET /admin HTTP/1.1\r\nHost: svc\r\n\r\n",
+            b"2;\nxx\r\n0\r\n\r\n",
+            b"\r\n",
+        ] {
+            let mut dec = ChunkedDecoder::new_request(0);
+            let e = chunked_end(&mut dec, bad).unwrap_err();
+            assert!(is_bad_chunked(&e), "{:?}", String::from_utf8_lossy(bad));
+        }
+        assert!(!is_bad_chunked(&io::Error::other("other")));
     }
 
     #[test]

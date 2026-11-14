@@ -430,6 +430,7 @@ fn tls_for(identity: &str, sni: &str) -> Option<Arc<UpstreamTls>> {
             Some(super::ROOTS),
             san.clone(),
             alpn,
+            false,
         )
         .ok()
     };
@@ -501,6 +502,7 @@ fn backend_cfg(cfg: &Config, name: &str, outlier: Option<OutlierCfg>) -> Cluster
         bind: None,
         tls_matches: Vec::new(),
         tls_default: None,
+        auto_sni: false,
         proto: UpstreamProto::UseDownstream,
         idle_timeout: Duration::from_secs(60),
         max_requests_per_conn: 0,

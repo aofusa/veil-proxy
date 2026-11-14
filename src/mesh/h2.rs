@@ -470,7 +470,8 @@ async fn forward(
         // 本文がまだ届いている（チャネル）なら、上流へ流し始めた後はリトライできない
         let replayable = req_rx.is_none();
         let picked = match upstream::pick(&f.cluster, c.orig_dst, f.hash, &tried) {
-            Ok(p) => p,
+            // B-375: auto_sni のクラスタは上流へ送る Host を TLS の名前にする
+            Ok(p) => p.with_request_host(&authority),
             Err(flag) => {
                 out.status = 503;
                 out.flag = flag;

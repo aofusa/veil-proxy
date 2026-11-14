@@ -65,6 +65,11 @@ docker build -f docker/Dockerfile.mesh-linkerd -t veil.local/linkerd-proxy:edge-
   - パスは、ルート・RBAC・JWT の照合の前に 1 回だけ正規化し、正規化したパスを上流へ送る（HCM の `normalize_path`・
     `merge_slashes`・`path_with_escaped_slashes_action`。既定は Istio の `BASE` と同じで、HCM が `normalize_path` を
     書かないときも正規化する）。エスケープされたスラッシュの扱いで拒否する要求は 400（`DPE`）。
+    `#`（フラグメント）を含む要求先・UTF-8 でないバイトを含む要求先は 400（HTTP/2 はストリームのエラー。Envoy の
+    フラグメントの拒否と同じ）。
+  - HTTP/1.1 の chunked の本文は厳格に読む（RFC 9112 §7.1）。フレーミングの不正な要求は 400（`DPE`）で接続を閉じ、
+    フレーミングの不正な応答は途中で切って両方の接続を閉じる。
+  - JWT の `exp`・`nbf` があって負でない数でなければトークンを拒否する（小数の NumericDate は受ける）。
   - `remoteIpBlocks` は Envoy の「元のクライアントのアドレス」を使う: `use_remote_address` なら接続の相手、そうでなければ
     X-Forwarded-For の右から `xff_num_trusted_hops` 番目。クライアントが書ける左端は使わない。
   - veil が評価できない RBAC の規則（CEL の条件、permission の `metadata`・`matcher`）は安全側に倒す: ALLOW のポリシーでは
@@ -124,6 +129,10 @@ init コンテナ（`linkerd-init`）も同じイメージで動くので、veil
 - 上流への TLS で `match_subject_alt_names` が無いときは、サーバ証明書を SNI の名前で検査する（Envoy の
   `auto_san_validation` 相当）。SNI の名前が無い接続はトラストバンドルでだけ検証する。`trusted_ca` の無い SAN の条件は
   拒否（NACK）する（Envoy と同じ）。
+- `auto_sni`・`auto_san_validation`（`upstream_http_protocol_options`。Istio は DestinationRule の TLS の `SIMPLE`・`MUTUAL` で
+  `sni`・`subjectAltNames` を書かないときに付ける）のクラスタは、要求のホスト（ポートを除く）を SNI の名前にして、その名前で
+  証明書を検査する（IP のホストも）。サーバ名にならないホストは接続を失敗にする。`override_auto_sni_header` は未対応
+  （`Host`・`:authority` を使う）。
 - 証明書の失効リスト（検証コンテキストの `crl`）は未対応。含む設定・SDS の秘密は、失効を検査せずに適用せず拒否（NACK）する。
 - 受けた `x-forwarded-client-cert` ヘッダは、相手が TLS でクライアント証明書を出したときだけ残す（`ALWAYS_FORWARD_ONLY` は
   常に残す。Envoy と同じ）。

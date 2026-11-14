@@ -342,6 +342,8 @@ pub struct MeshServerVerifier {
     /// 信頼アンカーの名前。`None` は検証しない（`insecure_skip_verify`）
     pub roots_name: Option<String>,
     pub san: Vec<StringMatcher>,
+    /// SAN の条件が無いとき、IP の名前でも証明書を検査する（要求の Host を名前にするクラスタの HTTP の接続。B-375）
+    pub verify_ip_name: bool,
 }
 
 impl ServerCertVerifier for MeshServerVerifier {
@@ -370,8 +372,14 @@ impl ServerCertVerifier for MeshServerVerifier {
         if self.san.is_empty() {
             // B-323: SAN の条件が無く SNI（DNS 名）があるときは、その名前で証明書を検査する（信頼アンカーに
             // つながる証明書なら宛先を問わず通していた。Envoy の auto_san_validation 相当）。SNI の無い
-            // 接続（IP で呼ぶ名前）は従来どおり名前を問わない
-            if let ServerName::DnsName(_) = server_name {
+            // 接続（IP で呼ぶ名前）は名前を問わない。ただし要求の Host を名前にするクラスタ（auto_sni）の HTTP の
+            // 接続は IP の名前でも検査する（B-375）
+            let check = match server_name {
+                ServerName::DnsName(_) => true,
+                ServerName::IpAddress(_) => self.verify_ip_name,
+                _ => false,
+            };
+            if check {
                 rustls::client::verify_server_name(&parsed, server_name)?;
             }
         } else if !san_matches(&parse_sans(end_entity), &self.san) {
@@ -451,6 +459,7 @@ pub fn client_config(
     roots_name: Option<&str>,
     san: Vec<StringMatcher>,
     alpn: &[&[u8]],
+    verify_ip_name: bool,
 ) -> Result<Arc<rustls::ClientConfig>, String> {
     let builder = rustls::ClientConfig::builder_with_provider(PROVIDER.clone())
         .with_safe_default_protocol_versions()
@@ -459,6 +468,7 @@ pub fn client_config(
         .with_custom_certificate_verifier(Arc::new(MeshServerVerifier {
             roots_name: roots_name.map(|s| s.to_string()),
             san,
+            verify_ip_name,
         }));
     let mut cfg = match cert_name {
         Some(c) => builder.with_client_cert_resolver(Arc::new(NamedClientCert(c.to_string()))),
@@ -522,6 +532,7 @@ mod tests {
         let v = MeshServerVerifier {
             roots_name: Some("test-root-b323".into()),
             san: Vec::new(),
+            verify_ip_name: false,
         };
         let ok = ServerName::try_from("a.example").unwrap();
         let bad = ServerName::try_from("b.example").unwrap();
@@ -535,7 +546,16 @@ mod tests {
             san: vec![StringMatcher::exact(
                 "spiffe://cluster.local/ns/demo/sa/srv",
             )],
+            verify_ip_name: false,
         };
         assert!(v.verify_server_cert(&der, &[], &bad, &[], now).is_ok());
+        // B-375: 要求の Host を名前にするクラスタは IP の名前も検査する（証明書に無い IP は通さない）
+        let v = MeshServerVerifier {
+            roots_name: Some("test-root-b323".into()),
+            san: Vec::new(),
+            verify_ip_name: true,
+        };
+        assert!(v.verify_server_cert(&der, &[], &ok, &[], now).is_ok());
+        assert!(v.verify_server_cert(&der, &[], &ip, &[], now).is_err());
     }
 }

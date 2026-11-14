@@ -27,9 +27,13 @@ pub fn spawn_h1(
         if *fraction < 1_000_000 && super::httpcore::rand_u32() % 1_000_000 >= *fraction {
             continue;
         }
-        let Ok(picked) = upstream::pick(slot, ctx.orig_dst, None, &[]) else {
+        let Ok(mut picked) = upstream::pick(slot, ctx.orig_dst, None, &[]) else {
             continue;
         };
+        // B-375: auto_sni のクラスタは元の要求の Host を TLS の名前にする（`-shadow` を付ける前の名前）
+        if picked.cfg.auto_sni {
+            picked = picked.with_request_host(&Bytes::copy_from_slice(authority));
+        }
         // ヘッダ（ホップバイホップを除く。chunked の本文はそのまま送るので Transfer-Encoding は残す）
         let mut head = BytesMut::with_capacity(512);
         head.put_slice(method);

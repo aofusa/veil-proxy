@@ -213,6 +213,7 @@ pub(super) async fn handle_proxy(
                                 req_path.to_vec(),
                                 prefix.to_vec(),
                                 headers.to_vec(),
+                                client_ip.to_string(),
                             );
                         }
 
@@ -413,132 +414,14 @@ pub(super) async fn handle_proxy(
 
     request.extend_from_slice(HEADER_CRLF);
 
-    // B-232: 転送ヘッダの方針（信頼しない送信元の値を捨て、クライアントの IP を入れる）
-    let fwd = ForwardedValues::new(security, client_ip);
-
-    for (name, value) in headers {
-        // host と connection ヘッダーは別途処理済みのためスキップ
-        if name.eq_ignore_ascii_case(b"host") || name.eq_ignore_ascii_case(b"connection") {
-            continue;
-        }
-
-        // RFC 7230 Section 6.1: Hop-by-hopヘッダーを削除
-        // Connection, Keep-Alive, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade
-        // これらのヘッダーはプロキシで終端され、バックエンドに転送してはならない
-        if is_hop_by_hop_header(name) {
-            continue;
-        }
-
-        // B-23（多層防御）: chunked 転送時にクライアント由来の Content-Length を
-        // バックエンドへ渡さない。フレーミング分類（classify_request_framing）が CL+TE を
-        // 既に 400 で拒否しているため通常ここには到達しないが、chunked では下で
-        // `Transfer-Encoding: chunked` を再付与するため、万一 CL が残っても
-        // バックエンドに CL+TE の曖昧メッセージを渡さないよう保険で除去する。
-        if is_chunked && name.eq_ignore_ascii_case(b"content-length") {
-            continue;
-        }
-
-        // B-11: Expect: 100-continue はプロキシが終端する（自ら 100 Continue を応答し、
-        // ボディを無条件に転送する）ため、バックエンドへは転送しない。転送すると
-        // バックエンドが独自の 100 Continue 中間応答を返し、応答解析と競合する。
-        if name.eq_ignore_ascii_case(b"expect") {
-            continue;
-        }
-
-        // 設定で削除が指定されているヘッダーをスキップ
-        // eq_ignore_ascii_case でアロケーションなしに大文字小文字無視比較
-        if security
-            .remove_request_headers
-            .iter()
-            .any(|h| name.eq_ignore_ascii_case(h.as_bytes()))
-        {
-            continue;
-        }
-        if fwd.as_ref().is_some_and(|f| !f.keeps(name)) {
-            continue;
-        }
-
-        // Header Injection防止: ヘッダー名と値の検証
-        // httparseによるパース後も、多層防御として再検証を行う
-        // 不正な文字（CR, LF, NUL等）を含むヘッダーは除外
-        if !is_valid_header_name(name) {
-            warn!(
-                "Invalid header name detected, skipping: {:?}",
-                String::from_utf8_lossy(name)
-            );
-            continue;
-        }
-        if !is_valid_header_value(value) {
-            warn!(
-                "Invalid header value detected (possible header injection), skipping header: {:?}",
-                String::from_utf8_lossy(name)
-            );
-            continue;
-        }
-
-        request.extend_from_slice(name);
-        request.extend_from_slice(HEADER_COLON);
-        request.extend_from_slice(value);
-        request.extend_from_slice(HEADER_CRLF);
-    }
-
-    // 設定で追加が指定されているヘッダーを追加
-    // 特殊変数の置換: $client_ip, $host, $request_uri
-    //
-    // F-168 P4: `host_str` の検索はループ不変なので外へ出し、値の展開は
-    // `expand_request_header_value` の 1 パスで再利用バッファへ書き込む
-    // （`String::replace` の 3 連鎖はプレースホルダが無い値でも中間 `String` を
-    // 3 つ確保していた）。
-    if !security.add_request_headers.is_empty() {
-        let host_str = headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(b"host"))
-            .map(|(_, v)| std::str::from_utf8(v).unwrap_or("-"))
-            .unwrap_or("-");
-
-        let mut scratch = crate::pool::header_value_scratch_get();
-        for (header_name, header_value) in &security.add_request_headers {
-            scratch.clear();
-            expand_request_header_value(header_value, client_ip, host_str, path_str, &mut scratch);
-
-            // Header Injection防止チェック
-            if !is_valid_header_value(&scratch) {
-                warn!("Invalid add_request_header value: {}", header_name);
-                continue;
-            }
-
-            request.extend_from_slice(header_name.as_bytes());
-            request.extend_from_slice(HEADER_COLON);
-            request.extend_from_slice(&scratch);
-            request.extend_from_slice(HEADER_CRLF);
-        }
-        crate::pool::header_value_scratch_put(scratch);
-    }
-    if let Some(f) = &fwd {
-        for (name, value) in f.pairs() {
-            request.extend_from_slice(name);
-            request.extend_from_slice(HEADER_COLON);
-            request.extend_from_slice(value);
-            request.extend_from_slice(HEADER_CRLF);
-        }
-    }
-
-    // Via ヘッダー追加 (RFC 7230 Section 5.7.1)
-    // プロキシ経由のリクエストに Via ヘッダーを追加
-    {
-        let config = CURRENT_CONFIG.load();
-        if config.performance.via_header_enabled {
-            let hostname = config
-                .performance
-                .via_header_hostname
-                .as_deref()
-                .unwrap_or("veil");
-            // Via: 1.1 <hostname>
-            request.extend_from_slice(b"Via: 1.1 ");
-            request.extend_from_slice(hostname.as_bytes());
-            request.extend_from_slice(HEADER_CRLF);
-        }
-    }
+    write_upstream_request_headers(
+        &mut request,
+        headers,
+        security,
+        client_ip,
+        path_str,
+        is_chunked,
+    );
 
     // chunked リクエストはボディを chunked フレームのままバックエンドへ転送する。
     // 上のループで Transfer-Encoding を hop-by-hop ヘッダとして除去しているため、
@@ -1669,5 +1552,235 @@ pub(super) async fn serve_from_disk_cache(
     match timeout(WRITE_TIMEOUT, client_stream.write_all(response)).await {
         Ok((Ok(_), _)) => Some((cached_entry.status_code, body_data.len() as u64)),
         _ => None,
+    }
+}
+
+/// 上流へ送る要求のヘッダ（Host の行の後ろ。`Transfer-Encoding`・`Connection` と終わりの空行は呼び出し側）を書く。
+///
+/// 生の転送（`handle_proxy`）と stale-while-revalidate の裏の更新（[`build_revalidation_request`]）で同じ方針にする
+/// （B-371: 裏の更新はクライアントの Host・転送ヘッダ・削除を指定したヘッダをそのまま上流へ送り、その応答を
+/// キャッシュしていた）。hop-by-hop・`Expect`・`remove_request_headers`・信頼しない送信元の転送ヘッダを除き、
+/// `add_request_headers`・転送ヘッダ（クライアントの IP）・Via を足す。`drop_content_length` はクライアントの
+/// `Content-Length` を送らないとき（chunked で送る・本文を送らない）。
+#[inline(always)]
+pub(crate) fn write_upstream_request_headers(
+    request: &mut Vec<u8>,
+    headers: &[(Bytes, Bytes)],
+    security: &SecurityConfig,
+    client_ip: &str,
+    path_str: &str,
+    drop_content_length: bool,
+) {
+    // B-232: 転送ヘッダの方針（信頼しない送信元の値を捨て、クライアントの IP を入れる）
+    let fwd = ForwardedValues::new(security, client_ip);
+
+    for (name, value) in headers {
+        // host と connection ヘッダーは別途処理済みのためスキップ
+        if name.eq_ignore_ascii_case(b"host") || name.eq_ignore_ascii_case(b"connection") {
+            continue;
+        }
+
+        // RFC 7230 Section 6.1: Hop-by-hopヘッダーを削除
+        // Connection, Keep-Alive, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade
+        // これらのヘッダーはプロキシで終端され、バックエンドに転送してはならない
+        if is_hop_by_hop_header(name) {
+            continue;
+        }
+
+        // B-23（多層防御）: chunked 転送時にクライアント由来の Content-Length を
+        // バックエンドへ渡さない。フレーミング分類（classify_request_framing）が CL+TE を
+        // 既に 400 で拒否しているため通常ここには到達しないが、chunked では下で
+        // `Transfer-Encoding: chunked` を再付与するため、万一 CL が残っても
+        // バックエンドに CL+TE の曖昧メッセージを渡さないよう保険で除去する。
+        if drop_content_length && name.eq_ignore_ascii_case(b"content-length") {
+            continue;
+        }
+
+        // B-11: Expect: 100-continue はプロキシが終端する（自ら 100 Continue を応答し、
+        // ボディを無条件に転送する）ため、バックエンドへは転送しない。転送すると
+        // バックエンドが独自の 100 Continue 中間応答を返し、応答解析と競合する。
+        if name.eq_ignore_ascii_case(b"expect") {
+            continue;
+        }
+
+        // 設定で削除が指定されているヘッダーをスキップ
+        // eq_ignore_ascii_case でアロケーションなしに大文字小文字無視比較
+        if security
+            .remove_request_headers
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h.as_bytes()))
+        {
+            continue;
+        }
+        if fwd.as_ref().is_some_and(|f| !f.keeps(name)) {
+            continue;
+        }
+
+        // Header Injection防止: ヘッダー名と値の検証
+        // httparseによるパース後も、多層防御として再検証を行う
+        // 不正な文字（CR, LF, NUL等）を含むヘッダーは除外
+        if !is_valid_header_name(name) {
+            warn!(
+                "Invalid header name detected, skipping: {:?}",
+                String::from_utf8_lossy(name)
+            );
+            continue;
+        }
+        if !is_valid_header_value(value) {
+            warn!(
+                "Invalid header value detected (possible header injection), skipping header: {:?}",
+                String::from_utf8_lossy(name)
+            );
+            continue;
+        }
+
+        request.extend_from_slice(name);
+        request.extend_from_slice(HEADER_COLON);
+        request.extend_from_slice(value);
+        request.extend_from_slice(HEADER_CRLF);
+    }
+
+    // 設定で追加が指定されているヘッダーを追加
+    // 特殊変数の置換: $client_ip, $host, $request_uri
+    //
+    // F-168 P4: `host_str` の検索はループ不変なので外へ出し、値の展開は
+    // `expand_request_header_value` の 1 パスで再利用バッファへ書き込む
+    // （`String::replace` の 3 連鎖はプレースホルダが無い値でも中間 `String` を
+    // 3 つ確保していた）。
+    if !security.add_request_headers.is_empty() {
+        let host_str = headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(b"host"))
+            .map(|(_, v)| std::str::from_utf8(v).unwrap_or("-"))
+            .unwrap_or("-");
+
+        let mut scratch = crate::pool::header_value_scratch_get();
+        for (header_name, header_value) in &security.add_request_headers {
+            scratch.clear();
+            expand_request_header_value(header_value, client_ip, host_str, path_str, &mut scratch);
+
+            // Header Injection防止チェック
+            if !is_valid_header_value(&scratch) {
+                warn!("Invalid add_request_header value: {}", header_name);
+                continue;
+            }
+
+            request.extend_from_slice(header_name.as_bytes());
+            request.extend_from_slice(HEADER_COLON);
+            request.extend_from_slice(&scratch);
+            request.extend_from_slice(HEADER_CRLF);
+        }
+        crate::pool::header_value_scratch_put(scratch);
+    }
+    if let Some(f) = &fwd {
+        for (name, value) in f.pairs() {
+            request.extend_from_slice(name);
+            request.extend_from_slice(HEADER_COLON);
+            request.extend_from_slice(value);
+            request.extend_from_slice(HEADER_CRLF);
+        }
+    }
+
+    // Via ヘッダー追加 (RFC 7230 Section 5.7.1)
+    // プロキシ経由のリクエストに Via ヘッダーを追加
+    {
+        let config = CURRENT_CONFIG.load();
+        if config.performance.via_header_enabled {
+            let hostname = config
+                .performance
+                .via_header_hostname
+                .as_deref()
+                .unwrap_or("veil");
+            // Via: 1.1 <hostname>
+            request.extend_from_slice(b"Via: 1.1 ");
+            request.extend_from_slice(hostname.as_bytes());
+            request.extend_from_slice(HEADER_CRLF);
+        }
+    }
+}
+
+/// stale-while-revalidate の裏の更新で上流へ送る要求（本文なし・`Connection: close`）。
+///
+/// B-371: 生の転送と同じく、上流の Host（`target.host`）・上流のパス（`path_prefix` を付ける）・ヘッダの方針
+/// （[`write_upstream_request_headers`]）で組み立てる。
+pub(crate) fn build_revalidation_request(
+    method: &[u8],
+    req_path: &[u8],
+    prefix: &[u8],
+    target: &ProxyTarget,
+    headers: &[(Bytes, Bytes)],
+    security: &SecurityConfig,
+    client_ip: &str,
+) -> Vec<u8> {
+    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    let final_path = compute_upstream_path(path_str, prefix, &target.path_prefix, false);
+    let mut request = Vec::with_capacity(512);
+    request.extend_from_slice(method);
+    request.extend_from_slice(HEADER_SPACE);
+    request.extend_from_slice(final_path.as_bytes());
+    request.extend_from_slice(HEADER_HTTP11_HOST);
+    request.extend_from_slice(target.host.as_bytes());
+    if !target.is_default_port() {
+        request.extend_from_slice(HEADER_PORT_COLON);
+        let mut port_buf = itoa::Buffer::new();
+        request.extend_from_slice(port_buf.format(target.port).as_bytes());
+    }
+    request.extend_from_slice(HEADER_CRLF);
+    write_upstream_request_headers(&mut request, headers, security, client_ip, path_str, true);
+    request.extend_from_slice(b"Connection: close\r\n\r\n");
+    request
+}
+
+#[cfg(test)]
+mod revalidation_request_tests {
+    use super::*;
+
+    /// B-371: stale-while-revalidate の裏の更新は生の転送と同じ方針で組み立てる（上流の Host・path_prefix・
+    /// remove_request_headers・信頼しない送信元の転送ヘッダを捨ててクライアントの IP・hop-by-hop を送らない）
+    #[test]
+    fn revalidation_request_follows_the_forwarding_policy() {
+        let target = ProxyTarget::parse("http://10.0.0.5:8080/base").unwrap();
+        let security = SecurityConfig {
+            remove_request_headers: vec!["x-secret".to_string()],
+            ..Default::default()
+        };
+        let h = |n: &'static [u8], v: &'static [u8]| (Bytes::from_static(n), Bytes::from_static(v));
+        let headers = vec![
+            h(b"Host", b"attacker.example"),
+            h(b"X-Forwarded-For", b"6.6.6.6"),
+            h(b"X-Secret", b"s3cret"),
+            h(b"Connection", b"keep-alive"),
+            h(b"Transfer-Encoding", b"chunked"),
+            h(b"Content-Length", b"5"),
+            h(b"Accept", b"*/*"),
+        ];
+        let req = build_revalidation_request(
+            b"GET",
+            b"/app/page?q=1",
+            b"/app",
+            &target,
+            &headers,
+            &security,
+            "192.0.2.7",
+        );
+        let req = String::from_utf8(req).unwrap();
+        assert!(
+            req.starts_with("GET /base/page?q=1 HTTP/1.1\r\nHost: 10.0.0.5:8080\r\n"),
+            "{req}"
+        );
+        assert!(req.contains("\r\nAccept: */*\r\n"), "{req}");
+        assert!(req.contains("\r\nx-forwarded-for: 192.0.2.7\r\n"), "{req}");
+        assert!(req.ends_with("\r\nConnection: close\r\n\r\n"), "{req}");
+        for leaked in [
+            "attacker.example",
+            "6.6.6.6",
+            "s3cret",
+            "keep-alive",
+            "Transfer-Encoding",
+            "Content-Length",
+        ] {
+            assert!(!req.contains(leaked), "{leaked} leaked: {req}");
+        }
+        assert_eq!(req.matches("Connection:").count(), 1, "{req}");
     }
 }

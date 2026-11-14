@@ -426,16 +426,10 @@ pub fn verify_token(
     {
         return None;
     }
-    let skew = prov.clock_skew;
-    match payload.get("exp").and_then(|e| e.as_u64()) {
-        Some(exp) if exp + skew < now => return None,
-        None if prov.require_expiration => return None,
-        _ => {}
-    }
-    if let Some(nbf) = payload.get("nbf").and_then(|e| e.as_u64()) {
-        if nbf > now + skew {
-            return None;
-        }
+    // B-374: TOML の `[route.jwt]` と同じ規則（小数の NumericDate は読み、数でない・負の `exp`・`nbf` は拒否する。
+    // 以前は `as_u64` が None を返すと `exp` が無いのと同じに扱い、期限の無いトークンとして通していた）
+    if !crate::jwt_verify::times_ok(&payload, now, prov.clock_skew, prov.require_expiration) {
+        return None;
     }
     let want: &[String] = if audiences.is_empty() {
         &prov.audiences
@@ -698,6 +692,38 @@ mod tests {
         let other = format!("sess={}", TOKEN_GROUP);
         let ho = |n: &str| (n == "cookie").then(|| Bytes::from(other.clone()));
         assert!(authenticate(&c, b"GET", b"/", &ho).is_ok());
+    }
+
+    /// B-374: 小数の NumericDate は読み、数でない・負の `exp`・`nbf` は拒否する（期限の無いトークンとして通さない）
+    #[test]
+    fn numeric_dates_fractional_and_invalid() {
+        let check = |payload: &str, now: u64| {
+            let (tok, jwks) = crate::jwt_verify::tests::es256_token(payload);
+            let prov = Provider {
+                name: "p".into(),
+                issuer: "".into(),
+                audiences: vec![],
+                require_expiration: false,
+                forward: true,
+                from_headers: vec![],
+                from_params: vec![],
+                from_cookies: vec![],
+                payload_in_metadata: "".into(),
+                space_delimited: vec![],
+                clock_skew: 0,
+                claim_to_headers: vec![],
+                keys: parse_jwks(&jwks),
+            };
+            verify_token(&prov, &tok, &[], now).is_some()
+        };
+        assert!(check(r#"{"exp":1700000000.5}"#, 1_600_000_000));
+        assert!(!check(r#"{"exp":1700000000.5}"#, 1_800_000_000));
+        assert!(!check(r#"{"exp":"2000000000"}"#, 1_600_000_000));
+        assert!(!check(r#"{"exp":-1}"#, 1_600_000_000));
+        assert!(!check(r#"{"nbf":1700000000.5}"#, 1_600_000_000));
+        assert!(!check(r#"{"nbf":"x"}"#, 1_600_000_000));
+        assert!(check(r#"{"nbf":1500000000}"#, 1_600_000_000));
+        assert!(check(r#"{}"#, 1_600_000_000));
     }
 
     #[test]

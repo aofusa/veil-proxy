@@ -1266,12 +1266,25 @@ impl Http3Handler {
                             ps.req_readable = true;
                         } else {
                             // バッファ経路（または未分類の初回バッチ）: stream_bodies へ排出。
-                            if let Some(w) = self
-                                .buffered_reqs
-                                .get_mut(&stream_id)
-                                .and_then(|br| br.recv_watch.as_mut())
-                            {
-                                w.last = crate::runtime::time::coarse_now();
+                            let tracked = match self.buffered_reqs.get_mut(&stream_id) {
+                                Some(br) => {
+                                    if let Some(w) = br.recv_watch.as_mut() {
+                                        w.last = crate::runtime::time::coarse_now();
+                                    }
+                                    true
+                                }
+                                None => new_headers.iter().any(|(id, _, _)| *id == stream_id),
+                            };
+                            if !tracked {
+                                // B-368: 応答を済ませて追跡していないストリーム（即時応答・完了）の本文は溜めない
+                                // （溜めると誰も消さず、接続が閉じるまで残った）。送信を止めてもらい
+                                // （STOP_SENDING。RFC 9114 §4.1.1）、以後の受信は quiche が捨てる
+                                let _ = self.conn.stream_shutdown(
+                                    stream_id,
+                                    quiche::Shutdown::Read,
+                                    H3_NO_ERROR_CODE,
+                                );
+                                continue;
                             }
                             let body = self.stream_bodies.entry(stream_id).or_default();
                             let limit = crate::l7::max_buffered_request_body();
@@ -1404,7 +1417,15 @@ impl Http3Handler {
                 }
                 Decision::Handled => {
                     self.stream_bodies.remove(&stream_id);
-                    // 即時応答済み（セキュリティ拒否等）— ストリーム close
+                    // 即時応答済み（セキュリティ拒否等）— ストリーム close。要求の残り（本文）は読まない
+                    // （B-368。STOP_SENDING(H3_NO_ERROR)、RFC 9114 §4.1.1）
+                    if more_frames {
+                        let _ = self.conn.stream_shutdown(
+                            stream_id,
+                            quiche::Shutdown::Read,
+                            H3_NO_ERROR_CODE,
+                        );
+                    }
                     self.metric_stream_close(stream_id);
                 }
                 Decision::Tunnel(req) => {
@@ -1439,6 +1460,9 @@ impl Http3Handler {
                 ps.req_eof_seen = true;
             } else if let Some(br) = self.buffered_reqs.get_mut(&stream_id) {
                 br.end = true;
+            } else {
+                // 追跡していないストリーム（B-368）。本文が残っていれば消す
+                self.stream_bodies.remove(&stream_id);
             }
         }
         self.ev_finished = finished;
@@ -2416,6 +2440,17 @@ mod tests {
         let mut bad_method = GOOD.to_vec();
         bad_method[0] = (":method", "GET /x");
         assert!(check(&bad_method).is_err());
+        // B-373: フラグメント・UTF-8 でない :path
+        let mut frag = GOOD.to_vec();
+        frag[3] = (":path", "/admin#x");
+        assert!(check(&frag).is_err());
+        let non_utf8: [(&[u8], &[u8]); 4] = [
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":authority", b"example.com"),
+            (b":path", b"/admin\xff"),
+        ];
+        assert!(h3_check_field_section(non_utf8, false).is_err());
     }
 
     #[test]
@@ -2983,6 +3018,124 @@ mod tests {
         );
         let _ = h.init_h3();
         assert!(h.h3_conn.is_none());
+    }
+
+    /// B-368: 即時に応答したストリーム（`:protocol` の無い CONNECT への 405）に後から本文が届いても溜めない。
+    /// 修正前は追跡していないストリームの本文を `stream_bodies` に溜め、接続が閉じるまで消さなかった
+    /// （ストリームごとに 16KB 以上が残り、繰り返すとメモリを使い切る）。
+    #[test]
+    fn test_b368_body_after_immediate_response_is_not_buffered() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let mut server_cfg = new_quic_config_with_certs(
+            ck.cert.pem().as_bytes(),
+            ck.signing_key.serialize_pem().as_bytes(),
+        )
+        .expect("server config");
+        server_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_cfg.set_initial_max_data(1 << 20);
+        server_cfg.set_initial_max_stream_data_bidi_remote(1 << 16);
+        server_cfg.set_initial_max_stream_data_uni(1 << 16);
+        server_cfg.set_initial_max_streams_bidi(16);
+        server_cfg.set_initial_max_streams_uni(16);
+        let quic_config = Rc::new(RefCell::new(server_cfg));
+        let server_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:40021".parse().unwrap();
+        let mut conns: ConnMapInner = HashMap::with_hasher(conn_map_hasher());
+        let notify = crate::http3_stream::H3Notify::new();
+        let spawner = crate::http3_stream::backend_task_spawner();
+        let wake_queue: crate::http3_stream::WakeQueue = Default::default();
+        let mut dirty = VecDeque::new();
+        let cid_key = hmac::Key::new(hmac::HMAC_SHA256, &[42u8; 32]);
+        let mut client_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_cfg.verify_peer(false);
+        client_cfg.set_initial_max_data(1 << 20);
+        client_cfg.set_initial_max_stream_data_bidi_local(1 << 16);
+        client_cfg.set_initial_max_stream_data_uni(1 << 16);
+        client_cfg.set_initial_max_streams_bidi(16);
+        client_cfg.set_initial_max_streams_uni(16);
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[5; 16]),
+            client_addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .unwrap();
+        let to_client = quiche::RecvInfo {
+            from: server_addr,
+            to: client_addr,
+        };
+        let mut buf = vec![0u8; 1500];
+        // 両者の送れるパケットを全部相手へ渡す（ネットワークの代わり）
+        let mut pump = |client: &mut quiche::Connection, conns: &mut ConnMapInner| {
+            for _ in 0..10 {
+                while let Ok((len, _)) = client.send(&mut buf) {
+                    process_datagram_segments(
+                        conns,
+                        &mut buf[..len],
+                        client_addr,
+                        None,
+                        &cid_key,
+                        &quic_config,
+                        server_addr,
+                        &notify,
+                        &spawner,
+                        &wake_queue,
+                        &mut dirty,
+                        Instant::now(),
+                    )
+                    .unwrap();
+                }
+                for h in conns.values_mut() {
+                    while let Ok((len, _)) = h.conn.send(&mut buf) {
+                        let _ = client.recv(&mut buf[..len], to_client);
+                    }
+                }
+            }
+        };
+        pump(&mut client, &mut conns);
+        assert!(client.is_established());
+        conns.values_mut().next().unwrap().init_h3().unwrap();
+
+        let h3_cfg = h3::Config::new().unwrap();
+        let mut ch3 = h3::Connection::with_transport(&mut client, &h3_cfg).unwrap();
+        let req = [
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":authority", b"localhost"),
+        ];
+        let sid = ch3.send_request(&mut client, &req, false).unwrap();
+        pump(&mut client, &mut conns);
+        let h = conns.values_mut().next().unwrap();
+        h.process_h3_events().unwrap();
+        assert!(h.stream_bodies.is_empty());
+
+        // 405 の後に本文を送る（修正前はここで stream_bodies に残った）
+        pump(&mut client, &mut conns);
+        let mut status = None;
+        while let Ok((id, ev)) = ch3.poll(&mut client) {
+            if let h3::Event::Headers { list, .. } = ev {
+                assert_eq!(id, sid);
+                status = list
+                    .iter()
+                    .find(|h| h.name() == b":status")
+                    .map(|h| h.value().to_vec());
+            }
+        }
+        assert_eq!(status.as_deref(), Some(&b"405"[..]));
+        let _ = ch3.send_body(&mut client, sid, b"x", true);
+        pump(&mut client, &mut conns);
+        let h = conns.values_mut().next().unwrap();
+        h.process_h3_events().unwrap();
+        assert!(
+            h.stream_bodies.is_empty(),
+            "a body sent after the immediate response must not be buffered"
+        );
+        assert!(!h.conn.is_closed());
     }
 
     /// F-152: `[http3] recv_drain_max`（reactor 経路の 1 イテレーションあたり

@@ -177,7 +177,7 @@ compression_enabled = true
 | **ディスクキャッシュ** | monoio非同期I/Oを使用した大容量レスポンス保存 |
 | **ETag/If-None-Match** | 条件付きリクエストに対する304 Not Modifiedレスポンス |
 | **If-Modified-Since** | 日付ベースの条件付きリクエスト検証 |
-| **stale-while-revalidate** | バックグラウンドで更新しながらstaleコンテンツを提供 |
+| **stale-while-revalidate** | バックグラウンドで更新しながらstaleコンテンツを提供（裏の要求は中継と同じに組み立てる: 上流の `Host`・`path_prefix`・ヘッダの削除・転送ヘッダ） |
 | **stale-if-error** | バックエンドエラー時にstaleコンテンツを提供 |
 | **Varyヘッダーサポート** | リクエストヘッダーに基づくキャッシュ分離 |
 | **パターンベース無効化** | globパターンによるキャッシュ無効化 |

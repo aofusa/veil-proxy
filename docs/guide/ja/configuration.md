@@ -166,7 +166,8 @@ max_concurrent_connections = 10000
 # "merge_slashes": base + 連続する "/" を 1 つにする
 # "off": 生のパスで照合して送る（v0.8.0 より前の動作）
 # %2F・%5C はそのまま残す。絶対形式の要求先（http://host/path）は origin 形式に直し、
-# それ以外の origin 形式でない要求先（CONNECT と OPTIONS の * を除く）は 400。
+# それ以外の origin 形式でない要求先（CONNECT と OPTIONS の * を除く）は 400。"#" を含む要求先・
+# UTF-8 でないバイトを含む要求先も 400（"off" を含むどのモードでも）。
 # path_normalization = "base"
 
 # seccomp システムコール制限（Linux専用）

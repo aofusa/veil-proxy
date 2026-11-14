@@ -2302,6 +2302,34 @@ pub(super) async fn write_api_chunked(
     }
 }
 
+/// `input` の chunked を読み、本文のデータを `body` に足す。終わりに達したら、その後ろのバイトを `overflow` に
+/// 足す（B-372）。
+#[cfg(any(feature = "handler", feature = "wasm"))]
+fn decode_chunked_into(
+    decoder: &mut ChunkedDecoder,
+    mut input: &[u8],
+    body: &mut Vec<u8>,
+    overflow: &mut BytesMut,
+) -> ChunkedFeedResult {
+    while !input.is_empty() {
+        let span = decoder.next_data_span(input);
+        body.extend_from_slice(&input[span.data_start..span.data_start + span.data_len]);
+        if span.complete {
+            overflow.extend_from_slice(&input[span.consumed..]);
+            return ChunkedFeedResult::Complete;
+        }
+        if span.limit_exceeded {
+            return if decoder.state == ChunkedState::SizeLimitExceeded {
+                ChunkedFeedResult::SizeLimitExceeded
+            } else {
+                ChunkedFeedResult::Invalid
+            };
+        }
+        input = &input[span.consumed..];
+    }
+    ChunkedFeedResult::Continue
+}
+
 /// ハンドラ用に HTTP/1.1 のリクエスト本文を全部読む（Content-Length / chunked、上限 `limit`）。
 /// 失敗はステータス（上限超過 413、それ以外 400）。Wasm の要求本文のフェーズ（F-271）も使う。
 /// 本文の終わりより後ろまで読んだ分（次の要求）は `overflow` の後ろに足す（B-186）。
@@ -2315,21 +2343,18 @@ pub(super) async fn read_full_request_body(
     overflow: &mut BytesMut,
 ) -> Result<Bytes, u16> {
     if is_chunked {
+        // B-372: 本文のデータだけを溜める（以前はフレーミングごと溜めてから復号していて、本文の上限が数えない
+        // チャンク拡張・トレーラ・サイズの桁で溜まる量に上限が無かった）
         let mut decoder = ChunkedDecoder::new_request(limit as u64);
-        let mut raw: Vec<u8> = initial_body.to_vec();
-        let mut state = decoder.feed(initial_body);
+        let mut body: Vec<u8> = Vec::new();
+        let mut state = decode_chunked_into(&mut decoder, initial_body, &mut body, overflow);
         while matches!(state, ChunkedFeedResult::Continue) {
             let buf = buf_get();
             match timeout(READ_TIMEOUT, stream.read(buf)).await {
                 Ok((Ok(n), mut b)) if n > 0 => {
                     b.set_valid_len(n);
-                    let data = b.as_valid_slice();
-                    let (res, used) = decoder.feed_counted(data);
-                    raw.extend_from_slice(&data[..used]);
-                    if matches!(res, ChunkedFeedResult::Complete) {
-                        overflow.extend_from_slice(&data[used..]);
-                    }
-                    state = res;
+                    state =
+                        decode_chunked_into(&mut decoder, b.as_valid_slice(), &mut body, overflow);
                     buf_put(b);
                 }
                 Ok((_, b)) => {
@@ -2340,7 +2365,7 @@ pub(super) async fn read_full_request_body(
             }
         }
         match state {
-            ChunkedFeedResult::Complete => Ok(Bytes::from(decode_chunked_body(&raw))),
+            ChunkedFeedResult::Complete => Ok(Bytes::from(body)),
             ChunkedFeedResult::SizeLimitExceeded => Err(413),
             ChunkedFeedResult::Continue | ChunkedFeedResult::Invalid => Err(400),
         }
@@ -2515,6 +2540,51 @@ mod b186_overflow_tests {
             send_rest(&c, b"lo\r\n0\r\n\r\n");
             let mut over = BytesMut::new();
             assert!(drain_request_body(&mut tls, 0, true, b"5\r\nhel", &mut over).await);
+            assert_eq!(&over[..], NEXT);
+        });
+    }
+
+    /// B-372: 本文の上限が数えないフレーミング（チャンク拡張・トレーラ・サイズの先頭の 0）で溜め続けない。
+    /// 修正前はフレーミングごと溜めてから復号していて、どれも本文の上限に届かないまま溜まり続けた
+    #[cfg(any(feature = "handler", feature = "wasm"))]
+    #[test]
+    fn read_full_request_body_bounds_chunked_framing() {
+        if !runtime_available() {
+            return;
+        }
+        crate::runtime::block_on(async {
+            let mut ext = b"1;".to_vec();
+            ext.extend_from_slice(&[b'a'; 20 * 1024]);
+            ext.extend_from_slice(b"\r\nx\r\n0\r\n\r\n");
+            let mut trailers = b"0\r\n".to_vec();
+            for _ in 0..1024 {
+                trailers.extend_from_slice(b"X-Pad: aaaaaaaaaaaaaaaaaaaa\r\n");
+            }
+            trailers.extend_from_slice(b"\r\n");
+            let mut zeros = vec![b'0'; 100];
+            zeros.extend_from_slice(b"1\r\nx\r\n0\r\n\r\n");
+            for case in [ext, trailers, zeros] {
+                let (s, c) = pair();
+                let mut tls = server(s).await;
+                send_rest(&c, &case);
+                let mut over = BytesMut::new();
+                let r = read_full_request_body(&mut tls, 0, true, b"", 1024, &mut over).await;
+                assert_eq!(r.err(), Some(400));
+            }
+            // 1 バイトずつのチャンク（データよりフレーミングが多い）も上限の範囲なら読める。溜めるのはデータだけ
+            let mut small = Vec::new();
+            for _ in 0..512 {
+                small.extend_from_slice(b"1;e=v\r\nx\r\n");
+            }
+            small.extend_from_slice(b"0\r\nX-T: 1\r\n\r\n");
+            let (s, c) = pair();
+            let mut tls = server(s).await;
+            send_rest(&c, &small);
+            let mut over = BytesMut::new();
+            let body = read_full_request_body(&mut tls, 0, true, b"", 1024, &mut over)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], &[b'x'; 512][..]);
             assert_eq!(&over[..], NEXT);
         });
     }

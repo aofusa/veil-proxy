@@ -231,6 +231,22 @@ impl PathRouter {
                 // fallback にも登録し、両経路の意味論を一致させる。深いパスは両方に一致するが
                 // 候補は上位（OptimizedRouter）で dedup される。
                 self.patterns.push((pattern.to_string(), route_idx));
+            } else if pattern.ends_with('/')
+                || self
+                    .router
+                    .insert(format!("{pattern}/"), vec![route_idx])
+                    .is_err()
+                || self
+                    .router
+                    .insert(format!("{pattern}/{{*rest}}"), vec![route_idx])
+                    .is_err()
+            {
+                // B-370: `*` の無いパス（`/admin`）も前方一致（`matches_path_pattern` と同じく `/admin/` と
+                // `/admin/...` にも一致する）。matchit には完全一致しか入れていなかったので、より広いルート
+                // （`/`）があると `/admin/users` はそちらへ行き、このルートの `[route.security]`・`[route.jwt]`
+                // が掛からなかった。子のパスも matchit に入れ、入らなければ（他のルートと衝突・末尾が `/`）
+                // 前方一致の照合（`matches_pattern`）へ回す
+                self.patterns.push((pattern.to_string(), route_idx));
             }
         }
     }
@@ -868,6 +884,56 @@ mod tests {
             "/apix must not match /api/*"
         );
         assert!(!router.get_candidates("/other").contains(&0));
+    }
+
+    /// B-370: `*` の無いパスも前方一致の候補になり、候補は前方一致の照合（`matches_pattern`。ルートの選択の
+    /// `matches_path_pattern` と同じ意味）と一致する。修正前は `/admin` が完全一致でしか候補にならず、より広い
+    /// ルート（`/`）があると `/admin/users` はそちらへ行って `/admin` のルートの検査が掛からなかった
+    #[test]
+    fn test_path_without_wildcard_is_a_prefix_candidate() {
+        let patterns = ["/admin", "/api/", "/static/*", "/a/b", "/admin/*"];
+        let mut router = PathRouter::new();
+        for (i, p) in patterns.iter().enumerate() {
+            router.add_route(i, Some(p));
+        }
+        router.add_route(patterns.len(), Some("/"));
+        let paths = [
+            "/admin",
+            "/admin/",
+            "/admin/users",
+            "/admin/a/b",
+            "/administrator",
+            "/adminx/y",
+            "/api",
+            "/api/",
+            "/api/x",
+            "/api//x",
+            "/static",
+            "/static/a.css",
+            "/a/b",
+            "/a/b/c",
+            "/a/bc",
+            "/",
+        ];
+        for path in paths {
+            let got = router.get_candidates(path);
+            assert!(got.contains(&patterns.len()), "{path}: catch-all");
+            for (i, p) in patterns.iter().enumerate() {
+                assert_eq!(
+                    got.contains(&i),
+                    router.matches_pattern(p, path),
+                    "pattern {p} path {path}"
+                );
+            }
+        }
+        // 選択の順（インデックス順の最初）で `/admin` のルートが catch-all より先に来る
+        let mut opt = OptimizedRouter::new();
+        opt.add_route(0, None, Some("/admin"), None);
+        opt.add_route(1, None, Some("/"), None);
+        opt.finalize();
+        let ip: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert_eq!(opt.get_candidates("h", "/admin/users", &ip), vec![0, 1]);
+        assert_eq!(opt.get_candidates("h", "/adminx", &ip), vec![1]);
     }
 
     #[test]

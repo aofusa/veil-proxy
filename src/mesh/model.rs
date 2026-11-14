@@ -1051,6 +1051,9 @@ pub struct ClusterCfg {
     pub tls_matches: Vec<(Vec<(String, String)>, Option<Arc<UpstreamTls>>)>,
     /// `transport_socket`（matches が無いときの既定）
     pub tls_default: Option<Arc<UpstreamTls>>,
+    /// 要求の Host（ポートを除く）を TLS の名前（SNI・証明書の検査）にする（`HttpProtocolOptions` の
+    /// `upstream_http_protocol_options` の auto_sni・auto_san_validation。HTTP の要求だけ。B-375）
+    pub auto_sni: bool,
     pub proto: UpstreamProto,
     pub idle_timeout: Duration,
     pub max_requests_per_conn: u32,

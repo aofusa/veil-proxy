@@ -241,6 +241,8 @@ pub fn spawn_background_revalidation(
     // 切り出し）になったため、こちらもそれに合わせる（これはリクエストヘッダーの再送用で
     // レスポンス側とは無関係）。
     headers: Vec<(bytes::Bytes, bytes::Bytes)>,
+    // B-371: 転送ヘッダ（X-Forwarded-For 等）に入れるクライアントの IP
+    client_ip: String,
 ) {
     let hash = cache_key.hash_value();
 
@@ -311,50 +313,14 @@ pub fn spawn_background_revalidation(
             }
         };
 
-        // リクエストを構築（Cow<str>で借用優先）
-        let path_str = std::str::from_utf8(&req_path).unwrap_or("/");
-        let sub_path: std::borrow::Cow<'_, str> = if prefix.is_empty() {
-            std::borrow::Cow::Borrowed(path_str)
-        } else {
-            let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
-            match path_str.strip_prefix(prefix_str) {
-                Some(stripped) => std::borrow::Cow::Borrowed(stripped),
-                None => std::borrow::Cow::Borrowed(path_str),
-            }
-        };
-
-        // ホスト名を取得
-        let host_header = headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(b"host"))
-            .map(|(_, v)| v.as_ref())
-            .unwrap_or(target.host.as_bytes());
-
         let method_str = std::str::from_utf8(&method).unwrap_or("GET");
 
-        // HTTPリクエストを構築
-        let mut request = Vec::with_capacity(512);
-        request.extend_from_slice(method_str.as_bytes());
-        request.extend_from_slice(b" ");
-        request.extend_from_slice(sub_path.as_bytes());
-        request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-        request.extend_from_slice(host_header);
-        request.extend_from_slice(b"\r\nConnection: close\r\n");
-
-        // 元のヘッダーを追加（一部除外）
-        for (name, value) in &headers {
-            if name.eq_ignore_ascii_case(b"host")
-                || name.eq_ignore_ascii_case(b"connection")
-                || name.eq_ignore_ascii_case(b"content-length")
-            {
-                continue;
-            }
-            request.extend_from_slice(name);
-            request.extend_from_slice(b": ");
-            request.extend_from_slice(value);
-            request.extend_from_slice(b"\r\n");
-        }
-        request.extend_from_slice(b"\r\n");
+        // B-371: 生の転送と同じ組み立て（上流の Host・path_prefix・remove_request_headers・転送ヘッダの方針・
+        // add_request_headers・Via）。以前はクライアントの Host と全ヘッダ（信頼しない送信元の X-Forwarded-For・
+        // 削除を指定したヘッダを含む）をそのまま送り、その応答を共有のキャッシュへ保存していた
+        let request = crate::proxy::build_revalidation_request(
+            &method, &req_path, &prefix, target, &headers, &security, &client_ip,
+        );
 
         // リクエスト送信
         let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;

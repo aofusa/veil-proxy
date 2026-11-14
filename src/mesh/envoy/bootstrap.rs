@@ -205,6 +205,7 @@ fn static_cluster(name: &str) -> ClusterCfg {
         bind: None,
         tls_matches: Vec::new(),
         tls_default: None,
+        auto_sni: false,
         proto: UpstreamProto::Http1,
         idle_timeout: Duration::from_secs(60),
         max_requests_per_conn: 0,

@@ -683,7 +683,7 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_group` | Group name to drop to after startup | none |
 | `max_concurrent_connections` | Maximum concurrent connections | 0 (unlimited) |
 | `blocked_ips` | Front-line IP/CIDR blocklist; matching connections are dropped right after `accept` (before the TLS handshake / handler spawn), avoiding expensive work for known-bad IPs. CIDRs are parsed once at startup (zero-alloc check on the accept hot path) and hot-reloadable via SIGHUP. Evaluated earlier than per-route `denied_ips`. | `[]` |
-| `path_normalization` | Request path normalization before routing and `[route.security]` checks; the normalized path is forwarded upstream. `"base"`: decode `%XX` of unreserved characters, `\` → `/`, remove dot segments. `"merge_slashes"`: base + collapse repeated `/`. `"off"`: raw path (pre-v0.8.0). Absolute-form targets become origin-form; other non-origin targets (except `CONNECT`, `OPTIONS *`) get 400 | `"base"` |
+| `path_normalization` | Request path normalization before routing and `[route.security]` checks; the normalized path is forwarded upstream. `"base"`: decode `%XX` of unreserved characters, `\` → `/`, remove dot segments. `"merge_slashes"`: base + collapse repeated `/`. `"off"`: raw path (pre-v0.8.0). Absolute-form targets become origin-form; other non-origin targets (except `CONNECT`, `OPTIONS *`) and targets with `#` or non-UTF-8 bytes get 400 | `"base"` |
 | `allow_security_failures` | Behavior when security feature activation fails | false |
 
 #### Security Feature Failure Handling

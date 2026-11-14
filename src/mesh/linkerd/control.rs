@@ -129,6 +129,7 @@ async fn mux(t: &CtlTarget) -> Result<Rc<H2Mux>, String> {
         Some(super::ROOTS),
         vec![StringMatcher::exact(&t.name)],
         &[],
+        false,
     )?;
     let name = rustls::pki_types::ServerName::try_from(t.name.clone())
         .map_err(|e| format!("server name {}: {}", t.name, e))?;

@@ -66,6 +66,7 @@ use self::websocket::*;
 mod forward;
 #[cfg(any(feature = "http2", feature = "http3"))]
 pub(crate) mod ws_tunnel;
+pub(crate) use self::forward::build_revalidation_request;
 use self::forward::*;
 mod buffered;
 use self::buffered::*;

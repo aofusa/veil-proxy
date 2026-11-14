@@ -68,6 +68,12 @@ Supported (checked with `tools/k8s/mesh-e2e.sh`, stock / veil / mixed):
   - Paths are normalized once before routing, RBAC and JWT matching, and the normalized path is sent upstream
     (HCM `normalize_path`, `merge_slashes`, `path_with_escaped_slashes_action`; Istio's `BASE` normalization by
     default, also when the HCM does not set `normalize_path`). A request the escaped-slash action rejects gets 400 (`DPE`).
+    Request targets that contain `#` (a fragment) or bytes that are not UTF-8 get 400 (HTTP/2: a stream error), as with
+    Envoy's fragment rejection.
+  - HTTP/1.1 chunked bodies are parsed strictly (RFC 9112 §7.1). A request with malformed framing gets 400 (`DPE`)
+    and the connection is closed; a response with malformed framing is cut off and both connections are closed.
+  - JWT `exp` / `nbf` that are present but are not non-negative numbers reject the token; fractional NumericDates are
+    accepted.
   - `remoteIpBlocks` uses Envoy's original client address: the peer with `use_remote_address`, otherwise the
     X-Forwarded-For entry `xff_num_trusted_hops` from the right. The client-controlled leftmost entry is never used.
   - RBAC rules veil cannot evaluate (CEL conditions, `metadata` and `matcher` permissions) fail closed: in an ALLOW
@@ -137,6 +143,10 @@ Supported (checked with `tools/k8s/linkerd-e2e.sh`, stock / veil / mixed):
 - For upstream TLS with no `match_subject_alt_names`, veil checks the server certificate against the SNI name (like
   Envoy's `auto_san_validation`); connections without an SNI name are checked against the trust bundle only. SAN
   matchers without `trusted_ca` are rejected (NACK), as with Envoy.
+- Clusters with `auto_sni` or `auto_san_validation` (`upstream_http_protocol_options`; Istio sets them for a
+  DestinationRule `SIMPLE` / `MUTUAL` TLS without `sni` / `subjectAltNames`) use the request's host (without the port)
+  as the SNI name and check the certificate against it, an IP host included. A host that is not a valid server name
+  fails the connection. `override_auto_sni_header` is not supported (the `Host` / `:authority` is used).
 - Certificate revocation lists (`crl` in a validation context) are not supported; configurations and SDS secrets that
   carry one are rejected (NACK) instead of being applied without revocation checks.
 - An inbound `x-forwarded-client-cert` header is kept only when the client presented a certificate over TLS

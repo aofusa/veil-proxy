@@ -473,8 +473,11 @@ Request-level hardening that came out of the audit:
 - IP allow/deny lists match IPv4-mapped IPv6 addresses as IPv4.
 - Request paths are normalized before routing and `[route.security]` checks and forwarded normalized
   (`[security] path_normalization`); absolute-form targets become origin-form, other non-origin targets get 400.
+  Targets that contain `#` (a fragment) or bytes that are not UTF-8 get 400 (HTTP/2 and HTTP/3: a stream error),
+  because backends that drop the fragment would serve a path the routes and checks did not see.
 - Chunked request bodies are parsed strictly (RFC 9112 §7.1; malformed framing is rejected) and nothing after
-  the terminating chunk is forwarded upstream as part of that request.
+  the terminating chunk is forwarded upstream as part of that request. A chunk-size line may be at most 64 bytes,
+  and chunk extensions and trailers at most 16 KiB each per request.
 - WebSocket upgrades apply `remove_request_headers` / `add_request_headers`; client bytes that follow the
   handshake are sent upstream only after a `101`.
 - HTTP/3 caps connections per worker (`[http3] max_connections`), answers Initials with a stateless Retry once

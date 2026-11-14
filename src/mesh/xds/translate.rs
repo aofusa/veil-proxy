@@ -371,7 +371,9 @@ fn downstream_tls(ctx: &p::DownstreamTlsContext) -> R<Arc<DownstreamTls>> {
     }))
 }
 
-pub fn upstream_tls(ctx: &p::UpstreamTlsContext) -> R<Arc<UpstreamTls>> {
+/// `auto_sni` はクラスタが要求の Host を TLS の名前にするか（[`ClusterCfg::auto_sni`]）。そのときは HTTP の接続の
+/// 名前が IP でも証明書を検査する（B-375）。
+pub fn upstream_tls(ctx: &p::UpstreamTlsContext, auto_sni: bool) -> R<Arc<UpstreamTls>> {
     let common = ctx.common_tls_context.clone().unwrap_or_default();
     let (cert, roots, sans) = common_tls(&common)?;
     let xds_alpn: Vec<&[u8]> = common.alpn_protocols.iter().map(|a| a.as_bytes()).collect();
@@ -396,15 +398,21 @@ pub fn upstream_tls(ctx: &p::UpstreamTlsContext) -> R<Arc<UpstreamTls>> {
     } else {
         (xds_alpn.clone(), xds_alpn.clone())
     };
-    let mk = |alpn: &[&[u8]]| {
-        crate::mesh::identity::client_config(cert.as_deref(), roots.as_deref(), sans.clone(), alpn)
+    let mk = |alpn: &[&[u8]], verify_ip_name: bool| {
+        crate::mesh::identity::client_config(
+            cert.as_deref(),
+            roots.as_deref(),
+            sans.clone(),
+            alpn,
+            verify_ip_name,
+        )
     };
     Ok(Arc::new(UpstreamTls {
         sni: ctx.sni.clone(),
         san_matchers: sans.clone(),
-        tcp: mk(&tcp_alpn)?,
-        h1: mk(&h1)?,
-        h2: mk(&h2)?,
+        tcp: mk(&tcp_alpn, false)?,
+        h1: mk(&h1, auto_sni)?,
+        h2: mk(&h2, auto_sni)?,
         mesh_mtls,
         transport: None,
         principal: match sans.as_slice() {
@@ -417,14 +425,17 @@ pub fn upstream_tls(ctx: &p::UpstreamTlsContext) -> R<Arc<UpstreamTls>> {
     }))
 }
 
-fn transport_socket_upstream(ts: &p::TransportSocket) -> R<Option<Arc<UpstreamTls>>> {
+fn transport_socket_upstream(
+    ts: &p::TransportSocket,
+    auto_sni: bool,
+) -> R<Option<Arc<UpstreamTls>>> {
     let Some(any) = &ts.typed_config else {
         return Ok(None);
     };
     if any.type_url == p::T_UPSTREAM_TLS {
         let ctx: p::UpstreamTlsContext =
             decode_any(any, p::T_UPSTREAM_TLS).ok_or("invalid UpstreamTlsContext")?;
-        return Ok(Some(upstream_tls(&ctx)?));
+        return Ok(Some(upstream_tls(&ctx, auto_sni)?));
     }
     if any.type_url.ends_with("RawBuffer") {
         return Ok(None);
@@ -434,7 +445,7 @@ fn transport_socket_upstream(ts: &p::TransportSocket) -> R<Option<Arc<UpstreamTl
         let iu: p::InternalUpstreamTransport =
             decode_any(any, p::T_INTERNAL_UPSTREAM).ok_or("invalid InternalUpstreamTransport")?;
         return match &iu.transport_socket {
-            Some(ts) => transport_socket_upstream(ts),
+            Some(ts) => transport_socket_upstream(ts, auto_sni),
             None => Ok(None),
         };
     }
@@ -1336,31 +1347,37 @@ pub fn cluster(c: &p::Cluster) -> R<ClusterCfg> {
         5 => LbPolicy::Maglev,
         _ => LbPolicy::RoundRobin,
     };
+    let hpo = c
+        .typed_extension_protocol_options
+        .get("envoy.extensions.upstreams.http.v3.HttpProtocolOptions")
+        .and_then(|any| decode_any::<p::HttpProtocolOptions>(any, p::T_HTTP_PROTOCOL_OPTIONS));
+    // B-375: Istio は DestinationRule の TLS（SIMPLE・MUTUAL）に `sni`・`subjectAltNames` を書かないとき、
+    // auto_sni・auto_san_validation を付ける（要求の Host を SNI にして、その名前で証明書を検査する）。読まずに
+    // 宛先の IP を名前にして繋ぎ、信頼アンカーにつながる証明書なら宛先を問わず通していた
+    let auto_sni = hpo
+        .as_ref()
+        .and_then(|h| h.upstream_http_protocol_options.as_ref())
+        .is_some_and(|u| u.auto_sni || u.auto_san_validation);
     let mut tls_matches = Vec::new();
     for m in &c.transport_socket_matches {
         let crit = m.r#match.as_ref().map(struct_strings).unwrap_or_default();
         let tls = match &m.transport_socket {
-            Some(ts) => {
-                transport_socket_upstream(ts).map_err(|e| format!("cluster {}: {}", c.name, e))?
-            }
+            Some(ts) => transport_socket_upstream(ts, auto_sni)
+                .map_err(|e| format!("cluster {}: {}", c.name, e))?,
             None => None,
         };
         tls_matches.push((crit, tls));
     }
     let tls_default = match &c.transport_socket {
-        Some(ts) => {
-            transport_socket_upstream(ts).map_err(|e| format!("cluster {}: {}", c.name, e))?
-        }
+        Some(ts) => transport_socket_upstream(ts, auto_sni)
+            .map_err(|e| format!("cluster {}: {}", c.name, e))?,
         None => None,
     };
     let mut proto = UpstreamProto::Http1;
     let mut idle_timeout = Duration::from_secs(3600);
     let mut max_requests_per_conn = 0;
-    if let Some(any) = c
-        .typed_extension_protocol_options
-        .get("envoy.extensions.upstreams.http.v3.HttpProtocolOptions")
     {
-        if let Some(hpo) = decode_any::<p::HttpProtocolOptions>(any, p::T_HTTP_PROTOCOL_OPTIONS) {
+        if let Some(hpo) = &hpo {
             proto = match &hpo.upstream_protocol_options {
                 Some(p::http_protocol_options::UpstreamProtocolOptions::ExplicitHttpConfig(e)) => {
                     if e.http2_protocol_options.is_some() {
@@ -1458,6 +1475,7 @@ pub fn cluster(c: &p::Cluster) -> R<ClusterCfg> {
         bind,
         tls_matches,
         tls_default,
+        auto_sni,
         proto,
         idle_timeout,
         max_requests_per_conn,
@@ -1564,6 +1582,41 @@ fn resolve(host: &str, port: u16) -> Vec<SocketAddr> {
 mod tests {
     use super::*;
     use crate::mesh::state::Registry;
+
+    /// B-375: `upstream_http_protocol_options` の auto_sni・auto_san_validation を読む
+    #[test]
+    fn cluster_reads_auto_sni() {
+        use prost::Message;
+        let with = |u: Option<p::UpstreamHttpProtocolOptions>| {
+            let mut c = p::Cluster {
+                name: "outbound|443||api.example.com".into(),
+                r#type: 0,
+                ..Default::default()
+            };
+            c.typed_extension_protocol_options.insert(
+                "envoy.extensions.upstreams.http.v3.HttpProtocolOptions".into(),
+                p::Any {
+                    type_url: p::T_HTTP_PROTOCOL_OPTIONS.into(),
+                    value: p::HttpProtocolOptions {
+                        upstream_http_protocol_options: u,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                },
+            );
+            cluster(&c).unwrap().auto_sni
+        };
+        assert!(!with(None));
+        assert!(with(Some(p::UpstreamHttpProtocolOptions {
+            auto_sni: true,
+            auto_san_validation: true,
+        })));
+        assert!(with(Some(p::UpstreamHttpProtocolOptions {
+            auto_sni: false,
+            auto_san_validation: true,
+        })));
+        assert!(!with(Some(p::UpstreamHttpProtocolOptions::default())));
+    }
 
     /// B-316: 1 つのチェーンの network RBAC（Istio は DENY と ALLOW を別のフィルタにする）をすべて残す
     #[test]
@@ -1785,6 +1838,7 @@ mod tests {
             bind: None,
             tls_matches: Vec::new(),
             tls_default: None,
+            auto_sni: false,
             proto: UpstreamProto::Http1,
             idle_timeout: Duration::from_secs(60),
             max_requests_per_conn: 0,

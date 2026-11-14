@@ -170,7 +170,8 @@ max_concurrent_connections = 10000
 # "merge_slashes": base + collapse repeated "/"
 # "off": match and forward the raw path (pre-v0.8.0 behavior)
 # %2F / %5C are kept encoded. Absolute-form targets (http://host/path) are converted to origin form;
-# other non-origin targets (except CONNECT and OPTIONS *) get 400.
+# other non-origin targets (except CONNECT and OPTIONS *) get 400, and so do targets that contain "#"
+# or bytes that are not UTF-8 (in every mode, "off" included).
 # path_normalization = "base"
 
 # seccomp system call restriction (Linux only)

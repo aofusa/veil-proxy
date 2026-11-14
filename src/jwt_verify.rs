@@ -145,6 +145,41 @@ pub struct Check<'a> {
     pub now: u64,
 }
 
+/// NumericDate（RFC 7519 §2。小数も取り得る）を秒で読む。負でない有限の数でなければ `None`。
+fn numeric_date(v: &serde_json::Value) -> Option<u64> {
+    match v.as_u64() {
+        Some(n) => Some(n),
+        None => match v.as_f64() {
+            Some(f) if f.is_finite() && f >= 0.0 => Some(f as u64),
+            _ => None,
+        },
+    }
+}
+
+/// `exp`・`nbf` を確かめる（TOML の `[route.jwt]` とメッシュの jwt_authn で共有する）。
+///
+/// B-322: あるのに負でない数でない `exp`・`nbf` は拒否する（以前は `as_u64` が None を返し、`exp` が無いのと
+/// 同じに扱って期限の無いトークンとして通していた。F33）。B-374: メッシュの検証も同じ規則にする（同じ誤りが
+/// 残っていた）。
+pub(crate) fn times_ok(
+    payload: &serde_json::Value,
+    now: u64,
+    skew: u64,
+    require_expiration: bool,
+) -> bool {
+    match payload.get("exp").map(numeric_date) {
+        Some(None) => return false,
+        Some(Some(exp)) if exp.saturating_add(skew) < now => return false,
+        None if require_expiration => return false,
+        _ => {}
+    }
+    match payload.get("nbf").map(numeric_date) {
+        Some(None) => false,
+        Some(Some(nbf)) => nbf <= now.saturating_add(skew),
+        None => true,
+    }
+}
+
 /// トークンを検証して payload を返す（署名・`iss`・`exp`・`nbf`・`aud`）。
 pub fn verify(c: &Check<'_>, token: &str) -> Option<serde_json::Value> {
     let mut parts = token.split('.');
@@ -175,28 +210,8 @@ pub fn verify(c: &Check<'_>, token: &str) -> Option<serde_json::Value> {
     if !c.issuer.is_empty() && payload.get("iss").and_then(|i| i.as_str()) != Some(c.issuer) {
         return None;
     }
-    let skew = c.clock_skew_secs;
-    // B-322: NumericDate は小数も取り得る（RFC 7519 §2）。あるのに負でない数でない `exp`・`nbf` は拒否する
-    // （以前は `as_u64` が None を返し、`exp` が無いのと同じに扱って期限の無いトークンとして通していた。F33）
-    let numeric_date = |v: &serde_json::Value| -> Result<u64, ()> {
-        match v.as_u64() {
-            Some(n) => Ok(n),
-            None => match v.as_f64() {
-                Some(f) if f.is_finite() && f >= 0.0 => Ok(f as u64),
-                _ => Err(()),
-            },
-        }
-    };
-    match payload.get("exp").map(numeric_date) {
-        Some(Err(())) => return None,
-        Some(Ok(exp)) if exp.saturating_add(skew) < c.now => return None,
-        None if c.require_expiration => return None,
-        _ => {}
-    }
-    match payload.get("nbf").map(numeric_date) {
-        Some(Err(())) => return None,
-        Some(Ok(nbf)) if nbf > c.now.saturating_add(skew) => return None,
-        _ => {}
+    if !times_ok(&payload, c.now, c.clock_skew_secs, c.require_expiration) {
+        return None;
     }
     if !c.audiences.is_empty() {
         let aud_ok = match payload.get("aud") {

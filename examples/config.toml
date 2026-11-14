@@ -740,6 +740,7 @@ watch = false
 # "off": 正規化しない（v0.8.0 より前の動作）
 # %2F・%5C はそのまま残す。絶対形式の要求先（http://host/path）は origin 形式に直し、
 # それ以外の origin 形式でない要求先（CONNECT と OPTIONS の * を除く）は 400 にする。
+# "#" を含む要求先・UTF-8 でないバイトを含む要求先も 400 にする（"off" を含むどのモードでも）。
 # path_normalization = "base"
 
 # セキュリティ機能の有効化に失敗した場合の動作

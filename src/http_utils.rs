@@ -1071,7 +1071,12 @@ pub(crate) fn build_redirect_url(
 ///
 /// B-317: HTTP/1.1 の CONNECT のトンネルは持たないので、authority 形式（`host:443`・`x/admin`）を
 /// 通常の要求として通さない（ルートの照合は catch-all にしか合わず、上流は `/admin` と読んでいた。F18）
+///
+/// B-373: `#` を含む要求先・UTF-8 でない要求先も `None`（[`request_target_is_clean`]）。
 pub(crate) fn origin_form_target(method: &[u8], target: &[u8]) -> Option<std::ops::Range<usize>> {
+    if !request_target_is_clean(target) {
+        return None;
+    }
     if target.first() == Some(&b'/') || (target == b"*" && method.eq_ignore_ascii_case(b"OPTIONS"))
     {
         return Some(0..target.len());
@@ -1093,11 +1098,22 @@ pub(crate) fn origin_form_target(method: &[u8], target: &[u8]) -> Option<std::op
     Some(rest + slash..target.len())
 }
 
+/// 要求先にフラグメント（`#`）が無く、UTF-8 として読めるか（B-373）。
+///
+/// `#` は要求先の文法に無い（RFC 9112 §3.2・RFC 9113 §8.3.1・RFC 9114 §4.3.1）。ルートの照合・メッシュの RBAC は
+/// `/admin#x` を `/admin` と見ないのに、上流の多くは `#` から後ろを捨てて `/admin` として処理する（Envoy も断る）。
+/// UTF-8 でない要求先は、ルートの照合が置換文字で読み、上流への要求・キャッシュのキーは `/` に置き換えていた。
+#[inline]
+pub(crate) fn request_target_is_clean(target: &[u8]) -> bool {
+    !target.contains(&b'#') && std::str::from_utf8(target).is_ok()
+}
+
 /// `:path` に空白・制御文字（0x00〜0x20・0x7F）が無いか（要求行に書いたとき分割されない）。
+/// `#` を含むもの・UTF-8 でないものも断る（[`request_target_is_clean`]。B-373）。
 #[cfg(any(feature = "http2", feature = "http3"))]
 #[inline]
 pub(crate) fn is_valid_request_target(path: &[u8]) -> bool {
-    !path.is_empty() && path.iter().all(|&b| b > 0x20 && b != 0x7f)
+    !path.is_empty() && path.iter().all(|&b| b > 0x20 && b != 0x7f) && request_target_is_clean(path)
 }
 
 // ====================
@@ -1497,8 +1513,13 @@ pub(crate) enum ChunkedFeedResult {
 /// 入力バッファ内に最初に現れた「連続したボディデータ範囲」と、フレーミングの進行状況を
 /// スカラのみで表す（ヒープ確保なし・`Copy`）。ストリーミング転送（F-32）で、読み取り
 /// バッファのサブスライスを中間 `Vec` なしに下流へそのまま送出するために使う。
-// ストリーミング転送（F-32）は http2 / http3 経路でのみ使用する
-#[cfg(any(feature = "http2", feature = "http3"))]
+// ストリーミング転送（F-32）の http2 / http3 経路と、本文を溜めるハンドラ・Wasm の経路（B-372）
+#[cfg(any(
+    feature = "http2",
+    feature = "http3",
+    feature = "handler",
+    feature = "wasm"
+))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChunkedSpan {
     /// 入力スライス内のボディデータ開始オフセット。
@@ -1545,7 +1566,21 @@ pub(crate) struct ChunkedDecoder {
     pub(crate) strict: bool,
     /// チャンクサイズの後に空白（BWS）を読んだ（厳格モード。この後は `;` か CR だけ）
     pub(crate) size_ended: bool,
+    /// 今のサイズの行の桁と空白の数（厳格モード。先頭の 0 も数える）
+    pub(crate) size_line_len: u16,
+    /// 本文全体のチャンク拡張のバイト数（厳格モード）
+    pub(crate) ext_total: u32,
+    /// 本文全体のトレーラの行のバイト数（厳格モード。行末の CRLF は数えない）
+    pub(crate) trailer_total: u32,
 }
+
+/// 厳格モードのサイズの行（16 進の桁とその後の空白。先頭の 0 も数える）の上限。
+/// B-372: 上限が無いと、本文を 1 バイトも数えないまま `0` の桁を送り続けられた
+pub(crate) const MAX_CHUNK_SIZE_LINE: u16 = 64;
+/// 厳格モードの本文全体のチャンク拡張の上限（hyper と同じ 16 KiB。B-372）
+pub(crate) const MAX_CHUNK_EXTENSIONS: u32 = 16 * 1024;
+/// 厳格モードの本文全体のトレーラの上限（B-372）
+pub(crate) const MAX_CHUNK_TRAILERS: u32 = 16 * 1024;
 
 impl ChunkedDecoder {
     /// 新しいChunkedDecoderを作成（サイズ制限付き）
@@ -1563,6 +1598,9 @@ impl ChunkedDecoder {
             max_body_size,
             strict: false,
             size_ended: false,
+            size_line_len: 0,
+            ext_total: 0,
+            trailer_total: 0,
         }
     }
 
@@ -1577,9 +1615,21 @@ impl ChunkedDecoder {
     /// [`ChunkedDecoder::feed`] と同じだが、終端（または不正・上限超過）に達したとき、そのバイトまでの
     /// 消費バイト数も返す（`Continue` なら `data.len()`）。終端より後ろのバイトを上流へ送らないために使う。
     pub(crate) fn feed_counted(&mut self, data: &[u8]) -> (ChunkedFeedResult, usize) {
-        for (i, &byte) in data.iter().enumerate() {
-            match self.feed_byte(byte) {
-                ChunkedFeedResult::Continue => continue,
+        let mut i = 0;
+        while i < data.len() {
+            if self.state == ChunkedState::ReadingChunkData && self.chunk_remaining > 0 {
+                // チャンクのデータはまとめて読み進める（1 バイトずつ `feed_byte` に通すのと同じ結果。
+                // B-369 でメッシュの要求の本文もこれで読むので、データの量に比例する費用を増やさない）
+                let take = self.chunk_remaining.min((data.len() - i) as u64);
+                self.chunk_remaining -= take;
+                i += take as usize;
+                if self.chunk_remaining == 0 {
+                    self.state = ChunkedState::ExpectingChunkDataCR;
+                }
+                continue;
+            }
+            match self.feed_byte(data[i]) {
+                ChunkedFeedResult::Continue => i += 1,
                 result => return (result, i + 1),
             }
         }
@@ -1596,7 +1646,11 @@ impl ChunkedDecoder {
     #[inline]
     fn push_size_digit(&mut self, d: u64) -> ChunkedFeedResult {
         if self.strict {
-            if self.size_ended || self.size_accumulator > (u64::MAX >> 4) {
+            self.size_line_len += 1;
+            if self.size_ended
+                || self.size_accumulator > (u64::MAX >> 4)
+                || self.size_line_len > MAX_CHUNK_SIZE_LINE
+            {
                 return self.invalid();
             }
             self.size_accumulator = (self.size_accumulator << 4) | d;
@@ -1622,13 +1676,7 @@ impl ChunkedDecoder {
     /// データをフィードして状態を更新
     /// 完了またはサイズ制限超過の場合は適切な結果を返す
     pub(crate) fn feed(&mut self, data: &[u8]) -> ChunkedFeedResult {
-        for &byte in data {
-            match self.feed_byte(byte) {
-                ChunkedFeedResult::Continue => continue,
-                result => return result,
-            }
-        }
-        ChunkedFeedResult::Continue
+        self.feed_counted(data).0
     }
 
     /// 1バイトを処理して状態を更新
@@ -1654,6 +1702,10 @@ impl ChunkedDecoder {
                     b' ' | b'\t' if self.strict && self.size_has_digit => {
                         // chunk-ext の前の BWS（RFC 9112 §7.1.1）。この後は `;` か CR だけ
                         self.size_ended = true;
+                        self.size_line_len += 1;
+                        if self.size_line_len > MAX_CHUNK_SIZE_LINE {
+                            return self.invalid();
+                        }
                     }
                     _ => {
                         if self.strict {
@@ -1668,8 +1720,11 @@ impl ChunkedDecoder {
                 // チャンク拡張はCRまでスキップ
                 if byte == b'\r' {
                     self.state = ChunkedState::ExpectingChunkSizeLF;
-                } else if self.strict && (byte == b'\n' || byte == 0) {
-                    return self.invalid();
+                } else if self.strict {
+                    self.ext_total += 1;
+                    if byte == b'\n' || byte == 0 || self.ext_total > MAX_CHUNK_EXTENSIONS {
+                        return self.invalid();
+                    }
                 }
             }
 
@@ -1678,6 +1733,7 @@ impl ChunkedDecoder {
                     return self.invalid();
                 }
                 self.size_ended = false;
+                self.size_line_len = 0;
                 if byte == b'\n' {
                     if !self.size_has_digit {
                         // サイズが解析できなかった場合、リセット
@@ -1750,6 +1806,12 @@ impl ChunkedDecoder {
                     _ => {
                         // トレーラーヘッダーの内容
                         self.trailer_line_empty = false;
+                        if self.strict {
+                            self.trailer_total += 1;
+                            if self.trailer_total > MAX_CHUNK_TRAILERS {
+                                return self.invalid();
+                            }
+                        }
                     }
                 }
             }
@@ -1801,7 +1863,13 @@ impl ChunkedDecoder {
     /// 呼び出し側は `consumed` バイトを処理済みとして `input[consumed..]` で再呼び出しし、
     /// `consumed == input.len()` になるまでループする。`complete`/`limit_exceeded` が立った
     /// 時点でループを終える。
-    #[cfg(any(feature = "http2", feature = "http3"))] // ストリーミング転送（F-32）は http2 / http3 経路のみ
+    // ストリーミング転送（F-32）の http2 / http3 経路と、本文を溜めるハンドラ・Wasm の経路（B-372）
+    #[cfg(any(
+        feature = "http2",
+        feature = "http3",
+        feature = "handler",
+        feature = "wasm"
+    ))]
     pub(crate) fn next_data_span(&mut self, input: &[u8]) -> ChunkedSpan {
         // 既に終端・制限超過に達していれば、これ以上入力を消費しない。
         match self.state {
@@ -2253,6 +2321,30 @@ mod idempotent_method_tests {
             Some(8..14)
         );
     }
+
+    /// B-373: フラグメント（`#`）を含む要求先・UTF-8 でない要求先は通さない（UTF-8 の非 ASCII は通す）
+    #[test]
+    fn origin_form_target_rejects_fragment_and_invalid_utf8() {
+        assert_eq!(super::origin_form_target(b"GET", b"/admin#x"), None);
+        assert_eq!(super::origin_form_target(b"GET", b"/a?q=1#frag"), None);
+        assert_eq!(super::origin_form_target(b"GET", b"http://h/admin#x"), None);
+        assert_eq!(super::origin_form_target(b"GET", b"/admin\xff"), None);
+        assert_eq!(super::origin_form_target(b"GET", b"/\xc3"), None);
+        let utf8 = "/\u{65e5}\u{672c}".as_bytes();
+        assert_eq!(super::origin_form_target(b"GET", utf8), Some(0..utf8.len()));
+        assert_eq!(super::origin_form_target(b"GET", b"/a%23b"), Some(0..6));
+    }
+
+    /// B-373: HTTP/2・HTTP/3 の `:path` も同じ
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    #[test]
+    fn request_target_rejects_fragment_and_invalid_utf8() {
+        assert!(super::is_valid_request_target(b"/admin"));
+        assert!(super::is_valid_request_target("/\u{65e5}".as_bytes()));
+        assert!(!super::is_valid_request_target(b"/admin#x"));
+        assert!(!super::is_valid_request_target(b"/admin\xff"));
+        assert!(!super::is_valid_request_target(b"/a b"));
+    }
 }
 
 #[cfg(all(test, any(feature = "http2", feature = "http3")))]
@@ -2302,6 +2394,112 @@ mod chunked_span_tests {
             d.feed(b"4x\r\nWiki\r\n0\r\n\r\n"),
             ChunkedFeedResult::Invalid
         );
+    }
+
+    /// B-372: 厳格なデコーダは本文の上限が数えないフレーミング（サイズの先頭の 0・空白、チャンク拡張、トレーラ）に
+    /// 上限を持つ。上限の範囲（先頭の 0 で幅をそろえたサイズ等）は通る
+    #[test]
+    fn strict_request_decoder_bounds_framing() {
+        let mut zeros = vec![b'0'; usize::from(MAX_CHUNK_SIZE_LINE)];
+        zeros.extend_from_slice(b"1\r\nx\r\n0\r\n\r\n");
+        assert_eq!(
+            ChunkedDecoder::new_request(0).feed(&zeros),
+            ChunkedFeedResult::Invalid
+        );
+        let mut d = ChunkedDecoder::new_request(0);
+        assert_eq!(
+            d.feed(b"00000001\r\nx\r\n0000\r\n\r\n"),
+            ChunkedFeedResult::Complete
+        );
+        let mut spaces = b"1".to_vec();
+        spaces.extend_from_slice(&[b' '; 100]);
+        spaces.extend_from_slice(b"\r\nx\r\n0\r\n\r\n");
+        assert_eq!(
+            ChunkedDecoder::new_request(0).feed(&spaces),
+            ChunkedFeedResult::Invalid
+        );
+        // 拡張は本文全体で数える（チャンクごとに小さくても足し合わせる）
+        let mut ext = Vec::new();
+        let one = format!("1;{}\r\nx\r\n", "e".repeat(1000));
+        for _ in 0..(MAX_CHUNK_EXTENSIONS as usize / 1000 + 1) {
+            ext.extend_from_slice(one.as_bytes());
+        }
+        assert_eq!(
+            ChunkedDecoder::new_request(0).feed(&ext),
+            ChunkedFeedResult::Invalid
+        );
+        // トレーラは行の中身だけを数える（行末の CRLF は数えない）
+        let line = b"X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut trailers = b"0\r\n".to_vec();
+        let mut counted = 0;
+        while counted <= MAX_CHUNK_TRAILERS as usize {
+            trailers.extend_from_slice(line);
+            trailers.extend_from_slice(b"\r\n");
+            counted += line.len();
+        }
+        trailers.extend_from_slice(b"\r\n");
+        assert_eq!(
+            ChunkedDecoder::new_request(0).feed(&trailers),
+            ChunkedFeedResult::Invalid
+        );
+        // 応答用（緩い）は上限を持たない（従来どおり）
+        assert_eq!(
+            ChunkedDecoder::new_unlimited().feed(&trailers),
+            ChunkedFeedResult::Complete
+        );
+    }
+
+    /// B-369: `feed_counted` のデータの一括の読み進めは、1 バイトずつ `feed_byte` に通すのと同じ結果になる
+    #[test]
+    fn feed_counted_matches_bytewise_feeding() {
+        let inputs: [&[u8]; 6] = [
+            b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\nGET /next",
+            b"a\r\n0123456789\r\n0\r\n\r\n",
+            b"4\r\nWikiXX0\r\n\r\n",
+            b"3\r\nabc\r\n1\r\n",
+            b"10\r\n0123456789abcdef\r\n0\r\n\r\nrest",
+            b"5\r\nab",
+        ];
+        for strict in [false, true] {
+            for input in inputs {
+                for limit in [0u64, 8] {
+                    let new = || {
+                        if strict {
+                            ChunkedDecoder::new_request(limit)
+                        } else {
+                            ChunkedDecoder::new(limit)
+                        }
+                    };
+                    let mut whole = new();
+                    let got = whole.feed_counted(input);
+                    let mut bytewise = new();
+                    let mut want = (ChunkedFeedResult::Continue, input.len());
+                    for (i, &b) in input.iter().enumerate() {
+                        let r = bytewise.feed_byte(b);
+                        if r != ChunkedFeedResult::Continue {
+                            want = (r, i + 1);
+                            break;
+                        }
+                    }
+                    assert_eq!(got, want, "{:?}", String::from_utf8_lossy(input));
+                    assert_eq!(whole.state, bytewise.state);
+                    assert_eq!(whole.chunk_remaining, bytewise.chunk_remaining);
+                    // 分けて渡しても同じ
+                    let mut split = new();
+                    let mut split_res = (ChunkedFeedResult::Continue, input.len());
+                    let mut off = 0;
+                    for part in input.chunks(3) {
+                        let (r, k) = split.feed_counted(part);
+                        if r != ChunkedFeedResult::Continue {
+                            split_res = (r, off + k);
+                            break;
+                        }
+                        off += part.len();
+                    }
+                    assert_eq!(split_res, want, "{:?}", String::from_utf8_lossy(input));
+                }
+            }
+        }
     }
 
     fn drive(decoder: &mut ChunkedDecoder, buffers: &[&[u8]]) -> (Vec<u8>, bool, bool) {

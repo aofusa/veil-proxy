@@ -180,7 +180,7 @@ Supports caching backend responses to reduce backend load and improve response t
 | **Disk Cache** | Large response storage using monoio async I/O |
 | **ETag/If-None-Match** | 304 Not Modified responses for conditional requests |
 | **If-Modified-Since** | Date-based conditional request validation |
-| **stale-while-revalidate** | Serve stale content while updating in background |
+| **stale-while-revalidate** | Serve stale content while updating in background (the background request is built like a proxied one: upstream `Host`, `path_prefix`, header removal and forwarding headers) |
 | **stale-if-error** | Serve stale content when backend returns errors |
 | **Vary Header Support** | Separate cache entries based on request headers |
 | **Pattern-based Invalidation** | Glob pattern cache invalidation |

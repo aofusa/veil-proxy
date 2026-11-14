@@ -744,6 +744,9 @@ pub struct Endpoint {
 pub struct HttpProtocolOptions {
     #[prost(message, optional, tag = "1")]
     pub common_http_protocol_options: Option<CommonHttpProtocolOptions>,
+    /// auto_sni・auto_san_validation（B-375）
+    #[prost(message, optional, tag = "2")]
+    pub upstream_http_protocol_options: Option<UpstreamHttpProtocolOptions>,
     #[prost(
         oneof = "http_protocol_options::UpstreamProtocolOptions",
         tags = "3, 4, 5"
@@ -778,6 +781,15 @@ pub struct UseDownstreamHttpConfig {
     pub http_protocol_options: Option<Empty>,
     #[prost(message, optional, tag = "2")]
     pub http2_protocol_options: Option<Empty>,
+}
+
+/// `envoy.config.core.v3.UpstreamHttpProtocolOptions`（B-375。`override_auto_sni_header` は読まない）
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct UpstreamHttpProtocolOptions {
+    #[prost(bool, tag = "1")]
+    pub auto_sni: bool,
+    #[prost(bool, tag = "2")]
+    pub auto_san_validation: bool,
 }
 
 /// `envoy.config.core.v3.HttpProtocolOptions`

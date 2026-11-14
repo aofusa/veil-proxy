@@ -13,6 +13,7 @@ use crate::runtime::io::{
 };
 use crate::runtime::tcp::TcpStream;
 use crate::runtime::{IoBuf, IoBufMut};
+use bytes::Bytes;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
@@ -103,11 +104,23 @@ pub struct Picked {
     pub idx: usize,
     pub addr: SocketAddr,
     pub tls: Option<Arc<UpstreamTls>>,
+    /// TLS の名前にする要求の Host（ポートを除く）。`ClusterCfg::auto_sni` の HTTP の要求だけ（B-375）
+    pub sni: Option<Bytes>,
 }
 
 impl Picked {
     pub fn endpoint(&self) -> Option<&MeshEndpoint> {
         self.eps.endpoints.get(self.idx)
+    }
+
+    /// B-375: `auto_sni` のクラスタ（Istio の DestinationRule の TLS で `sni`・`subjectAltNames` を書かないもの）は、
+    /// 要求の Host（ポートを除く）を SNI にして、その名前で証明書を検査する（Envoy の auto_sni・
+    /// auto_san_validation）。接続のプールも名前ごとに分ける。
+    pub fn with_request_host(mut self, host: &Bytes) -> Self {
+        if self.cfg.auto_sni && self.tls.is_some() {
+            self.sni = Some(host_without_port(host));
+        }
+        self
     }
 
     /// 同時要求数（LEAST_REQUEST）を数える。
@@ -171,6 +184,7 @@ pub fn pick(
             idx: usize::MAX,
             addr,
             tls,
+            sni: None,
         });
     }
     if eps.healthy.is_empty() {
@@ -236,6 +250,7 @@ pub fn pick(
         idx,
         addr,
         tls,
+        sni: None,
     })
 }
 
@@ -359,7 +374,19 @@ pub async fn connect(p: &Picked, alpn: Alpn) -> io::Result<UpIo> {
         (_, _, Alpn::H2) => tls.h2.clone(),
         (_, _, Alpn::Tcp) => tls.tcp.clone(),
     };
-    let name = server_name(&tls.sni, p.addr);
+    let name = match &p.sni {
+        Some(host) => match request_server_name(host) {
+            Some(n) => n,
+            None => {
+                super::stats::UPSTREAM_CX_CONNECT_FAIL.fetch_add(1, Ordering::Relaxed);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "request host is not a valid TLS server name",
+                ));
+            }
+        },
+        None => server_name(&tls.sni, p.addr),
+    };
     let hs = async {
         #[cfg(veil_ktls)]
         {
@@ -436,6 +463,27 @@ fn linkerd_transport_header(port: u16, alpn: &Alpn) -> Vec<u8> {
     out
 }
 
+/// Host からポートを除く（`[::1]:8080` は `::1`）。確保しない（同じバッファの切り出し）。
+fn host_without_port(host: &Bytes) -> Bytes {
+    if host.first() == Some(&b'[') {
+        return match host.iter().position(|&b| b == b']') {
+            Some(end) => host.slice(1..end),
+            None => host.clone(),
+        };
+    }
+    match host.iter().rposition(|&b| b == b':') {
+        Some(i) => host.slice(..i),
+        None => host.clone(),
+    }
+}
+
+/// 要求の Host を TLS の名前にする（IP なら IP の名前。SNI は送らない）。名前にならない Host は `None`
+/// （検査する名前が無いまま繋がない。B-375）。
+fn request_server_name(host: &[u8]) -> Option<rustls::pki_types::ServerName<'static>> {
+    let s = std::str::from_utf8(host).ok()?;
+    rustls::pki_types::ServerName::try_from(s.to_string()).ok()
+}
+
 fn server_name(sni: &str, addr: SocketAddr) -> rustls::pki_types::ServerName<'static> {
     if !sni.is_empty() {
         if let Ok(n) = rustls::pki_types::ServerName::try_from(sni.to_string()) {
@@ -460,7 +508,7 @@ pub fn negotiated_h2(io: &UpIo) -> bool {
 // プール（ワーカーごと）
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct PoolKey {
     addr: SocketAddr,
     /// TLS の設定（`Arc` のポインタ。平文は 0）
@@ -468,6 +516,8 @@ struct PoolKey {
     bind: Option<SocketAddr>,
     /// 内部リスナー経由（HBONE のトンネル）か
     internal: bool,
+    /// TLS の名前にした要求の Host（B-375。別の名前で検査した接続を使い回さない）
+    sni: Option<Bytes>,
 }
 
 fn pool_key(p: &Picked) -> PoolKey {
@@ -476,6 +526,7 @@ fn pool_key(p: &Picked) -> PoolKey {
         tls: p.tls.as_ref().map_or(0, |t| Arc::as_ptr(t) as usize),
         bind: p.cfg.bind,
         internal: p.endpoint().is_some_and(|e| e.internal.is_some()),
+        sni: p.sni.clone(),
     }
 }
 
@@ -551,7 +602,7 @@ pub(crate) async fn h2_mux(p: &Picked) -> io::Result<Rc<crate::http2::upstream_m
     let key = pool_key(p);
     let existing = H2_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
-        let v = pool.entry(key).or_default();
+        let v = pool.entry(key.clone()).or_default();
         v.retain(|m| !m.is_dead());
         v.iter().find(|m| m.has_capacity()).cloned()
     });
@@ -580,6 +631,26 @@ pub(crate) async fn h2_mux(p: &Picked) -> io::Result<Rc<crate::http2::upstream_m
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-375: 要求の Host からポートを除いて TLS の名前にする（名前にならない Host は繋がない）
+    #[test]
+    fn request_host_becomes_tls_server_name() {
+        let h = |s: &'static str| host_without_port(&Bytes::from_static(s.as_bytes()));
+        assert_eq!(h("api.example.com:443"), "api.example.com");
+        assert_eq!(h("api.example.com"), "api.example.com");
+        assert_eq!(h("[2001:db8::1]:8443"), "2001:db8::1");
+        assert_eq!(h("10.0.0.1:80"), "10.0.0.1");
+        assert!(matches!(
+            request_server_name(b"api.example.com"),
+            Some(rustls::pki_types::ServerName::DnsName(_))
+        ));
+        assert!(matches!(
+            request_server_name(b"2001:db8::1"),
+            Some(rustls::pki_types::ServerName::IpAddress(_))
+        ));
+        assert!(request_server_name(b"bad host").is_none());
+        assert!(request_server_name(b"\xff").is_none());
+    }
 
     /// EDS の更新で同じアドレスのエンドポイントの状態を引き継ぐ（F-218）。処理中の要求の終わりは新しい集合にも効く。
     #[test]
@@ -626,6 +697,7 @@ mod tests {
             bind: None,
             tls_matches: Vec::new(),
             tls_default: None,
+            auto_sni: false,
             proto: UpstreamProto::Http1,
             idle_timeout: Duration::from_secs(60),
             max_requests_per_conn: 0,

@@ -147,6 +147,7 @@ async fn originate(tp: &super::model::TcpProxyCfg, dst: SocketAddr) -> io::Resul
                 idx: usize::MAX,
                 addr: target,
                 cfg: cfg.clone(),
+                sni: None,
             };
             let io = super::upstream::connect(&picked, super::upstream::Alpn::H2).await?;
             let m = Rc::new(H2Mux::start(io, true, cfg.idle_timeout));
