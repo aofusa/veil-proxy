@@ -386,7 +386,7 @@ jobs:
         id: vm
         timeout-minutes: 60
         continue-on-error: true
-        uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
+        uses: cross-platform-actions/action@82668f1fbd89d9c99487604f822cbf6716f124d3 # v1.7.0
         with:
           operating_system: ${{ matrix.os }}
           architecture: ${{ matrix.vm_arch }}
@@ -408,7 +408,7 @@ jobs:
       - name: build, unit tests and smoke test in the VM (retry)
         if: steps.vm.outcome != 'success'
         timeout-minutes: 60
-        uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
+        uses: cross-platform-actions/action@82668f1fbd89d9c99487604f822cbf6716f124d3 # v1.7.0
         with:
           operating_system: ${{ matrix.os }}
           architecture: ${{ matrix.vm_arch }}
@@ -490,7 +490,7 @@ jobs:
         id: vm
         timeout-minutes: 85
         continue-on-error: true
-        uses: cross-platform-actions/action@e0b9770014ba65d5e0815f15b74031c3a635f641 # v1.6.0
+        uses: cross-platform-actions/action@82668f1fbd89d9c99487604f822cbf6716f124d3 # v1.7.0
         with:
           operating_system: ${{ matrix.os }}
           architecture: x86-64
