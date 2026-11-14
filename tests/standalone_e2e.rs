@@ -592,6 +592,96 @@ body = "ok"
     assert!(log.contains(want), "{log}");
 }
 
+/// `[security] blocked_ips` は HTTP/3 の新しい接続と L4（TCP）のリスナーにも掛かる（以前は TCP の HTTP の
+/// リスナーだけで、ブロックした送信元も HTTP/3・L4 なら通れた）。同じ設定で 127.0.0.1 を外したときは通る。
+#[cfg(feature = "http3")]
+#[test]
+fn blocked_ips_apply_to_http3_and_l4() {
+    use std::io::{Read, Write};
+    // L4 の上流: 受けたものをそのまま返す
+    let echo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut s in echo.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                while let Ok(n) = s.read(&mut buf) {
+                    if n == 0 || s.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let l4_echo = |port: u16| -> Option<Vec<u8>> {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(b"ping").ok()?;
+        let mut got = [0u8; 4];
+        c.read_exact(&mut got).ok()?;
+        Some(got.to_vec())
+    };
+
+    for blocked in ["192.0.2.1", "127.0.0.1"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = write_self_signed(dir.path());
+        let tls_port = free_port();
+        let l4_port = free_port();
+        let config = format!(
+            r#"
+[server]
+listen = "127.0.0.1:{tls_port}"
+threads = 1
+[security]
+blocked_ips = ["{blocked}"]
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ktls_enabled = false
+[http3]
+enabled = true
+
+[[route]]
+[route.conditions]
+path = "/ok"
+[route.action]
+type = "Respond"
+status = 200
+body = "ok"
+
+[[l4]]
+name = "echo"
+listen = "127.0.0.1:{l4_port}"
+  [[l4.upstreams]]
+  addr = "127.0.0.1:{echo_port}"
+"#,
+            cert = tp(&cert),
+            key = tp(&key),
+        );
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, config).unwrap();
+        let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+        assert!(
+            wait_for_port(tls_port, Duration::from_secs(20))
+                && wait_for_port(l4_port, Duration::from_secs(20)),
+            "{}",
+            veil.log()
+        );
+        let h3 = h3_get_status(tls_port, "/ok");
+        let l4 = l4_echo(l4_port);
+        if blocked == "127.0.0.1" {
+            assert!(
+                h3.is_err(),
+                "HTTP/3 from a blocked IP must not be served: {h3:?}"
+            );
+            assert_eq!(l4, None, "L4 from a blocked IP must be closed");
+        } else {
+            assert_eq!(h3, Ok(200), "{}", veil.log());
+            assert_eq!(l4.as_deref(), Some(b"ping".as_slice()), "{}", veil.log());
+        }
+    }
+}
+
 /// F-200: 削除されたキーは移行先を示すエラーで起動しない（`-t`）。
 #[test]
 fn f200_removed_keys_are_rejected_with_migration_hint() {

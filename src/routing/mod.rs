@@ -23,7 +23,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use ftlog::debug;
+use ftlog::{debug, warn};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
@@ -376,6 +376,16 @@ impl CidrMatcher {
             if let (Ok(network), Ok(prefix_len)) =
                 (network_str.parse::<IpAddr>(), prefix_len_str.parse::<u8>())
             {
+                // 照合のマスクは `32 - prefix_len`（IPv6 は 128）で作るので、長すぎる接頭辞は入れない
+                // （デバッグビルドでは要求のたびに桁あふれで panic していた）
+                let max_len = if network.is_ipv4() { 32 } else { 128 };
+                if prefix_len > max_len {
+                    warn!(
+                        "Ignoring source_ip entry '{}': prefix length exceeds {}",
+                        cidr, max_len
+                    );
+                    return;
+                }
                 match network {
                     IpAddr::V4(v4) => {
                         let network_u32 = u32::from_be_bytes(v4.octets());
@@ -413,7 +423,11 @@ impl CidrMatcher {
         } else {
             // Exact IP
             if let Ok(ip) = cidr.parse::<IpAddr>() {
-                self.exact_ips.entry(ip).or_default().push(route_idx);
+                // 照合する側（`get_candidates`）と同じく IPv4 射影は IPv4 で持つ
+                self.exact_ips
+                    .entry(ip.to_canonical())
+                    .or_default()
+                    .push(route_idx);
             }
         }
     }
@@ -427,7 +441,10 @@ impl CidrMatcher {
 
     /// Check if an IP matches and get candidate routes
     pub fn get_candidates(&self, addr: &SocketAddr) -> Vec<usize> {
-        let ip = addr.ip();
+        // IPv4 射影の IPv6（デュアルスタックのリスナーで受けた IPv4 のクライアント。`::ffff:10.0.0.1`）は IPv4 として
+        // 比べる。そのままだと IPv4 の `source_ip` の条件に一致せず、別のルートへ行っていた（`CidrRange::contains_addr`
+        // と同じ扱い）
+        let ip = addr.ip().to_canonical();
         let mut candidates = Vec::new();
 
         // 1. Check exact IP match
@@ -526,7 +543,8 @@ impl RouteCacheKey {
         let h1 = xxh3_64_with_seed(host, route_key_seed());
         let h2 = xxh3_64_with_seed(path, h1);
         let h3 = xxh3_64_with_seed(method, h2);
-        let hash = match source_ip.ip() {
+        // 照合（`CidrMatcher::get_candidates`）と同じく IPv4 射影は IPv4 として数える
+        let hash = match source_ip.ip().to_canonical() {
             IpAddr::V4(v4) => xxh3_64_with_seed(&v4.octets(), h3),
             IpAddr::V6(v6) => xxh3_64_with_seed(&v6.octets(), h3),
         };
@@ -953,6 +971,38 @@ mod tests {
         let candidates = matcher.get_candidates(&addr);
         assert!(candidates.contains(&1));
         assert!(candidates.contains(&2));
+    }
+
+    /// デュアルスタックのリスナーで受けた IPv4 のクライアント（`::ffff:a.b.c.d`）も IPv4 の条件に一致し、
+    /// 長すぎる接頭辞は入れない（照合で桁あふれしない）
+    #[test]
+    fn cidr_matcher_canonicalizes_ipv4_mapped_peers() {
+        let mut matcher = CidrMatcher::new();
+        matcher.add_route(0, Some(&["192.168.0.0/16".to_string()]));
+        matcher.add_route(1, Some(&["10.0.0.1".to_string()]));
+        matcher.add_route(2, Some(&["::ffff:10.0.0.2".to_string()]));
+        matcher.add_route(
+            3,
+            Some(&["10.0.0.0/40".to_string(), "2001:db8::/129".to_string()]),
+        );
+        matcher.optimize();
+
+        let addr: SocketAddr = "[::ffff:192.168.1.100]:8080".parse().unwrap();
+        assert_eq!(matcher.get_candidates(&addr), vec![0]);
+        let addr: SocketAddr = "[::ffff:10.0.0.1]:8080".parse().unwrap();
+        assert_eq!(matcher.get_candidates(&addr), vec![1]);
+        let addr: SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        assert_eq!(matcher.get_candidates(&addr), vec![2]);
+        let addr: SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
+        assert!(matcher.get_candidates(&addr).is_empty());
+
+        // キャッシュの鍵も同じ扱い
+        let mapped: SocketAddr = "[::ffff:10.0.0.1]:1".parse().unwrap();
+        let v4: SocketAddr = "10.0.0.1:2".parse().unwrap();
+        assert_eq!(
+            RouteCacheKey::new(b"h", b"/", b"GET", &mapped).hash,
+            RouteCacheKey::new(b"h", b"/", b"GET", &v4).hash
+        );
     }
 
     #[test]

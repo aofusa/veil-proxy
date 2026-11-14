@@ -1303,27 +1303,34 @@ fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
 fn matches_cidr(ip: &SocketAddr, cidr_ranges: &[String]) -> bool {
     use std::net::IpAddr;
 
-    let ip_addr = ip.ip();
+    // ルーター（`routing::CidrMatcher`）と同じ判定にする。以前は IPv4 の CIDR だけを見て、IPv6 の CIDR・IPv4 射影の
+    // IPv6（デュアルスタックのリスナーで受けた IPv4 のクライアント）は一致せず、`/0` は桁あふれしていた
+    let ip_addr = ip.ip().to_canonical();
 
     for cidr in cidr_ranges {
-        // シンプルなCIDRマッチング（IPv4のみ対応）
         if let Some((network_str, prefix_len_str)) = cidr.split_once('/') {
             if let (Ok(network), Ok(prefix_len)) =
-                (network_str.parse::<IpAddr>(), prefix_len_str.parse::<u8>())
+                (network_str.parse::<IpAddr>(), prefix_len_str.parse::<u32>())
             {
-                if let (IpAddr::V4(network_v4), IpAddr::V4(ip_v4)) = (network, ip_addr) {
-                    let mask = !((1u32 << (32 - prefix_len)) - 1);
-                    let network_u32 = u32::from_be_bytes(network_v4.octets());
-                    let ip_u32 = u32::from_be_bytes(ip_v4.octets());
-                    if (network_u32 & mask) == (ip_u32 & mask) {
-                        return true;
+                let hit = match (network, ip_addr) {
+                    (IpAddr::V4(n), IpAddr::V4(a)) if prefix_len <= 32 => {
+                        let mask = u32::MAX.checked_shl(32 - prefix_len).unwrap_or(0);
+                        (u32::from(n) & mask) == (u32::from(a) & mask)
                     }
+                    (IpAddr::V6(n), IpAddr::V6(a)) if prefix_len <= 128 => {
+                        let mask = u128::MAX.checked_shl(128 - prefix_len).unwrap_or(0);
+                        (u128::from(n) & mask) == (u128::from(a) & mask)
+                    }
+                    _ => false,
+                };
+                if hit {
+                    return true;
                 }
             }
         } else {
             // CIDR表記なし（完全一致）
             if let Ok(parsed_ip) = cidr.parse::<IpAddr>() {
-                if parsed_ip == ip_addr {
+                if parsed_ip.to_canonical() == ip_addr {
                     return true;
                 }
             }
@@ -1339,6 +1346,27 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
     use super::*;
     use std::net::ToSocketAddrs;
+
+    /// `source_ip` の再確認（ルートのキャッシュに当たったとき・線形の安全網）もルーターと同じく、IPv6 の CIDR・
+    /// IPv4 射影の IPv6・`/0` を扱い、長すぎる接頭辞では一致しない
+    #[test]
+    fn matches_cidr_handles_ipv6_mapped_and_edge_prefixes() {
+        let r = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert!(matches_cidr(&a("[::ffff:10.1.2.3]:1"), &r(&["10.0.0.0/8"])));
+        assert!(matches_cidr(&a("[::ffff:10.1.2.3]:1"), &r(&["10.1.2.3"])));
+        assert!(matches_cidr(&a("10.1.2.3:1"), &r(&["::ffff:10.1.2.3"])));
+        assert!(matches_cidr(&a("[2001:db8::5]:1"), &r(&["2001:db8::/32"])));
+        assert!(!matches_cidr(&a("[2001:db9::5]:1"), &r(&["2001:db8::/32"])));
+        assert!(matches_cidr(&a("192.0.2.1:1"), &r(&["0.0.0.0/0"])));
+        assert!(matches_cidr(&a("[2001:db9::5]:1"), &r(&["::/0"])));
+        assert!(!matches_cidr(&a("192.0.2.1:1"), &r(&["192.0.2.0/33"])));
+        assert!(!matches_cidr(
+            &a("[2001:db8::5]:1"),
+            &r(&["2001:db8::/129"])
+        ));
+        assert!(!matches_cidr(&a("192.0.2.1:1"), &r(&["2001:db8::/32"])));
+    }
 
     /// B-96: `path = "/"`（catch-all）はルーター本体（`any_path`）と同じく全パスに一致する。
     /// ルートキャッシュのヒット検証（`matches_conditions`）がこれを不一致と判定すると、

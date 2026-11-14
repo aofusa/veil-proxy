@@ -14,7 +14,7 @@
    - `header`: HTTPヘッダーマッチ（マップで複数ヘッダー指定可能、例: `{ "X-Version" = "v2" }`）
    - `method`: HTTPリクエストメソッドマッチ（配列で複数メソッド指定可能、例: `["GET", "POST"]`）
    - `query`: クエリパラメータマッチ（マップで複数クエリ指定可能、例: `{ "token" = "secret" }`）
-   - `source_ip`: ソースIPマッチ（CIDR表記、配列で複数CIDR指定可能、例: `["192.168.0.0/16", "10.0.0.0/8"]`）
+   - `source_ip`: ソースIPマッチ（CIDR表記、配列で複数CIDR指定可能、例: `["192.168.0.0/16", "10.0.0.0/8"]`）。デュアルスタックのリスナーで受けた IPv4 のクライアント（`::ffff:a.b.c.d`）は IPv4 として照合する。アドレスより長い接頭辞（IPv4 の `/33`・IPv6 の `/129`）の項目は警告を出して無視する
    - すべての条件はANDで結合されます。条件が指定されていない場合は、すべてのリクエストにマッチします（デフォルトルート）。
 2. **ルートアクション** (`[route.action]`): バックエンドアクション（File、Proxy、Redirectなど）
 3. **ルートレベルの設定** (`[route.security]`, `[route.cache]`, `[route.compression]`, `[route.buffering]`, `[route.open_file_cache]`): actionレベルの設定をオーバーライド
@@ -675,7 +675,7 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_user` | 起動後に降格するユーザー名 | なし |
 | `drop_privileges_group` | 起動後に降格するグループ名 | なし |
 | `max_concurrent_connections` | 同時接続数の上限 | 0（無制限） |
-| `blocked_ips` | 最前線 IP/CIDR ブロックリスト。`accept` 直後（TLS ハンドシェイク・ハンドラ生成の前）にマッチした接続を切断し、既知の不正 IP への高コスト処理を回避する。CIDR は起動時に一度だけパースされ（accept ホットパスはゼロアロケーション判定）、SIGHUP でホットリロード可能。ルート単位の `denied_ips` より前段で評価される。 | `[]` |
+| `blocked_ips` | 最前線 IP/CIDR ブロックリスト。`accept` 直後（TLS ハンドシェイク・ハンドラ生成の前）にマッチした接続を切断し、既知の不正 IP への高コスト処理を回避する。全部のリスナーに掛かる（HTTP の TLS・平文、L4 の TCP、HTTP/3 の新しい接続の Initial（Retry も返さない）、L4 の UDP の新しいセッション）。CIDR は起動時に一度だけパースされ（accept ホットパスはゼロアロケーション判定）、SIGHUP でホットリロード可能。ルート単位の `denied_ips` より前段で評価される。 | `[]` |
 | `path_normalization` | ルートの照合・`[route.security]` の検査の前の要求のパスの正規化。正規化したパスを上流へ送る。`"base"`: 予約されていない文字の `%XX` を戻し、`\` を `/` に、ドットのセグメントを除く。`"merge_slashes"`: base + 連続する `/` を 1 つに。`"off"`: 生のパス（v0.8.0 より前）。絶対形式の要求先は origin 形式に直し、それ以外の origin 形式でないもの（`CONNECT`・`OPTIONS *` を除く）と `#`・UTF-8 でないバイトを含むものは 400 | `"base"` |
 | `allow_security_failures` | セキュリティ機能の有効化に失敗した場合の動作 | false |
 

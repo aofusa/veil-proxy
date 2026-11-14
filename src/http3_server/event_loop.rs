@@ -340,6 +340,12 @@ pub(super) fn process_datagram_segments(
                         debug!("[HTTP/3] Non-initial packet for unknown connection");
                         continue;
                     }
+                    // `[security] blocked_ips`: TCP は accept の直後に断るが、HTTP/3 は見ておらず、ブロックした送信元も
+                    // HTTP/3 なら全部のルートへ届いた。新しい接続の Initial だけを見る（確立済みの接続のパケットには
+                    // 掛けない。TCP でもリロードで確立済みの接続は切らない）。Retry も返さない
+                    if crate::config::is_ip_blocked(from.ip()) {
+                        continue;
+                    }
 
                     // B-222: 接続数の上限・ハンドシェイク中の数で受け入れるか・Retry を返すかを決める。
                     // トークン付きの Initial は Retry を経たもの（DCID は Retry で渡したサーバの接続 ID）。

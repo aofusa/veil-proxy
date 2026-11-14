@@ -266,6 +266,11 @@ pub fn spawn_l4_listeners(
                                         // ような `batch_accepted` ローカルカウンタは不要。
                                         let handle_accepted =
                                             |stream: TcpStream, peer_addr: SocketAddr| {
+                                                // `[security] blocked_ips`（HTTP のリスナーと同じく accept の直後に
+                                                // 断る。L4 は見ていなかった）
+                                                if crate::config::is_ip_blocked(peer_addr.ip()) {
+                                                    return;
+                                                }
                                                 let _ = stream.set_nodelay(true);
 
                                                 let config_c = config.clone();
@@ -431,6 +436,10 @@ fn spawn_l4_handler_listener(
                                     }
                                     Err(_) => continue,
                                 };
+                                // `[security] blocked_ips`（HTTP のリスナーと同じく accept の直後に断る）
+                                if crate::config::is_ip_blocked(peer.ip()) {
+                                    continue;
+                                }
                                 if max_conn > 0
                                     && counter.current.load(Ordering::Relaxed) >= max_conn
                                 {

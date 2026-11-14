@@ -14,7 +14,7 @@ Routes are evaluated in array order (first-match). All routes use the unified `[
    - `header`: HTTP header matching (map for multiple headers, e.g., `{ "X-Version" = "v2" }`)
    - `method`: HTTP request method matching (array for multiple methods, e.g., `["GET", "POST"]`)
    - `query`: Query string parameter matching (map for multiple query params, e.g., `{ "token" = "secret" }`)
-   - `source_ip`: Source IP matching (CIDR notation, array for multiple CIDRs, e.g., `["192.168.0.0/16", "10.0.0.0/8"]`)
+   - `source_ip`: Source IP matching (CIDR notation, array for multiple CIDRs, e.g., `["192.168.0.0/16", "10.0.0.0/8"]`). An IPv4 client accepted on a dual-stack listener (`::ffff:a.b.c.d`) is matched as IPv4. Entries whose prefix is longer than the address (`/33` for IPv4, `/129` for IPv6) are ignored with a warning
    - All conditions are combined with AND logic. If a condition is not specified, it matches all requests (default route).
 2. **Route action** (`[route.action]`): Backend action (File, Proxy, Redirect, etc.)
 3. **Route-level settings** (`[route.security]`, `[route.cache]`, `[route.compression]`, `[route.buffering]`, `[route.open_file_cache]`): Override action-level settings
@@ -686,7 +686,7 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_user` | Username to drop to after startup | none |
 | `drop_privileges_group` | Group name to drop to after startup | none |
 | `max_concurrent_connections` | Maximum concurrent connections | 0 (unlimited) |
-| `blocked_ips` | Front-line IP/CIDR blocklist; matching connections are dropped right after `accept` (before the TLS handshake / handler spawn), avoiding expensive work for known-bad IPs. CIDRs are parsed once at startup (zero-alloc check on the accept hot path) and hot-reloadable via SIGHUP. Evaluated earlier than per-route `denied_ips`. | `[]` |
+| `blocked_ips` | Front-line IP/CIDR blocklist; matching connections are dropped right after `accept` (before the TLS handshake / handler spawn), avoiding expensive work for known-bad IPs. Applies to every listener: HTTP (TLS and cleartext), L4 TCP, the Initial packet of a new HTTP/3 connection (no Retry is sent), and new L4 UDP sessions. CIDRs are parsed once at startup (zero-alloc check on the accept hot path) and hot-reloadable via SIGHUP. Evaluated earlier than per-route `denied_ips`. | `[]` |
 | `path_normalization` | Request path normalization before routing and `[route.security]` checks; the normalized path is forwarded upstream. `"base"`: decode `%XX` of unreserved characters, `\` → `/`, remove dot segments. `"merge_slashes"`: base + collapse repeated `/`. `"off"`: raw path (pre-v0.8.0). Absolute-form targets become origin-form; other non-origin targets (except `CONNECT`, `OPTIONS *`) and targets with `#` or non-UTF-8 bytes get 400 | `"base"` |
 | `allow_security_failures` | Behavior when security feature activation fails | false |
 

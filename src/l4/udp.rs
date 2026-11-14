@@ -145,6 +145,10 @@ pub async fn handle_l4_udp_listener(
         let session = match session {
             Some(s) => s,
             None => {
+                // `[security] blocked_ips`: 新しいセッションを作らない（TCP の accept の直後に断るのと同じ）
+                if crate::config::is_ip_blocked(client_addr.ip()) {
+                    continue;
+                }
                 // 新規クライアント: 接続数上限チェック（max_connections = 同時セッション数上限）。
                 if config.max_connections > 0 && sessions.borrow().len() >= config.max_connections {
                     warn!(
