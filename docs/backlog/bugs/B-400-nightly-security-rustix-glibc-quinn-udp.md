@@ -28,6 +28,8 @@ main の `container-security-nightly` が 2026-11-12 から毎晩落ちていた
    `Dockerfile.glibc.aarch64`・`Dockerfile.vds-server`）。`.grype.yaml` の除外を消した（`ignore: []`）。
 3. vendoring 版の quinn-udp を 0.5.16 にした（0.5.14 → 0.5.16 の上流の差分を `patch` で当てた。veil の差分は変わらない。
    `README.veil.md` に上げ方を書いた）。`tools/perf/h3load/Cargo.lock` の quinn-udp を 0.5.16 にした。
+   vendoring 版を path で参照する `tests/api/grpc_client/Cargo.lock` は版の記録が 0.5.14 のまま残っていた（ライブラリの E2E の
+   ビルドが 0.5.16 と、その依存の socket2 0.6.5・windows-sys 0.61.2 に書き換えて気づいた）。書き換わった内容で揃えた。
 4. `vendored_ghsa_audit.py` の範囲の解釈: 並べた制約を全部満たす版が無いときだけ、上限（か一致）の後の下限・一致を別の範囲の
    始まりとして読む（`<= 6.0.0, >= 1.0.0` のように上限を先に書く範囲は従来どおり全部を満たす）。`A - B` は両端を含む範囲。
    読めない範囲・矛盾する範囲は「該当しない」と見なさず該当として報告する。`test_vendored_ghsa_audit.py` を足し、`ci.yml` の
