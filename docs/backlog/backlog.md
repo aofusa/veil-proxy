@@ -737,6 +737,7 @@
 | B-377 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-377-upstream-h2-max-frame-size-zero.md](bugs/B-377-upstream-h2-max-frame-size-zero.md) | 上流の HTTP/2 の多重化接続が SETTINGS_MAX_FRAME_SIZE を範囲を見ずに使い、0 を受けると HEADERS を分ける繰り返しが進まずワーカーが止まってメモリが尽きた。範囲外は接続エラーにする |
 | B-378 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-378-blocked-ips-http3-l4.md](bugs/B-378-blocked-ips-http3-l4.md) | 全体の `blocked_ips` を HTTP の TCP のリスナーだけで見ており、ブロックした送信元も HTTP/3・L4（TCP・UDP）なら通れた。HTTP/3 の新しい接続の Initial・L4 の accept・L4 の UDP の新しいセッションでも断る |
 | B-379 | P2 | 修正済み（feat/beat-nginx） | [bugs/B-379-source-ip-ipv4-mapped.md](bugs/B-379-source-ip-ipv4-mapped.md) | ルートの `source_ip` がデュアルスタックのリスナーで受けた IPv4 のクライアント（`::ffff:a.b.c.d`）に一致せず、キャッシュに当たったときの再確認は IPv6 の CIDR を見ず `/0` で桁あふれした。IPv4 射影を IPv4 として比べ、長すぎる接頭辞は無視する |
+| B-380 | P3 | 修正済み（feat/beat-nginx） | [bugs/B-380-cidr-ipv6-parse-overflow.md](bugs/B-380-cidr-ipv6-parse-overflow.md) | IP の CIDR の解析が std で読めない IPv6 を簡易の解析へ回し、区切りの多すぎる表記（`1:2:3:4:5:6:7::8:9`）で桁あふれして別のアドレスとして読んでいた（設定だけから届く）。std の解析だけにする |
 
 ---
 

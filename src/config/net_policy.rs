@@ -118,12 +118,10 @@ impl CidrRange {
         }
 
         // IPv6をパース
-        if let Some(ipv6) = ip_str
-            .parse::<std::net::Ipv6Addr>()
-            .ok()
-            .map(u128::from)
-            .or_else(|| Self::parse_ipv6(ip_str))
-        {
+        // std の解析だけを使う（正しい表記はすべて読める）。以前は失敗したら簡易の解析へ回し、区切りの多すぎる
+        // 表記（`1:2:3:4:5:6:7::8:9`）で `8 - 左 - 右` が桁あふれしていた（デバッグビルドは panic、リリースは
+        // でたらめな範囲として読んだ）
+        if let Some(ipv6) = ip_str.parse::<std::net::Ipv6Addr>().ok().map(u128::from) {
             let prefix = if prefix_len == 255 { 128 } else { prefix_len };
             if prefix > 128 {
                 return None;
@@ -163,66 +161,6 @@ impl CidrRange {
         Some(result)
     }
 
-    /// IPv6アドレス文字列をパース（簡易実装）
-    fn parse_ipv6(s: &str) -> Option<u128> {
-        // :: の展開を処理
-        let parts: Vec<&str> = s.split(':').collect();
-
-        // :: がある場合の処理
-        let has_double_colon = s.contains("::");
-        if has_double_colon {
-            let sides: Vec<&str> = s.split("::").collect();
-            if sides.len() > 2 {
-                return None;
-            }
-
-            let left_parts: Vec<&str> = if sides[0].is_empty() {
-                vec![]
-            } else {
-                sides[0].split(':').collect()
-            };
-
-            let right_parts: Vec<&str> = if sides.len() < 2 || sides[1].is_empty() {
-                vec![]
-            } else {
-                sides[1].split(':').collect()
-            };
-
-            let missing = 8 - left_parts.len() - right_parts.len();
-            let mut all_parts: Vec<u16> = Vec::with_capacity(8);
-
-            for part in &left_parts {
-                all_parts.push(u16::from_str_radix(part, 16).ok()?);
-            }
-            all_parts.resize(all_parts.len() + missing, 0);
-            for part in &right_parts {
-                all_parts.push(u16::from_str_radix(part, 16).ok()?);
-            }
-
-            if all_parts.len() != 8 {
-                return None;
-            }
-
-            let mut result: u128 = 0;
-            for (i, &part) in all_parts.iter().enumerate() {
-                result |= (part as u128) << (112 - i * 16);
-            }
-            return Some(result);
-        }
-
-        // :: がない場合
-        if parts.len() != 8 {
-            return None;
-        }
-
-        let mut result: u128 = 0;
-        for (i, part) in parts.iter().enumerate() {
-            let segment: u16 = u16::from_str_radix(part, 16).ok()?;
-            result |= (segment as u128) << (112 - i * 16);
-        }
-        Some(result)
-    }
-
     /// IPv4用のネットマスクを生成
     #[inline]
     fn mask_v4(prefix: u8) -> u128 {
@@ -249,24 +187,10 @@ impl CidrRange {
 
     /// IPアドレスがこのCIDR範囲に含まれるかチェック
     pub fn contains(&self, ip: &str) -> bool {
-        // 標準の形なら IpAddr を経由して、IPv4 射影の IPv6（::ffff:a.b.c.d）を IPv4 として見る（F-236 の F8）
-        if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-            return self.contains_addr(addr);
-        }
-        if self.is_ipv6 {
-            // IPv6
-            if let Some(ipv6) = Self::parse_ipv6(ip) {
-                let masked = ipv6 & Self::mask_v6(self.prefix_len);
-                return masked == self.network;
-            }
-        } else {
-            // IPv4
-            if let Some(ipv4) = Self::parse_ipv4(ip) {
-                let masked = (ipv4 as u128) & Self::mask_v4(self.prefix_len);
-                return masked == self.network;
-            }
-        }
-        false
+        // IpAddr を経由して、IPv4 射影の IPv6（::ffff:a.b.c.d）を IPv4 として見る（F-236 の F8）。アドレスとして
+        // 読めない文字列は含まない（以前は簡易の解析へ回し、区切りの多すぎる IPv6 で桁あふれしていた）
+        ip.parse::<std::net::IpAddr>()
+            .is_ok_and(|addr| self.contains_addr(addr))
     }
 
     /// `IpAddr` がこの CIDR 範囲に含まれるか（文字列を経由しないゼロアロケーション版）。
@@ -785,6 +709,22 @@ mod tests {
         let f = IpFilter::from_lists(&[" 10.0.0.0/8 ".to_string()], &[]);
         assert!(f.is_allowed("10.1.2.3"));
         assert!(!f.is_allowed("11.1.2.3"));
+    }
+
+    /// 区切りの多すぎる IPv6 の表記は範囲として読まず、照合でも一致しない（以前は `8 - 左 - 右` が桁あふれした）
+    #[test]
+    fn malformed_ipv6_is_rejected_without_overflow() {
+        for bad in [
+            "1:2:3:4:5:6:7::8:9",
+            "2001:db8:1:2:3:4:5::6:7/32",
+            "::1::2",
+            "1:2:3:4:5:6:7:8:9",
+        ] {
+            assert!(CidrRange::parse(bad).is_none(), "{bad}");
+        }
+        let r = CidrRange::parse("2001:db8::/32").unwrap();
+        assert!(!r.contains("2001:db8:1:2:3:4:5::6:7"));
+        assert!(r.contains("2001:db8:1:2:3:4:6:7"));
     }
 
     #[test]
