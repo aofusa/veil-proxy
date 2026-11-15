@@ -949,6 +949,14 @@ impl H3BufferedTask {
                 };
 
                 if !modules_to_apply.is_empty() {
+                    // B-408: ゲストに見せる `:authority`・`:scheme`・プロトコル
+                    modules_to_apply.set_request_info(crate::wasm::RequestInfo {
+                        authority: std::sync::Arc::from(
+                            std::str::from_utf8(authority).unwrap_or(""),
+                        ),
+                        scheme: "https",
+                        protocol: "HTTP/3",
+                    });
                     *wasm_modules_to_apply = Some(modules_to_apply.clone());
 
                     let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers

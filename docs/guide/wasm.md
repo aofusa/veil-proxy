@@ -9,7 +9,7 @@ Veil provides a WASM extension system fully compliant with Proxy-Wasm ABI v0.2.1
 ### Features
 
 - **Proxy-Wasm v0.2.1 Compliant**: 100% compatible with Nginx/Envoy
-- **AOT Compilation & Auto-Cache**: Modules are AOT-compiled; a `.cwasm` sidecar is generated next to each `.wasm` on first load and reused via `deserialize` on subsequent startups (invalidated automatically when the `.wasm` is newer or the wasmtime version changes; falls back to recompilation on any error). Explicit `.cwasm` paths are also supported.
+- **AOT Compilation & Auto-Cache**: Modules are AOT-compiled; a sidecar named after the module's content (`<module>.wasm.<hash>.cwasm`, the xxh3-128 of the `.wasm`) is generated next to each `.wasm` on first load and reused via `deserialize` on subsequent startups. A changed `.wasm` gets a new cache whatever its mtime, so restoring an older module (`cp -p`, tar, a package downgrade) never loads the newer module's native code; the cache of the previous content is removed once the new one is written. A cache from another wasmtime version is recompiled, and any error falls back to recompilation. veil no longer reads the old `<module>.wasm.cwasm` name and does not remove it; delete it unless the configuration names it. Explicit `.cwasm` paths are also supported.
 - **Pooling Allocator**: High-speed instance creation
 - **Async Execution (no Head-of-Line blocking)**: Modules run on wasmtime async support with fuel-based cooperative yielding (about every millisecond of guest CPU time, `yield_interval_us`), so a CPU-heavy filter cannot stall the io_uring worker's other I/O
 - **Capability Restrictions**: Fine-grained per-module permission control (all disabled by default)
@@ -168,6 +168,24 @@ On HTTP/1.1 the connection stays open after a filter's local response (`send_loc
 was pipelined behind the body is served next. The body of a local response is not sent for `HEAD` (the
 `Content-Length` stays the body's length) or for `1xx`, `204` and `304`.
 
+### Pseudo-headers and Request Properties
+
+As in Envoy, the request header map shows `:authority`, `:path`, `:method` and `:scheme` before the other headers, and
+the response header map shows `:status`, on HTTP/1.1, HTTP/2, HTTP/3 and WebSocket over HTTP/2 and HTTP/3, so filters
+written for Envoy can read `get_http_request_header(":path")`. `:path` includes the query string. `:authority` is the
+request's `:authority`, or the `Host` header on HTTP/1.1 (missing for an HTTP/1.0 request without `Host`). `:scheme` is
+`https` on TLS connections and `http` on cleartext HTTP/1.1; on HTTP/2 it is the request's own `:scheme`. A WebSocket
+request over HTTP/2 and HTTP/3 (extended CONNECT) shows `:method` as `GET`, the method veil uses for the upstream.
+The response phases and `on_log` see the request's pseudo-headers too, but not its other headers; a filter that needs
+them keeps them in its HTTP context with `instance_reuse = true`.
+
+Pseudo-headers are read-only. Replacing, adding or removing one returns `BadArgument`, so a filter cannot rewrite the
+path, method, authority or status. Setting one to its current value is accepted and changes nothing, so a filter can
+write back a whole map it read with `set_http_request_headers`. veil never forwards these entries as headers.
+
+The properties `request.host` (the same value as `:authority`), `request.scheme` and `request.protocol` (`HTTP/1.0`,
+`HTTP/1.1`, `HTTP/2` or `HTTP/3`) follow the same rules.
+
 ### Reusing the VM Context (`instance_reuse`)
 
 ```toml
@@ -214,12 +232,15 @@ status = 404
 name = "baseline"
 path = "/etc/veil/wasm/baseline_filter.wasm"
 data_files = { dataset = "/etc/veil/data/dataset.json" }
+
+[wasm.modules.capabilities]
+allowed_properties = ["plugin_data.*"]
 ```
 
 Each file is read when the configuration is loaded (startup and reload) and exposed to the filter as the
 property `plugin_data.<name>` (`get_property(["plugin_data", "dataset"])`). Nothing is read from disk per
-request. A missing file is a configuration error. If the module sets `allowed_properties`, include
-`"plugin_data.*"`.
+request. A missing file is a configuration error. Like every property, it is readable only when the module's
+`allowed_properties` includes it (`"plugin_data.*"` or `"plugin_data.dataset"`).
 
 ### Default Settings
 
@@ -285,6 +306,15 @@ and `[[l4]]` listeners may list only modules defined in an enabled `[wasm]` sect
 configuration. On FreeBSD in capability mode veil cannot open `.wasm` files after startup, so it rejects a reload
 that changes `[wasm]` (restart to apply such changes).
 
+On Linux with `[security] seccomp_mode = "filter"` or `"strict"`, veil cannot create executable memory after startup,
+so a reload cannot compile modules to native code. If the reloaded `[wasm]` section and the module and `data_files`
+files are unchanged, the reload keeps the running modules (it does not run `_start` or `proxy_on_configure` again)
+and applies the rest of the configuration. A reload that changes `[wasm]` or one of those files is rejected and the
+previous configuration stays in effect; restart veil to apply it. With `interpreter = true` the modules need no
+executable memory, so such a reload works as usual. With `seccomp_mode = "log"` veil makes the same decision but lets
+a reload that has to compile modules through and logs a warning, so the kernel log shows only the compilations that
+`filter` and `strict` would reject.
+
 Versions before 0.11.0 always continued after a failure (as `fail_open` does now, without the metric). Set
 `failure_policy = "fail_open"` in `[wasm.defaults]` to keep that behavior.
 
@@ -320,6 +350,8 @@ The `[wasm.defaults.pooling]` section configures the pooling allocator for high-
 | `allow_send_local_response` | Send local response | false |
 | `allow_http_calls` | HTTP external calls | false |
 | `allowed_upstreams` | Upstreams `proxy_http_call`/`proxy_grpc_call` may call. Empty allows every upstream group | [] |
+| `allowed_properties` | Properties `proxy_get_property` may read: exact paths (`"source.address"`), prefixes (`"request.*"`) or `"*"`. Empty allows none, and a property that is not allowed reads as not found. veil provides `request.path`, `request.url_path`, `request.host`, `request.method`, `request.scheme`, `request.protocol`, `request.query`, `request.time`, `request.total_size`, `response.code`, `response.code_details`, `source.address`, `destination.address`, `plugin_name`, `plugin_root_id` and `plugin_data.<name>` | [] |
+| `allow_property_write` | Set custom properties with `proxy_set_property` | false |
 
 A host function called without its capability returns `NotAllowed`. SDKs that unwrap the status (the Rust SDK
 `proxy-wasm` does for most calls) then panic, the callback traps, and the request is handled by `failure_policy`

@@ -44,15 +44,15 @@ pub(crate) fn get_property_value(state: &HostState, path: &str) -> Option<Proper
     match path {
         // Request properties
         "request.path" | "request.url_path" => Some(Str(state.http_ctx.request_path.clone())),
+        // B-408: HTTP/2・HTTP/3 は `:authority`（以前は `host` ヘッダだけを見ていたので取れなかった）
         "request.host" => state
             .http_ctx
-            .request_headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(b"host"))
-            .map(|(_, v)| Owned(v.clone())),
+            .request_authority()
+            .map(|v| Owned(v.to_vec())),
         "request.method" => Some(Str(state.http_ctx.request_method.clone())),
-        "request.scheme" => Some(Static(b"https")),
-        "request.protocol" => Some(Static(b"HTTP/1.1")),
+        // B-408: 以前は常に `https`・`HTTP/1.1` だった
+        "request.scheme" => Some(Static(state.http_ctx.request_scheme().as_bytes())),
+        "request.protocol" => Some(Static(state.http_ctx.request_protocol().as_bytes())),
         "request.query" => Some(Owned(state.http_ctx.request_query.as_bytes().to_vec())),
         "request.time" => {
             let now = std::time::SystemTime::now()
@@ -476,6 +476,40 @@ mod tests {
         // 許可の無いプロパティは読めない
         assert!(
             get_property_value(&state_with(&["request.path"]), "plugin_data.dataset").is_none()
+        );
+    }
+
+    /// B-408: `request.host`・`request.scheme`・`request.protocol` は要求の属性から（HTTP/2・HTTP/3 の `:authority`、
+    /// 平文の `http`、プロトコルの版）。属性が無い context は `Host` ヘッダ・`https`・`HTTP/1.1`
+    #[test]
+    fn b408_request_host_scheme_protocol_follow_request_info() {
+        let props = ["request.host", "request.scheme", "request.protocol"];
+        let read = |st: &HostState| {
+            props.map(|p| get_property_value(st, p).map(|v| v.as_bytes().to_vec()))
+        };
+        let mut st = state_with(&props);
+        st.http_ctx.request_headers = vec![(b"Host".to_vec(), b"h1.example".to_vec())];
+        assert_eq!(
+            read(&st),
+            [
+                Some(b"h1.example".to_vec()),
+                Some(b"https".to_vec()),
+                Some(b"HTTP/1.1".to_vec())
+            ]
+        );
+        st.http_ctx.request_headers.clear();
+        st.http_ctx.request_info = Some(crate::wasm::RequestInfo {
+            authority: Arc::from("h2.example:8080"),
+            scheme: "http",
+            protocol: "HTTP/2",
+        });
+        assert_eq!(
+            read(&st),
+            [
+                Some(b"h2.example:8080".to_vec()),
+                Some(b"http".to_vec()),
+                Some(b"HTTP/2".to_vec())
+            ]
         );
     }
 

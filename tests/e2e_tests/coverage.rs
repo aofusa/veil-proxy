@@ -605,26 +605,12 @@ pub(super) async fn test_http3_wasm_response_header_mutation() {
 /// F-132: HTTP/3 経由で WASM モジュールが LocalResponse を返した場合、それがそのまま
 /// クライアントへ返ること。
 ///
-/// 調査の経緯（重要）: 当初はパストラバーサルのクエリ文字列（`../../etc/passwd` 等）で
-/// 403 を検証しようとしたが、`tests/wasm/waf_filter.wasm`（`tests/fixtures/wasm/` に
-/// フォールバックコピー済み）は `examples/wasm-filters/waf-filter` の**古い版**
-/// （コミット `fd9ede9`〜、`cmdi-00N`/`sqli-00N`/`traversal-00N` 命名。現行 `crs-*` 版とは別物）
-/// からビルドされており、`on_http_request_headers` がパス/クエリを
-/// `self.get_http_request_header(":path")`（`:path` **疑似ヘッダをヘッダマップ経由**で取得）
-/// で読んでいる。しかし本リポジトリの WASM ホスト実装は `:path`/`:method` を
-/// リクエストコンテキストの別フィールド（`HttpContext::request_path`/`request_method`。
-/// `get_property("request.path")` 経由でのみ参照可能）として保持し、ヘッダマップ
-/// （`proxy_get_header_map_value` が読む `request_headers`）には含めない
-/// （`src/http3_server.rs`/`src/proxy.rs` とも疑似ヘッダを除外して `set_request()` へ渡す。
-/// `src/wasm/context.rs::set_request` 参照）。そのため `get_http_request_header(":path")` は
-/// **HTTP/1.1・HTTP/2・HTTP/3 のいずれでも** 常に `None` を返し、パス/クエリに基づく
-/// ルール（path traversal 等）は本バイナリでは発火しない
-/// （`curl -H "Host: localhost" https://127.0.0.1:8443/waf/?file=../../etc/passwd` を
-/// h2 で直接叩いても 200 が返ることを手動確認済み。HTTP/3 固有のリグレッションではない）。
-/// そこで **`user-agent` ヘッダ**（通常のヘッダマップに含まれ、疑似ヘッダの制約を受けない）
-/// を対象にした `cmdi-003`（`(?i)(^|;)\s*(cat|ls|...|curl|wget|...)\b`）ルールで
-/// LocalResponse を発火させる。これは「HTTP/3 で WASM の LocalResponse が機能すること」を
-/// 実証する目的を保ったまま、実際にこのモジュールが発火する条件に合わせたテストである。
+/// WAF（`examples/wasm-filters/waf-filter` の CRS Level 2）が、スキャナの User-Agent（`crs-913100`）と、`:path` の
+/// クエリのパストラバーサルを 403 にする。後者は Proxy-Wasm のゲストが `:path` 疑似ヘッダを読めることも確かめる
+/// （B-408。以前はどのプロトコルでも読めず、パスで判断する規則は発火しなかった）。
+///
+/// B-406: 以前の `tests/fixtures/wasm/waf_filter.wasm` は最初の版の例（2025-12）からビルドしたもので、要求ごとに全規則の
+/// 正規表現をコンパイルしていた（1 要求 50 ms 超）。負荷の高いときに要求のコールバックの実時間の締切を超えて 503 になった。
 ///
 /// B-58: OpenBSD だけ制限時間を大幅に延ばしている。OpenBSD は W^X 制約のため WASM を
 /// Cranelift JIT ではなく **Pulley インタープリタ**で実行する（B-52）。waf_filter は
@@ -657,30 +643,39 @@ pub(super) async fn test_http3_wasm_local_response() {
     };
 
     use common::http3_client::send_http3_request_full;
-    let resp = send_http3_request_full(
-        &mut send_request,
-        "GET",
-        "/waf/",
-        &[("user-agent", "curl/8.5.0")],
-        None,
-    )
-    .await
-    .expect("HTTP/3 waf request");
+    for (path, user_agent, what) in [
+        ("/waf/", "sqlmap/1.8", "a scanner User-Agent"),
+        (
+            "/waf/?file=../../etc/passwd",
+            "Mozilla/5.0",
+            "a path traversal in the query of :path",
+        ),
+    ] {
+        let resp = send_http3_request_full(
+            &mut send_request,
+            "GET",
+            path,
+            &[("user-agent", user_agent)],
+            None,
+        )
+        .await
+        .expect("HTTP/3 waf request");
 
-    assert_eq!(
-        resp.status, 403,
-        "HTTP/3 WAF WASM module should block a flagged User-Agent with 403, got status={} headers={:?}",
-        resp.status, resp.headers
-    );
-    let has_waf_marker = resp
-        .headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("x-waf-block"));
-    assert!(
-        has_waf_marker,
-        "WAF LocalResponse should carry x-waf-block header, got headers={:?}",
-        resp.headers
-    );
+        assert_eq!(
+            resp.status, 403,
+            "HTTP/3 WAF WASM module should block {} with 403, got status={} headers={:?}",
+            what, resp.status, resp.headers
+        );
+        let has_waf_marker = resp
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-waf-block"));
+        assert!(
+            has_waf_marker,
+            "WAF LocalResponse should carry x-waf-block header, got headers={:?}",
+            resp.headers
+        );
+    }
 }
 
 /// F-132: HTTP/3 の `Backend::File`（静的配信）ルートにも WASM on_response_headers が

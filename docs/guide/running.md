@@ -249,7 +249,13 @@ Test your configuration file before deploying or reloading:
 **Validation checks:**
 - TOML syntax parsing
 - Configuration value validation
-- TLS certificate and key file existence
+- TLS certificate and key file existence, then the TLS server configuration built as a start builds it (unparsable
+  PEM, a key that does not match the certificate, unknown `cipher_suites`, an unreadable `client_ca`)
+- `[wasm]` modules loaded as a start loads them, running each module's startup callbacks (`_start`,
+  `proxy_on_vm_start`, `proxy_on_configure`), so a module that would stop the start fails the test. Compiling a
+  module writes its AOT cache next to the `.wasm`, as a start does
+
+`-t` does not bind the listeners or connect to upstreams.
 
 **Output examples:**
 ```bash

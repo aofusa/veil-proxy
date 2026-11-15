@@ -9,7 +9,9 @@
 
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
+use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 mod crs_level1;
 mod crs_level2;
@@ -25,16 +27,18 @@ proxy_wasm::main! {{
     });
 }}
 
+// The compiled rules are built once per root context, in `on_configure`, and shared by every request's HTTP
+// context. Compiling them per request costs tens of milliseconds of guest CPU for each request.
 struct WafFilterRoot {
-    config: WafConfig,
-    engine: RuleEngine,
+    config: Rc<WafConfig>,
+    engine: OnceCell<Rc<RuleEngine>>,
 }
 
 impl WafFilterRoot {
     fn new() -> Self {
         Self {
-            config: WafConfig::default(),
-            engine: RuleEngine::new(),
+            config: Rc::new(WafConfig::default()),
+            engine: OnceCell::new(),
         }
     }
 }
@@ -45,6 +49,7 @@ impl RootContext for WafFilterRoot {
     fn on_configure(&mut self, plugin_configuration_size: usize) -> bool {
         if plugin_configuration_size == 0 {
             log::info!("[waf] Using default configuration (CRS Level 2)");
+            self.engine = OnceCell::from(Rc::new(RuleEngine::with_config(&self.config)));
             return true;
         }
 
@@ -57,8 +62,8 @@ impl RootContext for WafFilterRoot {
                         config.crs_level,
                         config.anomaly_scoring
                     );
-                    self.engine = RuleEngine::with_config(&config);
-                    self.config = config;
+                    self.engine = OnceCell::from(Rc::new(RuleEngine::with_config(&config)));
+                    self.config = Rc::new(config);
                 }
                 Err(e) => {
                     log::error!("[waf] Failed to parse configuration: {}", e);
@@ -74,18 +79,22 @@ impl RootContext for WafFilterRoot {
     }
 
     fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
+        // Hosts call `on_configure` before creating HTTP contexts; build the rules here only if one did not
+        let engine = self
+            .engine
+            .get_or_init(|| Rc::new(RuleEngine::with_config(&self.config)));
         Some(Box::new(WafFilter {
             context_id,
-            config: self.config.clone(),
-            engine: self.engine.clone(),
+            config: Rc::clone(&self.config),
+            engine: Rc::clone(engine),
         }))
     }
 }
 
 struct WafFilter {
     context_id: u32,
-    config: WafConfig,
-    engine: RuleEngine,
+    config: Rc<WafConfig>,
+    engine: Rc<RuleEngine>,
 }
 
 impl Context for WafFilter {}
@@ -97,17 +106,18 @@ impl HttpContext for WafFilter {
             return Action::Continue;
         }
 
-        // Check IP whitelist (優先度: パスホワイトリストより先)
-        let client_ip = self.get_http_request_header("x-forwarded-for")
-            .or_else(|| self.get_http_request_header("x-real-ip"))
-            .or_else(|| self.get_http_request_header("x-client-ip"));
-        
-        if let Some(ip) = client_ip {
-            // X-Forwarded-Forは複数IPを含む可能性がある（最初のIPを使用）
-            let first_ip = ip.split(',').next().unwrap_or(&ip).trim();
-            if self.config.is_ip_whitelisted(first_ip) {
-                log::debug!("[waf:{}] IP whitelisted: {}", self.context_id, first_ip);
-                return Action::Continue;
+        // Check IP whitelist (優先度: パスホワイトリストより先)。クライアントの送るヘッダ（X-Forwarded-For 等）は
+        // 誰でも書けるので見ない。プロキシが接続から得た相手のアドレス（`source.address`）だけを見る
+        // （モジュールの `allowed_properties` に `source.address` が要る。無ければ許可リストは効かず、検査する）
+        if !self.config.whitelist_ips.is_empty() {
+            if let Some(addr) = self
+                .get_property(vec!["source", "address"])
+                .and_then(|a| String::from_utf8(a).ok())
+            {
+                if self.config.is_ip_whitelisted(&addr) {
+                    log::debug!("[waf:{}] IP whitelisted: {}", self.context_id, addr);
+                    return Action::Continue;
+                }
             }
         }
 

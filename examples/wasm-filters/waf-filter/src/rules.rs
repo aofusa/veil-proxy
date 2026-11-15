@@ -3,10 +3,11 @@
 //! Detection rules inspired by OWASP ModSecurity CRS.
 //! Supports CRS Levels 1-3 with anomaly scoring.
 
-use regex::Regex;
+use regex::bytes::{RegexBuilder, RegexSet, RegexSetBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::{crs_level1, crs_level2, crs_level3};
 
@@ -136,74 +137,73 @@ impl Default for WafConfig {
 }
 
 impl WafConfig {
+    /// Whether the request path skips inspection. The query string is not part of the match, and a whitelisted
+    /// path matches only itself and the paths below it (`/health` matches `/health` and `/health/live`, not
+    /// `/healthz` or `/health-admin`). A path with characters outside `A-Z a-z 0-9 / - . _ ~` (percent-encoding,
+    /// `;` parameters, backslashes) or with `.` / `..` segments is never whitelisted, because an upstream may
+    /// decode or normalize it into a path outside the whitelisted one.
     pub fn is_path_whitelisted(&self, path: &str) -> bool {
-        for whitelist_path in &self.whitelist_paths {
-            if path.starts_with(whitelist_path) {
-                return true;
-            }
+        let path = path.split(['?', '#']).next().unwrap_or("");
+        let plain = path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'_' | b'~'));
+        if !plain || path.split('/').any(|seg| seg == "." || seg == "..") {
+            return false;
         }
-        false
+        self.whitelist_paths.iter().any(|w| {
+            !w.is_empty()
+                && (path == w
+                    || path.strip_prefix(w.as_str()).is_some_and(|rest| {
+                        w.ends_with('/') || rest.starts_with('/')
+                    }))
+        })
     }
 
-    /// Check if IP address is whitelisted
-    pub fn is_ip_whitelisted(&self, ip: &str) -> bool {
+    /// Whether the client address skips inspection. `addr` is the address of the peer as veil reports it in the
+    /// `source.address` property (`ip` or `ip:port`, IPv6 as `[ip]:port`). Entries are addresses or CIDR blocks
+    /// (`192.168.1.1`, `10.0.0.0/8`, `2001:db8::/32`).
+    pub fn is_ip_whitelisted(&self, addr: &str) -> bool {
         if self.whitelist_ips.is_empty() {
             return false;
         }
-        
-        // Normalize IP address (remove port if present)
-        let normalized_ip = ip.split(':').next().unwrap_or(ip);
-        
-        // Check exact match
-        if self.whitelist_ips.iter().any(|w| w == normalized_ip || w == ip) {
-            return true;
-        }
-        
-        // Check CIDR notation (basic support for IPv4)
-        for whitelist_entry in &self.whitelist_ips {
-            if whitelist_entry.contains('/') {
-                if Self::match_cidr(normalized_ip, whitelist_entry) {
-                    return true;
-                }
-            }
-        }
-        
-        false
+        let Some(ip) = parse_peer_ip(addr) else {
+            return false;
+        };
+        self.whitelist_ips.iter().any(|entry| match entry.split_once('/') {
+            Some((net, len)) => match (net.parse::<IpAddr>(), len.parse::<u8>()) {
+                (Ok(net), Ok(len)) => cidr_contains(net, len, ip),
+                _ => false,
+            },
+            None => entry.parse::<IpAddr>() == Ok(ip),
+        })
     }
-    
-    /// Basic CIDR matching (IPv4 only)
-    fn match_cidr(ip: &str, cidr: &str) -> bool {
-        // Simplified CIDR matching for IPv4
-        // Full implementation would require proper IP parsing library
-        if let Some((network, prefix_len)) = cidr.split_once('/') {
-            if let Ok(prefix) = prefix_len.parse::<u8>() {
-                if prefix == 32 {
-                    // /32 is exact match
-                    return network == ip;
-                } else if prefix == 24 {
-                    // /24 subnet match
-                    if let Some(dot_pos) = network.rfind('.') {
-                        let network_prefix = &network[..dot_pos];
-                        if let Some(ip_dot_pos) = ip.rfind('.') {
-                            let ip_prefix = &ip[..ip_dot_pos];
-                            return network_prefix == ip_prefix;
-                        }
-                    }
-                } else if prefix == 16 {
-                    // /16 subnet match
-                    if let Some(dot_pos) = network.rfind('.') {
-                        let network_prefix = &network[..network[..dot_pos].rfind('.').unwrap_or(0)];
-                        if let Some(ip_dot_pos) = ip.rfind('.') {
-                            let ip_prefix = &ip[..ip[..ip_dot_pos].rfind('.').unwrap_or(0)];
-                            return network_prefix == ip_prefix;
-                        }
-                    }
-                }
-                // For other prefix lengths, use simple prefix matching
-                return ip.starts_with(network);
-            }
+}
+
+/// The IP of a peer address (`ip`, `ip:port` or `[ipv6]:port`)
+fn parse_peer_ip(addr: &str) -> Option<IpAddr> {
+    let addr = addr.trim();
+    addr.parse::<IpAddr>()
+        .ok()
+        .or_else(|| addr.parse::<SocketAddr>().ok().map(|a| a.ip()))
+        .map(|ip| match ip {
+            // An IPv4 client on a dual-stack listener
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            v4 => v4,
+        })
+}
+
+/// Whether `ip` is in the block `net/len` (an invalid length or a different address family never matches)
+fn cidr_contains(net: IpAddr, len: u8, ip: IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(net), IpAddr::V4(ip)) if len <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+            u32::from(net) & mask == u32::from(ip) & mask
         }
-        false
+        (IpAddr::V6(net), IpAddr::V6(ip)) if len <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+            u128::from(net) & mask == u128::from(ip) & mask
+        }
+        _ => false,
     }
 }
 
@@ -249,31 +249,44 @@ impl fmt::Display for RuleCompilationError {
     }
 }
 
-/// Compiled rule with pre-compiled regex
+/// A detection rule. [`RuleEngine`] compiles the patterns of all its rules into one [`RegexSet`].
+///
+/// Patterns are byte regexes with Unicode mode off: `\w`, `\s`, `\b`, `\d`, `.` and `(?i)` are ASCII-only, like
+/// the HTTP syntax the rules inspect. With Unicode mode on, classes such as `.{1,100}` compile to UTF-8 automata
+/// hundreds of times larger, and building the rules no longer fits in a Proxy-Wasm host's CPU budget for starting
+/// a plugin (100 ms by default in veil). A pattern can still opt into Unicode with `(?u:...)`.
+#[derive(Clone)]
 pub struct CompiledRule {
     pub id: String,
     pub category: String,
-    pub regex: Regex,
+    pub pattern: String,
     pub severity: Severity,
     pub action: WafAction,
     pub targets: Vec<String>,
 }
 
-impl Clone for CompiledRule {
-    fn clone(&self) -> Self {
+impl CompiledRule {
+    /// A built-in rule. Its pattern is not compiled here: the CRS rule sets are checked by the unit tests, and
+    /// [`RuleEngine`] compiles every pattern once, in its [`RegexSet`].
+    pub fn builtin(
+        id: &str,
+        category: &str,
+        pattern: &str,
+        severity: Severity,
+        action: WafAction,
+        targets: Vec<String>,
+    ) -> Self {
         Self {
-            id: self.id.clone(),
-            category: self.category.clone(),
-            regex: Regex::new(self.regex.as_str()).unwrap(),
-            severity: self.severity,
-            action: self.action.clone(),
-            targets: self.targets.clone(),
+            id: id.to_string(),
+            category: category.to_string(),
+            pattern: pattern.to_string(),
+            severity,
+            action,
+            targets,
         }
     }
-}
 
-impl CompiledRule {
-    /// Create a new compiled rule, returning Result instead of panicking
+    /// Create a rule from a pattern that may be invalid (a custom rule), returning Result instead of panicking
     pub fn try_new(
         id: &str,
         category: &str,
@@ -282,15 +295,8 @@ impl CompiledRule {
         action: WafAction,
         targets: Vec<String>,
     ) -> Result<Self, RuleCompilationError> {
-        match Regex::new(pattern) {
-            Ok(regex) => Ok(Self {
-                id: id.to_string(),
-                category: category.to_string(),
-                regex,
-                severity,
-                action,
-                targets,
-            }),
+        match RegexBuilder::new(pattern).unicode(false).build() {
+            Ok(_) => Ok(Self::builtin(id, category, pattern, severity, action, targets)),
             Err(e) => Err(RuleCompilationError {
                 rule_id: id.to_string(),
                 pattern: pattern.to_string(),
@@ -323,23 +329,18 @@ impl CompiledRule {
 }
 
 /// WAF Rule Engine
+#[derive(Clone)]
 pub struct RuleEngine {
     rules: Vec<CompiledRule>,
+    /// The patterns of `rules`, in the same order (pattern `i` is `rules[i]`)
+    set: RegexSet,
     anomaly_scoring: bool,
     anomaly_threshold: u32,
 }
 
-impl Clone for RuleEngine {
-    fn clone(&self) -> Self {
-        Self {
-            rules: self.rules.clone(),
-            anomaly_scoring: self.anomaly_scoring,
-            anomaly_threshold: self.anomaly_threshold,
-        }
-    }
-}
-
 impl RuleEngine {
+    /// The rules of the default configuration (CRS Level 2)
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::with_config(&WafConfig::default())
     }
@@ -389,8 +390,18 @@ impl RuleEngine {
             config.anomaly_scoring
         );
 
+        // Every pattern compiled on its own (custom rules are checked above), so only the size limit can fail here
+        let set = RegexSetBuilder::new(rules.iter().map(|r| r.pattern.as_str()))
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|e| {
+                log::error!("[waf] Failed to compile the rule set: {}", e);
+                panic!("[waf] failed to compile the rule set: {}", e);
+            });
+
         Self {
             rules,
+            set,
             anomaly_scoring: config.anomaly_scoring,
             anomaly_threshold: config.anomaly_threshold,
         }
@@ -405,19 +416,53 @@ impl RuleEngine {
             let decoded = self.url_decode(target_value);
             
             // デコード前の文字列をチェック（エンコードされた攻撃パターン）
+            // `RegexSet::matches` は 1 回の走査で当たったルールを返す（ルールの順）
             let mut matched_in_encoded = false;
-            for rule in &self.rules {
+            for rule in self.set.matches(target_value.as_bytes()).iter().map(|i| &self.rules[i]) {
                 // Check if rule applies to this target
                 if !rule.matches_target(target_name) {
                     continue;
                 }
-                
-                if rule.regex.is_match(target_value) {
+
+                let violation = Violation {
+                    rule_id: rule.id.clone(),
+                    category: rule.category.clone(),
+                    target: target_name.clone(),
+                    matched_value: target_value.clone(),
+                    action: rule.action.clone(),
+                    severity: rule.severity,
+                };
+
+                if self.anomaly_scoring {
+                    total_score += rule.severity.score();
+                    violations.push(violation);
+
+                    if total_score >= self.anomaly_threshold {
+                        // Return the most severe violation
+                        return violations.into_iter()
+                            .max_by_key(|v| v.severity.score());
+                    }
+                } else {
+                    // Immediate mode: return first match
+                    return Some(violation);
+                }
+                matched_in_encoded = true;
+            }
+            
+            // デコード後の文字列をチェック（デコード後の攻撃パターン）
+            // デコード前でマッチした場合はスキップ（immediate modeの場合）
+            if !matched_in_encoded || self.anomaly_scoring {
+                for rule in self.set.matches(decoded.as_bytes()).iter().map(|i| &self.rules[i]) {
+                    // Check if rule applies to this target
+                    if !rule.matches_target(target_name) {
+                        continue;
+                    }
+
                     let violation = Violation {
                         rule_id: rule.id.clone(),
                         category: rule.category.clone(),
                         target: target_name.clone(),
-                        matched_value: target_value.clone(),
+                        matched_value: decoded.clone(),
                         action: rule.action.clone(),
                         severity: rule.severity,
                     };
@@ -434,43 +479,6 @@ impl RuleEngine {
                     } else {
                         // Immediate mode: return first match
                         return Some(violation);
-                    }
-                    matched_in_encoded = true;
-                }
-            }
-            
-            // デコード後の文字列をチェック（デコード後の攻撃パターン）
-            // デコード前でマッチした場合はスキップ（immediate modeの場合）
-            if !matched_in_encoded || self.anomaly_scoring {
-                for rule in &self.rules {
-                    // Check if rule applies to this target
-                    if !rule.matches_target(target_name) {
-                        continue;
-                    }
-                    
-                    if rule.regex.is_match(&decoded) {
-                        let violation = Violation {
-                            rule_id: rule.id.clone(),
-                            category: rule.category.clone(),
-                            target: target_name.clone(),
-                            matched_value: decoded.clone(),
-                            action: rule.action.clone(),
-                            severity: rule.severity,
-                        };
-
-                        if self.anomaly_scoring {
-                            total_score += rule.severity.score();
-                            violations.push(violation);
-
-                            if total_score >= self.anomaly_threshold {
-                                // Return the most severe violation
-                                return violations.into_iter()
-                                    .max_by_key(|v| v.severity.score());
-                            }
-                        } else {
-                            // Immediate mode: return first match
-                            return Some(violation);
-                        }
                     }
                 }
             }
@@ -697,6 +705,56 @@ mod tests {
         assert!(config.is_ip_whitelisted("10.0.0.100")); // CIDR match
         assert!(!config.is_ip_whitelisted("192.168.1.2"));
         assert!(!config.is_ip_whitelisted("10.0.1.100"));
+    }
+
+    /// Prefix lengths other than /16, /24 and /32 used to fall back to a string prefix match: `1.2.3.4/30`
+    /// whitelisted `1.2.3.40`-`1.2.3.49`, `10.0.0.0/8` matched nothing, and IPv6 never matched.
+    #[test]
+    fn test_ip_whitelist_cidr_and_ipv6() {
+        let config = WafConfig {
+            whitelist_ips: vec![
+                "1.2.3.4/30".to_string(),
+                "10.0.0.0/8".to_string(),
+                "2001:db8::/32".to_string(),
+                "::1".to_string(),
+                "bad/entry".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(config.is_ip_whitelisted("1.2.3.7"));
+        assert!(!config.is_ip_whitelisted("1.2.3.40"));
+        assert!(!config.is_ip_whitelisted("1.2.3.8"));
+        assert!(config.is_ip_whitelisted("10.200.1.2:443"));
+        assert!(config.is_ip_whitelisted("[2001:db8:1::5]:8443"));
+        assert!(config.is_ip_whitelisted("2001:db8:ffff::1"));
+        assert!(!config.is_ip_whitelisted("2001:db9::1"));
+        assert!(config.is_ip_whitelisted("::1"));
+        assert!(config.is_ip_whitelisted("::ffff:10.1.1.1")); // IPv4-mapped
+        assert!(!config.is_ip_whitelisted("not-an-ip"));
+        assert!(!config.is_ip_whitelisted(""));
+    }
+
+    /// The path whitelist used to be a plain prefix match on `:path` (with the query): `/healthz`, `/health-admin`
+    /// and `/health/../admin` were whitelisted too.
+    #[test]
+    fn test_path_whitelist_segment_boundary() {
+        let config = WafConfig {
+            whitelist_paths: vec!["/health".to_string(), "/static/".to_string()],
+            ..Default::default()
+        };
+        assert!(config.is_path_whitelisted("/health"));
+        assert!(config.is_path_whitelisted("/health?verbose=1"));
+        assert!(config.is_path_whitelisted("/health/live"));
+        assert!(config.is_path_whitelisted("/static/app.js"));
+        assert!(!config.is_path_whitelisted("/static"));
+        assert!(!config.is_path_whitelisted("/healthz"));
+        assert!(!config.is_path_whitelisted("/health-admin"));
+        assert!(!config.is_path_whitelisted("/health/../admin"));
+        assert!(!config.is_path_whitelisted("/health/./x"));
+        assert!(!config.is_path_whitelisted("/health/%2e%2e/admin"));
+        assert!(!config.is_path_whitelisted("/health;/../admin"));
+        assert!(!config.is_path_whitelisted("/health\\..\\admin"));
+        assert!(!config.is_path_whitelisted("/api?next=/health"));
     }
 
     #[test]

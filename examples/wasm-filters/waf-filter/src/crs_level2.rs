@@ -29,169 +29,169 @@ pub fn get_rules() -> Vec<CompiledRule> {
 
 fn get_sqli_rules() -> Vec<CompiledRule> {
     vec![
-        CompiledRule::try_new(
+        CompiledRule::builtin(
             "crs-942200",
             "SQL Injection - Comment Markers",
             r"(--|#|/\*|\*/)",
             Severity::Medium,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-942210",
             "SQL Injection - Stacked Queries",
             r";\s*(select|insert|update|delete|drop|union|create|alter)\b",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-942220",
             "SQL Injection - Time-based Blind",
             r"(?i)(benchmark\s*\(|sleep\s*\(|waitfor\s+delay\s|pg_sleep)",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-942230",
             "SQL Injection - Hex Encoding",
             r"(?i)(0x[0-9a-f]{8,}|char\s*\(\s*\d+\s*\)|concat\s*\()",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-942240",
             "SQL Injection - HAVING/GROUP BY",
             r"(?i)(\bhaving\b\s+\d|group\s+by\s+\d)",
             Severity::Medium,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
+        ),
     ]
 }
 
 fn get_xss_rules() -> Vec<CompiledRule> {
     vec![
-        CompiledRule::try_new(
+        CompiledRule::builtin(
             "crs-941200",
             "XSS - SVG Events",
             r"(?i)<\s*svg[^>]*\s+on\w+\s*=",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-941210",
             "XSS - Data URI",
             r"(?i)data\s*:\s*(text/html|application/javascript)",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-941220",
             "XSS - VBScript",
             r"(?i)vbscript\s*:",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-941230",
             "XSS - Expression",
             r"(?i)expression\s*\(",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-941240",
             "XSS - Meta/Link Tags",
             r"(?i)<\s*(meta|link)[^>]*(http-equiv|href)\s*=",
             Severity::Medium,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
+        ),
     ]
 }
 
 fn get_command_injection_rules() -> Vec<CompiledRule> {
     vec![
-        CompiledRule::try_new(
+        CompiledRule::builtin(
             "crs-932100",
             "Command Injection - Shell Metacharacters",
             r"[;|`$]\s*\w+",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-932110",
             "Command Injection - Command Substitution",
             r"\$\([^)]+\)|\$\{[^}]+\}",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-932120",
             "Command Injection - Common Commands",
             r"(?i)(^|[;&|])\s*(cat|ls|id|whoami|uname|curl|wget|nc|bash|sh|python|perl|php|ruby)\s",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-932130",
             "Command Injection - Unix Paths",
             r"(?i)/(bin|usr/bin|sbin)/(sh|bash|cat|ls|curl|wget|nc)",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
+        ),
     ]
 }
 
 fn get_rfi_lfi_rules() -> Vec<CompiledRule> {
     vec![
-        CompiledRule::try_new(
+        CompiledRule::builtin(
             "crs-931100",
             "LFI - PHP Wrapper",
             r"(?i)(php|file|data|expect|input|zip|phar)://",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-931110",
             "RFI - Remote URL Injection",
             r"(?i)[?&](file|url|path|src|include)=https?://",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
+        ),
     ]
 }
 
 fn get_scanner_detection_rules() -> Vec<CompiledRule> {
     vec![
-        CompiledRule::try_new(
+        CompiledRule::builtin(
             "crs-913100",
             "Scanner Detection - Nikto",
             r"(?i)nikto|nmap|masscan|dirbuster|gobuster|wfuzz|sqlmap",
             Severity::Medium,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-913110",
             "Scanner Detection - Aggressive Crawler",
             r"(?i)(python-requests|go-http-client|java/).*(bot|crawler|spider)",
             Severity::Low,
             WafAction::Log,
             vec![],
-        ).expect("CRS rule should be valid"),
+        ),
     ]
 }

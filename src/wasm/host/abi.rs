@@ -14,20 +14,30 @@
 
 /// ヘッダマップを Proxy-Wasm ABI 形式へ直列化する
 pub(crate) fn serialize_headers(headers: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    serialize_pairs(headers.iter().map(|(k, v)| (&k[..], &v[..])))
+}
+
+/// 名前と値の組を Proxy-Wasm ABI 形式へ直列化する（組を複製せずに並べる。B-408 で疑似ヘッダを前に足す）
+pub(crate) fn serialize_pairs<'a, I>(pairs: I) -> Vec<u8>
+where
+    I: Iterator<Item = (&'a [u8], &'a [u8])> + Clone,
+{
     let mut size: usize = 4;
-    for (key, value) in headers {
+    let mut count: u32 = 0;
+    for (key, value) in pairs.clone() {
         size += key.len() + value.len() + 10;
+        count += 1;
     }
     let mut buf = Vec::with_capacity(size);
 
-    buf.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
     // サイズテーブル
-    for (key, value) in headers {
+    for (key, value) in pairs.clone() {
         buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
     }
     // データ本体（NUL 終端）
-    for (key, value) in headers {
+    for (key, value) in pairs {
         buf.extend_from_slice(key);
         buf.push(0);
         buf.extend_from_slice(value);

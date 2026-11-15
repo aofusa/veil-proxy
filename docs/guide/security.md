@@ -82,6 +82,11 @@ listed values is handled like a disallowed call (`log` / `EPERM` / `SIGSYS`):
 `setuid`, `setgid`, `setgroups`, `setresuid` and `setresgid` are no longer allowed: veil drops privileges before it
 installs the filter. These checks were added in v0.10.0.
 
+Because `PROT_EXEC` is refused under `filter` and `strict`, a configuration reload cannot compile Proxy-Wasm modules
+to native code: it keeps the running modules when `[wasm]` and the module files are unchanged and is rejected
+otherwise (see [Proxy-Wasm](wasm.md#failure-handling)). `log` keeps the running modules in the same way and lets a
+reload that has to compile them through with a warning.
+
 **Which threads are sandboxed.** veil installs the seccomp filter with `SECCOMP_FILTER_FLAG_TSYNC`, so it applies to
 every thread of the process, including the control-plane threads started before it (logging, configuration and
 certificate reload, VDS, ACME, health checks, cache cleanup, Proxy-Wasm tick and gRPC). Landlock has no such flag and

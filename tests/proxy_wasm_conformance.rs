@@ -70,12 +70,17 @@ impl Harness {
 
     /// プラグイン名（共有キューの持ち主）を指定してハーネスを作る。
     async fn named(capabilities: ModuleCapabilities, plugin_name: &str) -> Self {
+        let mut http_ctx = HttpContext::new(1, capabilities);
+        http_ctx.plugin_name = plugin_name.into();
+        Self::with_ctx(http_ctx).await
+    }
+
+    /// 要求・応答を置いた context でハーネスを作る。
+    async fn with_ctx(http_ctx: HttpContext) -> Self {
         let engine = build_conformance_test_engine().expect("engine should build");
         let linker = build_conformance_test_linker(&engine).expect("linker should build");
         let module = Module::new(&engine, HARNESS_WAT).expect("abi_harness.wat should compile");
 
-        let mut http_ctx = HttpContext::new(1, capabilities);
-        http_ctx.plugin_name = plugin_name.into();
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(&engine, host_state);
 
@@ -555,6 +560,270 @@ async fn item3_map_type_read_write_roundtrip() {
         Conformance::Implemented,
         "HttpRequestHeaders/Trailers, HttpResponseHeaders/Trailers で仕様どおり動作",
     );
+}
+
+/// Proxy-Wasm ABI のヘッダの表（`count`・名前と値の長さの表・NUL 終端のデータ）を読む。
+fn parse_pairs(buf: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let u32_at = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) as usize;
+    let count = u32_at(0);
+    let mut data = 4 + count * 8;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let (klen, vlen) = (u32_at(4 + i * 8), u32_at(8 + i * 8));
+        let key = buf[data..data + klen].to_vec();
+        data += klen + 1;
+        let value = buf[data..data + vlen].to_vec();
+        data += vlen + 1;
+        out.push((key, value));
+    }
+    out
+}
+
+impl Harness {
+    /// `proxy_get_header_map_value` の結果（状態と値）。
+    async fn header_value(&mut self, map_type: i32, key: &[u8]) -> (i32, Vec<u8>) {
+        self.write(scratch::KEY, key);
+        let status = self
+            .call(
+                "test_proxy_get_header_map_value",
+                &[
+                    map_type,
+                    scratch::KEY,
+                    key.len() as i32,
+                    scratch::OUT_PTR,
+                    scratch::OUT_SIZE,
+                ],
+            )
+            .await;
+        if status != PROXY_RESULT_OK {
+            return (status, Vec::new());
+        }
+        let ptr = self.read_i32(scratch::OUT_PTR);
+        let size = self.read_i32(scratch::OUT_SIZE);
+        (status, self.read_bytes(ptr, size as usize))
+    }
+
+    /// `proxy_get_header_map_pairs` の組。
+    async fn header_pairs(&mut self, map_type: i32) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let status = self
+            .call(
+                "test_proxy_get_header_map_pairs",
+                &[map_type, scratch::OUT_PTR, scratch::OUT_SIZE],
+            )
+            .await;
+        assert_eq!(status, PROXY_RESULT_OK);
+        let ptr = self.read_i32(scratch::OUT_PTR);
+        let size = self.read_i32(scratch::OUT_SIZE);
+        parse_pairs(&self.read_bytes(ptr, size as usize))
+    }
+
+    /// 名前と値を書いて `name`（`replace`・`add`）を呼ぶ。
+    async fn write_header(&mut self, func: &str, map_type: i32, key: &[u8], value: &[u8]) -> i32 {
+        self.write(scratch::KEY, key);
+        self.write(scratch::VALUE, value);
+        self.call(
+            func,
+            &[
+                map_type,
+                scratch::KEY,
+                key.len() as i32,
+                scratch::VALUE,
+                value.len() as i32,
+            ],
+        )
+        .await
+    }
+}
+
+/// B-408: Envoy と同じく、要求ヘッダの表に `:authority`・`:path`・`:method`・`:scheme`、応答ヘッダの表に `:status` が
+/// 見える（Envoy 向けのフィルタは `:path` をヘッダとして読む）。書き換え・削除・追加は `BadArgument` で、保持する
+/// ヘッダ（上流・クライアントへ送るもの）には入らない。
+#[tokio::test]
+async fn b408_pseudo_headers_are_visible_and_read_only() {
+    use veil::wasm::{RequestInfo, HTTP_REQUEST_HEADERS, HTTP_RESPONSE_HEADERS};
+
+    let mut ctx = HttpContext::new(1, Harness::all_caps());
+    ctx.set_request(
+        "POST".into(),
+        "/api/items?id=7".into(),
+        vec![(b"x-a".to_vec(), b"1".to_vec())],
+        "192.0.2.1".into(),
+    );
+    ctx.request_info = Some(RequestInfo {
+        authority: "example.com:8443".into(),
+        scheme: "https",
+        protocol: "HTTP/2",
+    });
+    ctx.set_response(201, vec![(b"x-b".to_vec(), b"2".to_vec())]);
+    let mut h = Harness::with_ctx(ctx).await;
+
+    // 読み取り
+    for (name, value) in [
+        (&b":path"[..], &b"/api/items?id=7"[..]),
+        (b":method", b"POST"),
+        (b":authority", b"example.com:8443"),
+        (b":scheme", b"https"),
+    ] {
+        assert_eq!(
+            h.header_value(HTTP_REQUEST_HEADERS, name).await,
+            (PROXY_RESULT_OK, value.to_vec()),
+            "{}",
+            String::from_utf8_lossy(name)
+        );
+    }
+    assert_eq!(
+        h.header_value(HTTP_RESPONSE_HEADERS, b":status").await,
+        (PROXY_RESULT_OK, b"201".to_vec())
+    );
+    // 要求の疑似ヘッダは応答ヘッダの表には無い
+    assert_eq!(
+        h.header_value(HTTP_RESPONSE_HEADERS, b":path").await.0,
+        PROXY_RESULT_NOT_FOUND
+    );
+    let pairs = h.header_pairs(HTTP_REQUEST_HEADERS).await;
+    let names: Vec<&[u8]> = pairs.iter().map(|(k, _)| &k[..]).collect();
+    assert_eq!(
+        names,
+        [&b":authority"[..], b":path", b":method", b":scheme", b"x-a"]
+    );
+    let pairs = h.header_pairs(HTTP_RESPONSE_HEADERS).await;
+    assert_eq!(pairs[0], (b":status".to_vec(), b"201".to_vec()));
+    assert_eq!(pairs[1], (b"x-b".to_vec(), b"2".to_vec()));
+
+    // 書き換え・追加・削除は BadArgument（同じ値に置くことだけは何も変えずに OK）
+    assert_eq!(
+        h.write_header(
+            "test_proxy_replace_header_map_value",
+            HTTP_REQUEST_HEADERS,
+            b":path",
+            b"/admin"
+        )
+        .await,
+        PROXY_RESULT_BAD_ARGUMENT
+    );
+    assert_eq!(
+        h.write_header(
+            "test_proxy_replace_header_map_value",
+            HTTP_REQUEST_HEADERS,
+            b":path",
+            b"/api/items?id=7"
+        )
+        .await,
+        PROXY_RESULT_OK
+    );
+    assert_eq!(
+        h.write_header(
+            "test_proxy_add_header_map_value",
+            HTTP_REQUEST_HEADERS,
+            b":method",
+            b"GET"
+        )
+        .await,
+        PROXY_RESULT_BAD_ARGUMENT
+    );
+    assert_eq!(
+        h.write_header(
+            "test_proxy_replace_header_map_value",
+            HTTP_RESPONSE_HEADERS,
+            b":status",
+            b"200"
+        )
+        .await,
+        PROXY_RESULT_BAD_ARGUMENT
+    );
+    h.write(scratch::KEY, b":path");
+    assert_eq!(
+        h.call(
+            "test_proxy_remove_header_map_value",
+            &[HTTP_REQUEST_HEADERS, scratch::KEY, 5],
+        )
+        .await,
+        PROXY_RESULT_BAD_ARGUMENT
+    );
+
+    // 読んだ組をそのまま戻す往復は通る。疑似ヘッダは保持するヘッダに入らない
+    let pairs = h.header_pairs(HTTP_REQUEST_HEADERS).await;
+    let mut roundtrip = pairs.clone();
+    roundtrip.push((b"x-c".to_vec(), b"3".to_vec()));
+    let buf = veil_test_support::serialize_headers_for_test(&roundtrip);
+    h.write(scratch::VALUE, &buf);
+    assert_eq!(
+        h.call(
+            "test_proxy_set_header_map_pairs",
+            &[HTTP_REQUEST_HEADERS, scratch::VALUE, buf.len() as i32],
+        )
+        .await,
+        PROXY_RESULT_OK
+    );
+    assert_eq!(
+        h.store.data().http_ctx.request_headers,
+        vec![
+            (b"x-a".to_vec(), b"1".to_vec()),
+            (b"x-c".to_vec(), b"3".to_vec())
+        ]
+    );
+    // 値を変えた疑似ヘッダを含む組は断る（何も変えない）
+    let mut changed = pairs;
+    changed[1].1 = b"/admin".to_vec();
+    let buf = veil_test_support::serialize_headers_for_test(&changed);
+    h.write(scratch::VALUE, &buf);
+    assert_eq!(
+        h.call(
+            "test_proxy_set_header_map_pairs",
+            &[HTTP_REQUEST_HEADERS, scratch::VALUE, buf.len() as i32],
+        )
+        .await,
+        PROXY_RESULT_BAD_ARGUMENT
+    );
+    assert_eq!(h.store.data().http_ctx.request_headers.len(), 2);
+
+    record(
+        "B-408: 疑似ヘッダ（:authority/:path/:method/:scheme/:status）",
+        Conformance::Implemented,
+        "読み取りは Envoy と同じ。書き換え・削除・追加は BadArgument（同じ値に置く往復は OK）",
+    );
+}
+
+/// B-408: 要求の属性を置かない呼び出し元（メッシュのデータプレーン）は、疑似ヘッダを自分で表に入れて、ゲストが書き換えた
+/// 値を受け取る（Envoy の `:path` の書き換えを上流へ反映する）。その context では従来どおり表をそのまま見せて書かせる。
+#[tokio::test]
+async fn b408_caller_supplied_pseudo_headers_stay_writable() {
+    use veil::wasm::HTTP_REQUEST_HEADERS;
+
+    let mut ctx = HttpContext::new(1, Harness::all_caps());
+    ctx.set_request(
+        "GET".into(),
+        "/a".into(),
+        vec![
+            (b":method".to_vec(), b"GET".to_vec()),
+            (b":path".to_vec(), b"/a".to_vec()),
+            (b":authority".to_vec(), b"svc.ns".to_vec()),
+            (b"x-a".to_vec(), b"1".to_vec()),
+        ],
+        "192.0.2.1".into(),
+    );
+    let mut h = Harness::with_ctx(ctx).await;
+    assert_eq!(
+        h.header_value(HTTP_REQUEST_HEADERS, b":authority").await,
+        (PROXY_RESULT_OK, b"svc.ns".to_vec())
+    );
+    assert_eq!(
+        h.write_header(
+            "test_proxy_replace_header_map_value",
+            HTTP_REQUEST_HEADERS,
+            b":path",
+            b"/b"
+        )
+        .await,
+        PROXY_RESULT_OK
+    );
+    assert_eq!(h.header_pairs(HTTP_REQUEST_HEADERS).await.len(), 4);
+    assert!(h
+        .store
+        .data()
+        .http_ctx
+        .request_headers
+        .contains(&(b":path".to_vec(), b"/b".to_vec())));
 }
 
 #[tokio::test]

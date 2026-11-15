@@ -255,6 +255,10 @@ impl InstancePool {
 #[derive(Default)]
 pub struct RequestSessions {
     entries: RefCell<Vec<SessionEntry>>,
+    /// 要求の属性（B-408。プロトコルの経路がモジュールを走らせる前に 1 回だけ置く）
+    request_info: std::cell::OnceCell<super::RequestInfo>,
+    /// 要求のメソッドとパス（B-408。要求ヘッダの段が置き、要求を持たない応答の段・`on_log` の context へ写す）
+    request_line: std::cell::OnceCell<(Arc<str>, Arc<str>)>,
 }
 
 pub(crate) struct SessionEntry {
@@ -265,6 +269,26 @@ pub(crate) struct SessionEntry {
 }
 
 impl RequestSessions {
+    /// 要求の属性を置く（B-408。2 回目以降は無視する）
+    pub fn set_request_info(&self, info: super::RequestInfo) {
+        let _ = self.request_info.set(info);
+    }
+
+    /// 要求の属性（B-408）
+    pub fn request_info(&self) -> Option<&super::RequestInfo> {
+        self.request_info.get()
+    }
+
+    /// 要求のメソッドとパスを置く（B-408。2 回目以降は無視する）
+    pub(crate) fn set_request_line(&self, method: &Arc<str>, path: &Arc<str>) {
+        let _ = self.request_line.set((method.clone(), path.clone()));
+    }
+
+    /// 要求のメソッドとパス（B-408）
+    pub(crate) fn request_line(&self) -> Option<&(Arc<str>, Arc<str>)> {
+        self.request_line.get()
+    }
+
     pub(crate) fn find(
         &self,
         module: usize,

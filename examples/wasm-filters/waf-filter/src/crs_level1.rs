@@ -23,111 +23,111 @@ pub fn get_rules() -> Vec<CompiledRule> {
 
 fn get_sqli_rules() -> Vec<CompiledRule> {
     vec![
-        CompiledRule::try_new(
+        CompiledRule::builtin(
             "crs-942100",
             "SQL Injection - UNION SELECT",
             r"(?i)\bunion\b\s+(all\s+)?select\b",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-942110",
             "SQL Injection - Basic SELECT FROM",
             r"(?i)\bselect\b.{1,100}\bfrom\b.{1,100}\bwhere\b",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-942120",
             "SQL Injection - DROP/DELETE/TRUNCATE",
             r"(?i)(\bdrop\b\s+\b(table|database|schema)\b|\bdelete\b\s+\bfrom\b|\btruncate\b\s+\btable\b)",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-942130",
             "SQL Injection - INSERT INTO",
             r"(?i)\binsert\b\s+\binto\b\s+\w+\s*\(",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-942140",
             "SQL Injection - UPDATE SET",
             r"(?i)\bupdate\b\s+\w+\s+\bset\b\s+\w+\s*=",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-942150",
             "SQL Injection - Boolean Logic",
             r#"(?i)('|")\s*(or|and)\s*('|")?\s*(=|1|true)"#,
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
+        ),
     ]
 }
 
 fn get_xss_rules() -> Vec<CompiledRule> {
     vec![
-        CompiledRule::try_new(
+        CompiledRule::builtin(
             "crs-941100",
             "XSS - Script Tag",
             r"(?i)<\s*script[^>]*>",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-941110",
             "XSS - JavaScript URI",
             r"(?i)javascript\s*:",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-941120",
             "XSS - Event Handlers",
             r"(?i)\bon(error|load|click|mouse|focus|blur|change|submit|key|touch)\s*=",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-941130",
             "XSS - Iframe/Frame/Object/Embed",
             r"(?i)<\s*(iframe|frame|object|embed)[^>]*>",
             Severity::High,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
+        ),
     ]
 }
 
 fn get_path_traversal_rules() -> Vec<CompiledRule> {
     vec![
-        CompiledRule::try_new(
+        CompiledRule::builtin(
             "crs-930100",
             "Path Traversal - Basic",
             r"(\.\.(/|\\|%2f|%5c)){2,}",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
-        CompiledRule::try_new(
+        ),
+        CompiledRule::builtin(
             "crs-930110",
             "Path Traversal - Sensitive Files",
             r"(?i)(/etc/(passwd|shadow|hosts)|/proc/self|c:\\\\windows\\\\system32)",
             Severity::Critical,
             WafAction::Block,
             vec![],
-        ).expect("CRS rule should be valid"),
+        ),
     ]
 }

@@ -950,6 +950,30 @@ impl std::fmt::Display for KernelVersion {
 // セキュリティ制限の適用
 // ====================
 
+/// seccomp の下での実行可能なメモリの作成（`mmap`・`mprotect` の `PROT_EXEC`。F-25）の扱い（B-404）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecMemory {
+    /// 制限しない（seccomp を掛けていない）
+    Allowed,
+    /// 通すが記録する（`log`）
+    Logged,
+    /// 拒否する（`filter`・`strict`）
+    Denied,
+}
+
+/// [`ExecMemory`] を数にしたもの（0 = Allowed、1 = Logged、2 = Denied）。seccomp を掛けた後に 1 度だけ書く
+static EXEC_MEMORY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// このプロセスで実行可能なメモリを作れるか（B-404）。WASM のモジュールをネイティブのコードへコンパイルできるかの
+/// 判断に使う（設定のリロードのときだけ見る）
+pub fn exec_memory() -> ExecMemory {
+    match EXEC_MEMORY.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ExecMemory::Logged,
+        2 => ExecMemory::Denied,
+        _ => ExecMemory::Allowed,
+    }
+}
+
 /// セキュリティ制限を適用
 ///
 /// 権限降格後、ワーカースレッド起動前に呼び出すことを推奨。
@@ -1018,6 +1042,14 @@ pub fn apply_security_restrictions(config: &SecurityConfig) -> io::Result<()> {
     if config.enable_seccomp && config.seccomp_mode != SeccompMode::Disabled {
         if kernel.supports_seccomp() {
             apply_seccomp(config)?; // 既にエラーを返している
+            let exec_memory = match config.seccomp_mode {
+                SeccompMode::Log => 1,
+                SeccompMode::Filter | SeccompMode::Strict => 2,
+                SeccompMode::Disabled => 0,
+            };
+            if cfg!(target_os = "linux") {
+                EXEC_MEMORY.store(exec_memory, std::sync::atomic::Ordering::Relaxed);
+            }
             info!("seccomp filter applied (mode: {:?})", config.seccomp_mode);
         } else {
             return Err(io::Error::new(

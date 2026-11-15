@@ -31,6 +31,8 @@ mod openbsd_stack;
 pub mod persistent_context;
 pub mod queue_notify;
 mod registry;
+// B-404: エンジンを作った元の `[wasm]` とファイルの印
+mod source;
 // B-179: shared data の表（モジュール名ごとにプロセスで共有）
 pub(crate) mod shared_data;
 pub mod tick_manager;
@@ -41,7 +43,7 @@ mod tests;
 
 pub use capabilities::{CapabilityPreset, ModuleCapabilities};
 pub use constants::*;
-pub use context::{HostState, HttpContext};
+pub use context::{HostState, HttpContext, RequestInfo};
 pub use engine::{
     BodyFilterResult, FilterEngine, FilterResult, NetworkAction, NetworkFilterResult, RequestMeta,
 };
@@ -79,7 +81,7 @@ pub use queue_notify::{
     get_queue_stats, notify_queue_subscribers, process_pending_notifications, queue_enqueued,
     subscribe_to_queue, unsubscribe_from_queue, QueueStats,
 };
-pub use registry::ModuleRegistry;
+pub use registry::{uses_pulley, ModuleRegistry};
 pub use tick_manager::{
     get_min_tick_period, get_tick_stats, process_ticks, register_tick, TickStats,
 };

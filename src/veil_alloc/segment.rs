@@ -204,9 +204,7 @@ impl Segment {
         self.zero_mask &= !m;
         stats::DIRTY_SLOTS.fetch_sub(was_dirty, Ordering::Relaxed);
         stats::ACTIVE_SLOTS.fetch_add(n, Ordering::Relaxed);
-        for i in first..first + n {
-            self.slot_head[i] = first as u8;
-        }
+        self.slot_head[first..first + n].fill(first as u8);
         zero
     }
 

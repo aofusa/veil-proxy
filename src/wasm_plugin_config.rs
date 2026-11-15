@@ -222,6 +222,15 @@ impl WasmModules {
     pub fn sessions(&self) -> Option<&crate::wasm::RequestSessions> {
         self.sessions.as_deref()
     }
+
+    /// ゲストに見せる要求の属性（`:authority`・`:scheme`・プロトコル。B-408）を置く。要求ごとの状態が無い並び
+    /// （モジュールが無い・[`Self::shared`]）では何もしない
+    #[cfg(feature = "wasm")]
+    pub fn set_request_info(&self, info: crate::wasm::RequestInfo) {
+        if let Some(s) = &self.sessions {
+            s.set_request_info(info);
+        }
+    }
 }
 
 impl std::ops::Deref for WasmModules {

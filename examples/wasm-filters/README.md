@@ -60,31 +60,54 @@ target/wasm32-wasip1/release/
 ### 設定例 (config.toml)
 
 ```toml
-# WASMフィルタを有効化
+# WASMフィルタを読み込む（モジュールごとに名前・パス・設定・権限を書く）
+[wasm]
+enabled = true
+
+[[wasm.modules]]
+name = "waf"
+path = "/path/to/waf_filter.wasm"
+# インスタンスを要求の間で使い回す（ルールの正規表現をインスタンスごとに 1 回だけ組み立てる）
+instance_reuse = true
+configuration = '''
+{
+  "mode": "block",
+  "crs_level": "2"
+}
+'''
+[wasm.modules.capabilities]
+allow_logging = true
+allow_request_headers_read = true
+allow_send_local_response = true
+
+[[wasm.modules]]
+name = "lua"
+path = "/path/to/lua_filter.wasm"
+configuration = '''
+{
+  "script": "function on_request() veil.log('info', veil.get_path()) return 'continue' end"
+}
+'''
+[wasm.modules.capabilities]
+allow_logging = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_response_headers_read = true
+allow_response_headers_write = true
+allow_send_local_response = true
+
+# ルートの modules に並べた順に走る
 [[route]]
+modules = ["waf", "lua"]
 [route.conditions]
 path = "/api/*"
 [route.action]
 type = "Proxy"
 upstream = "backend"
-
-[[routes.wasm_filters]]
-path = "/path/to/waf_filter.wasm"
-config = '''
-{
-  "mode": "block",
-  "rules": ["sqli", "xss"]
-}
-'''
-
-[[routes.wasm_filters]]
-path = "/path/to/lua_filter.wasm"
-config = '''
-{
-  "script": "function on_request() veil.log('info', veil.get_path()) return 'continue' end"
-}
-'''
 ```
+
+権限（`capabilities`）は既定ですべて無効です。各フィルタの README の設定例と、
+[docs/guide/wasm.md](../../docs/guide/wasm.md) を参照してください。
 
 ## フィルタ詳細
 

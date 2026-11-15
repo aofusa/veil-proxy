@@ -9,7 +9,7 @@ VeilはProxy-Wasm ABI v0.2.1に完全準拠したWASM拡張システムを提供
 ### 特徴
 
 - **Proxy-Wasm v0.2.1準拠**: Nginx/Envoyと100%互換
-- **AOTコンパイル・自動キャッシュ**: モジュールを AOT コンパイルし、初回ロード時に `.wasm` の隣へ `.cwasm` サイドカーを自動生成。次回起動時はそれを `deserialize` して高速起動する（`.wasm` が新しい場合や wasmtime 版が変わった場合は自動無効化し、エラー時は再コンパイルへフォールバック）。明示的な `.cwasm` パス指定も可。
+- **AOTコンパイル・自動キャッシュ**: モジュールを AOT コンパイルし、初回ロード時に `.wasm` の隣へ中身の印を名前に入れたサイドカー（`<モジュール>.wasm.<ハッシュ>.cwasm`。`.wasm` の xxh3-128）を自動生成。次回起動時はそれを `deserialize` して高速起動する。`.wasm` の中身が変われば mtime に関係なく別のキャッシュになるので、古い版のモジュールを戻しても（`cp -p`・tar・パッケージの版下げ）新しい版のネイティブのコードを読まない。新しいキャッシュを書いたら前の中身のキャッシュは消す。wasmtime の版が違うキャッシュはコンパイルし直し、エラー時も再コンパイルへフォールバックする。以前の名前 `<モジュール>.wasm.cwasm` はもう読まず、消しもしない（設定で指定していなければ消してよい）。明示的な `.cwasm` パス指定も可。
 - **Pooling Allocator**: 高速なインスタンス化
 - **非同期実行（Head-of-Line ブロッキングなし）**: wasmtime async support + Fuel ベースの協調的 yield（ゲストの CPU 時間で約 1ms ごと。`yield_interval_us`）で実行。CPU バウンドなフィルタが io_uring ワーカーの他 I/O をストールさせない
 - **Capability制限**: モジュールごとの細かい権限制御（デフォルト全て無効）
@@ -163,6 +163,23 @@ veil は本文を全部読んでから（Content-Length・chunked。上限は `m
 HTTP/1.1 では、フィルタのローカル応答（`send_local_response`）の後も接続を続け、本文の後ろにパイプラインで届いた要求を
 続けて処理する。ローカル応答の本文は、`HEAD` の要求（`Content-Length` は本文の長さのまま）と `1xx`・`204`・`304` では送らない。
 
+### 疑似ヘッダと要求のプロパティ
+
+Envoy と同じく、要求ヘッダの表には他のヘッダの前に `:authority`・`:path`・`:method`・`:scheme`、応答ヘッダの表には `:status` が
+見える。HTTP/1.1・HTTP/2・HTTP/3 と、HTTP/2・HTTP/3 の WebSocket のどれでも同じで、Envoy 向けのフィルタは
+`get_http_request_header(":path")` をそのまま読める。`:path` はクエリ文字列を含む。`:authority` は要求の `:authority`、HTTP/1.1 では
+`Host` ヘッダ（`Host` の無い HTTP/1.0 の要求には無い）。`:scheme` は TLS の接続では `https`、平文の HTTP/1.1 では `http`、HTTP/2 では
+要求の `:scheme`。HTTP/2・HTTP/3 の WebSocket の要求（拡張 CONNECT）の `:method` は、veil が上流へ送る `GET` になる。
+応答の段と `on_log` からも要求の疑似ヘッダは見えるが、それ以外の要求ヘッダは見えない。必要なフィルタは `instance_reuse = true` に
+して HTTP の context に持っておく。
+
+疑似ヘッダは読み取りだけ。置き換え・追加・削除は `BadArgument` を返し、フィルタからパス・メソッド・authority・状態コードは
+書き換えられない。今と同じ値に置くことは受け付けて何も変えないので、読んだ表をそのまま `set_http_request_headers` で
+書き戻せる。veil はこれらをヘッダとして転送しない。
+
+プロパティ `request.host`（`:authority` と同じ値）・`request.scheme`・`request.protocol`（`HTTP/1.0`・`HTTP/1.1`・`HTTP/2`・
+`HTTP/3`）も同じ。
+
 ### VM の文脈の使い回し（`instance_reuse`）
 
 ```toml
@@ -206,11 +223,14 @@ status = 404
 name = "baseline"
 path = "/etc/veil/wasm/baseline_filter.wasm"
 data_files = { dataset = "/etc/veil/data/dataset.json" }
+
+[wasm.modules.capabilities]
+allowed_properties = ["plugin_data.*"]
 ```
 
 各ファイルは設定のロード時（起動・リロード）に読み、プロパティ `plugin_data.<名前>` としてフィルタに見せる
 （`get_property(["plugin_data", "dataset"])`）。要求ごとのディスクの読み取りは無い。ファイルが無ければ設定のエラー。
-モジュールに `allowed_properties` を書くなら `"plugin_data.*"` を含める。
+他のプロパティと同じく、モジュールの `allowed_properties` に含めたときだけ読める（`"plugin_data.*"` か `"plugin_data.dataset"`）。
 
 ### デフォルト設定
 
@@ -269,6 +289,13 @@ L4 のネットワークフィルタ（`[[l4]] wasm_modules`）も同じ `failur
 だけで、それ以外の名前は設定を拒否する。FreeBSD の capability mode では起動後に `.wasm` を開けないので、`[wasm]` を変える
 リロードは拒否する（変更は再起動で反映する）。
 
+Linux で `[security] seccomp_mode = "filter"`・`"strict"` のときは、起動後に実行可能なメモリを作れないので、リロードでモジュールを
+ネイティブのコードへコンパイルできない。リロードの `[wasm]` とモジュール・`data_files` のファイルが変わっていなければ、動いている
+モジュールをそのまま使い（`_start`・`proxy_on_configure` は走らせ直さない）、残りの設定を反映する。`[wasm]` かそれらのファイルを
+変えたリロードは拒否し、前の設定のまま動く（変更は再起動で反映する）。`interpreter = true` のモジュールは実行可能なメモリが
+要らないので、そのようなリロードも従来どおり反映する。`seccomp_mode = "log"` も同じように判断し、コンパイルが要るリロードは
+通して警告を出す（カーネルの記録には `filter`・`strict` で拒否されるコンパイルだけが残る）。
+
 0.11.0 より前は失敗しても常に続けていた（今の `fail_open` と同じ。メトリクスは無かった）。`[wasm.defaults]` に
 `failure_policy = "fail_open"` を書くと以前と同じになる。
 
@@ -304,6 +331,8 @@ L4 のネットワークフィルタ（`[[l4]] wasm_modules`）も同じ `failur
 | `allow_send_local_response` | ローカルレスポンス送信 | false |
 | `allow_http_calls` | HTTP外部呼び出し | false |
 | `allowed_upstreams` | `proxy_http_call`・`proxy_grpc_call` が呼べる上流。空なら全上流グループを許す | [] |
+| `allowed_properties` | `proxy_get_property` で読めるプロパティ。パスそのもの（`"source.address"`）・接頭辞（`"request.*"`）・`"*"`。空なら何も読めず、許していないプロパティは無いものとして返る。veil が用意するのは `request.path`・`request.url_path`・`request.host`・`request.method`・`request.scheme`・`request.protocol`・`request.query`・`request.time`・`request.total_size`・`response.code`・`response.code_details`・`source.address`・`destination.address`・`plugin_name`・`plugin_root_id`・`plugin_data.<名前>` | [] |
+| `allow_property_write` | `proxy_set_property` でカスタムのプロパティを書く | false |
 
 capability の無いホスト関数は `NotAllowed` を返す。その状態を unwrap する SDK（Rust の `proxy-wasm` は多くの呼び出しでそうする）は
 panic し、コールバックがトラップして要求は `failure_policy` で扱われる（既定は `503`）。veil は、`proxy_send_local_response`・

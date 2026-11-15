@@ -82,6 +82,11 @@ seccomp_mode = "filter"  # "log" / "filter" / "strict"
 `setuid`・`setgid`・`setgroups`・`setresuid`・`setresgid` は許可しません（veil はフィルタを掛ける前に権限を降格します）。
 これらの検査は v0.10.0 で足しました。
 
+`filter`・`strict` では `PROT_EXEC` を拒否するので、設定のリロードは Proxy-Wasm のモジュールをネイティブのコードへ
+コンパイルできません。`[wasm]` とモジュールのファイルが変わっていなければ動いているモジュールを使い続け、変わっていれば
+リロードを拒否します（[Proxy-Wasm](wasm.md#失敗の扱い)）。`log` も同じように使い続け、コンパイルが要るリロードは通して
+警告します。
+
 **サンドボックスが掛かるスレッド。** veil は seccomp のフィルタを `SECCOMP_FILTER_FLAG_TSYNC` で掛けるので、先に作った
 制御プレーンのスレッド（ログ・設定と証明書のリロード・VDS・ACME・ヘルスチェック・キャッシュの掃除・Proxy-Wasm の tick と gRPC）を
 含むプロセスの全スレッドに効きます。Landlock にはこれに当たるものが無く、掛けたスレッドとその後に作るスレッド（メインスレッド・

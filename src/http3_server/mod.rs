@@ -1628,6 +1628,8 @@ impl Http3Handler {
                     path: Bytes::copy_from_slice(path),
                     authority: Bytes::copy_from_slice(authority),
                     protocol: Bytes::copy_from_slice(protocol),
+                    #[cfg(feature = "wasm")]
+                    scheme: "https",
                     headers: headers
                         .iter()
                         .filter(|h| !h.name().starts_with(b":"))
@@ -3422,11 +3424,27 @@ mod tests {
         ));
     }
 
+    /// `runtime::block_on` を使えるか。docker build のサンドボックス等、io_uring が拒否される環境ではランタイムを
+    /// 起動できない（`http3_stream` のテストと同じ判定）
+    #[cfg(all(target_os = "linux", veil_rt_uring))]
+    fn runtime_available() -> bool {
+        crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
+    #[cfg(all(target_os = "linux", not(veil_rt_uring)))]
+    fn runtime_available() -> bool {
+        true
+    }
+
     /// B-361: GSO を有効にしたソケットでも、cmsg の無い単発の送信は分割されない（1200 バイトを超える単発のパケット・
     /// 経路 MTU の探索のパケットがそのまま届く）。束は cmsg のセグメント長で分かれる
     #[cfg(target_os = "linux")]
     #[test]
     fn gso_socket_keeps_single_large_packets_whole() {
+        if !runtime_available() {
+            eprintln!("io_uring unavailable; skipping");
+            return;
+        }
         let recv = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         recv.set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
@@ -3484,6 +3502,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn gso_batch_carries_a_short_last_segment() {
+        if !runtime_available() {
+            eprintln!("io_uring unavailable; skipping");
+            return;
+        }
         let recv = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         recv.set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
@@ -3530,21 +3552,20 @@ mod tests {
 
     /// F-305: カーネルが GSO の束を拒む経路（チェックサムを付けないソケット。`SO_NO_CHECK` で `EINVAL` になる）では、
     /// ソケットの GSO を下ろし、拒まれた束を 1 パケットずつ送り直す（パケットを失わない）。sendmmsg の経路と
-    /// io_uring の送出の経路（使えるときだけ）の両方で確かめる
+    /// io_uring の送出の経路（io_uring のビルドだけ）の両方で確かめる
     #[cfg(target_os = "linux")]
     #[test]
     fn gso_rejection_falls_back_to_single_packets() {
-        #[cfg(veil_rt_uring)]
-        let uring = crate::runtime::ring::IoUring::new(8, 0).is_ok();
-        #[cfg(not(veil_rt_uring))]
-        let uring = false;
-        let mut paths = vec![false];
-        if uring {
-            paths.push(true);
-        } else {
-            eprintln!("io_uring unavailable; checking only the sendmmsg path");
+        if !runtime_available() {
+            eprintln!("io_uring unavailable; skipping");
+            return;
         }
-        for use_uring in paths {
+        let paths: &[bool] = if cfg!(veil_rt_uring) {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        for &use_uring in paths {
             let recv = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             recv.set_read_timeout(Some(std::time::Duration::from_secs(2)))
                 .unwrap();

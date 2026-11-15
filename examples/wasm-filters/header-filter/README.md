@@ -44,16 +44,25 @@ cargo build --target wasm32-wasip1 --release
 ### veil-proxy設定（config.toml）
 
 ```toml
+[wasm]
+enabled = true
+
+[[wasm.modules]]
+name = "header_filter"
+path = "/path/to/header_filter.wasm"
+# configuration は不要
+[wasm.modules.capabilities]
+allow_logging = true
+allow_request_headers_write = true
+allow_response_headers_write = true
+
 [[route]]
+modules = ["header_filter"]
 [route.conditions]
 path = "/api/*"
 [route.action]
 type = "Proxy"
 upstream = "backend"
-
-[[routes.wasm_filters]]
-path = "/path/to/header_filter.wasm"
-# configは不要
 ```
 
 ## 動作フロー

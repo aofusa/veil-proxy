@@ -942,6 +942,16 @@ pub(super) async fn handle_requests(
                 let headers_for_proxy = if modules_to_apply.is_empty() {
                     headers_for_proxy
                 } else {
+                    // B-408: ゲストに見せる `:authority`・`:scheme`・プロトコル（要求のすべての段で使う）
+                    modules_to_apply.set_request_info(crate::wasm::RequestInfo {
+                        authority: Arc::from(std::str::from_utf8(&host_bytes).unwrap_or("")),
+                        scheme: if tls_stream.is_plain() {
+                            "http"
+                        } else {
+                            "https"
+                        },
+                        protocol: if http10 { "HTTP/1.0" } else { "HTTP/1.1" },
+                    });
                     let config = CURRENT_CONFIG.load();
                     if let Some(ref wasm_engine) = config.wasm_filter_engine {
                         // routes内で指定されたmodulesを優先

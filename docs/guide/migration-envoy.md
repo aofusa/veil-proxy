@@ -27,7 +27,7 @@ compared response by response (`tests/migration/`).
 | `clusters[]` | `[upstreams."<name>"]` | `lb_policy`, health checks, outlier detection, circuit breaker. |
 | `load_assignment.endpoints` | `servers = [...]` | URLs with weights. |
 | HTTP filters (`envoy.filters.http.*`) | route-level settings and Proxy-Wasm modules | See the tables below. |
-| `envoy.filters.http.wasm` | `[wasm]` + route `modules` | Proxy-Wasm ABI 0.2.1: Envoy's Rust / C++ / TinyGo filters run unchanged ([wasm.md](wasm.md)). |
+| `envoy.filters.http.wasm` | `[wasm]` + route `modules` | Proxy-Wasm ABI 0.2.1: Envoy's Rust / C++ / TinyGo filters run unchanged, including reading `:path` and the other pseudo-headers; rewriting pseudo-headers is not supported ([wasm.md](wasm.md#pseudo-headers-and-request-properties)). |
 | xDS (LDS / RDS / CDS / EDS) | [VDS](vds.md) | Routes and upstreams only, State-of-the-World; listeners and TLS need a restart. |
 | `admin` | `[admin]`, `[prometheus]` | Reload status, metrics on `/__metrics`. |
 | hot restart | `SIGHUP` | Zero-downtime reload in the same process; the listeners are kept. |

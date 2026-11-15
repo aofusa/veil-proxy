@@ -54,3 +54,11 @@ CPU の量（燃料）は足りていても実時間が 1 秒を超え、`interr
   `proxy_on_context_create` が `wasm trap: interrupt` で落ちる。
 - clippy（`full`・`full,epoll`、`-D warnings`）、WASM の単体試験 173 件。
 - E2E: io_uring を 2 回・epoll を 1 回回して、594 件がすべて通った。
+
+## 追記（2026-11-14）
+
+修正の後も、main の CI を直す途中の E2E（seccomp の `log`）で `coverage::test_http3_wasm_local_response` が 1 回 503 になった。
+残っていた原因は試験に使うモジュールの側にあった: `tests/fixtures/wasm/waf_filter.wasm` は最初の版の例からビルドしたもので、
+要求のコールバック（`on_http_request_headers`）が毎回すべての規則の正規表現をコンパイルしていた（1 要求 50〜58 ms）。負荷の
+高いときに要求のコールバックの実時間の締切（約 1 秒）を超えていた。[B-406](B-406-waf-example-fixture-compiles-rules-per-request.md)
+で例を直してビルドし直した。

@@ -70,8 +70,8 @@ cargo build --target wasm32-wasip1 --release
 | `anomaly_scoring` | bool | false | 異常スコアリングモード（true: スコア累積、false: 即座にブロック） |
 | `anomaly_threshold` | number | 5 | 異常スコア閾値（anomaly_scoring=true時） |
 | `inspect_body` | bool | false | リクエストボディを検査するか |
-| `whitelist_paths` | array | ["/health", "/metrics"] | 検査をスキップするパス |
-| `whitelist_ips` | array | [] | 検査をスキップするIPアドレス |
+| `whitelist_paths` | array | ["/health", "/metrics"] | 検査をスキップするパス（そのパスとその下だけ。クエリ文字列は見ない） |
+| `whitelist_ips` | array | [] | 検査をスキップするクライアントのアドレス・CIDR（IPv4・IPv6。`source.address` の読み取りが要る） |
 | `custom_rules` | array | [] | カスタムルール定義 |
 
 ## CRS保護レベル
@@ -140,8 +140,12 @@ Level 2に加えて、高度な攻撃手法を検出します。
    - モードが`off`の場合は通過
 
 2. **ホワイトリストチェック**
-   - パスが`whitelist_paths`に含まれる場合は通過
-   - IPアドレスが`whitelist_ips`に含まれる場合は通過
+   - 接続の相手のアドレス（プロパティ `source.address`）が`whitelist_ips`のアドレス・CIDR に含まれる場合は通過。
+     クライアントが書ける `X-Forwarded-For`・`X-Real-IP` 等のヘッダは見ません。`source.address` を読めない
+     （モジュールの `allowed_properties` に無い）ときは許可リストは効かず、検査します
+   - パス（クエリ文字列を除く）が`whitelist_paths`のパスそのもの、またはその下（`/health` なら `/health/live`。`/healthz`
+     は含まない）の場合は通過。`%` の符号化・`;`・`\`・`.`・`..` の区切りを含むパスは、上流が別のパスに解釈し得るので
+     許可しません
 
 3. **検査対象の収集**
    - URI/パス
@@ -184,16 +188,15 @@ Level 2に加えて、高度な攻撃手法を検出します。
 ### veil-proxy設定（config.toml）
 
 ```toml
-[[route]]
-[route.conditions]
-path = "/api/*"
-[route.action]
-type = "Proxy"
-upstream = "backend"
+[wasm]
+enabled = true
 
-[[routes.wasm_filters]]
+[[wasm.modules]]
+name = "waf"
 path = "/path/to/waf_filter.wasm"
-config = '''
+# インスタンスを要求の間で使い回す（ルールの正規表現をインスタンスごとに 1 回だけ組み立てる）
+instance_reuse = true
+configuration = '''
 {
   "mode": "block",
   "crs_level": "2",
@@ -202,9 +205,33 @@ config = '''
   "whitelist_paths": ["/health", "/metrics", "/public"]
 }
 '''
+[wasm.modules.capabilities]
+allow_logging = true
+allow_request_headers_read = true
+# inspect_body を使うとき
+allow_request_body_read = true
+allow_send_local_response = true
+# whitelist_ips を使うとき（接続の相手のアドレス）
+allowed_properties = ["source.address"]
+
+[[route]]
+modules = ["waf"]
+[route.conditions]
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "backend"
 ```
 
 ## 注意事項
+
+- ルールの正規表現は `on_configure`（インスタンスの起動時）に 1 つの `RegexSet` へまとめてコンパイルし、要求ごとの
+  HTTP コンテキストはそれを共有します（要求ごとにコンパイルし直さない）。veil では `instance_reuse = true` にすると
+  インスタンスを使い回すので、コンパイルはインスタンスごとに 1 回になります（`false` だと要求ごとに新しいインスタンスを作るので、
+  要求ごとに起動時の処理が走ります）
+- 正規表現は ASCII のバイト列として照合します（`\w`・`\s`・`\b`・`\d`・`.`・`(?i)` は ASCII だけ）。Unicode の文字クラスは
+  `(?u:...)` で明示したときだけ使えます。Unicode のままだと `.{1,100}` のような部分が巨大なオートマトンになり、ルールの
+  組み立てが veil の起動時の CPU の予算（`max_execution_time_ms`、既定 100ms）に収まりません
 
 - 本番環境では`whitelist_paths`を適切に設定してください
 - 誤検知を避けるため、まず`detect`モードでテストしてから`block`モードに切り替えることを推奨します

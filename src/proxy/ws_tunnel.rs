@@ -31,6 +31,9 @@ pub(crate) struct TunnelRequest {
     pub(crate) authority: Bytes,
     /// `:protocol`
     pub(crate) protocol: Bytes,
+    /// `:scheme`（`http` か `https`。Proxy-Wasm のゲストに見せる）
+    #[cfg(feature = "wasm")]
+    pub(crate) scheme: &'static str,
     /// 疑似ヘッダ以外のヘッダ（名前は小文字）
     pub(crate) headers: Vec<(Bytes, Bytes)>,
     pub(crate) client_ip: std::rc::Rc<str>,
@@ -377,6 +380,17 @@ async fn wasm_request_headers(
         return Ok(none());
     };
     let modules = crate::wasm_plugin_config::WasmModules::for_request(modules.clone());
+    // B-408: ゲストに見せる `:authority`・`:scheme`・プロトコル（トンネルは上流へ GET の Upgrade として渡す）
+    modules.set_request_info(crate::wasm::RequestInfo {
+        authority: Arc::from(std::str::from_utf8(&req.authority).unwrap_or("")),
+        scheme: req.scheme,
+        protocol: match out {
+            #[cfg(feature = "http2")]
+            TunnelOut::H2 { .. } => "HTTP/2",
+            #[cfg(feature = "http3")]
+            TunnelOut::H3 { .. } => "HTTP/3",
+        },
+    });
     let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = req
         .headers
         .iter()

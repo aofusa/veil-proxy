@@ -140,16 +140,13 @@ WebdisはRedisコマンドをHTTP APIとして提供します。
 ### veil-proxy設定（config.toml）
 
 ```toml
-[[route]]
-[route.conditions]
-path = "/api/*"
-[route.action]
-type = "Proxy"
-upstream = "backend"
+[wasm]
+enabled = true
 
-[[routes.wasm_filters]]
+[[wasm.modules]]
+name = "cache_filter"
 path = "/path/to/cache_filter.wasm"
-config = '''
+configuration = '''
 {
   "backend": "redis",
   "redis": {
@@ -162,6 +159,24 @@ config = '''
   "upstream": "cache"
 }
 '''
+[wasm.modules.capabilities]
+allow_logging = true
+allow_request_headers_read = true
+allow_response_headers_read = true
+allow_response_headers_write = true
+allow_response_body_read = true
+allow_send_local_response = true
+allow_http_calls = true
+# dispatch_http_call の宛先（`[upstreams.cache]` に Webdis などを書く）
+allowed_upstreams = ["cache"]
+
+[[route]]
+modules = ["cache_filter"]
+[route.conditions]
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "backend"
 ```
 
 ### キャッシュバイパス

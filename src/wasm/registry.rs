@@ -60,6 +60,19 @@ fn spawn_epoch_ticker(engine: &Engine) {
     }
 }
 
+/// `config` のエンジンが Pulley インタープリタで動くか（ネイティブのコードを作らない）。
+///
+/// OpenBSD/NetBSD、および `veil_wasm_nosignals`（B-55: netbsd 全アーキ・freebsd/openbsd の aarch64。
+/// third_party/wasmtime = veil-proxy-wasmtime を使うターゲット）は設定値を無視して常に Pulley（B-52/F-140/B-55）。
+/// 他ターゲットは `[wasm] interpreter = true` のときだけ。実行可能なメモリを作れないリロードで作り直してよいかの
+/// 判断にも使う（B-404）
+pub fn uses_pulley(config: &WasmConfig) -> bool {
+    cfg!(target_os = "openbsd")
+        || cfg!(target_os = "netbsd")
+        || cfg!(veil_wasm_nosignals)
+        || config.interpreter
+}
+
 /// import する host 関数と、それを使うのに要る capability（B-299）。ヘッダ・本文の読み書きは引数の
 /// map の種類で決まるので、import からは判断できない（ここに載せない）
 const IMPORT_CAPABILITIES: &[(&str, &str, fn(&ModuleCapabilities) -> bool)] = &[
@@ -140,10 +153,7 @@ impl ModuleRegistry {
         // `veil_wasm_nosignals`（B-55: netbsd 全アーキ・freebsd/openbsd の aarch64。
         // build.rs 発行）のターゲットは third_party/wasmtime（veil-proxy-wasmtime）を使い、
         // ネイティブコードを生成しない Pulley 実行のみを前提にしているため常に Pulley。
-        let pulley = cfg!(target_os = "openbsd")
-            || cfg!(target_os = "netbsd")
-            || cfg!(veil_wasm_nosignals)
-            || config.interpreter;
+        let pulley = uses_pulley(config);
 
         let reuse_modules = config.modules.iter().filter(|m| m.instance_reuse).count();
         let mut registry = Self {
@@ -235,11 +245,7 @@ impl ModuleRegistry {
         // freebsd/openbsd の aarch64。third_party/wasmtime = veil-proxy-wasmtime を使う
         // ターゲット）は設定値を無視して常に Pulley（B-52/F-140/B-55）。
         // 他ターゲットは `[wasm] interpreter = true` のときだけ Pulley を選択する。
-        let use_pulley = cfg!(target_os = "openbsd")
-            || cfg!(target_os = "netbsd")
-            || cfg!(veil_wasm_nosignals)
-            || wasm_config.interpreter;
-        if use_pulley {
+        if uses_pulley(wasm_config) {
             // ポインタ幅に合わせて pulley64 / pulley32 を選ぶ。
             config.target(if cfg!(target_pointer_width = "64") {
                 "pulley64"
@@ -337,11 +343,16 @@ impl ModuleRegistry {
 
     /// `.wasm` を AOT サイドカーキャッシュ経由でロードする（F-36）。
     ///
-    /// 1. `<path><suffix>` が存在し `.wasm` 以降に生成されていれば `deserialize_file` で
-    ///    高速ロードする（Cranelift JIT を回避し起動時間とメモリを削減）。
-    /// 2. 不在・古い・wasmtime 版不一致（deserialize 失敗）の場合は `from_file` で
-    ///    コンパイルし、その AOT バイナリをサイドカーへ書き出す（ベストエフォート、
-    ///    書き込み失敗は無視してコンパイル済みモジュールをそのまま使う）。
+    /// 1. `.wasm` を読み、中身の xxh3-128 を名前に入れたキャッシュ `<path>.<32 桁の 16 進><suffix>` があれば
+    ///    `deserialize_file` で高速ロードする（Cranelift JIT を回避し起動時間とメモリを削減）。
+    /// 2. 無い・wasmtime 版不一致（deserialize 失敗）の場合は読んだバイト列をコンパイルし、その AOT バイナリを
+    ///    キャッシュへ書き出す（ベストエフォート、書き込み失敗は無視してコンパイル済みモジュールをそのまま使う）。
+    ///    書けたら同じ `.wasm` の古い版のキャッシュ（同じ形の名前で中身の印が違うもの）を消す。
+    ///
+    /// B-407: 以前は `<path><suffix>` の mtime が `.wasm` 以降なら新しいとみなしていたので、古い版の `.wasm` を
+    /// mtime ごと戻す（`cp -p`・tar・パッケージの入れ直し）と、新しい版のネイティブのコードを読んでいた。
+    /// 名前に中身の印を入れたので、`.wasm` の mtime・置き方に関係なく、別の中身のキャッシュは読まない。
+    /// 以前の `<path><suffix>` は読まないし消さない（設定に明示した `.cwasm` かもしれない）。
     ///
     /// `suffix` はキャッシュファイル名の拡張子で、通常は `.cwasm`。Pulley
     /// インタープリタ使用時（F-135）は `.pulley.cwasm` を渡し、Cranelift ネイティブ
@@ -359,22 +370,11 @@ impl ModuleRegistry {
         wasm_path: &Path,
         suffix: &str,
     ) -> anyhow::Result<Module> {
-        // サイドカーパス: "<path><suffix>"
-        let cache_path: PathBuf = {
-            let mut s = wasm_path.as_os_str().to_owned();
-            s.push(suffix);
-            PathBuf::from(s)
-        };
+        let wasm = std::fs::read(wasm_path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {}", wasm_path.display(), e))?;
+        let cache_path = aot_cache_path(wasm_path, &wasm, suffix);
 
-        // キャッシュが .wasm 以降に生成されていれば deserialize を試みる
-        let cache_fresh = matches!(
-            (
-                std::fs::metadata(wasm_path).and_then(|m| m.modified()),
-                std::fs::metadata(&cache_path).and_then(|m| m.modified()),
-            ),
-            (Ok(wasm_mtime), Ok(cache_mtime)) if cache_mtime >= wasm_mtime
-        );
-        if cache_fresh {
+        if cache_path.exists() {
             // SAFETY: 自前生成の AOT キャッシュのみ deserialize。版不一致/破損は Err となり
             // 下のコンパイル経路へフォールバックする。
             match unsafe { Module::deserialize_file(engine, &cache_path) } {
@@ -388,8 +388,8 @@ impl ModuleRegistry {
             }
         }
 
-        // コンパイル（JIT/AOT by Cranelift）
-        let module = Module::from_file(engine, wasm_path)?;
+        // コンパイル（JIT/AOT by Cranelift）。印を取ったのと同じバイト列をコンパイルする
+        let module = Module::new(engine, &wasm)?;
 
         // AOT バイナリをサイドカーへ書き出す（ベストエフォート、失敗は無視）。
         // tmp へ書いて rename することで部分書き込み/競合を避ける。
@@ -411,6 +411,7 @@ impl ModuleRegistry {
                     .and_then(|_| std::fs::rename(&tmp_path, &cache_path));
                 if written.is_ok() {
                     ftlog::debug!("WASM AOT cache written: {}", cache_path.display());
+                    remove_stale_aot_caches(wasm_path, &cache_path, suffix);
                 } else {
                     let _ = std::fs::remove_file(&tmp_path);
                     ftlog::debug!(
@@ -438,5 +439,177 @@ impl ModuleRegistry {
     /// Get the Wasmtime engine
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+}
+
+/// AOT キャッシュのパス `<path>.<中身の xxh3-128 の 32 桁の 16 進><suffix>`（B-407）
+fn aot_cache_path(wasm_path: &Path, wasm: &[u8], suffix: &str) -> PathBuf {
+    let mut s = wasm_path.as_os_str().to_owned();
+    s.push(format!(
+        ".{:032x}{}",
+        xxhash_rust::xxh3::xxh3_128(wasm),
+        suffix
+    ));
+    PathBuf::from(s)
+}
+
+/// `name` が `wasm_name` の AOT キャッシュの名前（`<wasm_name>.<32 桁の小文字の 16 進><suffix>`）か（B-407）
+fn is_aot_cache_name(name: &str, wasm_name: &str, suffix: &str) -> bool {
+    name.strip_prefix(wasm_name)
+        .and_then(|r| r.strip_prefix('.'))
+        .and_then(|r| r.strip_suffix(suffix))
+        .is_some_and(|h| h.len() == 32 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// 同じ `.wasm` の古い版の AOT キャッシュを消す（B-407。ベストエフォート）。消すのはこの形の名前で `keep` 以外のものだけ
+/// （以前の `<path><suffix>`・設定に明示した `.cwasm`・Pulley とネイティブのもう一方は残す）
+// 理由付き allow: AOT キャッシュの片付けは設定適用時（起動/リロード）のコールドパス。
+#[allow(clippy::disallowed_methods)]
+fn remove_stale_aot_caches(wasm_path: &Path, keep: &Path, suffix: &str) {
+    let (Some(dir), Some(wasm_name)) = (
+        wasm_path.parent(),
+        wasm_path.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_aot_cache_name(name, wasm_name, suffix) || Some(name.as_ref()) == keep.file_name() {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => ftlog::debug!("WASM AOT cache removed (stale): {}", entry.path().display()),
+            Err(e) => ftlog::debug!(
+                "WASM AOT cache not removed ({}): {}",
+                e,
+                entry.path().display()
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b407_aot_cache_name_pattern() {
+        let h = "0123456789abcdef0123456789abcdef";
+        let n = |s: &str| format!("f.wasm.{s}");
+        assert!(is_aot_cache_name(
+            &n(&format!("{h}.cwasm")),
+            "f.wasm",
+            ".cwasm"
+        ));
+        assert!(is_aot_cache_name(
+            &n(&format!("{h}.pulley.cwasm")),
+            "f.wasm",
+            ".pulley.cwasm"
+        ));
+        // 以前の名前・もう一方の種類・別のモジュール・形の違うものは消さない
+        assert!(!is_aot_cache_name("f.wasm.cwasm", "f.wasm", ".cwasm"));
+        assert!(!is_aot_cache_name(
+            &n(&format!("{h}.pulley.cwasm")),
+            "f.wasm",
+            ".cwasm"
+        ));
+        assert!(!is_aot_cache_name(
+            &n(&format!("{h}.cwasm")),
+            "f.wasm",
+            ".pulley.cwasm"
+        ));
+        assert!(!is_aot_cache_name(
+            &format!("g.wasm.{h}.cwasm"),
+            "f.wasm",
+            ".cwasm"
+        ));
+        assert!(!is_aot_cache_name(
+            &n(&format!("{}.cwasm", h.to_uppercase())),
+            "f.wasm",
+            ".cwasm"
+        ));
+        assert!(!is_aot_cache_name(
+            &n(&format!("{h}0.cwasm")),
+            "f.wasm",
+            ".cwasm"
+        ));
+        assert!(!is_aot_cache_name(&n(".cwasm"), "f.wasm", ".cwasm"));
+    }
+
+    /// B-407: 古い版の `.wasm` を mtime ごと戻しても（`cp -p`・tar）、新しい版の AOT キャッシュを読まない。
+    /// 古い版のキャッシュは新しい版を書いたときに消え、以前の名前（`<path>.cwasm`）は触らない
+    #[test]
+    // 理由付き allow: テストのフィクスチャ作成（ホットパス外）。
+    #[allow(clippy::disallowed_methods)]
+    fn b407_restoring_an_older_module_does_not_load_the_newer_cache() {
+        let dir = std::env::temp_dir().join(format!("veil-b407-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.wasm");
+        let legacy = dir.join("m.wasm.cwasm");
+        std::fs::write(&legacy, b"legacy").unwrap();
+        let engine = Engine::default();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let put = |text: &str, mtime: Option<std::time::SystemTime>| {
+            std::fs::write(&path, text).unwrap();
+            if let Some(t) = mtime {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(t)
+                    .unwrap();
+            }
+        };
+        let load = || ModuleRegistry::load_or_compile_with_cache(&engine, &path, ".cwasm").unwrap();
+        let caches = || {
+            let mut v: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|n| is_aot_cache_name(n, "m.wasm", ".cwasm"))
+                .collect();
+            v.sort();
+            v
+        };
+        let v1 = r#"(module (func (export "v1")))"#;
+        let v2 = r#"(module (func (export "v2")))"#;
+
+        put(v1, Some(old));
+        assert!(load().get_export("v1").is_some());
+        let first = caches();
+        assert_eq!(first.len(), 1);
+        // 2 回目はキャッシュから（同じ中身）
+        assert!(load().get_export("v1").is_some());
+        assert_eq!(caches(), first);
+
+        put(v2, None);
+        assert!(load().get_export("v2").is_some());
+        let second = caches();
+        assert_eq!(second.len(), 1, "the cache of the older version is removed");
+        assert_ne!(second, first);
+
+        // 古い版を古い mtime ごと戻す（新しい版のキャッシュより古い）。以前はそのキャッシュを読んでいた
+        put(v1, Some(old));
+        let m = load();
+        assert!(
+            m.get_export("v1").is_some(),
+            "loaded the newer module's cache"
+        );
+        assert!(m.get_export("v2").is_none());
+        assert_eq!(caches(), first);
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

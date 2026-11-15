@@ -1345,6 +1345,16 @@ pub(super) async fn h2_request_task(
     notify.notify();
 }
 
+/// Proxy-Wasm のゲストに見せる要求の `:scheme`（B-408。`request.scheme` も同じ）。
+/// 要求の `:scheme` が `http` なら `http`、それ以外（無い場合を含む）は `https`。
+#[cfg(all(feature = "http2", feature = "wasm"))]
+fn h2_wasm_scheme(headers: &[crate::http2::hpack::HeaderField]) -> &'static str {
+    match headers.iter().find(|h| h.name.as_ref() == b":scheme") {
+        Some(h) if h.value.as_ref() == b"http" => "http",
+        _ => "https",
+    }
+}
+
 /// 拡張 CONNECT（WebSocket over HTTP/2。F-288）の要求を [`ws_tunnel::serve`] へ渡す。
 #[cfg(feature = "http2")]
 async fn h2_serve_tunnel(
@@ -1357,6 +1367,8 @@ async fn h2_serve_tunnel(
         path: ctx.path.clone(),
         authority: ctx.authority.clone(),
         protocol: ctx.protocol.clone().unwrap_or_default(),
+        #[cfg(feature = "wasm")]
+        scheme: h2_wasm_scheme(&ctx.headers),
         headers: ctx
             .headers
             .iter()
@@ -1703,12 +1715,20 @@ pub(super) async fn h2_dispatch(
                 crate::wasm::empty_wasm_modules()
             };
             if !modules_to_apply.is_empty() {
+                // B-408: ゲストに見せる `:authority`・`:scheme`・プロトコル（疑似ヘッダはホストが context から作る）
+                modules_to_apply.set_request_info(crate::wasm::RequestInfo {
+                    authority: Arc::from(std::str::from_utf8(&ctx.authority).unwrap_or("")),
+                    scheme: h2_wasm_scheme(&ctx.headers),
+                    protocol: "HTTP/2",
+                });
                 // WASM ホスト API 境界は `Vec<u8>` 所有ペアを要求するため、ここでのみ
                 // `Bytes` → `Vec<u8>` へコピーする（guest 側は独立コピーを要するため
                 // 避けられない境界コスト。ホットパス本体〈R1/R2〉には影響しない）。
+                // 残りの疑似ヘッダ（`:scheme`）は渡さない（B-408。ゲストにはホストが context から見せる）
                 let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = ctx
                     .headers
                     .iter()
+                    .filter(|h| !h.name.starts_with(b":"))
                     .map(|h| (h.name.to_vec(), h.value.to_vec()))
                     .collect();
                 let wasm_result = wasm_engine
@@ -1838,6 +1858,7 @@ pub(super) async fn h2_dispatch(
                     .as_ref()
                     .unwrap_or(&ctx.headers)
                     .iter()
+                    .filter(|h| !h.name.starts_with(b":"))
                     .map(|h| (h.name.to_vec(), h.value.to_vec()))
                     .collect();
                 let meta = crate::wasm::RequestMeta {

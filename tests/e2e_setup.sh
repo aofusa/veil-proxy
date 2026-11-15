@@ -329,9 +329,8 @@ prepare_fixtures() {
     # 必要なディレクトリの作成
     mkdir -p "${FIXTURES_DIR}/wasm"
     mkdir -p "/tmp/veil_buffer"
-    # cp -p でソースの mtime を維持する。維持しないと毎回コピー先 .wasm の mtime が
-    # 更新され、前回生成の AOT キャッシュ（<path>.cwasm）が「古い」と判定されて
-    # 毎回 WASM を再コンパイルしてしまう（起動が数十秒遅くなる）。
+    # AOT キャッシュ（<path>.<中身の印>.cwasm。B-407）は中身で引くので、同じモジュールなら
+    # コピーし直しても再コンパイルしない（mtime は見ない）。cp -p は以前の mtime 方式の名残。
     # tests/wasm/*.wasm は gitignore 対象のため、追跡済み tests/fixtures/wasm/ をフォールバックに使う
     copy_wasm_module() {
         local name="$1"

@@ -228,16 +228,13 @@ https://auth.example.com/.well-known/jwks.json
 ### veil-proxy設定（config.toml）
 
 ```toml
-[[route]]
-[route.conditions]
-path = "/api/*"
-[route.action]
-type = "Proxy"
-upstream = "backend"
+[wasm]
+enabled = true
 
-[[routes.wasm_filters]]
+[[wasm.modules]]
+name = "jwt_filter"
 path = "/path/to/jwt_filter.wasm"
-config = '''
+configuration = '''
 {
   "algorithms": ["RS256"],
   "jwks_url": "https://auth.example.com/.well-known/jwks.json",
@@ -251,6 +248,22 @@ config = '''
   "skip_paths": ["/health", "/metrics"]
 }
 '''
+[wasm.modules.capabilities]
+allow_logging = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_send_local_response = true
+allow_http_calls = true
+# JWKS を取りに行く宛先（`[upstreams.jwks]` に認可サーバを書く）
+allowed_upstreams = ["jwks"]
+
+[[route]]
+modules = ["jwt_filter"]
+[route.conditions]
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "backend"
 ```
 
 ### リクエスト例

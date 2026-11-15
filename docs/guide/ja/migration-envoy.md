@@ -27,7 +27,7 @@ Envoy 1.36 と veil 0.9 で確かめました。下の完全な設定例はす�
 | `clusters[]` | `[upstreams."<name>"]` | `lb_policy`、ヘルスチェック、外れ値の検出、サーキットブレーカー。 |
 | `load_assignment.endpoints` | `servers = [...]` | 重み付きの URL。 |
 | HTTP のフィルタ（`envoy.filters.http.*`） | ルートの設定と Proxy-Wasm のモジュール | 下の表。 |
-| `envoy.filters.http.wasm` | `[wasm]` + ルートの `modules` | Proxy-Wasm ABI 0.2.1。Envoy 向けの Rust・C++・TinyGo のフィルタがそのまま動く（[wasm.md](wasm.md)）。 |
+| `envoy.filters.http.wasm` | `[wasm]` + ルートの `modules` | Proxy-Wasm ABI 0.2.1。Envoy 向けの Rust・C++・TinyGo のフィルタがそのまま動く（`:path` 等の疑似ヘッダも読める。疑似ヘッダの書き換えはできない。[wasm.md](wasm.md#疑似ヘッダと要求のプロパティ)）。 |
 | xDS（LDS・RDS・CDS・EDS） | [VDS](vds.md) | ルートと上流だけ、State-of-the-World。リスナーと TLS の変更は再起動が要る。 |
 | `admin` | `[admin]`、`[prometheus]` | 読み直しの状態、`/__metrics` のメトリクス。 |
 | hot restart | `SIGHUP` | 同じプロセスのまま止めずに読み直す。リスナーはそのまま。 |

@@ -227,6 +227,146 @@ allow_response_headers_write = true
     assert_eq!(r.header("x-b383"), Some("1"), "{:?}", r);
 }
 
+// ===================== B-404 =====================
+
+/// B-404: seccomp（strict）を掛けた後の SIGHUP のリロードは、WASM のモジュールをネイティブのコードへコンパイルし直さない
+/// （`mprotect(PROT_EXEC)` が拒否され、プロセスごと落ちていた）。`[wasm]` もファイルも同じなら起動時のエンジンを使い続けて
+/// 他の変更を反映し、`[wasm]` が変わったリロードは断って前の設定のまま動く。`interpreter = true`（Pulley）なら作り直せる。
+#[cfg(all(target_os = "linux", feature = "wasm"))]
+#[test]
+fn b404_reload_under_seccomp_keeps_compiled_wasm() {
+    let dir = tempfile::tempdir().unwrap();
+    let wat = dir.path().join("adder.wat");
+    std::fs::write(&wat, B383_HEADER_ADDER).unwrap();
+    let www = dir.path().join("www");
+    std::fs::create_dir(&www).unwrap();
+    std::fs::write(www.join("a.txt"), "static").unwrap();
+    let (up, _seen) =
+        standalone::parity::spawn_recording_upstream(|_| (200, String::new(), b"up".to_vec()));
+    let port = free_port();
+    let config = |wasm_extra: &str, static_prefix: Option<&str>| {
+        let static_route = static_prefix
+            .map(|p| {
+                format!(
+                    r#"
+[[route]]
+[route.conditions]
+path = "/{p}/*"
+[route.action]
+type = "File"
+path = "{www}"
+"#,
+                    www = tp(&www)
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[security]
+enable_seccomp = true
+seccomp_mode = "strict"
+[wasm]
+enabled = true
+{wasm_extra}
+[[wasm.modules]]
+name = "adder"
+path = "{wat}"
+[wasm.modules.capabilities]
+allow_response_headers_read = true
+allow_response_headers_write = true
+{static_route}
+[[route]]
+modules = ["adder"]
+[route.conditions]
+path = "/"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}/"
+"#,
+            wat = tp(&wat)
+        )
+    };
+    let filtered = || {
+        http1_get(port, "/x")
+            .map(|r| r.status == 200 && r.header("x-b383") == Some("1"))
+            .unwrap_or(false)
+    };
+    let served = |prefix: &str| {
+        http1_get(port, &format!("/{prefix}/a.txt"))
+            .map(|r| r.status == 200 && r.body == b"static")
+            .unwrap_or(false)
+    };
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, config("", None)).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(30)),
+        "{}",
+        veil.log()
+    );
+    assert!(
+        filtered(),
+        "filter did not run at startup; log:\n{}",
+        veil.log()
+    );
+
+    // `[wasm]` は同じでルートを足したリロード: 反映され、フィルタも走り続ける（プロセスは落ちない）
+    std::fs::write(&cfg_path, config("", Some("s1"))).unwrap();
+    veil.sighup();
+    assert!(
+        wait_until(Duration::from_secs(10), || served("s1")),
+        "reload with the same [wasm] was not applied; log:\n{}",
+        veil.log()
+    );
+    assert!(filtered(), "filter lost after reload; log:\n{}", veil.log());
+
+    // `[wasm]` を変えたリロード: 断られ、前の設定（フィルタ有り・s1 有り）のまま
+    std::fs::write(
+        &cfg_path,
+        config("[wasm.defaults]\nmax_execution_time_ms = 50", Some("s2")),
+    )
+    .unwrap();
+    veil.sighup();
+    assert!(
+        wait_until(Duration::from_secs(10), || veil
+            .log()
+            .contains("seccomp forbids executable memory")),
+        "reload changing [wasm] was not rejected; log:\n{}",
+        veil.log()
+    );
+    assert!(
+        filtered(),
+        "filter lost after rejected reload; log:\n{}",
+        veil.log()
+    );
+    assert!(served("s1"), "previous routes lost; log:\n{}", veil.log());
+    assert!(
+        !served("s2"),
+        "rejected routes applied; log:\n{}",
+        veil.log()
+    );
+
+    // Pulley へ切り替えるリロード: 実行可能なメモリが要らないので作り直せる
+    std::fs::write(&cfg_path, config("interpreter = true", Some("s3"))).unwrap();
+    veil.sighup();
+    assert!(
+        wait_until(Duration::from_secs(20), || served("s3")),
+        "reload switching to the interpreter was not applied; log:\n{}",
+        veil.log()
+    );
+    assert!(
+        filtered(),
+        "filter did not run on the interpreter; log:\n{}",
+        veil.log()
+    );
+}
+
 /// 環境変数で `route.0.action.path` のような配列添字つきのパスも上書きできる。
 /// CLI の `--override` は環境変数より優先される。
 #[test]

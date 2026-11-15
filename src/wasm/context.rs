@@ -97,6 +97,20 @@ pub fn empty_plugin_data() -> PluginData {
     EMPTY.get_or_init(|| Arc::new(HashMap::new())).clone()
 }
 
+/// ゲストに見せる要求の属性のうち、パス・メソッド・ヘッダの他のもの（B-408）。
+///
+/// `:authority`・`:scheme` の疑似ヘッダと `request.host`・`request.scheme`・`request.protocol` のプロパティになる。
+/// 要求ごとの [`super::RequestSessions`] に置き、要求のすべての段の context へ写す。
+#[derive(Clone)]
+pub struct RequestInfo {
+    /// `:authority`（HTTP/1.1 は `Host`）
+    pub authority: std::sync::Arc<str>,
+    /// `http` か `https`
+    pub scheme: &'static str,
+    /// `HTTP/1.0`・`HTTP/1.1`・`HTTP/2`・`HTTP/3`
+    pub protocol: &'static str,
+}
+
 /// HTTP context for a single request
 pub struct HttpContext {
     // === Context IDs ===
@@ -118,6 +132,10 @@ pub struct HttpContext {
     pub request_method: std::sync::Arc<str>,
     /// Request query string
     pub request_query: String,
+    /// `:authority`・`:scheme`・プロトコル（B-408。無ければ `Host` ヘッダ・`https`・`HTTP/1.1`）。
+    /// `Some` の context では、ホストが要求・応答ヘッダの表の疑似ヘッダを context から作り、ゲストには書き換えさせない。
+    /// `None`（メッシュのデータプレーン）は呼び出し元が表に入れた疑似ヘッダをそのまま見せ、書き換えも受け取る
+    pub request_info: Option<RequestInfo>,
     /// Is request body complete
     pub request_body_complete: bool,
 
@@ -315,6 +333,7 @@ impl HttpContext {
             request_path: empty_str(),
             request_method: empty_str(),
             request_query: String::new(),
+            request_info: None,
             request_body_complete: false,
             response_status: 0,
             response_headers: Vec::new(),
@@ -373,14 +392,58 @@ impl HttpContext {
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         client_ip: std::sync::Arc<str>,
     ) {
+        self.set_request_line(method, path);
+        self.request_headers = headers;
+        self.client_ip = client_ip;
+    }
+
+    /// メソッドとパス（クエリ文字列も）を置く
+    pub fn set_request_line(&mut self, method: std::sync::Arc<str>, path: std::sync::Arc<str>) {
         // Extract query string
         if let Some(pos) = path.find('?') {
             self.request_query = path[pos + 1..].to_string();
         }
         self.request_method = method;
         self.request_path = path;
-        self.request_headers = headers;
-        self.client_ip = client_ip;
+    }
+
+    /// `:authority`（B-408）。要求の属性が無ければ表の `:authority`（メッシュのデータプレーンが入れる）か `Host` ヘッダ
+    pub fn request_authority(&self) -> Option<&[u8]> {
+        match &self.request_info {
+            Some(info) => Some(info.authority.as_bytes()),
+            None => self
+                .request_headers
+                .iter()
+                .find(|(k, _)| k == b":authority")
+                .or_else(|| {
+                    self.request_headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(b"host"))
+                })
+                .map(|(_, v)| v.as_slice()),
+        }
+    }
+
+    /// `:scheme`（B-408）。要求の属性が無ければ表の `:scheme` が `http` のときだけ `http`
+    pub fn request_scheme(&self) -> &'static str {
+        match &self.request_info {
+            Some(info) => info.scheme,
+            None if self
+                .request_headers
+                .iter()
+                .any(|(k, v)| k == b":scheme" && v == b"http") =>
+            {
+                "http"
+            }
+            None => "https",
+        }
+    }
+
+    /// `request.protocol`（B-408）
+    pub fn request_protocol(&self) -> &'static str {
+        self.request_info
+            .as_ref()
+            .map_or("HTTP/1.1", |i| i.protocol)
     }
 
     /// Set request body（F-61: 共有 `Bytes` をゼロコピーで受け取る）

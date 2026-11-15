@@ -1717,7 +1717,7 @@ watch = false
 # # failure_policy = "fail_open"
 #
 # # F-271: 起動時（と設定のリロード時）に読むファイル。値はプロパティ `plugin_data.<名前>` で読める
-# # （capabilities の allowed_properties を書くなら "plugin_data.*" を含める）。要求ごとのファイルの読み取りは無い。
+# # （capabilities の allowed_properties に "plugin_data.*" 等を含めたときだけ読める）。要求ごとのファイルの読み取りは無い。
 # # data_files = { dataset = "/etc/veil/data/dataset.json" }
 #
 # # F-148: ルート単位で configuration を上書きしたい場合は [[route]] 側の
@@ -1767,7 +1767,8 @@ watch = false
 #   # 同時 HTTP コール数の上限（allow_http_calls = true 時）
 #   # max_http_calls = 10
 #
-#   # 読み取りを許可するプロパティパスのパターン（空 = 全許可）
+#   # 読み取りを許可するプロパティパスのパターン（パスそのもの・"request.*" の接頭辞・"*"）。
+#   # 空（既定）なら何も読めない（data_files の plugin_data.<名前> も "plugin_data.*" 等で許す）
 #   # allowed_properties = ["request.path", "request.method"]
 #
 #   # proxy_set_property によるカスタムプロパティ書き込みを許可

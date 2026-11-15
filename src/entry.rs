@@ -150,7 +150,8 @@ pub fn run_server(opts: ServerOptions) {
 
     // -t オプション: 設定ファイルのテストのみ
     if opts.test_config {
-        match test_config_file(&config_path) {
+        // B-409: 起動と同じく TLS の設定を組み立て、WASM のモジュールを読み込む
+        match crate::config::test_config_for_startup(&config_path) {
             Ok(()) => {
                 println!(
                     "veil: configuration file {} test is successful",

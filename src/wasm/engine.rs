@@ -120,11 +120,16 @@ pub struct FilterEngine {
     /// F-62 の Pause/resume（`resolve_pending_http_calls_inline`）のように store を止めたまま外部 I/O を
     /// 待つ経路では、再開の直前に締切を引き直す（B-56）。
     epoch_deadline: u64,
+    /// 作った元の `[wasm]` とモジュール・`data_files` のファイルの印（B-404。実行可能なメモリを作れないリロードで、
+    /// このエンジンを使い続けてよいかを判断する）
+    source: super::source::WasmSource,
 }
 
 impl FilterEngine {
     /// Create a new filter engine
     pub fn new(config: &WasmConfig) -> anyhow::Result<Self> {
+        // B-404: ファイルの印はモジュールを読む前に取る（読んでいる間に置き換えられたら、次のリロードは「変わった」と見る）
+        let source = super::source::WasmSource::of(config);
         let registry = ModuleRegistry::new(config)?;
 
         // Calculate fuel limit (roughly 1M instructions per ms)
@@ -145,7 +150,14 @@ impl FilterEngine {
             fuel_limit,
             fuel_yield_interval,
             epoch_deadline,
+            source,
         })
+    }
+
+    /// このエンジンが `config` と同じ `[wasm]`・同じモジュールと `data_files` のファイルから作られたか。違えば
+    /// その理由（B-404）。設定のリロードのときだけ呼ぶ（ファイルの `stat` を伴う）
+    pub fn source_change(&self, config: &WasmConfig) -> Option<String> {
+        self.source.change(&super::source::WasmSource::of(config))
     }
 
     /// Execute on_request_headers callback for all modules (deprecated — no-op)
@@ -184,6 +196,10 @@ impl FilterEngine {
                 headers,
                 body: None,
             };
+        }
+        // B-408: 後の段（応答・`on_log`）の context にも要求のメソッドとパスを見せる
+        if let Some(s) = sessions {
+            s.set_request_line(method, path);
         }
 
         let mut current_headers = headers;
@@ -443,9 +459,21 @@ impl FilterEngine {
         &self,
         module: &LoadedModule,
         configuration: &Arc<[u8]>,
-        http_ctx: HttpContext,
+        mut http_ctx: HttpContext,
         sessions: Option<&RequestSessions>,
     ) -> Result<Session, (anyhow::Error, Box<HttpContext>)> {
+        // B-408: 要求の属性（`:authority`・`:scheme`・プロトコル）は要求のどの段でもゲストに見せる。応答の段・`on_log` の
+        // context には要求が無いので、要求ヘッダの段と同じメソッドとパスも見せる（`:path`・`request.path` 等）
+        if let Some(s) = sessions {
+            if http_ctx.request_info.is_none() {
+                http_ctx.request_info = s.request_info().cloned();
+            }
+            if http_ctx.request_method.is_empty() {
+                if let Some((method, path)) = s.request_line() {
+                    http_ctx.set_request_line(method.clone(), path.clone());
+                }
+            }
+        }
         let root_context_id = 1i32;
         if module.instance_reuse {
             let module_key = module as *const LoadedModule as usize;

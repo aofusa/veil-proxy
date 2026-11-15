@@ -2333,3 +2333,119 @@ mod failure_policy_tests {
         });
     }
 }
+
+// B-408: 応答の段の context にも要求の疑似ヘッダ（`:path` 等）と応答の `:status` が見える。インラインの WAT で確かめる
+mod b408_pseudo_header_phase_tests {
+    use crate::wasm::{
+        FilterEngine, FilterResult, ModuleCapabilities, ModuleConfig, RequestInfo, WasmConfig,
+    };
+    use crate::wasm_plugin_config::{ModuleRef, WasmModules};
+    use std::sync::Arc;
+
+    /// 応答ヘッダの段で要求の `:path` を `x-path`、応答の `:status` を `x-status` として応答ヘッダへ足すモジュール
+    const MODULE: &str = r#"(module
+  (import "env" "proxy_get_header_map_value"
+    (func $get (param i32 i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_add_header_map_value"
+    (func $add (param i32 i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (global $bump (mut i32) (i32.const 4096))
+  (data (i32.const 0) ":path")
+  (data (i32.const 16) "x-path")
+  (data (i32.const 32) ":status")
+  (data (i32.const 48) "x-status")
+  (func (export "proxy_on_memory_allocate") (param $n i32) (result i32)
+    (local $p i32)
+    (local.set $p (global.get $bump))
+    (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+    (local.get $p))
+  (func (export "proxy_on_context_create") (param i32 i32))
+  (func (export "proxy_on_vm_start") (param i32 i32) (result i32) (i32.const 1))
+  (func (export "proxy_on_configure") (param i32 i32) (result i32) (i32.const 1))
+  (func (export "proxy_on_request_headers") (param i32 i32 i32) (result i32) (i32.const 0))
+  (func (export "proxy_on_response_headers") (param i32 i32 i32) (result i32)
+    (if (i32.eqz (call $get (i32.const 0) (i32.const 0) (i32.const 5) (i32.const 64) (i32.const 68)))
+      (then (drop (call $add (i32.const 2) (i32.const 16) (i32.const 6)
+        (i32.load (i32.const 64)) (i32.load (i32.const 68))))))
+    (if (i32.eqz (call $get (i32.const 2) (i32.const 32) (i32.const 7) (i32.const 64) (i32.const 68)))
+      (then (drop (call $add (i32.const 2) (i32.const 48) (i32.const 8)
+        (i32.load (i32.const 64)) (i32.load (i32.const 68))))))
+    (i32.const 0))
+)"#;
+
+    fn engine(dir: &std::path::Path, instance_reuse: bool) -> Arc<FilterEngine> {
+        let path = dir.join("m.wat");
+        // 理由付き allow: テストのフィクスチャ作成（ホットパス外）。
+        #[allow(clippy::disallowed_methods)]
+        std::fs::write(&path, MODULE).unwrap();
+        let config = WasmConfig {
+            enabled: true,
+            defaults: Default::default(),
+            modules: vec![ModuleConfig {
+                name: "m".to_string(),
+                path: path.to_string_lossy().into_owned(),
+                capabilities: ModuleCapabilities {
+                    allow_request_headers_read: true,
+                    allow_response_headers_read: true,
+                    allow_response_headers_write: true,
+                    ..Default::default()
+                },
+                instance_reuse,
+                ..Default::default()
+            }],
+            interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+        };
+        let engine = FilterEngine::new(&config).unwrap();
+        engine.validate().unwrap();
+        Arc::new(engine)
+    }
+
+    #[test]
+    fn response_phase_sees_request_path_and_status() {
+        let dir = std::env::temp_dir().join(format!("veil-b408-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for reuse in [false, true] {
+            let engine = engine(&dir, reuse);
+            let modules = WasmModules::for_request(Arc::new(vec![ModuleRef::from_name("m")]));
+            modules.set_request_info(RequestInfo {
+                authority: Arc::from("a.example"),
+                scheme: "https",
+                protocol: "HTTP/2",
+            });
+            let r =
+                futures::executor::block_on(engine.clone().on_request_headers_with_modules_async(
+                    modules.clone(),
+                    Arc::from("/p?q=1"),
+                    Arc::from("GET"),
+                    vec![],
+                    Arc::from("127.0.0.1"),
+                    true,
+                ));
+            assert!(matches!(r, FilterResult::Continue { .. }));
+            let r =
+                futures::executor::block_on(engine.clone().on_response_headers_with_modules_async(
+                    modules.clone(),
+                    200,
+                    vec![(b"x-u".to_vec(), b"1".to_vec())],
+                    true,
+                ));
+            let FilterResult::Continue { headers, .. } = r else {
+                panic!("expected Continue (reuse={reuse})");
+            };
+            assert_eq!(
+                headers,
+                vec![
+                    (b"x-u".to_vec(), b"1".to_vec()),
+                    (b"x-path".to_vec(), b"/p?q=1".to_vec()),
+                    (b"x-status".to_vec(), b"200".to_vec()),
+                ],
+                "reuse={reuse}"
+            );
+            futures::executor::block_on(crate::wasm::on_request_complete_async(engine, modules));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

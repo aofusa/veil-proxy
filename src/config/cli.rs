@@ -124,6 +124,33 @@ fn config_file_help() -> String {
 // 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
 #[allow(clippy::disallowed_methods)]
 pub fn test_config_file(path: &Path) -> io::Result<()> {
+    check_config_file(path).map(|_| ())
+}
+
+/// `veil -t`: [`test_config_file`] の検査に加えて、起動時と同じく TLS の証明書と鍵から TLS の設定を組み立て、
+/// `[wasm]` のモジュールを読み込んで起動時のコールバック（`_start`・`proxy_on_vm_start`・`proxy_on_configure`）を
+/// 走らせる（B-409）。以前は壊れた PEM・鍵の不一致・起動時に失敗するモジュールのある設定も「successful」と報告し、
+/// その設定で起動すると止まっていた。モジュールのコンパイルは AOT キャッシュを書く（起動と同じ）。
+///
+/// TLS の設定の組み立てはプロセスで共有する値（クライアント認証・セッション再開の方式）を記録するので、すぐ終わる
+/// `-t` のプロセスだけで使う（ライブラリが起動の前に呼ぶ [`test_config_file`] は従来どおり）。
+pub fn test_config_for_startup(path: &Path) -> io::Result<()> {
+    let config = check_config_file(path)?;
+    if config.tls.is_configured() {
+        super::tls_server::load_tls_config(
+            &config.tls,
+            config.tls.ktls_enabled,
+            config.server.http2_enabled,
+        )
+        .map_err(|e| io::Error::new(e.kind(), format!("[tls]: {}", e)))?;
+    }
+    #[cfg(feature = "wasm")]
+    drop(super::loaded::build_wasm_engine(config.wasm.as_ref())?);
+    Ok(())
+}
+
+/// 設定ファイルを読み、検証して返す（[`test_config_file`] の本体）
+fn check_config_file(path: &Path) -> io::Result<Config> {
     // ファイル存在確認
     // API ライブラリのモードではファイルが無くてもよい（既定設定のみで起動する）。
     #[cfg(feature = "handler")]
@@ -147,7 +174,7 @@ pub fn test_config_file(path: &Path) -> io::Result<()> {
 
     // TLS証明書の存在確認（平文専用サーバで `[tls]` が無い場合は対象外）
     if !config.tls.is_configured() {
-        return Ok(());
+        return Ok(config);
     }
     let cert_path = Path::new(&config.tls.cert_path);
     if !cert_path.exists() {
@@ -166,5 +193,84 @@ pub fn test_config_file(path: &Path) -> io::Result<()> {
         ));
     }
 
-    Ok(())
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B-409: `veil -t` は起動と同じく TLS の設定を組み立てるので、壊れた PEM を起動前に見つける
+    #[test]
+    // 理由付き allow: テストのフィクスチャ作成（ホットパス外）。
+    #[allow(clippy::disallowed_methods)]
+    fn b409_startup_test_rejects_unparsable_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(
+            &cert,
+            "-----BEGIN CERTIFICATE-----\nnot base64 !!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &key,
+            "-----BEGIN PRIVATE KEY-----\nnot base64 !!\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let path = dir.path().join("config.toml");
+        let toml_path = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\nlisten = \"127.0.0.1:8443\"\n[tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\n",
+                toml_path(&cert),
+                toml_path(&key)
+            ),
+        )
+        .unwrap();
+        // ファイルがあるかだけを見る検査は通る
+        test_config_file(&path).unwrap();
+        let err = test_config_for_startup(&path).unwrap_err();
+        assert!(err.to_string().starts_with("[tls]: "), "{err}");
+    }
+
+    /// B-409: `veil -t` は起動と同じく WASM のモジュールを読み込み、起動時のコールバックを走らせる
+    #[cfg(feature = "wasm")]
+    #[test]
+    // 理由付き allow: テストのフィクスチャ作成（ホットパス外）。
+    #[allow(clippy::disallowed_methods)]
+    fn b409_startup_test_runs_wasm_module_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = |configure: i32| {
+            format!(
+                r#"(module
+  (memory (export "memory") 1)
+  (func (export "proxy_on_context_create") (param i32 i32))
+  (func (export "proxy_on_vm_start") (param i32 i32) (result i32) (i32.const 1))
+  (func (export "proxy_on_configure") (param i32 i32) (result i32) (i32.const {configure}))
+  (func (export "proxy_on_request_headers") (param i32 i32 i32) (result i32) (i32.const 0))
+)"#
+            )
+        };
+        let path = dir.path().join("config.toml");
+        let wasm = dir.path().join("m.wasm");
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\nlisten_cleartext = \"127.0.0.1:8080\"\nenable_secure_redirect = false\n\
+                 [wasm]\nenabled = true\n\
+                 [[wasm.modules]]\nname = \"m\"\npath = \"{}\"\n",
+                wasm.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        std::fs::write(&wasm, module(1)).unwrap();
+        test_config_for_startup(&path).unwrap();
+        // `proxy_on_configure` が失敗するモジュール: 起動は止まるので -t も失敗にする
+        std::fs::write(&wasm, module(0)).unwrap();
+        test_config_file(&path).unwrap();
+        let err = test_config_for_startup(&path).unwrap_err();
+        assert!(err.to_string().contains("WASM"), "{err}");
+    }
 }

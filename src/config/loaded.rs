@@ -701,20 +701,68 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
 ///
 /// FreeBSD の capability mode では `.wasm`・`data_files` を開けないので起動時のエンジンを使い続ける
 /// （`[wasm]` が起動時と違うリロードは `check_capability_mode_reload` が先に断っている）。
+///
+/// B-404: seccomp を掛けた後は、モジュールをネイティブのコードへコンパイルすると `mprotect(PROT_EXEC)` が
+/// 拒否される（`strict` ではプロセスごと落ちる）。今のエンジンが同じ `[wasm]`・同じファイルから作られていれば
+/// それを使い続け（モジュールの `_start`・`proxy_on_configure` は走らせ直さない）、違えば `filter`・`strict` では
+/// リロードを断る（前の設定のまま）。`log` は同じ判断をして、違うときはコンパイルを通して警告する（`log` の記録が
+/// `filter`・`strict` で拒否されることだけを示すように）。
 #[cfg(feature = "wasm")]
 fn reload_wasm_engine(
     wasm: Option<&crate::wasm::WasmConfig>,
 ) -> io::Result<Option<Arc<crate::wasm::FilterEngine>>> {
+    use crate::security::ExecMemory;
     #[cfg(target_os = "freebsd")]
     if crate::security::capsicum::is_capability_mode() {
         return Ok(CURRENT_CONFIG.load().wasm_filter_engine.clone());
     }
+    let exec_memory = crate::security::exec_memory();
+    if exec_memory != ExecMemory::Allowed {
+        match compiled_wasm_engine(CURRENT_CONFIG.load().wasm_filter_engine.as_ref(), wasm) {
+            Some(Ok(engine)) => return Ok(Some(engine)),
+            Some(Err(change)) if exec_memory == ExecMemory::Denied => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "seccomp forbids executable memory after startup, so a reload cannot \
+                         compile WASM modules ({change}); restart veil to apply this change, or \
+                         set [wasm] interpreter = true"
+                    ),
+                ));
+            }
+            Some(Err(change)) => warn!(
+                "this reload compiles WASM modules ({}), which needs executable memory: seccomp \
+                 in log mode lets it through, but seccomp_mode = \"filter\" or \"strict\" \
+                 rejects such a reload",
+                change
+            ),
+            None => {}
+        }
+    }
     build_wasm_engine(wasm)
+}
+
+/// 今のエンジンを新しい `[wasm]` にそのまま使えるか（B-404）。ネイティブのコードが要らない（WASM を使わない・
+/// Pulley）なら `None`（作り直してよい）。要るなら、今のエンジンが同じ `[wasm]`・同じモジュールと `data_files` の
+/// ファイルから作られていれば `Ok(そのエンジン)`、違えば `Err(違うところ)`（作り直すにはコンパイルが要る）
+#[cfg(feature = "wasm")]
+fn compiled_wasm_engine(
+    current: Option<&Arc<crate::wasm::FilterEngine>>,
+    wasm: Option<&crate::wasm::WasmConfig>,
+) -> Option<Result<Arc<crate::wasm::FilterEngine>, String>> {
+    let wasm = wasm.filter(|w| w.enabled && !crate::wasm::uses_pulley(w))?;
+    Some(match current {
+        Some(engine) => match engine.source_change(wasm) {
+            None => Ok(engine.clone()),
+            Some(why) => Err(why),
+        },
+        None => Err("[wasm] was enabled".to_string()),
+    })
 }
 
 /// `[wasm]` からフィルタのエンジンを作る（起動時とリロード。B-383）。無効なら `None`
 #[cfg(feature = "wasm")]
-fn build_wasm_engine(
+pub(super) fn build_wasm_engine(
     wasm: Option<&crate::wasm::WasmConfig>,
 ) -> io::Result<Option<Arc<crate::wasm::FilterEngine>>> {
     let Some(wasm_config) = wasm.filter(|w| w.enabled) else {
@@ -2240,5 +2288,63 @@ mod b383_wasm_section_tests {
             .insert("deny".to_string(), "/deny.txt".to_string());
         assert_ne!(wasm_section_value(Some(&a)), wasm_section_value(Some(&c)));
         assert_ne!(wasm_section_value(Some(&a)), wasm_section_value(None));
+    }
+
+    /// B-404: seccomp を掛けた後のリロードは、同じ `[wasm]`・同じファイルなら今のエンジンを使い続けられ、
+    /// 変わっていればコンパイルが要る。WASM を使わない・Pulley のリロードは作り直してよい
+    #[test]
+    fn b404_compiled_engine_is_reused_only_without_changes() {
+        let fixture = "tests/fixtures/wasm/header_filter.wasm";
+        if !Path::new(fixture).exists() {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("m.wasm");
+        std::fs::copy(fixture, &module).unwrap();
+        let parse = |extra: &str| -> crate::wasm::WasmConfig {
+            toml::from_str(&format!(
+                "enabled = true\n{extra}[[modules]]\nname = \"m\"\npath = {:?}\n",
+                module.to_string_lossy()
+            ))
+            .unwrap()
+        };
+        let start = parse("");
+        if crate::wasm::uses_pulley(&start) {
+            eprintln!("this target always uses Pulley; skipping");
+            return;
+        }
+        let current = Arc::new(crate::wasm::FilterEngine::new(&start).expect("engine"));
+        let change = |cur: Option<&Arc<crate::wasm::FilterEngine>>, w: &crate::wasm::WasmConfig| {
+            match compiled_wasm_engine(cur, Some(w)) {
+                Some(Err(why)) => why,
+                Some(Ok(_)) => panic!("expected a change, got the current engine"),
+                None => panic!("expected a change, got a rebuild"),
+            }
+        };
+
+        // 同じ設定・同じファイル: 今のエンジンを使い続ける
+        match compiled_wasm_engine(Some(&current), Some(&start)) {
+            Some(Ok(e)) => assert!(Arc::ptr_eq(&e, &current)),
+            Some(Err(why)) => panic!("unexpected change: {why}"),
+            None => panic!("expected the current engine, got a rebuild"),
+        }
+        // `[wasm]` が変わった・起動時に `[wasm]` が無かった
+        let changed = parse("[defaults]\nmax_execution_time_ms = 7\n");
+        assert!(change(Some(&current), &changed).contains("[wasm] section"));
+        assert!(change(None, &changed).contains("[wasm] was enabled"));
+        // モジュールのファイルを置き換えた
+        let tmp = dir.path().join("m.wasm.new");
+        std::fs::copy(fixture, &tmp).unwrap();
+        std::fs::rename(&tmp, &module).unwrap();
+        assert!(change(Some(&current), &start).contains("m.wasm"));
+        // WASM を使わない・Pulley: 作り直してよい
+        assert!(compiled_wasm_engine(Some(&current), None).is_none());
+        let mut disabled = start.clone();
+        disabled.enabled = false;
+        assert!(compiled_wasm_engine(Some(&current), Some(&disabled)).is_none());
+        let mut pulley = start.clone();
+        pulley.interpreter = true;
+        assert!(compiled_wasm_engine(Some(&current), Some(&pulley)).is_none());
     }
 }
