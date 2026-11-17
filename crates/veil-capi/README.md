@@ -242,7 +242,7 @@ HTTP/2・HTTP/3 のどれでも同じです。規則の全体はガイドの `li
 | `veil_grpc_channel_unary` / `_unary_async` / `veil_grpc_channel_call`（`veil_grpc_call_options_t`） | 単項・全種類のメソッド |
 | `veil_grpc_client_send / close_send / recv / finish / status_message / metadata / cancel / call_free` | 呼び出しの操作 |
 | `veil_response_defer` / `veil_deferred_response / complete / is_closed / free` | 遅延応答（任意のスレッドから後で返す） |
-| `veil_register_route_ex2`（`veil_route_options_t.body_schema_json`） | JSON Schema で本文を検証し、合わなければ 422 |
+| `veil_register_route_ex2`（`veil_route_options_t.body_schema_json`） | JSON Schema で本文を検証し、合わなければ 422（Content-Type が JSON でなければ 415） |
 | `veil_test_new / request / free`（`veil_test_request_t`）、`veil_test_response_*` | ソケットを開かずにルートを呼ぶ試験 |
 
 呼び出しは veil の専用スレッド（Python の gRPC クライアントと共有）で動きます。待つ形をワーカー（`VEIL_ROUTE_INLINE` の

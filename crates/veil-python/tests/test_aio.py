@@ -239,6 +239,56 @@ class TestWebSocket(unittest.TestCase):
         self.assertEqual(s.sent, [(1, "hi")])
         self.assertEqual(route.openapi()["operationId"], "E")
 
+    # B-413: WebSocketEndpoint のルートの依存（app・router・ルート）はアップグレードの前に解き、失敗は HTTP のステータスで断る
+    def test_endpoint_dependencies_run_before_upgrade(self):
+        events = []
+
+        def token(websocket: veil.WebSocket, x_token: str = veil.Header()):
+            if x_token != "ok":
+                raise veil.HTTPException(403, "bad token")
+            websocket.state.user = "alice"
+
+        def scoped():
+            events.append("enter")
+            yield
+            events.append("exit")
+
+        app = veil.App(dependencies=[veil.Depends(token)])
+        router = veil.APIRouter(dependencies=[veil.Depends(scoped)])
+
+        @router.websocket("/e")
+        class E(veil.WebSocketEndpoint):
+            def on_connect(self, websocket):
+                events.append(("connect", websocket.state.user))
+
+            def on_disconnect(self, websocket, code):
+                events.append(code)
+
+        app.include_router(router)
+        route = app.websocket_routes[-1]
+        self.assertIs(route.endpoint, E)
+        # 認証の依存が断る（アップグレードしない）・ヘッダが無ければ 422
+        self.assertEqual(route._endpoint_check(req(headers=[("x-token", "no")])), 403)
+        self.assertEqual(route._endpoint_check(req()), 422)
+        # 断った接続ではセッションを作らない（先に入った yield の依存には例外が渡る）
+        self.assertTrue(all(e == "enter" for e in events), events)
+        events.clear()
+        checked = route._endpoint_check(req(headers=[("x-token", "ok")]))
+        self.assertIsInstance(checked, tuple)
+
+        class Sender:
+            def send(self, op, data):
+                return 0
+
+            def close(self, code, reason):
+                pass
+
+        sess = route._endpoint_session(Sender(), req(headers=[("x-token", "ok")]), checked)
+        sess.on_connect()
+        sess.on_close(1000)
+        # 依存が websocket.state に置いた値が見え、yield の後ろは接続が閉じてから走る
+        self.assertEqual(events, ["enter", ("connect", "alice"), 1000, "exit"])
+
 
 class TestLoop(unittest.TestCase):
     @classmethod

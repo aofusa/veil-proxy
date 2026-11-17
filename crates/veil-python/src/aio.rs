@@ -936,27 +936,70 @@ impl veil::api::ws::WsSession for EndpointSession {
 }
 
 /// Serve an `@app.websocket` route whose handler is a `WebSocketEndpoint` class (callbacks on the handler pool).
-pub fn websocket_endpoint(route: Arc<Py<PyAny>>, req: Request) -> Response {
+///
+/// The route's dependencies (app, router and route `dependencies=`) run on the GIL lane before the upgrade; a
+/// failing one answers the handshake with its HTTP status instead of `101`.
+pub async fn websocket_endpoint(
+    route: Arc<Py<PyAny>>,
+    req: Request,
+    lane: Arc<crate::lane::Lane>,
+) -> Response {
     let up = match WebSocketUpgrade::from_request(&req) {
         Ok(u) => u,
         Err(r) => return r,
     };
-    up.on_upgrade_blocking(move |tx: WsSender| {
+    // B-413: 以前は依存を解かずに `on_connect` を呼んでいた（app・router・ルートの認証の依存が素通りだった）
+    veil::api::bridge::call_blocking_via(crate::lane::OnLane(lane), req, move |req, _ctx| {
         Python::attach(|py| {
-            let r = (|| -> PyResult<EndpointSession> {
-                let sender = Py::new(py, NativeWsSender { tx: tx.clone() })?;
+            let checked = (|| -> PyResult<Result<(Py<NativeRequest>, Py<PyAny>), u16>> {
                 let nreq = Py::new(py, NativeRequest::new(req))?;
-                let session = route.call_method1(py, "_endpoint_session", (sender, nreq))?;
-                session.call_method0(py, "on_connect")?;
-                Ok(EndpointSession { session, tx })
+                let state = route.call_method1(py, "_endpoint_check", (nreq.clone_ref(py),))?;
+                if let Ok(status) = state.extract::<u16>(py) {
+                    return Ok(Err(status));
+                }
+                Ok(Ok((nreq, state)))
             })();
-            match r {
-                Ok(s) => Some(Box::new(s) as Box<dyn veil::api::ws::WsSession>),
+            let (nreq, state) = match checked {
+                Ok(Ok(v)) => v,
+                Ok(Err(status)) => return Response::error(status, reject_reason(status)),
                 Err(e) => {
                     e.print(py);
-                    None
+                    return Response::error(500, "Internal Server Error");
                 }
-            }
+            };
+            up.on_upgrade_blocking(move |tx: WsSender| {
+                Python::attach(|py| {
+                    let r = (|| -> PyResult<EndpointSession> {
+                        let sender = Py::new(py, NativeWsSender { tx: tx.clone() })?;
+                        let session =
+                            route.call_method1(py, "_endpoint_session", (sender, nreq, state))?;
+                        session.call_method0(py, "on_connect")?;
+                        Ok(EndpointSession { session, tx })
+                    })();
+                    match r {
+                        Ok(s) => Some(Box::new(s) as Box<dyn veil::api::ws::WsSession>),
+                        Err(e) => {
+                            e.print(py);
+                            None
+                        }
+                    }
+                })
+            })
         })
     })
+    .await
+}
+
+/// The reason phrase of a refused WebSocket handshake.
+fn reject_reason(status: u16) -> &'static str {
+    match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        _ if status < 500 => "Bad Request",
+        _ => "Internal Server Error",
+    }
 }

@@ -1980,7 +1980,9 @@ impl Http3Handler {
             tls_profile,
             pool_max_idle: security.max_idle_connections_per_host,
             pool_idle_timeout_secs: security.idle_connection_timeout_secs,
-            no_response_body: method.eq_ignore_ascii_case(b"HEAD"),
+            // B-417: メソッドは大文字小文字を区別する（RFC 9110 §9.1）。`:method` はそのまま上流へ送るので、`head` を HEAD と
+            // 見て本文を読まないと、上流が送った本文を残したまま接続をプールへ戻した
+            no_response_body: method == b"HEAD",
             retry_idempotent: crate::http_utils::is_idempotent_method(method),
             #[cfg(feature = "http2")]
             h2,

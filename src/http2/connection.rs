@@ -705,12 +705,17 @@ where
                 header_block,
             } => {
                 // RFC 7540 Section 5.3.1: 自己依存チェック
+                // B-416: ストリームのエラーで断るブロックも HPACK で読む（`reject_header_block`）
                 if let Some(ref p) = priority {
                     if p.dependency == stream_id {
-                        return Err(Http2Error::stream_error(
-                            stream_id,
-                            Http2ErrorCode::ProtocolError,
-                            "Stream cannot depend on itself",
+                        return Err(self.reject_header_block(
+                            end_headers,
+                            &header_block,
+                            Http2Error::stream_error(
+                                stream_id,
+                                Http2ErrorCode::ProtocolError,
+                                "Stream cannot depend on itself",
+                            ),
                         ));
                     }
                 }
@@ -931,14 +936,15 @@ where
         self.continuation_count = 0;
 
         // ヘッダーブロックサイズチェック (HPACK Bomb 対策)
+        // B-416: 読まないブロックは相手のエンコーダと動的表を揃えられないので、接続のエラーにする（以前はストリームの
+        // エラーで接続を続け、同じ接続の後の要求のインデックスが別のフィールドを指した）
         if header_block.len() > self.local_settings.max_header_block_size {
             ftlog::warn!(
                 "[HTTP/2] Header block too large: {} bytes (limit: {})",
                 header_block.len(),
                 self.local_settings.max_header_block_size
             );
-            return Err(Http2Error::stream_error(
-                stream_id,
+            return Err(Http2Error::connection_error(
                 Http2ErrorCode::EnhanceYourCalm,
                 "Header block size limit exceeded",
             ));
@@ -967,10 +973,14 @@ where
             ) && !end_stream
             {
                 // Second HEADERS without END_STREAM - must be a protocol error
-                return Err(Http2Error::stream_error(
-                    stream_id,
-                    Http2ErrorCode::ProtocolError,
-                    "Second HEADERS frame without END_STREAM",
+                return Err(self.reject_header_block(
+                    end_headers,
+                    header_block,
+                    Http2Error::stream_error(
+                        stream_id,
+                        Http2ErrorCode::ProtocolError,
+                        "Second HEADERS frame without END_STREAM",
+                    ),
                 ));
             }
         }
@@ -987,12 +997,14 @@ where
                 if let Some(id) = e.rst_stream_id() {
                     let _ = self.send_rst_stream(id, e.error_code()).await;
                 }
-                return Err(e);
+                return Err(self.reject_header_block(end_headers, header_block, e));
             }
         };
 
-        // 状態遷移
-        stream.recv_headers(end_stream)?;
+        // 状態遷移（B-416: 閉じたストリーム（veil がリセットした直後のトレーラ等）へのブロックも読んでから断る）
+        if let Err(e) = stream.recv_headers(end_stream) {
+            return Err(self.reject_header_block(end_headers, header_block, e));
+        }
 
         // Priority を設定
         if let Some(p) = priority {
@@ -1080,8 +1092,8 @@ where
                 new_size,
                 self.local_settings.max_header_block_size
             );
-            return Err(Http2Error::stream_error(
-                stream_id,
+            // B-416: 読まないブロックは動的表を揃えられないので接続のエラー
+            return Err(Http2Error::connection_error(
                 Http2ErrorCode::EnhanceYourCalm,
                 "Cumulative header block size limit exceeded",
             ));
@@ -1120,6 +1132,31 @@ where
         }
 
         Ok(None)
+    }
+
+    // B-416: ストリームのエラーで断る HEADERS のブロックも HPACK で読んで捨て、相手のエンコーダと動的表を揃える
+    // （RFC 9113 §4.3。以前は読まずに捨てて接続を続け、同じ接続の後の要求のインデックスが別のフィールドを指した。
+    // 前段の多重化プロキシの後ろでは別の利用者のヘッダと入れ替わる）。
+    //
+    // ブロックがこのフレームで終わるなら読んでから `err` を返す。CONTINUATION が続くブロックは読めないので接続の
+    // エラー（COMPRESSION_ERROR）にする（以前も後ろの CONTINUATION が接続のエラーになっていた）。`err` が接続の
+    // エラーなら読まない（接続ごと閉じる）。
+    fn reject_header_block(
+        &mut self,
+        end_headers: bool,
+        header_block: &[u8],
+        err: Http2Error,
+    ) -> Http2Error {
+        if err.rst_stream_id().is_none() {
+            return err;
+        }
+        if !end_headers || header_block.len() > self.local_settings.max_header_block_size {
+            return Http2Error::compression_error("Refused header block was not decoded");
+        }
+        match self.hpack_decoder.decode(header_block) {
+            Ok(_) => err,
+            Err(e) => Http2Error::compression_error(format!("HPACK decode error: {}", e)),
+        }
     }
 
     /// ヘッダーブロックをデコードしてストリームに設定
@@ -3035,6 +3072,80 @@ mod tests {
                     .await;
                 assert!(r.is_err_and(|e| e.should_goaway()), "stream {}", id);
             }
+        });
+    }
+
+    /// B-416: ストリームのエラーで断る HEADERS のブロックも HPACK で読む。読まずに捨てると、相手のエンコーダが表に
+    /// 入れたフィールドが veil の表に無く、同じ接続の後の要求のインデックスが別のフィールドを指す
+    #[test]
+    fn refused_header_blocks_keep_the_hpack_table_in_sync() {
+        futures::executor::block_on(async {
+            use crate::http2::frame::types::PrioritySpec;
+            let mut conn = Http2Connection::new(NullIo, Http2Settings::default());
+            let mut enc = crate::http2::hpack::HpackEncoder::new(4096);
+            let headers =
+                |stream_id: u32, priority: Option<PrioritySpec>, block: &[u8]| Frame::Headers {
+                    stream_id,
+                    end_stream: true,
+                    end_headers: true,
+                    priority,
+                    header_block: block.to_vec(),
+                };
+            // 1. veil がリセットした直後（表に残る閉じたストリーム）へのトレーラ
+            conn.streams.get_or_create_client_stream(1).unwrap();
+            conn.streams.get(1).unwrap().send_rst_stream();
+            let b = enc.encode(&[(b"x-user", b"alice", false)]).unwrap();
+            let e = conn
+                .process_frame(headers(1, None, &b))
+                .await
+                .expect_err("stream error");
+            assert!(!e.should_goaway(), "{}", e);
+            // 2. 自分に依存する優先度の要求
+            let b = enc.encode(&[(b"x-role", b"admin", false)]).unwrap();
+            let self_dep = PrioritySpec {
+                dependency: 3,
+                exclusive: false,
+                weight: 16,
+            };
+            let e = conn
+                .process_frame(headers(3, Some(self_dep), &b))
+                .await
+                .expect_err("stream error");
+            assert!(!e.should_goaway(), "{}", e);
+            // 3. 次の要求は相手の表のエントリをインデックスで参照する
+            let b = enc
+                .encode(&[
+                    (b":method", b"GET", false),
+                    (b":scheme", b"https", false),
+                    (b":path", b"/", false),
+                    (b":authority", b"example.com", false),
+                    (b"x-user", b"alice", false),
+                    (b"x-role", b"admin", false),
+                ])
+                .unwrap();
+            let r = conn.process_frame(headers(5, None, &b)).await;
+            assert!(matches!(r, Ok(Some(_))), "{:?}", r.err());
+            let got = &conn.streams.get_ref(5).unwrap().request_headers;
+            for (n, v) in [(&b"x-user"[..], &b"alice"[..]), (b"x-role", b"admin")] {
+                assert!(got.iter().any(|f| f.name == n && f.value == v), "{:?}", got);
+            }
+            // CONTINUATION の続く断るブロックは読めないので接続のエラー
+            let b = enc.encode(&[(b"x-a", b"b", false)]).unwrap();
+            let e = conn
+                .process_frame(Frame::Headers {
+                    stream_id: 7,
+                    end_stream: true,
+                    end_headers: false,
+                    priority: Some(PrioritySpec {
+                        dependency: 7,
+                        exclusive: false,
+                        weight: 16,
+                    }),
+                    header_block: b.to_vec(),
+                })
+                .await
+                .expect_err("connection error");
+            assert!(e.should_goaway(), "{}", e);
         });
     }
 

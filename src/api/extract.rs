@@ -193,10 +193,34 @@ pub fn query_param_opt<T: std::str::FromStr>(
     }
 }
 
-/// Deserializes a JSON body (a JSON syntax or type error gives 422, as in FastAPI).
+// B-418: JSON の本文は Content-Type が JSON のときだけ読む。以前は型を見ずに読み、CORS の事前確認の要らない
+// 別サイトからの要求（`enctype="text/plain"` のフォーム、型の無い Blob を送る `fetch`・`sendBeacon`）が利用者の
+// Cookie を付けて JSON のハンドラを動かせた（FastAPI の CVE-2021-32677 と同じ。axum の `Json` も 415）
+/// Whether a `Content-Type` value names JSON: `application/json` or `application/*+json` (parameters are ignored).
+pub fn is_json_content_type(ct: Option<&str>) -> bool {
+    let Some(ct) = ct else { return false };
+    let media = ct.split(';').next().unwrap_or("").trim();
+    let Some((ty, sub)) = media.split_once('/') else {
+        return false;
+    };
+    let sub = sub.as_bytes();
+    ty.eq_ignore_ascii_case("application")
+        && (sub.eq_ignore_ascii_case(b"json")
+            || (sub.len() > 5 && sub[sub.len() - 5..].eq_ignore_ascii_case(b"+json")))
+}
+
+/// Deserializes a JSON body (a JSON syntax or type error gives 422, as in FastAPI). The request's `Content-Type`
+/// must be `application/json` or `application/*+json`; another or a missing one gives 415, so that a cross-site form
+/// or `fetch` that skips the CORS preflight cannot reach the handler.
 pub fn json_body<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, Response> {
     if req.body.is_empty() {
         return Err(single_error("body", None, "missing", "Field required"));
+    }
+    if !is_json_content_type(req.header("content-type")) {
+        return Err(Response::error(
+            415,
+            "Content-Type must be application/json",
+        ));
     }
     serde_json::from_slice::<T>(&req.body).map_err(|e| {
         let kind = if e.is_syntax() || e.is_eof() {
@@ -261,10 +285,60 @@ mod tests {
 
     #[test]
     fn json_body_errors_are_422() {
-        let req = Request::new("POST", "/x", vec![], "{bad");
+        let ct = || {
+            vec![(
+                Bytes::from_static(b"content-type"),
+                Bytes::from_static(b"application/json"),
+            )]
+        };
+        let req = Request::new("POST", "/x", ct(), "{bad");
         let r = json_body::<Value>(&req).unwrap_err();
         assert_eq!(r.status_code(), 422);
-        let req = Request::new("POST", "/x", vec![], "{\"a\": 1}");
+        let req = Request::new("POST", "/x", ct(), "{\"a\": 1}");
         assert_eq!(json_body::<Value>(&req).unwrap()["a"], 1);
+    }
+
+    // B-418: JSON 以外・無い Content-Type は 415（別サイトの text/plain のフォーム・型の無い Blob の fetch を断る）
+    #[test]
+    fn json_body_requires_a_json_content_type() {
+        let req = |ct: Option<&'static str>| {
+            let headers = ct
+                .map(|v| {
+                    vec![(
+                        Bytes::from_static(b"content-type"),
+                        Bytes::from_static(v.as_bytes()),
+                    )]
+                })
+                .unwrap_or_default();
+            Request::new("POST", "/x", headers, "{\"a\": 1}")
+        };
+        for ok in [
+            "application/json",
+            "Application/JSON; charset=utf-8",
+            "application/merge-patch+json",
+            "application/vnd.api+JSON",
+        ] {
+            assert_eq!(json_body::<Value>(&req(Some(ok))).unwrap()["a"], 1, "{ok}");
+        }
+        for bad in [
+            None,
+            Some("text/plain"),
+            Some("text/plain; charset=utf-8"),
+            Some("application/x-www-form-urlencoded"),
+            Some("multipart/form-data; boundary=x"),
+            Some("application/jsonx"),
+            Some("application/+json"),
+            Some("text/json"),
+            Some(""),
+        ] {
+            assert_eq!(
+                json_body::<Value>(&req(bad)).unwrap_err().status_code(),
+                415,
+                "{bad:?}"
+            );
+        }
+        // 本文が無ければ従来どおり 422（必須の本文の欠け）
+        let empty = Request::new("POST", "/x", vec![], "");
+        assert_eq!(json_body::<Value>(&empty).unwrap_err().status_code(), 422);
     }
 }

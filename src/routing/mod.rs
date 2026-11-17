@@ -342,6 +342,8 @@ pub struct CidrMatcher {
     exact_ips: HashMap<IpAddr, Vec<usize>>,
     /// Routes without source_ip condition
     any_ip: Vec<usize>,
+    /// Whether any route has a source_ip condition (even one whose entries did not parse)
+    ip_restricted: bool,
 }
 
 impl CidrMatcher {
@@ -352,6 +354,7 @@ impl CidrMatcher {
             v6_ranges: Vec::new(),
             exact_ips: HashMap::new(),
             any_ip: Vec::new(),
+            ip_restricted: false,
         }
     }
 
@@ -362,8 +365,11 @@ impl CidrMatcher {
                 self.any_ip.push(route_idx);
             }
             Some(ranges) => {
+                // B-422: 読める項目が 1 つも無くても IP の条件のあるルートとして数える（そのルートはどの IP にも
+                // 一致しない。以前は設定の全部の項目が読めないと `has_conditions` が偽になり、全ルートを IP の候補にした）
+                self.ip_restricted = true;
                 for cidr in ranges {
-                    self.add_cidr(route_idx, cidr);
+                    self.add_cidr(route_idx, cidr.trim());
                 }
             }
         }
@@ -495,7 +501,10 @@ impl CidrMatcher {
 
     /// Check if this matcher has any source_ip conditions
     pub fn has_conditions(&self) -> bool {
-        !self.v4_ranges.is_empty() || !self.v6_ranges.is_empty() || !self.exact_ips.is_empty()
+        self.ip_restricted
+            || !self.v4_ranges.is_empty()
+            || !self.v6_ranges.is_empty()
+            || !self.exact_ips.is_empty()
     }
 }
 
@@ -962,6 +971,29 @@ mod tests {
         let ip: SocketAddr = "127.0.0.1:1".parse().unwrap();
         assert_eq!(opt.get_candidates("h", "/admin/users", &ip), vec![0, 1]);
         assert_eq!(opt.get_candidates("h", "/adminx", &ip), vec![1]);
+    }
+
+    /// B-422: source_ip の項目が 1 つも読めない（ほかのルートにも IP の条件が無い）ときも、そのルートはどの IP にも
+    /// 一致しない（以前は IP の条件を丸ごと飛ばして全ルートを候補にした）。前後の空白は読む
+    #[test]
+    fn unparsable_source_ip_fails_closed() {
+        let ip: SocketAddr = "203.0.113.9:1".parse().unwrap();
+        let mut opt = OptimizedRouter::new();
+        opt.add_route(0, None, Some("/admin"), Some(&["192.168.1.*".to_string()]));
+        opt.add_route(1, None, Some("/"), None);
+        opt.finalize();
+        assert_eq!(opt.get_candidates("h", "/admin/x", &ip), vec![1]);
+
+        let mut opt = OptimizedRouter::new();
+        opt.add_route(0, None, Some("/admin"), Some(&[" 203.0.113.0/24 ".to_string()]));
+        opt.finalize();
+        assert_eq!(opt.get_candidates("h", "/admin/x", &ip), vec![0]);
+
+        // 空の一覧もどの IP にも一致しない（`upstream::matches_cidr` と同じ）
+        let mut opt = OptimizedRouter::new();
+        opt.add_route(0, None, Some("/admin"), Some(&[]));
+        opt.finalize();
+        assert!(opt.get_candidates("h", "/admin/x", &ip).is_empty());
     }
 
     #[test]

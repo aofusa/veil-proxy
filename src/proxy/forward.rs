@@ -518,6 +518,40 @@ pub(super) async fn handle_proxy(
                 let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
                 Some((client_stream, 413, 0, true))
             } else {
+                // B-420: 上流の h2c へは本文の全量を送る。以前は見出しと一緒に読めた分だけを送って END_STREAM にし、
+                // 残りの本文をクライアントの接続の次の要求として読んでいた（要求の密輸）。chunked はフレーミングごと送っていた
+                let full_body;
+                let mut client_wants_close = client_wants_close;
+                let body: &[u8] = if is_chunked || content_length > initial_body.len() {
+                    match read_h2c_request_body(
+                        &mut client_stream,
+                        security,
+                        headers,
+                        content_length,
+                        is_chunked,
+                        is_grpc,
+                        initial_body,
+                    )
+                    .await
+                    {
+                        Ok((b, pipelined)) => {
+                            // 本文の後ろまで読んだ分（次の要求）はこの経路から返せないので、応答の後に閉じる
+                            client_wants_close |= pipelined;
+                            full_body = b;
+                            &full_body
+                        }
+                        Err(status) => {
+                            let err: &[u8] = match status {
+                                413 => ERR_MSG_REQUEST_TOO_LARGE,
+                                _ => ERR_MSG_BAD_REQUEST,
+                            };
+                            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err.to_vec())).await;
+                            return Some((client_stream, status, 0, true));
+                        }
+                    }
+                } else {
+                    initial_body
+                };
                 let added = expanded_added_headers(
                     security,
                     client_ip,
@@ -535,7 +569,7 @@ pub(super) async fn handle_proxy(
                     method,
                     final_path.as_bytes(),
                     headers,
-                    initial_body,
+                    body,
                     client_wants_close,
                     &added,
                 )
@@ -1010,6 +1044,32 @@ pub(super) enum H1ViaH2 {
     Http1(ServerTls),
 }
 
+// B-414: 上流の content-length を写す前に確かめる
+/// HTTP/2 の上流の応答の `content-length`。行が無ければ `Ok(None)`、すべての行が同じ 10 進の数なら
+/// `Ok(Some(n))`、読めない値・食い違う値があれば `Err(())`（RFC 9113 §8.1.1 の不正な応答）。
+#[cfg(feature = "http2")]
+fn h2_upstream_content_length(headers: &[(Bytes, Bytes)]) -> Result<Option<usize>, ()> {
+    let mut found = None;
+    for (n, v) in headers {
+        if !n.eq_ignore_ascii_case(b"content-length") {
+            continue;
+        }
+        let digits = v.trim_ascii();
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return Err(());
+        }
+        let parsed: usize = std::str::from_utf8(digits)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or(())?;
+        match found {
+            Some(prev) if prev != parsed => return Err(()),
+            _ => found = Some(parsed),
+        }
+    }
+    Ok(found)
+}
+
 /// HTTP/2 の上流（h2c・TLS の h2）の応答を HTTP/1.1 の head（空行まで）にする。
 ///
 /// ステータス行は `HTTP/1.1`、ホップバイホップと `remove_response_headers` を落とし、`add_response_headers`・Alt-Svc を足し
@@ -1164,7 +1224,8 @@ pub(super) async fn proxy_h1_via_https_h2(
         }
         _ => return bad_gateway(client_stream).await,
     };
-    let no_body = method.eq_ignore_ascii_case(b"HEAD") || status == 204 || status == 304;
+    // B-417: メソッドは大文字小文字を区別する（`head` は HEAD ではない。HTTP/1.1 の経路の `request_is_head` と揃える）
+    let no_body = method == b"HEAD" || status == 204 || status == 304;
     let header = |hs: &[(Bytes, Bytes)], name: &[u8]| {
         hs.iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -1174,11 +1235,12 @@ pub(super) async fn proxy_h1_via_https_h2(
     let is_grpc = content_type
         .as_deref()
         .is_some_and(|ct| ct.starts_with(b"application/grpc"));
-    let content_length: Option<usize> = header(&resp_headers, b"content-length").and_then(|v| {
-        std::str::from_utf8(&v)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-    });
+    // B-414: 上流の content-length は、すべての行が同じ 10 進の数のときだけ使う（食い違い・読めない値は 502。
+    // 以前は最初の行だけを読み、ほかの行もそのままクライアントへ写していた）
+    let content_length: Option<usize> = match h2_upstream_content_length(&resp_headers) {
+        Ok(v) => v,
+        Err(()) => return bad_gateway(client_stream).await,
+    };
     let should_compress = if is_grpc || no_body {
         None
     } else {
@@ -1261,12 +1323,23 @@ pub(super) async fn proxy_h1_via_https_h2(
         };
     }
 
-    // 長さ既知（または本文なし）ならそのまま、不明なら chunked で書く。
+    // 長さ既知なら自分の Content-Length の行、本文なしなら上流のまま、不明なら chunked で書く。
+    // B-414: 長さ既知でも上流の行は写さない（検証した 1 行だけにする）
     let chunked = !no_body && content_length.is_none();
-    let framing: &[u8] = if chunked {
-        b"Transfer-Encoding: chunked\r\n"
-    } else {
-        b""
+    let mut cl_line = [0u8; 40];
+    let framing: &[u8] = match content_length {
+        _ if chunked => b"Transfer-Encoding: chunked\r\n",
+        Some(n) if !no_body => {
+            let mut nb = itoa::Buffer::new();
+            let digits = nb.format(n).as_bytes();
+            let mut len = 0;
+            for part in [&b"Content-Length: "[..], digits, b"\r\n"] {
+                cl_line[len..len + part.len()].copy_from_slice(part);
+                len += part.len();
+            }
+            &cl_line[..len]
+        }
+        _ => b"",
     };
     let Some(head) = render_h2_upstream_head(
         status,
@@ -1293,10 +1366,16 @@ pub(super) async fn proxy_h1_via_https_h2(
     }
     let mut sent: u64 = 0;
     let mut trailers: Option<Vec<(Bytes, Bytes)>> = None;
+    // B-414: 長さ既知の本文は宣言した長さを超えて書かない。超える DATA・足りないまま終わった本文は接続を閉じて
+    // 切り詰めを示す（以前は DATA をそのまま書き、余りがクライアントの次の応答として読まれ得た）
+    let declared = content_length.map(|n| n as u64);
     loop {
         match timeout(READ_TIMEOUT, stream.resp_rx.recv()).await {
             Ok(None) => break,
             Ok(Some(UpResp::Data(b))) => {
+                if declared.is_some_and(|n| sent + b.len() as u64 > n) {
+                    return H1ViaH2::Done(Some((client_stream, status, sent, true)));
+                }
                 sent += b.len() as u64;
                 let ok = if chunked {
                     let mut size = Vec::with_capacity(12);
@@ -1325,6 +1404,9 @@ pub(super) async fn proxy_h1_via_https_h2(
             }
         }
     }
+    if declared.is_some_and(|n| sent != n) {
+        return H1ViaH2::Done(Some((client_stream, status, sent, true)));
+    }
     if chunked {
         let mut tail = Vec::with_capacity(64);
         tail.extend_from_slice(b"0\r\n");
@@ -1343,6 +1425,48 @@ pub(super) async fn proxy_h1_via_https_h2(
         }
     }
     H1ViaH2::Done(Some((client_stream, status, sent, client_wants_close)))
+}
+
+// B-420
+/// HTTP/1.1 で受けた要求の本文を、上流の h2c へ送るために全部読む（chunked は復号する。上限は Content-Length の
+/// 要求が `max_request_body_size`、chunked が `max_chunked_body_size`、gRPC は `MAX_GRPC_BODY_SIZE` まで）。
+/// 返す `bool` は本文の後ろまで読んだか（次の要求が来ている）。失敗はステータス（上限超過 413、それ以外 400）。
+#[cfg(feature = "http2")]
+async fn read_h2c_request_body(
+    client_stream: &mut ServerTls,
+    security: &SecurityConfig,
+    headers: &[(Bytes, Bytes)],
+    content_length: usize,
+    is_chunked: bool,
+    is_grpc: bool,
+    initial_body: &[u8],
+) -> Result<(Bytes, bool), u16> {
+    // chunked はクライアントが 100 Continue を待つことがある（Content-Length の要求は h1 の経路が先に返している）
+    if is_chunked && crate::http_utils::check_expect_continue(headers) {
+        match timeout(WRITE_TIMEOUT, client_stream.write_all(HTTP_100_CONTINUE.to_vec())).await {
+            Ok((Ok(_), _)) => {}
+            _ => return Err(400),
+        }
+    }
+    let mut limit = if is_chunked {
+        security.max_chunked_body_size
+    } else {
+        security.max_request_body_size
+    };
+    if is_grpc {
+        limit = limit.min(MAX_GRPC_BODY_SIZE);
+    }
+    let mut overflow = BytesMut::new();
+    let body = super::h1::read_full_request_body(
+        client_stream,
+        content_length,
+        is_chunked,
+        initial_body,
+        limit,
+        &mut overflow,
+    )
+    .await?;
+    Ok((body, !overflow.is_empty()))
 }
 
 /// H2C (HTTP/2 over cleartext) プロキシ
@@ -1413,7 +1537,7 @@ pub(super) async fn proxy_h2c(
 
     // F-285: Wasm の応答本文のフェーズ（受けるモジュールのあるルートだけ。圧縮の前。gRPC・本文の無い応答は除く）
     #[cfg(feature = "wasm")]
-    if !(method.eq_ignore_ascii_case(b"HEAD")
+    if !(method == b"HEAD"
         || matches!(status_code, 100..=199 | 204 | 304)
         || response.headers.iter().any(|(n, v)| {
             n.eq_ignore_ascii_case(b"content-type") && v.starts_with(b"application/grpc")
@@ -1444,7 +1568,8 @@ pub(super) async fn proxy_h2c(
     let is_grpc = content_type
         .as_deref()
         .is_some_and(|ct| ct.starts_with(b"application/grpc"));
-    let no_body = method.eq_ignore_ascii_case(b"HEAD") || status_code == 204 || status_code == 304;
+    // B-417: 大文字小文字を区別する
+    let no_body = method == b"HEAD" || status_code == 204 || status_code == 304;
     let should_compress = if is_grpc || no_body || response.body.is_empty() {
         None
     } else {
@@ -1734,6 +1859,31 @@ pub(crate) fn build_revalidation_request(
 #[cfg(test)]
 mod revalidation_request_tests {
     use super::*;
+
+    /// B-414: HTTP/2 の上流の content-length は全部の行が同じ数のときだけ使う
+    #[cfg(feature = "http2")]
+    #[test]
+    fn h2_upstream_content_length_rejects_conflicts() {
+        let h = |n: &'static [u8], v: &'static [u8]| (Bytes::from_static(n), Bytes::from_static(v));
+        assert_eq!(h2_upstream_content_length(&[]), Ok(None));
+        assert_eq!(
+            h2_upstream_content_length(&[h(b"content-length", b"5")]),
+            Ok(Some(5))
+        );
+        assert_eq!(
+            h2_upstream_content_length(&[h(b"content-length", b"5"), h(b"Content-Length", b" 5")]),
+            Ok(Some(5))
+        );
+        for bad in [
+            vec![h(b"content-length", b"5"), h(b"content-length", b"6")],
+            vec![h(b"content-length", b"+5")],
+            vec![h(b"content-length", b"5, 5")],
+            vec![h(b"content-length", b"")],
+            vec![h(b"content-length", b"99999999999999999999999999")],
+        ] {
+            assert_eq!(h2_upstream_content_length(&bad), Err(()), "{bad:?}");
+        }
+    }
 
     /// B-371: stale-while-revalidate の裏の更新は生の転送と同じ方針で組み立てる（上流の Host・path_prefix・
     /// remove_request_headers・信頼しない送信元の転送ヘッダを捨ててクライアントの IP・hop-by-hop を送らない）

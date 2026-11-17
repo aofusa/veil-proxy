@@ -60,9 +60,9 @@ pub use aws_lc_rs::hmac;
 pub use ring::hmac;
 
 // F-262: WebSocket の `Sec-WebSocket-Accept`（SHA-1(key + GUID)）。依存を増やさずプラットフォームの暗号プロバイダを使う
-// （ハンドラと、HTTP/2・HTTP/3 の拡張 CONNECT を上流の HTTP/1.1 の WebSocket へ中継するプロキシ（F-288））。
+// （ハンドラと、HTTP/2・HTTP/3 の拡張 CONNECT を上流の HTTP/1.1 の WebSocket へ中継するプロキシ（F-288）。
+// B-415 で HTTP/1.1 の WebSocket の中継も上流の 101 を確かめるのに使うので、feature を問わずにコンパイルする）。
 /// SHA-1 of the concatenation of `parts` (legacy use only: the WebSocket handshake).
-#[cfg(any(feature = "handler", feature = "http2", feature = "http3"))]
 pub(crate) fn sha1_legacy(parts: &[&[u8]]) -> [u8; 20] {
     #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
     use aws_lc_rs::digest;

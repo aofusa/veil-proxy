@@ -221,8 +221,10 @@ TOML
   expect "ApiError 404" "user 0 does not exist" curl -s "$B/users/0"
   expect "Query<T>" '{"users":["x1","x2"]}' curl -s "$B/users?limit=2&prefix=x"
   expect "Query<T> validation 422" '"less_than_equal"' curl -s "$B/users?limit=500"
-  expect "POST 201" "201" curl -s -o /dev/null -w "%{http_code}" -X POST "$B/users" -d '{"name":"al","age":30}'
-  expect "POST validation 422" '"too_short"' curl -s -X POST "$B/users" -d '{"name":"","age":200,"email":"bad"}'
+  expect "POST 201" "201" curl -s -o /dev/null -w "%{http_code}" -X POST "$B/users" -H 'content-type: application/json' -d '{"name":"al","age":30}'
+  expect "POST validation 422" '"too_short"' curl -s -X POST "$B/users" -H 'content-type: application/json' -d '{"name":"","age":200,"email":"bad"}'
+  # B-418: Json<T> は Content-Type が JSON の要求だけを受ける（別サイトの text/plain のフォーム）
+  expect "POST text/plain 415" "415" curl -s -o /dev/null -w "%{http_code}" -X POST "$B/users" -H 'content-type: text/plain' -d '{"name":"al","age":30}'
   expect "offloaded sync fn" "500500" curl -s "$B/compute/1000"
   expect "catch-all" "file: a/b/c" curl -s "$B/files/a/b/c"
   expect "App::get" "pong" curl -s "$B/ping"
@@ -1560,11 +1562,13 @@ run_c_kit() { # F-291: C の helpers kit（libveil_kit・examples/api/c-kit）�
     "curl -s -i '$B/client/async' | tr -d '\r' | grep -iE '^x-deferred:|^200 ' | tr A-Z a-z | paste -sd'|' -"
   expect "C deferred response from a thread" "later" curl -s "$B/deferred"
   # JSON 本文の検証（422）と OpenAPI の requestBody
-  expect "C body schema 422" '422 {"detail":[' bash -c "curl -s -w '%{http_code} ' -o '$W/422' -X POST --data '{\"name\":\"\",\"extra\":1}' '$B/users'; cat '$W/422'"
+  expect "C body schema 422" '422 {"detail":[' bash -c "curl -s -w '%{http_code} ' -o '$W/422' -X POST -H 'content-type: application/json' --data '{\"name\":\"\",\"extra\":1}' '$B/users'; cat '$W/422'"
   expect "C body schema error kinds" "extra_forbidden missing too_short" bash -c \
     "$PY3 -I -c 'import json,sys; d=json.load(open(sys.argv[1]))[\"detail\"]; print(\" \".join(sorted(e[\"type\"] for e in d)))' '$W/422'"
-  expect "C body schema invalid JSON" "json_invalid" curl -s -X POST --data '{bad' "$B/users"
-  expect "C body schema valid" '201 {"name":"ann","age":3}' bash -c "curl -s -w '%{http_code} ' -o '$W/201' -X POST --data '{\"name\":\"ann\",\"age\":3}' '$B/users'; cat '$W/201'"
+  expect "C body schema invalid JSON" "json_invalid" curl -s -X POST -H 'content-type: application/json' --data '{bad' "$B/users"
+  expect "C body schema valid" '201 {"name":"ann","age":3}' bash -c "curl -s -w '%{http_code} ' -o '$W/201' -X POST -H 'content-type: application/json' --data '{\"name\":\"ann\",\"age\":3}' '$B/users'; cat '$W/201'"
+  # B-418: JSON の本文を宣言したルートは Content-Type が JSON でなければ 415（form-urlencoded・型無し）
+  expect "C body schema form 415" "415" curl -s -o /dev/null -w "%{http_code}" -X POST --data '{"name":"ann","age":3}' "$B/users"
   expect "C body schema in OpenAPI" '"required":["name","age"]' bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[\"paths\"][\"/users\"][\"post\"][\"requestBody\"][\"content\"][\"application/json\"][\"schema\"], separators=(\",\",\":\")))'"
   # gRPC のチャネル（自分の gRPC サービスへ）と Balanced（1 台目は落ちている）
   expect "C gRPC channel unary" "code=0 msg=ping trailer=yes" curl -s "$B/grpc/unary"

@@ -458,7 +458,8 @@ impl<'a> StaticRequest<'a> {
         I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
     {
         let mut r = StaticRequest {
-            head: method.eq_ignore_ascii_case(b"HEAD"),
+            // B-417: メソッドは大文字小文字を区別する（`head` を HEAD と見て本文を省くと、区別する前段は本文を待ち続ける）
+            head: method == b"HEAD",
             range: None,
             if_range: None,
             if_none_match: None,
@@ -1429,6 +1430,8 @@ mod tests {
     fn head_flag() {
         assert!(req(&[], b"HEAD").head);
         assert!(!req(&[], b"GET").head);
+        // B-417: メソッドは大文字小文字を区別する
+        assert!(!req(&[], b"head").head);
     }
 
     #[test]

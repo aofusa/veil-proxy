@@ -473,8 +473,9 @@ typedef struct veil_route_options {
     const char *body_schema_json;  /* a JSON Schema of the body (NULL = no validation) */
 } veil_route_options_t;
 #define VEIL_ROUTE_OPTIONS_INIT { sizeof(veil_route_options_t) }
-/* Like veil_register_route_ex, with options (`opts` may be NULL). With body_schema_json, a body that is not JSON
- * or does not match is answered with 422 {"detail": [{"type", "loc", "msg"}]} before the handler runs (loc starts
+/* Like veil_register_route_ex, with options (`opts` may be NULL). With body_schema_json, a request whose
+ * Content-Type is not application/json (or application/*+json) is answered with 415, and a body that is not JSON
+ * or does not match with 422 {"detail": [{"type", "loc", "msg"}]}, before the handler runs (loc starts
  * with "body"), and the schema becomes the operation's requestBody in OpenAPI. Supported keywords: type (also
  * "null" and lists of types), properties, required, additionalProperties, items, minItems, maxItems, minLength,
  * maxLength, pattern, enum, const, minimum, maximum, exclusiveMinimum, exclusiveMaximum, multipleOf,

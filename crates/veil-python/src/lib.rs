@@ -556,9 +556,11 @@ fn run(py: Python<'_>, config: PyConfig, handlers: Vec<Py<PyAny>>) -> PyResult<(
                     .ok_or_else(|| PyValueError::new_err(format!("unknown handler id {}", id)))?
                     .clone_ref(py),
             );
+            let lane = Arc::clone(&lane);
             Arc::new(move |req: Request| {
                 let route = Arc::clone(&route);
-                Box::pin(async move { aio::websocket_endpoint(route, req) })
+                let lane = Arc::clone(&lane);
+                Box::pin(aio::websocket_endpoint(route, req, lane))
             })
         } else {
             Arc::new(move |req: Request| Box::pin(aio::websocket_on_loop(id, req)))

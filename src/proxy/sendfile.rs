@@ -81,6 +81,14 @@ pub(super) async fn handle_sendfile(
         path_str
     };
 
+    // B-419: 空のセグメント（`//`）のあるパスは配信しない（ルートの選択は `//` を潰さないので、潰して解決すると狭い
+    // ルートの制限を外れた要求に同じファイルを返す）
+    if crate::http_utils::path_has_empty_segment(path_str) {
+        let err_buf = ERR_MSG_NOT_FOUND.to_vec();
+        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+        return Some((tls_stream, 404, 0, true));
+    }
+
     // パストラバーサル防止（簡易チェック）。B-396: Windows のドライブ等でルートを置き換えるサブパスも断る
     if remainder.contains("..")
         || !crate::http_utils::is_plain_relative_subpath(remainder.trim_start_matches('/'))

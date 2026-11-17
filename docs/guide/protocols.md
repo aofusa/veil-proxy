@@ -91,6 +91,11 @@ stream_idle_timeout_secs = 60
 
 When limits are exceeded, the server responds with `ENHANCE_YOUR_CALM` (0xb) error and closes the connection.
 
+A header block that veil refuses for one stream (too many concurrent streams, a stream it has already reset, an
+invalid priority) is still HPACK-decoded before the stream is reset, so later requests on the same connection decode
+with the same dynamic table as the client. A block that cannot be decoded (over `max_header_block_size`, or one that
+continues in `CONTINUATION` frames on a refused stream) closes the connection.
+
 A stream whose request body stops arriving is reset with `RST_STREAM(CANCEL)` once no body data has been received for the
 route's `[route.security] client_body_timeout_secs` (default 30 seconds), until the response starts.
 `stream_idle_timeout_secs` is the limit for streams that have no route setting (for example a request that matched no

@@ -14,7 +14,7 @@
    - `header`: HTTPヘッダーマッチ（マップで複数ヘッダー指定可能、例: `{ "X-Version" = "v2" }`）
    - `method`: HTTPリクエストメソッドマッチ（配列で複数メソッド指定可能、例: `["GET", "POST"]`）
    - `query`: クエリパラメータマッチ（マップで複数クエリ指定可能、例: `{ "token" = "secret" }`）
-   - `source_ip`: ソースIPマッチ（CIDR表記、配列で複数CIDR指定可能、例: `["192.168.0.0/16", "10.0.0.0/8"]`）。デュアルスタックのリスナーで受けた IPv4 のクライアント（`::ffff:a.b.c.d`）は IPv4 として照合する。アドレスより長い接頭辞（IPv4 の `/33`・IPv6 の `/129`）の項目は警告を出して無視する
+   - `source_ip`: ソースIPマッチ（CIDR表記、配列で複数CIDR指定可能、例: `["192.168.0.0/16", "10.0.0.0/8"]`）。デュアルスタックのリスナーで受けた IPv4 のクライアント（`::ffff:a.b.c.d`）は IPv4 として照合する。項目はすべて IP アドレスか CIDR の範囲でなければならず、読めない項目（`192.168.1.*` のようなワイルドカード、ホスト名、IPv4 の `/33` のようなアドレスより長い接頭辞）は設定の誤りになる。空の一覧のルートはどのクライアントにも一致しない
    - すべての条件はANDで結合されます。条件が指定されていない場合は、すべてのリクエストにマッチします（デフォルトルート）。
 2. **ルートアクション** (`[route.action]`): バックエンドアクション（File、Proxy、Redirectなど）
 3. **ルートレベルの設定** (`[route.security]`, `[route.cache]`, `[route.compression]`, `[route.buffering]`, `[route.open_file_cache]`): actionレベルの設定をオーバーライド
@@ -83,6 +83,10 @@ path = "/var/www/docs/"
 | `/docs` | `"/docs"` | `/var/www/docs/index.html` ※直接返す |
 | `/docs/` | `"/docs"` | `/var/www/docs/index.html` |
 | `/docs/guide/intro.html` | `"/docs"` | `/var/www/docs/guide/intro.html` |
+
+連続したスラッシュ（`//`。クエリより前）のあるパスには、`File` のルートは 404 を返します。ルートは連続したスラッシュを
+潰さずに選ぶので（`//admin/x` は `/admin/*` に一致しません）、潰したファイルを返すと狭いルートの制限を外れます。
+ルートを選ぶ前に潰すには `path_normalization = "merge_slashes"` を使います。
 
 #### 3. インデックスファイルの指定
 
@@ -452,6 +456,10 @@ gRPC の要求（`content-type: application/grpc*`）はフルパス（`/package
 - HTTP/2の多重化とヘッダー圧縮をバックエンド通信でも活用
 - Prior Knowledgeモードを使用（Upgrade経由ではない）
 
+HTTP/1.1 で受けた要求は、本文の全量を H2C のバックエンドへ送ります（残りの本文を読み、`chunked` は復号してから送る。
+上限は `max_request_body_size`、`chunked` は `max_chunked_body_size`。超えれば 413）。クライアントが本文の後ろに次の要求を
+続けて送っていた場合は、応答の後に接続を閉じます。
+
 **H2C バックエンド接続の多重化（F-174）**: ワーカーごとにバックエンドのアドレス単位で上流 HTTP/2 接続をプールし、**1 本の接続を複数の要求が同時に共有**します（接続ごとに 1 つのアクタータスクが HEADERS/DATA を書き出し、受信フレームをストリームごとのチャネルへ振り分けます）。新しい接続を張るのは、プール内のすべての接続が相手の `SETTINGS_MAX_CONCURRENT_STREAMS` に達したか GOAWAY を受けたときだけです。要求本文は接続・ストリーム両方のフロー制御ウィンドウに従い（B-106）、受信した DATA は下流が受け取ってから WINDOW_UPDATE します。ストリームの無い接続は `idle_connection_timeout_secs` 後に GOAWAY で閉じます（`0` でプール無効）。アクターは上流からの切断を即座に検知するため、切れた接続を割り当てることはありません。上流に拒否されたストリーム（REFUSED_STREAM、GOAWAY の `last_stream_id` より後）と、応答 head より前に失敗した冪等な要求は、新しいストリームで 1 回だけ再送します。これにより gRPC 中継（`クライアント → veil (TLS h2/h3) → バックエンド (h2c)`）で呼び出しごとのハンドシェイクと上流接続を回避できます。
 
 > **Note**: H2CはHTTPSバックエンド（TLS接続）では使用できません。内部ネットワークでのgRPC通信など、TLSが不要な環境でのみ使用してください。
@@ -626,6 +634,9 @@ upstream = "websocket-pool"
 - 中継は両方向を同時に待ち、データの届いた側から読みます。データを失わず、アイドルのトンネルは CPU も syscall も使いません。
   書き込みには他の応答と同じ時間の上限があり、読まない相手はトンネルを閉じさせます（両方の接続を握り続けられません）。
 - 上流への接続は常に HTTP/1.1 です（上流が `use_h2c`・TLS の HTTP/2 のルートでも）。
+- クライアントがほかのトークンを並べても上流へは `Upgrade: websocket` だけを送り（`HTTP2-Settings` は送りません）、
+  WebSocket へ切り替える `101`（`Upgrade: websocket` と、クライアントの `Sec-WebSocket-Key` に合う `Sec-WebSocket-Accept`）
+  だけを中継します。それ以外の `101`（`h2c` への切り替え等）は 502 です。
 - `101` の応答（とアップグレードを断った応答）は通常のプロキシの応答と同じくルートの応答ヘッダの方針を通ります
   （`remove_response_headers`・`add_response_headers`・`Server`）。上流がアップグレードしなければ応答全体（本文も）を返して接続を閉じます。
   `101` 以外の `1xx` は捨てます。
@@ -675,8 +686,8 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_user` | 起動後に降格するユーザー名（root で起動したとき）。`drop_privileges_group` を指定しなければ、その利用者の主グループへ下ろす。補助グループは常に外し、外せないときや root に戻れるときは起動を止める | なし |
 | `drop_privileges_group` | 起動後に降格するグループ名 | なし |
 | `max_concurrent_connections` | 同時接続数の上限 | 0（無制限） |
-| `blocked_ips` | 最前線 IP/CIDR ブロックリスト。`accept` 直後（TLS ハンドシェイク・ハンドラ生成の前）にマッチした接続を切断し、既知の不正 IP への高コスト処理を回避する。全部のリスナーに掛かる（HTTP の TLS・平文、L4 の TCP、HTTP/3 の新しい接続の Initial（Retry も返さない）、L4 の UDP の新しいセッション）。CIDR は起動時に一度だけパースされ（accept ホットパスはゼロアロケーション判定）、SIGHUP でホットリロード可能。ルート単位の `denied_ips` より前段で評価される。 | `[]` |
-| `path_normalization` | ルートの照合・`[route.security]` の検査の前の要求のパスの正規化。正規化したパスを上流へ送る。`"base"`: 予約されていない文字の `%XX` を戻し、`\` を `/` に、ドットのセグメントを除く。`"merge_slashes"`: base + 連続する `/` を 1 つに。`"off"`: 生のパス（v0.8.0 より前）。絶対形式の要求先は origin 形式に直し、それ以外の origin 形式でないもの（`CONNECT`・`OPTIONS *` を除く）と `#`・UTF-8 でないバイトを含むものは 400 | `"base"` |
+| `blocked_ips` | 最前線 IP/CIDR ブロックリスト。`accept` 直後（TLS ハンドシェイク・ハンドラ生成の前）にマッチした接続を切断し、既知の不正 IP への高コスト処理を回避する。全部のリスナーに掛かる（HTTP の TLS・平文、L4 の TCP、HTTP/3 の新しい接続の Initial（Retry も返さない）、L4 の UDP の新しいセッション、ライブラリの UDP のハンドラ（`l4-handler`）へのデータグラムごと）。CIDR は起動時に一度だけパースされ（accept ホットパスはゼロアロケーション判定）、SIGHUP でホットリロード可能。ルート単位の `denied_ips` より前段で評価される。 | `[]` |
+| `path_normalization` | ルートの照合・`[route.security]` の検査の前の要求のパスの正規化。正規化したパスを上流へ送る。`"base"`: 予約されていない文字の `%XX` を戻し、16 進 2 桁の続かない `%` を `%25` にし、`\` を `/` に、ドットのセグメントを除く。`"merge_slashes"`: base + 連続する `/` を 1 つに。`"off"`: 生のパス（v0.8.0 より前）。絶対形式の要求先は origin 形式に直し、それ以外の origin 形式でないもの（`CONNECT`・`OPTIONS *` を除く）と `#`・UTF-8 でないバイトを含むものは 400 | `"base"` |
 | `escaped_slashes` | パスのエスケープされたスラッシュ（`%2F`・`%5C`）の扱い。`"keep"`: エスケープしたまま送る。ただし `path_normalization` が有効なとき、エスケープされたスラッシュがドットのセグメントを作るパス（`/public/..%2Fadmin`）は 400。`"reject"`: `%2F`・`%5C` を含むパスはすべて 400。`"unescape"`: `/` に戻してから正規化する | `"keep"` |
 | `allow_security_failures` | セキュリティ機能の有効化に失敗した場合の動作 | false |
 

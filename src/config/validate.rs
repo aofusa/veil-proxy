@@ -564,6 +564,11 @@ pub(super) fn validate_route_config(
             validate_ip_list(&format!("route '{route_name}' security.{key}"), list)?;
         }
     }
+    // B-422: ルートの条件の source_ip も読めない項目を断る（以前はルーターが黙って捨て、設定の全部の source_ip が
+    // 読めないとルーターが IP の条件を丸ごと飛ばして、IP を絞ったルートがどのクライアントにも一致した）
+    if let Some(list) = &route.conditions.source_ip {
+        validate_ip_list(&format!("route '{route_name}' conditions.source_ip"), list)?;
+    }
     match &route.action {
         BackendConfig::Proxy { url, .. } => {
             if ProxyTarget::parse(url).is_none() {
@@ -787,5 +792,33 @@ mod b383_tests {
                 .contains("wasm_modules are not supported for UDP"),
             "{e}"
         );
+    }
+}
+
+// B-422: ルートの条件の source_ip の読めない項目は設定の誤り（以前はルーターが黙って捨て、全部が読めないと IP の
+// 条件が丸ごと外れた）
+#[cfg(test)]
+mod b422_tests {
+    use super::*;
+
+    #[test]
+    fn route_source_ip_entries_must_parse() {
+        let cfg = |ips: &str| -> Config {
+            toml::from_str(&format!(
+                "[server]\nlisten_cleartext = \"127.0.0.1:18080\"\nenable_secure_redirect = false\n\
+                 [[route]]\n[route.conditions]\npath = \"/admin/*\"\nsource_ip = {ips}\n\
+                 [route.action]\ntype = \"Respond\"\nstatus = 200\nbody = \"ok\"\n"
+            ))
+            .unwrap()
+        };
+        validate_config(&cfg(r#"["10.0.0.0/8", "192.0.2.1", "2001:db8::/32"]"#)).unwrap();
+        for bad in [
+            r#"["192.168.1.*"]"#,
+            r#"["10.0.0.0/40"]"#,
+            r#"["example.com"]"#,
+        ] {
+            let e = validate_config(&cfg(bad)).unwrap_err();
+            assert!(e.to_string().contains("conditions.source_ip"), "{bad}: {e}");
+        }
     }
 }

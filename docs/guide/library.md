@@ -306,7 +306,7 @@ Arguments are bound by type and name:
 | Argument | Source |
 |----------|--------|
 | `&Request` / `Request` | the whole request |
-| `Json<T>` | JSON body |
+| `Json<T>` | JSON body (the request's `Content-Type` must be `application/json` or `application/*+json`, otherwise 415) |
 | `Query<T>` | the whole query string deserialized into `T` |
 | `Form<T>` | `application/x-www-form-urlencoded` body (or the text fields of a `multipart/form-data` body) |
 | `MultipartForm<T>`, `UploadFile`, `Vec<UploadFile>`, `Option<UploadFile>`, `Multipart` | `multipart/form-data` body (see [Forms and file uploads](#forms-and-file-uploads)) |
@@ -1242,7 +1242,8 @@ interoperability checks as the Rust gRPC example).
   client left). `veil_deferred_free(d)` answers 500 instead. Not on `VEIL_ROUTE_INLINE` routes. Middleware "after"
   steps do not run on a deferred response.
 - JSON body validation: `veil_register_route_ex2(cfg, path, methods, fn, ud, &veil_route_options_t)` with
-  `body_schema_json` (a JSON Schema). A body that is not JSON or does not match is answered with 422 and
+  `body_schema_json` (a JSON Schema). A request whose `Content-Type` is not `application/json` (or
+  `application/*+json`) is answered with 415, and a body that is not JSON or does not match with 422 and
   `{"detail": [{"type", "loc", "msg"}]}` (the format of Rust's `Validate` and FastAPI; `loc` starts with `"body"`)
   before the handler runs, and the schema becomes the route's `requestBody` in OpenAPI. Supported keywords: `type`
   (also `null` and lists of types), `properties`, `required`, `additionalProperties`, `items`, `minItems`,
@@ -1290,7 +1291,9 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
   `@app.get(...)` and `app.run()`. Arguments are bound by name and annotation, returns are converted
   (dict/list → JSON, `str` → text, `veil.Response`, `(body, status)`, `None` → 204), `veil.HTTPException(404, "...")`
   gives `{"detail": ...}`. With **pydantic** installed, `BaseModel` bodies are validated and described in OpenAPI;
-  without it, `body_constraints` validates dict bodies. OpenAPI is served at `/openapi.json` and `/docs`.
+  without it, `body_constraints` validates dict bodies. OpenAPI is served at `/openapi.json` and `/docs`. As in
+  FastAPI, a JSON body is read only when the request has no `Content-Type` or a JSON one (`application/json`,
+  `application/*+json`); another `Content-Type` (such as a cross-site `text/plain` form) gives 415.
 - **offload and the GIL.** Handlers hold the GIL while they run. By default (`offload=True`) they run on veil's
   Python handler threads (`[api] handler_threads`), so a network worker never waits for the GIL. The threads take
   turns: one runs requests back to back while it holds the GIL, a second waits for the GIL and takes over as soon as
@@ -1317,7 +1320,9 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # blocks (exposed; defau
   (a failing startup exits with status 1); a dict yielded by the lifespan is merged into `app.state`.
 - **WebSocket (F-263)** with the names of Starlette / FastAPI: `@app.websocket("/ws")` on
   `async def f(websocket: veil.WebSocket)` (`accept`, `receive_text/bytes/json`, `iter_text/bytes/json`,
-  `send_text/bytes/json`, `close`, `veil.WebSocketDisconnect`) and `veil.WebSocketEndpoint` classes. The frames,
+  `send_text/bytes/json`, `close`, `veil.WebSocketDisconnect`) and `veil.WebSocketEndpoint` classes. The route's
+  dependencies (`App`, `APIRouter` and `@app.websocket(dependencies=...)`) run before the handshake is answered for
+  both kinds: one raising `HTTPException` refuses the upgrade with its status (422 for invalid parameters). The frames,
   Ping / Pong, UTF-8 checks, close handshake and limits are handled in Rust (the `[api] websocket_*` keys apply);
   Python only sees complete messages. WebSocket routes are listed in OpenAPI with `x-veil-websocket` (`receive=` /
   `send=` pydantic models, `validate=True` closes with 1007 on a mismatch). `veil.Response.switching_protocols(protocol,

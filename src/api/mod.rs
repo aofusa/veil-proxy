@@ -110,8 +110,8 @@ pub(crate) fn is_builtin_enabled(entry: &HandlerEntry, settings: &app::ApiSettin
 #[doc(hidden)]
 pub mod __private {
     pub use super::extract::{
-        form_body, json_body, path_param, query_param, query_param_opt, query_struct, FromRequest,
-        FromRequestAsync,
+        form_body, is_json_content_type, json_body, path_param, query_param, query_param_opt,
+        query_struct, FromRequest, FromRequestAsync,
     };
     pub use super::handler::{
         BodyMeta, HandlerFuture, OperationMeta, ParamMeta, ResponseMeta, RouteDef, WebSocketMeta,

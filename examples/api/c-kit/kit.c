@@ -677,6 +677,14 @@ static int selftest(void) {
     veil_test_response_free(out);
     r.method = "POST";
     r.target = "/users";
+    r.body = (const uint8_t *)"{\"name\":\"ann\",\"age\":3}";
+    r.body_len = strlen((const char *)r.body);
+    /* JSON の本文を宣言したルートは Content-Type が JSON でなければ 415 */
+    EXPECT(veil_test_request(t, &r, &out) == VEIL_OK && veil_test_response_status(out) == 415);
+    veil_test_response_free(out);
+    static const char *const json_ct[] = {"content-type", "application/json"};
+    r.headers = json_ct;
+    r.n_headers = 1;
     r.body = (const uint8_t *)"{\"name\":\"\",\"x\":1}";
     r.body_len = strlen((const char *)r.body);
     EXPECT(veil_test_request(t, &r, &out) == VEIL_OK && veil_test_response_status(out) == 422);

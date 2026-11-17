@@ -499,6 +499,11 @@ pub(crate) async fn serve_udp(handler: L4UdpFn, listen_addr: SocketAddr, listene
             }
             Err(_) => continue,
         };
+        // B-421: `[security] blocked_ips` はここでも当てる（TCP のハンドラ・L4 の UDP の中継と同じ。以前は検査せずに
+        // ハンドラへ渡して応答も返していた）
+        if crate::config::is_ip_blocked(peer.ip()) {
+            continue;
+        }
         let dgram = L4Datagram {
             data: Bytes::copy_from_slice(&buf[..n]),
             peer,

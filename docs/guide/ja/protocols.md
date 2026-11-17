@@ -91,6 +91,10 @@ stream_idle_timeout_secs = 60
 
 制限を超過した場合、サーバーは `ENHANCE_YOUR_CALM` (0xb) エラーで応答し、接続を閉じます。
 
+ストリーム単位で断るヘッダブロック（同時ストリーム数の超過・veil がリセット済みのストリーム・不正な優先度）も、
+ストリームをリセットする前に HPACK で読みます（同じ接続の後の要求をクライアントと同じ動的表で読むため）。
+読めないブロック（`max_header_block_size` の超過、断るストリームで `CONTINUATION` へ続くもの）は接続を閉じます。
+
 要求本文が届かなくなったストリームは、ルートの `[route.security] client_body_timeout_secs`（既定 30 秒）の間本文を受け取らなければ
 （応答を始めるまで）`RST_STREAM(CANCEL)` で打ち切ります。`stream_idle_timeout_secs` はルートの設定の無いストリーム（どのルートにも
 当たらなかった要求、最後の CONTINUATION が届かないヘッダなど）の上限です。確かめるのは受信中のストリームがある接続ごとに 1 秒に 1 回です。HTTP/3 もルートの

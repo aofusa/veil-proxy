@@ -388,6 +388,57 @@ pub(super) async fn test_h2c_handshake_failure() {
 
 // カテゴリ3: リクエスト/レスポンステスト（優先度: 高）
 
+/// B-420: 見出しの後に遅れて届いた本文も上流の h2c へ送り、クライアントの接続の次の要求として読まない。以前は
+/// 見出しと一緒に読めた分（ここでは空）だけを送って END_STREAM にし、残りの本文（要求の形をしたもの）を次の要求として
+/// 処理していた（要求の密輸）
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http2")]
+pub(super) async fn test_b420_h2c_late_body_is_not_a_second_request() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connector = tokio_rustls::TlsConnector::from(create_client_config());
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", PROXY_PORT))
+        .await
+        .expect("TCP connect");
+    let mut stream = connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .expect("TLS connect");
+    let hidden: &[u8] = b"GET /h2c/test.txt HTTP/1.1\r\nHost: localhost\r\nx-b420: hidden\r\n\r\n";
+    let head = format!(
+        "POST /h2c/test.txt HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+        hidden.len()
+    );
+    stream.write_all(head.as_bytes()).await.expect("write head");
+    stream.flush().await.expect("flush head");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stream.write_all(hidden).await.expect("write body");
+    stream.flush().await.expect("flush body");
+    let mut all = Vec::new();
+    let mut tmp = [0u8; 8192];
+    while let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut tmp)).await
+    {
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&tmp[..n]);
+    }
+    let text = String::from_utf8_lossy(&all);
+    let status_lines = text
+        .match_indices("HTTP/1.1 ")
+        .filter(|(i, _)| *i == 0 || text[..*i].ends_with('\n'))
+        .count();
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert_eq!(
+        status_lines, 1,
+        "the late body must not be answered as a second request: {text}"
+    );
+}
+
 #[tokio::test]
 #[ntest::timeout(15000)]
 #[cfg(feature = "http2")]

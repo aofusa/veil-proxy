@@ -1124,6 +1124,16 @@ pub(crate) fn is_plain_relative_subpath(sub: &str) -> bool {
     }
 }
 
+// B-419: ルートは `//` を潰さずに選ぶ（`path_normalization = "base"` の既定。`//admin/x` は `/admin/*` に当たらない）。
+// 静的配信がファイルの解決で `//` を潰すと、狭いルートの制限（`[route.security]`・JWT・Wasm）を外れて来た要求に広いルートの
+// 下の同じファイルを返した。空のセグメントのあるパスは配信しない（`merge_slashes` ならルートの前に潰れている）
+/// Whether the path part of a request target (before `?`) has an empty segment (`//`).
+#[inline]
+pub(crate) fn path_has_empty_segment(target: &str) -> bool {
+    let path = target.find('?').map_or(target, |q| &target[..q]);
+    path.contains("//")
+}
+
 /// Windows のパスとして接頭辞（ドライブ・UNC）もルートも無い相対パスか（B-396）
 #[inline]
 fn windows_plain_relative(sub: &str) -> bool {
@@ -2418,6 +2428,18 @@ mod idempotent_method_tests {
         assert!(!w("/abs"));
         assert!(super::is_plain_relative_subpath("css/style.css"));
         assert!(!super::is_plain_relative_subpath("/abs"));
+    }
+
+    /// B-419: 静的配信は空のセグメント（`//`）のあるパスを配信しない（クエリの中の `//` は見ない）
+    #[test]
+    fn static_path_empty_segment() {
+        use super::path_has_empty_segment as e;
+        for p in ["//admin/x", "/static//css/a.css", "/a/b//", "//", "/x//?q=1"] {
+            assert!(e(p), "{p}");
+        }
+        for p in ["/", "/admin/x", "/static/css/", "/a?u=http://x//y", "/a/b.css?x=//"] {
+            assert!(!e(p), "{p}");
+        }
     }
 
     /// B-317: CONNECT の authority 形式は通さない（origin 形式・絶対形式・`OPTIONS *` だけ）

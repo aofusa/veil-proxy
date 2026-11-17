@@ -176,7 +176,14 @@ pub fn normalize(path: &[u8], cfg: &PathNormalization) -> Result<Option<Vec<u8>>
                 continue;
             }
         }
-        decoded.push(if b == b'\\' && cfg.normalize { b'/' } else { b });
+        if b == b'%' && cfg.normalize {
+            // B-412: 16 進 2 桁の続かない `%` は `%25` にする。そのまま残すと、後ろで戻した予約されていない文字と
+            // 組み合わさって新しいエスケープになる（`%2%45` → `%2E`・`%2%46` → `%2F`）。照合はそれを普通の文字として
+            // 見るが、上流は `.`・`/` に戻してドットのセグメントを取り除くので、ルートの制限の外へ出られる
+            decoded.extend_from_slice(b"%25");
+        } else {
+            decoded.push(if b == b'\\' && cfg.normalize { b'/' } else { b });
+        }
         i += 1;
     }
     // 2. ドットのセグメント・連続するスラッシュ
@@ -356,8 +363,34 @@ mod tests {
         assert_eq!(n("/.well-known/x", c), "/.well-known/x");
         assert_eq!(n("/a/..b/c", c), "/a/..b/c");
         assert_eq!(n("*", c), "*");
-        assert_eq!(n("/bad%zz", c), "/bad%zz");
-        assert_eq!(n("/end%4", c), "/end%4");
+        // B-412: 16 進 2 桁の続かない `%` は `%25` にする
+        assert_eq!(n("/bad%zz", c), "/bad%25zz");
+        assert_eq!(n("/end%4", c), "/end%254");
+        assert_eq!(n("/end%", c), "/end%25");
+    }
+
+    // B-412: 戻した文字が前の `%` と組み合わさって新しいエスケープ（`%2E`・`%2F`・`%5C`）を作らない
+    #[test]
+    fn stray_percent_does_not_form_new_escapes() {
+        let c = PathNormalization::default();
+        assert_eq!(n("/public/%2%45%2%45/admin", c), "/public/%252E%252E/admin");
+        assert_eq!(n("/public/..%2%46admin", c), "/public/..%252Fadmin");
+        assert_eq!(
+            n("/public/%%32%45%%32%45/admin", c),
+            "/public/%252E%252E/admin"
+        );
+        assert_eq!(n("/a%5%43b", c), "/a%255Cb");
+        // 結果をもう一度正規化しても変わらない（冪等）
+        for p in [
+            "/public/%2%45%2%45/admin",
+            "/x/%%32%46%2e%2e/y",
+            "/%2%2e%2e/%2%41",
+            "/a%%%41%41",
+            "/bad%zz/../ok",
+        ] {
+            let once = n(p, c);
+            assert_eq!(n(&once, c), once, "{p}");
+        }
     }
 
     #[test]

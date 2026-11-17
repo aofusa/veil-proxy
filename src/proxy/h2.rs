@@ -3936,6 +3936,11 @@ pub(super) async fn h2_sendfile(
         path_str
     };
 
+    // B-419: 空のセグメント（`//`）のあるパスは配信しない（ルートの選択は `//` を潰さない）
+    if crate::http_utils::path_has_empty_segment(path_str) {
+        return h2_emit_error(resp_tx, notify, 404, b"Not Found").await;
+    }
+
     // B-396: Windows のドライブ等でルートを置き換えるサブパスも断る
     if remainder.contains("..")
         || !crate::http_utils::is_plain_relative_subpath(remainder.trim_start_matches('/'))

@@ -282,10 +282,15 @@ async def _run_ws(el, job):
 class WebSocketEndpoint:
     """Class-based WebSocket handler with the method names of Starlette's ``WebSocketEndpoint``.
 
-    The connection is accepted before :meth:`on_connect`; the callbacks run one at a time per connection on the
-    handler pool (plain ``def``) or on the event loop (``async def``). ``encoding`` is ``"text"``, ``"bytes"``,
-    ``"json"`` or ``None`` (``str`` or ``bytes`` as received). ``websocket`` here has ``send_text``,
-    ``send_bytes``, ``send_json``, ``close``, ``client``, ``headers``, ``path_params`` and ``state``.
+    The route's dependencies (``App(dependencies=...)``, ``APIRouter(dependencies=...)`` and
+    ``@app.websocket(..., dependencies=...)``) run before the handshake is answered: one that raises
+    ``HTTPException`` refuses the upgrade with its status (422 for invalid parameters). The connection is then
+    accepted before :meth:`on_connect`, and the code after ``yield`` of those dependencies runs once the
+    connection closed. The callbacks run one at a time per connection on the handler pool (plain ``def``) or
+    on the event loop (``async def``). ``encoding`` is ``"text"``, ``"bytes"``, ``"json"`` or ``None`` (``str``
+    or ``bytes`` as received). ``websocket`` here has ``send_text``, ``send_bytes``, ``send_json``, ``close``,
+    ``client``, ``headers``, ``path_params`` and ``state`` (what the dependencies put in ``websocket.state`` is
+    kept).
     """
 
     encoding = None
@@ -354,9 +359,17 @@ class _SyncWebSocket:
 class _EndpointSession:
     """Drives one :class:`WebSocketEndpoint` instance (called from Rust on the handler pool)."""
 
-    def __init__(self, cls, sender, request):
+    def __init__(self, cls, sender, request, checked=None):
+        # B-413: ``checked`` はアップグレードの前の ``WebSocketRoute._endpoint_check`` の結果（依存に渡した
+        # ``websocket`` と、依存の後始末の文脈。後始末が無ければ ``None``）
+        if checked is None:
+            ws, ctx = _SyncWebSocket(sender, request), None
+        else:
+            ws, ctx = checked
+            ws._s = sender
         self.ep = cls()
-        self.ws = _SyncWebSocket(sender, request)
+        self.ws = ws
+        self._ctx = ctx
 
     def _call(self, name, *args):
         f = getattr(self.ep, name)
@@ -385,4 +398,13 @@ class _EndpointSession:
         self._call("on_receive", data)
 
     def on_close(self, code):
-        self._call("on_disconnect", code)
+        try:
+            self._call("on_disconnect", code)
+        finally:
+            ctx, self._ctx = self._ctx, None
+            if ctx is not None:
+                from . import _deps
+
+                exc = _deps.finish_sync(ctx, None)
+                if exc is not None:
+                    traceback.print_exception(type(exc), exc, exc.__traceback__)

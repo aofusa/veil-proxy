@@ -195,7 +195,9 @@ pub fn http_response_parse_smoke(data: &[u8]) {
 /// Normalizes `data[1..]` as a request path with the configuration chosen by `data[0]` (must not panic).
 ///
 /// Invariants: a rewritten path starts with `/` and keeps the query; with `normalize` on, the result
-/// has no `.` or `..` segment (a decoded `%2E` counts), so a route prefix cannot be escaped.
+/// has no `.` or `..` segment (a decoded `%2E` counts), every `%` in it starts an escape that does not
+/// stand for an unreserved character, and normalizing it again changes nothing, so a route prefix cannot
+/// be escaped.
 pub fn path_norm_smoke(data: &[u8]) {
     use crate::path_norm::{normalize, EscapedSlashes, PathNormalization};
 
@@ -238,6 +240,31 @@ pub fn path_norm_smoke(data: &[u8]) {
                 String::from_utf8_lossy(&checked)
             );
         }
+        // B-412: 戻した文字が前の `%` と組み合わさって新しいエスケープを作っていない
+        let hex = |b: u8| (b as char).to_digit(16);
+        let mut i = 0;
+        while let Some(off) = p[i..].iter().position(|&b| b == b'%') {
+            let at = i + off;
+            let (Some(h), Some(l)) = (
+                p.get(at + 1).copied().and_then(hex),
+                p.get(at + 2).copied().and_then(hex),
+            ) else {
+                panic!("stray % left in {:?}", String::from_utf8_lossy(&checked));
+            };
+            let c = (h * 16 + l) as u8;
+            assert!(
+                !(c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~')),
+                "escaped unreserved character left in {:?}",
+                String::from_utf8_lossy(&checked)
+            );
+            i = at + 3;
+        }
+        assert_eq!(
+            normalize(&checked, &cfg),
+            Ok(None),
+            "normalization is not idempotent for {:?}",
+            String::from_utf8_lossy(path)
+        );
     }
 }
 
@@ -325,6 +352,8 @@ mod f279_smoke_tests {
                 b"/%2e%2E/%2E/x",
                 b"//a//b/%2F..",
                 b"/%%32F/..",
+                b"/public/%2%45%2%45/admin",
+                b"/x/..%2%46y%2",
                 b"/a\\..\\b",
                 b"relative/../x",
                 b"/",

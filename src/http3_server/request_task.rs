@@ -1541,7 +1541,8 @@ impl H3BufferedTask {
                         tls_profile: upstream_group.tls_profile(),
                         pool_max_idle: security.max_idle_connections_per_host,
                         pool_idle_timeout_secs: security.idle_connection_timeout_secs,
-                        no_response_body: method.eq_ignore_ascii_case(b"HEAD"),
+                        // B-417: 大文字小文字を区別する（`head` を HEAD と見ると上流の本文を残してプールへ戻した）
+                        no_response_body: method == b"HEAD",
                         idempotent: crate::http_utils::is_idempotent_method(method),
                     };
                     crate::http3_stream::exchange_buffered(&cfg, Bytes::from(request))
@@ -1792,6 +1793,12 @@ impl H3BufferedTask {
         };
 
         let clean_sub = sub_path.trim_start_matches('/');
+
+        // B-419: 空のセグメント（`//`）のあるパスは配信しない（ルートの選択は `//` を潰さない）
+        if crate::http_utils::path_has_empty_segment(path_str) {
+            self.send_error_response(404, b"Not Found").await?;
+            return Ok((404, 9));
+        }
 
         // パストラバーサル防止。B-396: Windows のドライブ等でルートを置き換えるサブパスも断る
         if clean_sub.contains("..") || !crate::http_utils::is_plain_relative_subpath(clean_sub) {

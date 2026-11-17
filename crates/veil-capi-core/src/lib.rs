@@ -638,8 +638,9 @@ pub struct veil_route_options_t {
     pub flags: u32,
     /// An OpenAPI Operation Object as JSON (NULL: none).
     pub openapi_json: *const c_char,
-    /// A JSON Schema of the request body (NULL: no validation). A body that is not JSON or does not match is
-    /// answered with 422 and `{"detail": [...]}` before the handler runs; the schema is also documented as the
+    /// A JSON Schema of the request body (NULL: no validation). A request whose `Content-Type` is not
+    /// `application/json` (or `application/*+json`) is answered with 415, and a body that is not JSON or does not
+    /// match with 422 and `{"detail": [...]}`, before the handler runs; the schema is also documented as the
     /// operation's `requestBody`.
     pub body_schema_json: *const c_char,
 }
@@ -836,6 +837,11 @@ fn make_handler(
         Box::pin(async move {
             // F-291: 本文の JSON Schema に合わなければハンドラを呼ばずに 422
             if let Some(s) = &schema {
+                // B-418: JSON の本文を宣言したルートは Content-Type が JSON の要求だけを受ける（別サイトの text/plain の
+                // フォーム・型の無い Blob の fetch は CORS の事前確認無しに利用者の Cookie を付けて届く）
+                if !veil::api::__private::is_json_content_type(req.header("content-type")) {
+                    return veil::api::Response::error(415, "Content-Type must be application/json");
+                }
                 if let Err(e) = validate::check_body(s, req.body()) {
                     return e.into_response();
                 }

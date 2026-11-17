@@ -14,7 +14,7 @@ Routes are evaluated in array order (first-match). All routes use the unified `[
    - `header`: HTTP header matching (map for multiple headers, e.g., `{ "X-Version" = "v2" }`)
    - `method`: HTTP request method matching (array for multiple methods, e.g., `["GET", "POST"]`)
    - `query`: Query string parameter matching (map for multiple query params, e.g., `{ "token" = "secret" }`)
-   - `source_ip`: Source IP matching (CIDR notation, array for multiple CIDRs, e.g., `["192.168.0.0/16", "10.0.0.0/8"]`). An IPv4 client accepted on a dual-stack listener (`::ffff:a.b.c.d`) is matched as IPv4. Entries whose prefix is longer than the address (`/33` for IPv4, `/129` for IPv6) are ignored with a warning
+   - `source_ip`: Source IP matching (CIDR notation, array for multiple CIDRs, e.g., `["192.168.0.0/16", "10.0.0.0/8"]`). An IPv4 client accepted on a dual-stack listener (`::ffff:a.b.c.d`) is matched as IPv4. Every entry must be an IP address or a CIDR range: an entry that does not parse (a wildcard such as `192.168.1.*`, a host name, a prefix longer than the address such as `/33` for IPv4) is a configuration error. A route with an empty list matches no client
    - All conditions are combined with AND logic. If a condition is not specified, it matches all requests (default route).
 2. **Route action** (`[route.action]`): Backend action (File, Proxy, Redirect, etc.)
 3. **Route-level settings** (`[route.security]`, `[route.cache]`, `[route.compression]`, `[route.buffering]`, `[route.open_file_cache]`): Override action-level settings
@@ -83,6 +83,10 @@ path = "/var/www/docs/"
 | `/docs` | `"/docs"` | `/var/www/docs/index.html` *returned directly |
 | `/docs/` | `"/docs"` | `/var/www/docs/index.html` |
 | `/docs/guide/intro.html` | `"/docs"` | `/var/www/docs/guide/intro.html` |
+
+A path with repeated slashes (`//`, before the query) gets 404 from a `File` route. Routes are chosen without
+collapsing them (`//admin/x` does not match `/admin/*`), so serving the collapsed file would skip the narrower
+route's restrictions. Use `path_normalization = "merge_slashes"` to collapse repeated slashes before routing.
 
 #### 3. Index File Specification
 
@@ -458,6 +462,11 @@ gRPC requests (`content-type: application/grpc*`) keep their full path (`/packag
 - Leverage HTTP/2 multiplexing and header compression for backend communication
 - Uses Prior Knowledge mode (not via Upgrade)
 
+A request received over HTTP/1.1 is sent to an H2C backend with its whole body: veil reads the rest of the body
+(and decodes `chunked`) before sending the request, up to `max_request_body_size` (`max_chunked_body_size` for
+`chunked`; 413 above it). If the client already sent its next request behind the body, the connection is closed
+after the response.
+
 **H2C Backend Connection Multiplexing (F-174)**: each worker keeps a pool of upstream HTTP/2 connections keyed by backend address, and **many requests share one connection concurrently** (one actor task per connection writes HEADERS/DATA and dispatches received frames to per-stream channels). A new connection is opened only when every pooled connection has reached the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` or received GOAWAY. Request bodies respect both the connection and the stream flow-control windows (B-106), and received DATA is acknowledged with WINDOW_UPDATE only after the downstream has consumed it. A connection with no streams is closed with GOAWAY after `idle_connection_timeout_secs` (`0` disables pooling); the actor notices an upstream close immediately, so stale connections are not handed out. Streams refused by the upstream (REFUSED_STREAM, or above GOAWAY's `last_stream_id`) and idempotent requests that fail before the response head are retried once on a fresh stream. This is what makes gRPC relaying (`client → veil (TLS h2/h3) → backend (h2c)`) avoid a handshake per call and per-call upstream connections.
 
 > **Note**: H2C cannot be used with HTTPS backends (TLS connections). Use only in environments where TLS is not required, such as gRPC communication within internal networks.
@@ -635,6 +644,9 @@ How the tunnel behaves:
   tunnel costs no CPU or system calls. Writes have the same time limit as other responses, so a peer that stops reading
   closes the tunnel instead of holding both connections.
 - The upstream connection is always HTTP/1.1, including routes whose upstream uses `use_h2c` or HTTP/2 over TLS.
+- veil sends `Upgrade: websocket` to the upstream whatever other tokens the client listed (`HTTP2-Settings` is not
+  forwarded), and relays only a `101` that switches to WebSocket: `Upgrade: websocket` and a `Sec-WebSocket-Accept`
+  that matches the client's `Sec-WebSocket-Key`. Any other `101` (for example a switch to `h2c`) gets 502.
 - The `101` response (and a refused upgrade) goes through the route's response-header policy like any proxied response:
   `remove_response_headers`, `add_response_headers` and `Server` apply. When the upstream does not upgrade, its whole
   response (with the body) is returned and the connection is closed. `1xx` responses other than `101` are dropped.
@@ -686,8 +698,8 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_user` | Username to drop to after startup (when veil starts as root). Without `drop_privileges_group`, the group becomes the user's primary group. Supplementary groups are always cleared; veil stops if it cannot clear them or could still switch back to root | none |
 | `drop_privileges_group` | Group name to drop to after startup | none |
 | `max_concurrent_connections` | Maximum concurrent connections | 0 (unlimited) |
-| `blocked_ips` | Front-line IP/CIDR blocklist; matching connections are dropped right after `accept` (before the TLS handshake / handler spawn), avoiding expensive work for known-bad IPs. Applies to every listener: HTTP (TLS and cleartext), L4 TCP, the Initial packet of a new HTTP/3 connection (no Retry is sent), and new L4 UDP sessions. CIDRs are parsed once at startup (zero-alloc check on the accept hot path) and hot-reloadable via SIGHUP. Evaluated earlier than per-route `denied_ips`. | `[]` |
-| `path_normalization` | Request path normalization before routing and `[route.security]` checks; the normalized path is forwarded upstream. `"base"`: decode `%XX` of unreserved characters, `\` → `/`, remove dot segments. `"merge_slashes"`: base + collapse repeated `/`. `"off"`: raw path (pre-v0.8.0). Absolute-form targets become origin-form; other non-origin targets (except `CONNECT`, `OPTIONS *`) and targets with `#` or non-UTF-8 bytes get 400 | `"base"` |
+| `blocked_ips` | Front-line IP/CIDR blocklist; matching connections are dropped right after `accept` (before the TLS handshake / handler spawn), avoiding expensive work for known-bad IPs. Applies to every listener: HTTP (TLS and cleartext), L4 TCP, the Initial packet of a new HTTP/3 connection (no Retry is sent), new L4 UDP sessions, and each datagram to a library UDP handler (`l4-handler`). CIDRs are parsed once at startup (zero-alloc check on the accept hot path) and hot-reloadable via SIGHUP. Evaluated earlier than per-route `denied_ips`. | `[]` |
+| `path_normalization` | Request path normalization before routing and `[route.security]` checks; the normalized path is forwarded upstream. `"base"`: decode `%XX` of unreserved characters, re-encode a `%` not followed by two hex digits as `%25`, `\` → `/`, remove dot segments. `"merge_slashes"`: base + collapse repeated `/`. `"off"`: raw path (pre-v0.8.0). Absolute-form targets become origin-form; other non-origin targets (except `CONNECT`, `OPTIONS *`) and targets with `#` or non-UTF-8 bytes get 400 | `"base"` |
 | `escaped_slashes` | Encoded slashes (`%2F`, `%5C`) in the path. `"keep"`: forwarded encoded, but a path where an encoded slash forms a dot segment (`/public/..%2Fadmin`) gets 400 while `path_normalization` is on. `"reject"`: every path with `%2F` / `%5C` gets 400. `"unescape"`: decoded to `/` before normalization | `"keep"` |
 | `allow_security_failures` | Behavior when security feature activation fails | false |
 

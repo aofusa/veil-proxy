@@ -296,7 +296,7 @@ async fn get_user(id: u64, verbose: Option<bool>) -> Result<Json<User>, ApiError
 | 引数 | 取得元 |
 |------|--------|
 | `&Request` / `Request` | リクエスト全体 |
-| `Json<T>` | JSON 本文 |
+| `Json<T>` | JSON 本文（要求の `Content-Type` は `application/json` か `application/*+json`。ほかは 415） |
 | `Query<T>` | クエリ文字列全体を `T` にデシリアライズ |
 | `Form<T>` | `application/x-www-form-urlencoded` の本文（`multipart/form-data` の本文のファイル以外のフィールドも） |
 | `MultipartForm<T>`・`UploadFile`・`Vec<UploadFile>`・`Option<UploadFile>`・`Multipart` | `multipart/form-data` の本文（[フォームとファイルのアップロード](#フォームとファイルのアップロード)） |
@@ -1180,7 +1180,8 @@ Operation Object を JSON で渡すと説明が反映されます）。設定は
   `veil_deferred_complete(d)` で送ります（相手が切断していれば `VEIL_ERR_CLOSED`）。`veil_deferred_free(d)` は代わりに 500 を
   返します。`VEIL_ROUTE_INLINE` のルートでは使えません。遅延応答にはミドルウェアの後処理は走りません。
 - JSON 本文の検証: `veil_register_route_ex2(cfg, path, methods, fn, ud, &veil_route_options_t)` の `body_schema_json`
-  （JSON Schema）。JSON でない・合わない本文には、ハンドラを呼ぶ前に 422 と `{"detail": [{"type", "loc", "msg"}]}`
+  （JSON Schema）。`Content-Type` が `application/json`（か `application/*+json`）でない要求には 415、JSON でない・
+  合わない本文には、ハンドラを呼ぶ前に 422 と `{"detail": [{"type", "loc", "msg"}]}`
   （Rust の `Validate`・FastAPI と同じ形。`loc` は `"body"` から）を返し、スキーマは OpenAPI のルートの `requestBody` に
   なります。使えるキーワード: `type`（`null`・型の配列も）、`properties`、`required`、`additionalProperties`、`items`、
   `minItems`、`maxItems`、`minLength`、`maxLength`、`pattern`、`enum`、`const`、`minimum`、`maximum`、`exclusiveMinimum`、
@@ -1226,6 +1227,8 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
   引数は名前と注釈で束縛され、戻り値は変換されます（dict/list → JSON、`str` → テキスト、`veil.Response`、`(body, status)`、`None` → 204）。
   `veil.HTTPException(404, "...")` は `{"detail": ...}` になります。**pydantic** があれば `BaseModel` の本文を検証して OpenAPI に反映し、
   無ければ `body_constraints` で dict の本文を検証します。OpenAPI は `/openapi.json` と `/docs` で公開されます。
+  FastAPI と同じく、JSON の本文は `Content-Type` が無いか JSON（`application/json`・`application/*+json`）のときだけ
+  読みます。ほかの `Content-Type`（別サイトの `text/plain` のフォーム等）は 415 です。
 - **offload と GIL。** ハンドラは GIL を握って実行されます。既定（`offload=True`）では veil の Python 用のハンドラスレッド
   （`[api] handler_threads`）で実行されるので、ネットワークワーカーが GIL を待つことはありません。スレッドは交代で動きます。1 本が
   GIL を握ったまま要求を続けて処理し、もう 1 本が GIL を待っていて、ハンドラが GIL を手放すと（`time.sleep`・ブロッキングな I/O・
@@ -1246,7 +1249,9 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
   lifespan が yield した dict は `app.state` に入ります。
 - **WebSocket（F-263）** は Starlette / FastAPI と同じ名前です。`@app.websocket("/ws")` を `async def f(websocket: veil.WebSocket)`
   に付けます（`accept`・`receive_text/bytes/json`・`iter_text/bytes/json`・`send_text/bytes/json`・`close`・`veil.WebSocketDisconnect`）。
-  `veil.WebSocketEndpoint` のクラスも使えます。フレーム・Ping / Pong・UTF-8 の検査・クローズの手順・上限は Rust で処理し（`[api] websocket_*`
+  `veil.WebSocketEndpoint` のクラスも使えます。どちらもルートの依存（`App`・`APIRouter`・`@app.websocket(dependencies=...)`）は
+  ハンドシェイクに答える前に解き、`HTTPException` を投げた依存はそのステータスでアップグレードを断ります（引数の誤りは 422）。
+  フレーム・Ping / Pong・UTF-8 の検査・クローズの手順・上限は Rust で処理し（`[api] websocket_*`
   が効く）、Python は組み立て済みのメッセージだけを見ます。WebSocket のルートは `x-veil-websocket` 付きで OpenAPI に載ります（`receive=` /
   `send=` に pydantic のモデル、`validate=True` で型に合わなければ 1007）。`veil.Response.switching_protocols(protocol, factory)` で任意の
   プロトコルへアップグレードできます（`veil.Protocol` か `veil.AsyncProtocol`）。

@@ -12,7 +12,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
 
 import veil  # noqa: E402
-from veil import App, HTTPException, JSONResponse, Request, Response  # noqa: E402
+from veil import App, Body, HTTPException, JSONResponse, Request, Response  # noqa: E402
 
 try:
     from pydantic import BaseModel, Field
@@ -143,6 +143,28 @@ class TestBinding(Base):
         r2 = self.req(self.last(), body=b"{bad")
         self.assertEqual(r2.status, 422)
         self.assertEqual(self.j(r2)["detail"][0]["type"], "json_invalid")
+
+    # B-418: 付いている Content-Type が JSON でなければ本文を JSON として読まない（別サイトの text/plain のフォーム）。
+    # 無いときは FastAPI と同じく読む
+    def test_body_requires_json_content_type_when_given(self):
+        @self.app.post("/b")
+        def f(body: dict):
+            return body
+
+        @self.app.post("/e")
+        def g(a: int = Body(embed=True)):
+            return {"a": a}
+
+        body_routes = [(self.app.routes[-2], b'{"a": 1}', {"a": 1}), (self.app.routes[-1], b'{"a": 1}', {"a": 1})]
+        for route, body, want in body_routes:
+            for ct in (None, "application/json", "application/json; charset=utf-8", "application/merge-patch+json"):
+                headers = [] if ct is None else [("content-type", ct)]
+                r = self.req(route, body=body, headers=headers)
+                self.assertEqual((r.status, self.j(r)), (200, want), ct)
+            for ct in ("text/plain", "text/plain;charset=UTF-8", "application/x-www-form-urlencoded",
+                       "multipart/form-data; boundary=x", "application/jsonx", "text/json"):
+                r = self.req(route, body=body, headers=[("content-type", ct)])
+                self.assertEqual(r.status, 415, ct)
 
     def test_async_handler(self):
         @self.app.get("/a")

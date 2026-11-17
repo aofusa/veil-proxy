@@ -2321,7 +2321,7 @@ pub(super) async fn write_api_chunked(
 
 /// `input` の chunked を読み、本文のデータを `body` に足す。終わりに達したら、その後ろのバイトを `overflow` に
 /// 足す（B-372）。
-#[cfg(any(feature = "handler", feature = "wasm"))]
+#[cfg(any(feature = "handler", feature = "wasm", feature = "http2"))]
 fn decode_chunked_into(
     decoder: &mut ChunkedDecoder,
     mut input: &[u8],
@@ -2349,8 +2349,8 @@ fn decode_chunked_into(
 
 /// ハンドラ用に HTTP/1.1 のリクエスト本文を全部読む（Content-Length / chunked、上限 `limit`）。
 /// 失敗はステータス（上限超過 413、それ以外 400）。Wasm の要求本文のフェーズ（F-271）も使う。
-/// 本文の終わりより後ろまで読んだ分（次の要求）は `overflow` の後ろに足す（B-186）。
-#[cfg(any(feature = "handler", feature = "wasm"))]
+/// 本文の終わりより後ろまで読んだ分（次の要求）は `overflow` の後ろに足す（B-186）。上流の h2c へ送る要求（B-420）も使う。
+#[cfg(any(feature = "handler", feature = "wasm", feature = "http2"))]
 pub(super) async fn read_full_request_body(
     stream: &mut ServerTls,
     content_length: usize,

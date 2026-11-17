@@ -645,6 +645,24 @@ class _ValidationFailed(Exception):
         self.errors = errors
 
 
+# B-418: 付いている Content-Type が JSON でなければ本文を JSON として読まない（別サイトの `enctype="text/plain"` の
+# フォームは CORS の事前確認無しに利用者の Cookie を付けて届く。FastAPI の CVE-2021-32677 と同じ。無いときは FastAPI と
+# 同じく JSON として読む）
+def _json_body_allowed(req):
+    """Whether the request body may be read as JSON: no ``content-type`` (as in FastAPI), ``application/json`` or
+    ``application/*+json``."""
+    ct = req.headers.get("content-type")
+    if ct is None:
+        return True
+    typ, _, sub = ct.split(";", 1)[0].strip().lower().partition("/")
+    return typ == "application" and (sub == "json" or (len(sub) > 5 and sub.endswith("+json")))
+
+
+def _check_json_body(req):
+    if not _json_body_allowed(req):
+        raise HTTPException(415, "Content-Type must be application/json")
+
+
 def _err(loc, msg, typ):
     return {"loc": list(loc), "msg": msg, "type": typ}
 
@@ -1241,6 +1259,7 @@ class Route:
             if not body.strip():
                 state["json"] = None
             else:
+                _check_json_body(req)
                 try:
                     state["json"] = json.loads(body)
                 except (ValueError, UnicodeDecodeError) as e:
@@ -1323,6 +1342,7 @@ class Route:
             if required:
                 errors.append(_err(["body"], "Field required", "missing"))
             return
+        _check_json_body(req)
         try:
             if p is not None and p.model is not None:
                 try:
@@ -1810,11 +1830,33 @@ class WebSocketRoute(Route):
             elif ws.application_state != WebSocketState.DISCONNECTED:
                 await ws.close(1008)
 
-    def _endpoint_session(self, sender, req):
+    def _endpoint_check(self, req):
+        # B-413: WebSocketEndpoint のルートの依存（app・router・ルートの dependencies）をアップグレードの前に解く
+        # （Rust が GIL のスレッドから呼ぶ）。断るときは HTTP のステータス、通すときは _endpoint_session へ渡す値を返す。
+        # 以前は依存を解かずに on_connect を呼んでいた（認証の依存が素通りだった）
+        from .websockets import _SyncWebSocket
+
+        ws = _SyncWebSocket(None, req)
+        if not self.dependencies:
+            return (ws, None)
+        ctx = _deps.Ctx()
+        ctx.state["websocket"] = ws
+        try:
+            try:
+                _deps.solve_sync(self._tree(), req, ctx, self._bind_one)
+                if ctx.errors:
+                    raise _ValidationFailed(ctx.errors)
+            except BaseException as e:
+                raise _deps.finish_sync(ctx, e)
+        except (_ValidationFailed, HTTPException) as e:
+            return 422 if isinstance(e, _ValidationFailed) else e.status_code
+        return (ws, ctx if ctx.exits else None)
+
+    def _endpoint_session(self, sender, req, checked=None):
         # WebSocketEndpoint の接続ごとのセッション（Rust のハンドラ用プールから呼ぶ）
         from .websockets import _EndpointSession
 
-        return _EndpointSession(self.endpoint, sender, req)
+        return _EndpointSession(self.endpoint, sender, req, checked)
 
     def openapi(self):
         """The Operation Object of the handshake (``GET`` → 101) with ``x-veil-websocket``."""

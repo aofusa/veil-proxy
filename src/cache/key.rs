@@ -12,10 +12,12 @@ pub enum CacheableMethod {
 
 impl CacheableMethod {
     /// バイト列からパース
+    // B-417: メソッドは大文字小文字を区別する（RFC 9110 §9.1）。`get` は上流へそのまま送られて GET とは別の応答に
+    // なり得るので、GET のキーに保存しない
     pub fn from_bytes(method: &[u8]) -> Option<Self> {
-        if method.eq_ignore_ascii_case(b"GET") {
+        if method == b"GET" {
             Some(CacheableMethod::Get)
-        } else if method.eq_ignore_ascii_case(b"HEAD") {
+        } else if method == b"HEAD" {
             Some(CacheableMethod::Head)
         } else {
             None
@@ -315,5 +317,22 @@ mod tests {
         let key = CacheKey::from_request(b"POST", "example.com", "/api/users", None, true, None, 0);
 
         assert!(key.is_none());
+    }
+
+    // B-417: メソッドは大文字小文字を区別する（`get` は上流へそのまま送られるので GET のキーに保存しない）
+    #[test]
+    fn method_is_case_sensitive() {
+        for m in [&b"get"[..], b"Get", b"head", b"hEAD"] {
+            assert!(CacheableMethod::from_bytes(m).is_none());
+            assert!(CacheKey::from_request(m, "example.com", "/", None, true, None, 0).is_none());
+        }
+        assert_eq!(
+            CacheableMethod::from_bytes(b"GET"),
+            Some(CacheableMethod::Get)
+        );
+        assert_eq!(
+            CacheableMethod::from_bytes(b"HEAD"),
+            Some(CacheableMethod::Head)
+        );
     }
 }

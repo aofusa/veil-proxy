@@ -71,12 +71,19 @@ pub(super) async fn handle_websocket_proxy(
     // （以前は削除・追加の指定が WebSocket の経路にだけ効いていなかった。F-236 の再走査の F2）。
     let added = expanded_added_headers(security, client_ip, host, path_str);
     // B-307: `Connection` は `Upgrade` だけにし、`Connection` に挙がったホップバイホップのヘッダは送らない
-    request.extend_from_slice(b"Connection: Upgrade\r\n");
+    // B-415: `Upgrade` は `websocket` だけにする（以前はクライアントの値をそのまま写し、`h2c` 等も一緒に送れた）。
+    // `HTTP2-Settings` も送らない
+    request.extend_from_slice(b"Connection: Upgrade\r\nUpgrade: websocket\r\n");
+    let expected_accept = headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(b"sec-websocket-key"))
+        .map(|(_, v)| ws_accept_for(v.trim_ascii()));
     for (name, value) in headers {
         if name.eq_ignore_ascii_case(b"host")
             || name.eq_ignore_ascii_case(b"connection")
-            || (!name.eq_ignore_ascii_case(b"upgrade")
-                && crate::http_utils::connection_lists(headers, name))
+            || name.eq_ignore_ascii_case(b"upgrade")
+            || name.eq_ignore_ascii_case(b"http2-settings")
+            || crate::http_utils::connection_lists(headers, name)
             || name.eq_ignore_ascii_case(b"keep-alive")
             || name.eq_ignore_ascii_case(b"transfer-encoding")
             || name.eq_ignore_ascii_case(b"proxy-connection")
@@ -111,6 +118,10 @@ pub(super) async fn handle_websocket_proxy(
     let body_len = content_length.min(initial_body.len());
     request.extend_from_slice(&initial_body[..body_len]);
     let after_upgrade = &initial_body[body_len..];
+    let handshake = UpstreamHandshake {
+        request,
+        expected_accept,
+    };
 
     // WebSocketポーリング設定を取得
     let poll_config = security.websocket_poll_config();
@@ -123,7 +134,7 @@ pub(super) async fn handle_websocket_proxy(
             target,
             tls_profile,
             connect_timeout,
-            request,
+            handshake,
             after_upgrade,
             &poll_config,
             security,
@@ -135,13 +146,72 @@ pub(super) async fn handle_websocket_proxy(
             client_stream,
             target,
             connect_timeout,
-            request,
+            handshake,
             after_upgrade,
             &poll_config,
             security,
         )
         .await
     }
+}
+
+// B-415: 101 で確かめる `Sec-WebSocket-Accept` を要求と一緒に運ぶ
+/// 上流へ送る WebSocket のハンドシェイク
+pub(super) struct UpstreamHandshake {
+    request: Vec<u8>,
+    /// クライアントの `Sec-WebSocket-Key` から求めた値（鍵が無ければ `None` で、101 は受け入れない）
+    expected_accept: Option<[u8; 28]>,
+}
+
+/// `Sec-WebSocket-Key` に対する `Sec-WebSocket-Accept`（RFC 6455 §4.2.2: SHA-1(key + GUID) の base64）
+fn ws_accept_for(key: &[u8]) -> [u8; 28] {
+    const GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let digest = crate::tls_provider::sha1_legacy(&[key, GUID]);
+    let mut out = [b'='; 28];
+    for (c, o) in digest.chunks(3).zip(out.chunks_mut(4)) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        o[0] = T[(n >> 18) as usize & 63];
+        o[1] = T[(n >> 12) as usize & 63];
+        if c.len() > 1 {
+            o[2] = T[(n >> 6) as usize & 63];
+        }
+        if c.len() > 2 {
+            o[3] = T[n as usize & 63];
+        }
+    }
+    out
+}
+
+// B-415: 上流の 101 が本当に WebSocket への切り替えか（`Upgrade` に `websocket`、`Sec-WebSocket-Accept` が 1 つで
+// クライアントの鍵から求めた値と一致）。以前はどの 101 でも生の中継を始めていた（`h2c` 等への切り替えで
+// ルートの検査の外の通り道になり得た）
+fn upstream_switched_to_websocket(raw_head: &[u8], expected_accept: Option<&[u8; 28]>) -> bool {
+    let Some(expected) = expected_accept else {
+        return false;
+    };
+    let mut storage = [httparse::EMPTY_HEADER; 64];
+    let mut resp = httparse::Response::new(&mut storage);
+    if resp.parse(raw_head).is_err() {
+        return false;
+    }
+    let mut upgrade_ws = false;
+    let mut accepts = 0;
+    let mut accept_ok = false;
+    for h in resp.headers.iter() {
+        if h.name.eq_ignore_ascii_case("upgrade") {
+            upgrade_ws |= h
+                .value
+                .split(|&b| b == b',')
+                .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"websocket"));
+        } else if h.name.eq_ignore_ascii_case("sec-websocket-accept") {
+            accepts += 1;
+            accept_ok = h.value.trim_ascii() == &expected[..];
+        }
+    }
+    upgrade_ws && accepts == 1 && accept_ok
 }
 
 /// WebSocket の上流へ送るパス（ルートの接頭辞を外して上流の `path_prefix` を前に付ける。HTTP/1.1 と
@@ -168,7 +238,7 @@ pub(super) async fn handle_websocket_proxy_http(
     mut client_stream: ServerTls,
     target: &ProxyTarget,
     connect_timeout: Duration,
-    request: Vec<u8>,
+    handshake: UpstreamHandshake,
     after_upgrade: &[u8],
     poll_config: &WebSocketPollConfig,
     security: &SecurityConfig,
@@ -202,7 +272,7 @@ pub(super) async fn handle_websocket_proxy_http(
     websocket_handshake_and_relay(
         &mut client_stream,
         &mut backend_stream,
-        request,
+        handshake,
         after_upgrade,
         security,
         poll_config.idle_timeout,
@@ -216,7 +286,7 @@ pub(super) async fn handle_websocket_proxy_https(
     target: &ProxyTarget,
     tls_profile: crate::upstream_tls::TlsProfile,
     connect_timeout: Duration,
-    request: Vec<u8>,
+    handshake: UpstreamHandshake,
     after_upgrade: &[u8],
     poll_config: &WebSocketPollConfig,
     security: &SecurityConfig,
@@ -276,7 +346,7 @@ pub(super) async fn handle_websocket_proxy_https(
     websocket_handshake_and_relay(
         &mut client_stream,
         &mut backend_stream,
-        request,
+        handshake,
         after_upgrade,
         security,
         poll_config.idle_timeout,
@@ -293,11 +363,15 @@ pub(super) async fn handle_websocket_proxy_https(
 async fn websocket_handshake_and_relay<B: RelayIo>(
     client_stream: &mut ServerTls,
     backend_stream: &mut B,
-    request: Vec<u8>,
+    handshake: UpstreamHandshake,
     after_upgrade: &[u8],
     security: &SecurityConfig,
     idle_timeout: Option<Duration>,
 ) -> Option<(u16, u64)> {
+    let UpstreamHandshake {
+        request,
+        expected_accept,
+    } = handshake;
     let (write_res, returned_request) =
         match timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await {
             Ok(r) => r,
@@ -362,6 +436,17 @@ async fn websocket_handshake_and_relay<B: RelayIo>(
     );
     let rest = &response_buf[parsed.header_len..];
 
+    if status_code == 101
+        && !upstream_switched_to_websocket(
+            &response_buf[..parsed.header_len],
+            expected_accept.as_ref(),
+        )
+    {
+        debug!("WebSocket upstream did not switch to WebSocket (Upgrade or Sec-WebSocket-Accept)");
+        let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+        return Some((502, 0));
+    }
     if status_code == 101 {
         debug!("WebSocket upgrade successful, starting bidirectional transfer");
         let mut out = head;
@@ -698,4 +783,44 @@ pub(super) async fn websocket_relay<A: RelayIo, B: RelayIo>(
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B-415: クライアントの鍵から求めた `Sec-WebSocket-Accept`（RFC 6455 §1.3 の例）
+    #[test]
+    fn accept_key_matches_rfc6455_example() {
+        assert_eq!(
+            &ws_accept_for(b"dGhlIHNhbXBsZSBub25jZQ==")[..],
+            &b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="[..]
+        );
+    }
+
+    // B-415: 上流の 101 は WebSocket への切り替えで、鍵に合う Accept を 1 つだけ持つときだけ中継する
+    #[test]
+    fn only_a_websocket_101_with_the_right_accept_is_relayed() {
+        let accept = ws_accept_for(b"dGhlIHNhbXBsZSBub25jZQ==");
+        let ok =
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: WebSocket\r\nConnection: Upgrade\r\n\
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+        assert!(upstream_switched_to_websocket(ok, Some(&accept)));
+        // 鍵が無い要求・h2c への切り替え・Accept の誤り・Accept が 2 つ
+        assert!(!upstream_switched_to_websocket(ok, None));
+        for bad in [
+            &b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n"[..],
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: AAAA\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Accept: x\r\n\r\n",
+        ] {
+            assert!(
+                !upstream_switched_to_websocket(bad, Some(&accept)),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
 }

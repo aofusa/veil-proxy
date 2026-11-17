@@ -5,7 +5,7 @@
 
     curl localhost:8000/ping
     curl localhost:8000/hello/world?greeting=Hi
-    curl -X POST localhost:8000/users -d '{"name":"alice","age":30}'
+    curl -X POST localhost:8000/users -H 'content-type: application/json' -d '{"name":"alice","age":30}'
     open http://localhost:8000/docs
 """
 
