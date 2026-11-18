@@ -2,8 +2,12 @@
 # VDS の参照制御プレーン（tools/vds/server、F-199。gRPC + REST）のイメージ。
 #
 #   docker build -f docker/Dockerfile.vds-server -t veil-vds-server:latest .
-#   docker run --rm -v $PWD/snapshot.toml:/etc/vds/snapshot.toml -p 18000:18000 veil-vds-server:latest \
-#       --snapshot /etc/vds/snapshot.toml --listen 0.0.0.0:18000
+#   docker run --rm -v $PWD/snapshot.toml:/etc/vds/snapshot.toml -v $PWD/token:/etc/vds/token:ro \
+#       -p 18000:18000 veil-vds-server:latest
+#
+# 既定の CMD はトークン（/etc/vds/token。veil の [vds] token_file と同じ値）を求める。トークン無しでは 0.0.0.0 で
+# 待ち受けない（スナップショットには上流のアドレス・ヘッダの値が載り、ACK・NACK でノードの配信を止められる。B-470）。
+# ノードごとのトークンは CMD を `--node-tokens <ファイル>` に置き換える（1 行に `<ノード ID> <トークン>`）。
 #
 # 本体（veil）とは独立したクレート。テスト・小規模運用向けの参照実装（本番は自前の制御プレーンを推奨）。
 
@@ -24,4 +28,4 @@ COPY --from=builder /veil-vds-server /usr/local/bin/veil-vds-server
 USER 65532:65532
 EXPOSE 18000
 ENTRYPOINT ["/usr/local/bin/veil-vds-server"]
-CMD ["--snapshot", "/etc/vds/snapshot.toml", "--listen", "0.0.0.0:18000"]
+CMD ["--snapshot", "/etc/vds/snapshot.toml", "--listen", "0.0.0.0:18000", "--token-file", "/etc/vds/token"]

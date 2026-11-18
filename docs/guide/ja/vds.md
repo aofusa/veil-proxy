@@ -234,9 +234,9 @@ JSON の `null` は取り除かれます（TOML に null は無いため）。�
 
 ```bash
 veil-vds-server --snapshot snapshot.toml --listen 0.0.0.0:18000 \
-    [--token-file token] [--hold 30] [--tls-cert cert.pem --tls-key key.pem]
+    (--token-file token | --node-tokens node-tokens) [--hold 30] [--tls-cert cert.pem --tls-key key.pem]
 python3 tools/vds/vds_server.py --snapshot snapshot.toml --listen 0.0.0.0:18000 \
-    [--token-file token] [--hold 30]
+    (--token-file token | --node-tokens node-tokens) [--hold 30]
 ```
 
 スナップショットは `[[route]]` と `[upstreams.<name>]` だけを `config.toml` とまったく同じ書式で書いた TOML ファイルです。
@@ -255,7 +255,23 @@ upstream = "api"
 
 サーバはファイルを監視し、内容が変わると（バージョンは SHA-256 の先頭 16 桁）gRPC のストリームへ押し出し、保留中の REST の要求に応答します。TOML として解析できない
 スナップショットは公開されず、前のものが残ります。エンドポイントは gRPC のサービス（Rust 版のみ）、`POST /v1/discovery`、`GET /v1/status`
-（ノードごとの ACK 済みバージョン・最後の NACK・転送を JSON で返す）、`GET /healthz` です。veil 側の設定は次のとおりです。
+（ノードごとの ACK 済みバージョン・最後の NACK・転送を JSON で返す）、`GET /healthz` です。トークンを使うと、
+`/healthz` 以外（`/v1/status` も）は `Authorization: Bearer <トークン>` が要ります。ログに書くノード ID・NACK の文は
+制御文字を書き換えて書き、Python 版は有限の数でない `poll_timeout_secs` に 400 を返します。
+
+認証:
+
+- `--token-file` は全ノードで共有する 1 つのトークンです。持つ者はどのノード ID でも名乗れ、他のノードの名前で
+  スナップショットを読み、ACK・NACK を送れます。NACK するとスナップショットが変わるまでそのノードへ今の版を送りません。
+- `--node-tokens` はノードごとのトークンです（1 行に `<ノード ID> <トークン>`、`#` からはコメント）。`node.id` が
+  トークンのノードでない要求には 403（gRPC は `PERMISSION_DENIED`）を返します。各ノードの `token_file` にそのノードの
+  トークンを置き、`node_id` を合わせてください。
+- どちらも無ければ、`--allow-unauthenticated` を付けない限りループバックのアドレスでしか待ち受けません。
+  `docker/Dockerfile.vds-server` のイメージは `/etc/vds/token` からトークンを読みます。
+- 前に ACK したノードが空の `version_info` で来たら（veil を再起動した）、前に NACK した版でも今の版を送り直します。
+  NACK した版を ACK したら、その NACK は消えます。
+
+veil 側の設定は次のとおりです。
 
 ```toml
 [vds]

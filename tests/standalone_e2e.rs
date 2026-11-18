@@ -1351,9 +1351,15 @@ retry_max_ms = 1000
             // 状態は TLS の向こう（このテストのクライアントは平文のみ）なので見ない
             return String::new();
         }
-        http1_get(cp_port, "/v1/status")
-            .map(|r| r.text())
-            .unwrap_or_default()
+        http1_request(
+            cp_port,
+            "GET",
+            "/v1/status",
+            &[("Authorization", "Bearer s3cret")],
+            b"",
+        )
+        .map(|r| r.text())
+        .unwrap_or_default()
     };
     assert!(
         wait_until(Duration::from_secs(15), body_is("A")),
@@ -1397,6 +1403,11 @@ retry_max_ms = 1000
             "status: {}",
             s
         );
+    }
+    if !tls {
+        // B-456: 状態（ノードの一覧・NACK の文）もトークンが要る
+        let r = http1_get(cp_port, "/v1/status").expect("status without a token");
+        assert_eq!(r.status, 401, "status must need the token: {}", r.text());
     }
 
     if transport == "grpc" {

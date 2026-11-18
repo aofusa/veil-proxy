@@ -250,9 +250,9 @@ Two reference implementations ship with veil. Both serve a snapshot file and kee
 
 ```bash
 veil-vds-server --snapshot snapshot.toml --listen 0.0.0.0:18000 \
-    [--token-file token] [--hold 30] [--tls-cert cert.pem --tls-key key.pem]
+    (--token-file token | --node-tokens node-tokens) [--hold 30] [--tls-cert cert.pem --tls-key key.pem]
 python3 tools/vds/vds_server.py --snapshot snapshot.toml --listen 0.0.0.0:18000 \
-    [--token-file token] [--hold 30]
+    (--token-file token | --node-tokens node-tokens) [--hold 30]
 ```
 
 The snapshot is a TOML file containing only `[[route]]` and `[upstreams.<name>]`, written exactly like
@@ -273,7 +273,24 @@ upstream = "api"
 The servers watch the file; when its content changes (the version is the first 16 hex digits of the SHA-256), they
 push it to gRPC streams and answer the held REST requests. A snapshot that fails to parse as TOML is not published and the previous one stays.
 Endpoints: the gRPC service (Rust only), `POST /v1/discovery`, `GET /v1/status` (per-node acknowledged version,
-last NACK and transport, as JSON) and `GET /healthz`. Run veil with:
+last NACK and transport, as JSON) and `GET /healthz`. With a token, every endpoint except `/healthz`, including
+`/v1/status`, needs `Authorization: Bearer <token>`. The servers write the node ids and NACK messages they log with
+control characters escaped, and the Python server answers 400 to a `poll_timeout_secs` that is not a finite number.
+
+Authentication:
+
+- `--token-file` holds one token that every node shares. Whoever holds it can act as any node id: read the snapshot
+  and send ACKs and NACKs in another node's name. A NACK keeps the current version from that node until the snapshot
+  changes.
+- `--node-tokens` gives each node its own token, one `<node-id> <token>` per line (`#` starts a comment). A request
+  whose `node.id` is not the token's node gets 403 (gRPC `PERMISSION_DENIED`). Put each node's token in its
+  `token_file` and set its `node_id` to match.
+- Without either, the servers listen only on a loopback address unless you pass `--allow-unauthenticated`. The
+  `docker/Dockerfile.vds-server` image reads its token from `/etc/vds/token`.
+- A node that acknowledged a version before and then asks with an empty `version_info` (a restarted veil) gets the
+  current version again even if it rejected it earlier, and acknowledging a rejected version clears the rejection.
+
+Run veil with:
 
 ```toml
 [vds]

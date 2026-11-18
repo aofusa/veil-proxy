@@ -169,14 +169,17 @@ TOML
   if retry 240 bash -c "kubectl -n $NS exec client -c curl -- curl -s -m 10 -o /dev/null -w '%{redirect_url}' http://veil-app/vds-added | grep -q from-vds"; then
     ok "VDS delivered a new route through the mesh"
   else bad "VDS route not applied"; kubectl -n "$NS" logs deploy/veil-app -c veil | grep -i vds | tail -5; fi
-  # 6b. 購読が gRPC の双方向ストリームで ACK まで届いている（制御プレーンの状態）
-  out=$(kubectl -n "$NS" exec client -c curl -- curl -s -m 10 http://veil-vds:18000/v1/status)
+  # 6b. 購読が gRPC の双方向ストリームで ACK まで届いている（制御プレーンの状態。B-456: 状態もトークンが要る）
+  local vds_auth; vds_auth="Authorization: Bearer $(kubectl -n "$NS" get secret veil-vds-token -o jsonpath='{.data.token}' | base64 -d)"
+  out=$(kubectl -n "$NS" exec client -c curl -- curl -s -m 10 -o /dev/null -w '%{http_code}' http://veil-vds:18000/v1/status)
+  [[ "$out" == 401 ]] && ok "VDS status needs the token" || bad "VDS status without a token: $out"
+  out=$(kubectl -n "$NS" exec client -c curl -- curl -s -m 10 -H "$vds_auth" http://veil-vds:18000/v1/status)
   [[ "$out" == *'"transport":"grpc"'* && "$out" == *'"acked_version":"'[0-9a-f]* ]] \
     && ok "VDS over a gRPC stream through the mesh (acked)" || bad "VDS status: $out"
   # 6c. 制御プレーンを作り直しても再接続して最新の版を受け取る
   kubectl -n "$NS" rollout restart deploy/veil-vds >/dev/null
   kubectl -n "$NS" rollout status deploy/veil-vds --timeout=300s >/dev/null
-  if retry 120 bash -c "kubectl -n $NS exec client -c curl -- curl -s -m 10 http://veil-vds:18000/v1/status | grep -q '\"transport\":\"grpc\"'"; then
+  if retry 120 bash -c "kubectl -n $NS exec client -c curl -- curl -s -m 10 -H '$vds_auth' http://veil-vds:18000/v1/status | grep -q '\"transport\":\"grpc\"'"; then
     ok "VDS stream reconnected after the control plane restarted"
   else bad "VDS did not reconnect"; fi
   # 7. graceful shutdown: veil が SIGTERM を受けてから止まるまでの時間をログの時刻で測る
