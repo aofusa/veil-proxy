@@ -830,6 +830,7 @@
 | B-469 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-469-python-nan-range-bypass.md](bugs/B-469-python-nan-range-bypass.md) | Python の数の範囲の検査（ge・gt・le・lt、minimum・maximum）を NaN が通っていた |
 | B-474 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-474-windows-wasm-reuse-test-copy-mtime.md](bugs/B-474-windows-wasm-reuse-test-copy-mtime.md) | Windows で WASM のエンジンの再利用の試験が、mtime を写したコピーへの置き換えを見分けられずに失敗していた（印は大きさと mtime だけ。印を見るのは seccomp のある Linux のリロードだけなので試験の不具合） |
 | B-475 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-475-uring-accept-loop-cancel-race.md](bugs/B-475-uring-accept-loop-cancel-race.md) | io_uring の accept のループが停止の確認の 1 秒の区切りで受理の要求を取り消し、行き違ってカーネルが受理した接続を後始末が閉じていた（区切りの直後の接続が応答無しで切られる。Accept を区切りをまたいで持ち越す） |
+| B-476 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-476-access-log-slot-retire-race.md](bugs/B-476-access-log-slot-retire-race.md) | アクセスログのライターが溜めを外すかどうかを取り出しの後で数え、その間に足してから溜めを手放した（スレッドが終わった・リロードで送り先を替えた）スレッドの行を溜めごと捨てていた（取り出しの前に数える） |
 
 ---
 

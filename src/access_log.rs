@@ -338,6 +338,14 @@ impl Sink {
             reg.closed = true;
         }
         reg.slots.retain(|slot| {
+            // B-476: 足すスレッドが終わった溜め（登録の 1 本だけが残る）は外す。外すかどうかは取り出しの前に数えて
+            // 決める（取り出しの後に数えると、その間に足してから溜めを手放した＝スレッドが終わった・リロードで送り先を
+            // 替えたスレッドの行を溜めごと捨てる）。溜めは登録の時にしか配らないので、1 本なら以後は誰も足さない
+            let alone = Arc::strong_count(slot) == 1;
+            if alone {
+                // 手放したスレッドの最後の追記を見る（Arc の解放の Release と対にする）
+                std::sync::atomic::fence(Ordering::Acquire);
+            }
             let mut p = lock(slot);
             if close {
                 p.closed = true;
@@ -352,8 +360,7 @@ impl Sink {
                 batch.full.push(fresh);
             }
             drop(p);
-            // 足すスレッドが終わった溜め（登録の 1 本だけが残る）は外す。中身は上で取り出した
-            Arc::strong_count(slot) > 1
+            !alone
         });
         !batch.full.is_empty()
     }
