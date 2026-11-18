@@ -593,6 +593,10 @@ pub struct veil_grpc_client_call_t {
     call: Arc<BlockingCall>,
     /// 最後に受け取ったメッセージ（`veil_grpc_client_recv` の戻り値が指す。次の recv まで有効）
     current: Option<Bytes>,
+    /// 終わる前に読んだ応答ヘッダの写し（`veil_grpc_client_metadata` の戻り値が指す。届いた後は変わらないので
+    /// 解放まで有効）
+    // B-452: 以前は値を `current` へ写し、recv で受け取ったメッセージ（C が指している）を解放していた
+    initial: Vec<(Bytes, Bytes)>,
     /// 終わった後の状態（`veil_grpc_client_finish` で入る）
     status: Option<CallStatus>,
 }
@@ -602,6 +606,7 @@ impl veil_grpc_client_call_t {
         veil_grpc_client_call_t {
             call,
             current: None,
+            initial: Vec::new(),
             status: None,
         }
     }
@@ -854,7 +859,7 @@ pub unsafe extern "C" fn veil_grpc_client_status_message(
 }
 
 /// The value of the response metadata `name` (headers first, then trailers after the end; not NUL-terminated),
-/// or NULL.
+/// or NULL. The value stays valid until the call is freed.
 ///
 /// # Safety
 ///
@@ -869,16 +874,18 @@ pub unsafe extern "C" fn veil_grpc_client_metadata(
         return out_none(len);
     };
     if c.status.is_none() {
-        // 応答ヘッダだけ（届いていなければ空）。状態に写して指す先を残す
-        let initial = c.call.initial_metadata();
-        if let Some(v) = initial
+        // 応答ヘッダだけ（届いていなければ空）。届いたら写しを持ち、指す先を解放まで残す（届いた後は変わらない）
+        if c.initial.is_empty() {
+            c.initial = c.call.initial_metadata();
+        }
+        return match c
+            .initial
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
         {
-            c.current = Some(v.1.clone());
-            return out_bytes(c.current.as_ref().unwrap(), len);
-        }
-        return out_none(len);
+            Some((_, v)) => out_bytes(v, len),
+            None => out_none(len),
+        };
     }
     let s = c.status.as_ref().unwrap();
     match s

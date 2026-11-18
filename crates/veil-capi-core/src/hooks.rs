@@ -512,8 +512,10 @@ pub unsafe extern "C" fn veil_config_on_startup(
     VEIL_OK
 }
 
-/// Adds a function called after the server stopped (after all workers ended, just before `veil_run` returns, on its
-/// thread). They run in reverse registration order, only when the server had started.
+/// Adds a function called after the server stopped (after all workers ended and the jobs they gave the handler pool
+/// finished, just before `veil_run` returns, on its thread). They run in reverse registration order, only when the
+/// server had started. If handler jobs are still running `[server] graceful_shutdown_timeout_secs` (at least one
+/// second) after the server stopped, the functions are not called, so that the state they free stays valid.
 ///
 /// # Safety
 ///
@@ -532,6 +534,28 @@ pub unsafe extern "C" fn veil_config_on_shutdown(
     };
     cfg.shutdown.push((func, UserData(user_data)));
     VEIL_OK
+}
+
+// B-467: 停止の関数は C の状態（ミドルウェア・ハンドラの user_data）を解放する。ハンドラ用プールはプロセスに 1 つで、
+// サーバが止まった後もキューに残った要求のハンドラ・after_send の関数を動かすので、それが全部終わってから呼ぶ。
+// `[server] graceful_shutdown_timeout_secs`（最低 1 秒）を過ぎても終わらなければ、解放すると動いている仕事が
+// 解放済みの状態に触れるので呼ばない（状態はプロセスの終わりまで残る）
+/// Calls the shutdown functions once the jobs given to the handler pool have finished (see above).
+pub(crate) fn run_shutdown_after_jobs(hooks: Vec<Hook>) {
+    if hooks.is_empty() {
+        return;
+    }
+    let secs = veil::config::GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    if veil::runtime::offload::wait_handler_jobs(std::time::Duration::from_secs(secs)) {
+        run_shutdown(hooks);
+    } else {
+        ftlog::error!(
+            "[api] handler jobs are still running {} s after the server stopped; the shutdown functions are not called, so that the state they free stays valid",
+            secs
+        );
+    }
 }
 
 /// Calls the shutdown functions in reverse order.

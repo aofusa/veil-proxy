@@ -551,8 +551,7 @@ impl Upgraded {
     where
         F: FnOnce(&mut super::l4::L4Out) -> Option<Box<dyn super::l4::L4Session>> + Send + 'static,
     {
-        use super::l4::{L4Out, L4Session};
-        use std::sync::{Arc, Mutex};
+        use super::l4::{L4Out, SessionCloser};
         let Some((session, out)) = crate::runtime::offload::offload_handler(move || {
             let mut out = L4Out::default();
             (connect(&mut out), out)
@@ -562,14 +561,13 @@ impl Upgraded {
             return;
         };
         let (writes, close) = out.into_parts();
-        if self.write_vectored_all(&writes).await.is_err() {
-            return;
-        }
         let Some(session) = session else {
+            let _ = self.write_vectored_all(&writes).await;
             return;
         };
-        let session: Arc<Mutex<Box<dyn L4Session>>> = Arc::new(Mutex::new(session));
-        if !close {
+        // B-468: セッションができた後は、最初の送信の失敗・タスクの破棄でも on_close を呼ぶ
+        let (closer, session) = SessionCloser::new(session);
+        if self.write_vectored_all(&writes).await.is_ok() && !close {
             let mut buf = BytesMut::new();
             loop {
                 let (res, b) = self.read(buf).await;
@@ -582,7 +580,9 @@ impl Upgraded {
                 let s = session.clone();
                 let Some(out) = crate::runtime::offload::offload_handler(move || {
                     let mut out = L4Out::default();
-                    s.lock().unwrap().on_data(&data, &mut out);
+                    s.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .on_data(&data, &mut out);
                     out
                 })
                 .await
@@ -596,9 +596,7 @@ impl Upgraded {
             }
         }
         let _ = self.shutdown().await;
-        let s = session.clone();
-        let _ =
-            crate::runtime::offload::offload_handler(move || s.lock().unwrap().on_close()).await;
+        closer.close().await;
     }
 }
 

@@ -55,20 +55,19 @@ fn json_content_type(ct: Option<&str>) -> bool {
     .any(|m| media.eq_ignore_ascii_case(m))
 }
 
-/// GET で実行する操作が mutation か（解析できない文書は実行器に任せてエラーを返させる）。
-fn is_mutation(r: &mut async_graphql::Request) -> bool {
+/// GET で実行する操作が mutation か。空の文書・解析できない文書はエラーにする（persisted query 等の拡張は空の文書を
+/// 保存した文書へ差し替えるので、mutation かどうかを実行の前に確かめられない。B-448）。
+fn is_mutation(r: &mut async_graphql::Request) -> Result<bool, async_graphql::ServerError> {
     use async_graphql::parser::types::{DocumentOperations, OperationType};
     let name = r.operation_name.clone();
-    let Ok(doc) = r.parsed_query() else {
-        return false;
-    };
-    match &doc.operations {
+    let doc = r.parsed_query()?;
+    Ok(match &doc.operations {
         DocumentOperations::Single(op) => op.node.ty == OperationType::Mutation,
         DocumentOperations::Multiple(ops) => ops
             .iter()
             .filter(|(n, _)| name.as_deref().is_none_or(|want| n.as_str() == want))
             .any(|(_, op)| op.node.ty == OperationType::Mutation),
-    }
+    })
 }
 
 fn accepts(req: &Request, media: &str) -> bool {
@@ -95,9 +94,13 @@ where
             match async_graphql::http::parse_query_string(req.query()) {
                 Ok(mut r) => {
                     // GET で mutation を実行しない（SameSite=Lax の Cookie はトップレベルの GET 遷移に付く。B-196）
-                    if is_mutation(&mut r) {
-                        return Response::error(405, "mutations require POST")
-                            .with_header("allow", "POST");
+                    match is_mutation(&mut r) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            return Response::error(405, "mutations require POST")
+                                .with_header("allow", "POST")
+                        }
+                        Err(e) => return Response::bad_request(&e.message),
                     }
                     async_graphql::BatchRequest::Single(r)
                 }

@@ -418,6 +418,7 @@ run_graphql() {
   local B="http://127.0.0.1:$P/graphql" J='content-type: application/json'
   expect "GraphQL POST" '{"data":{"add":3}}' curl -s -X POST "$B" -H "$J" -d '{"query":"{ add(a:1,b:2) }"}'
   expect "GraphQL GET" '{"data":{"add":5}}' curl -s "$B?query=%7Badd(a:2,b:3)%7D"
+  expect "GraphQL GET without a document is 400" "400" curl -s -o /dev/null -w '%{http_code}' "$B?extensions=%7B%7D"
   expect "GraphQL variables" '{"data":{"greeting":"Hello, veil!"}}' curl -s -X POST "$B" -H "$J" -d '{"query":"query($n:String!){ greeting(name:$n) }","variables":{"n":"veil"}}'
   expect "GraphQL mutation" '{"data":{"increment":5}}' curl -s -X POST "$B" -H "$J" -d '{"query":"mutation { increment(by:5) }"}'
   expect "GraphQL batch" '[{"data":{"add":2}},{"data":{"count":5}}]' curl -s -X POST "$B" -H "$J" -d '[{"query":"{ add(a:1,b:1) }"},{"query":"{ count }"}]'
@@ -593,6 +594,9 @@ run_c_multipart() { # F-266: C の veil_multipart_next（VEIL_ROUTE_FORM の /up
   # バイトの総和: hello = 532、v = 118
   expect "C multipart (form route, memory)" "t=1/118(mem);f:s.txt=5/532(mem);" curl -s -F t=v -F "f=@$W/s.txt" "$B/upload"
   expect "C multipart (buffered body)" "f:s.txt=5/532(mem);" curl -s -F "f=@$W/s.txt" "$B/parse"
+  # B-453: 長いパートの名前でも out を越えて書かない（切り詰めて返し、落ちない）
+  expect "C multipart long names are truncated" "AAAA" curl -s -F "$(head -c 5000 /dev/zero | tr '\0' A)=v" -F "$(head -c 5000 /dev/zero | tr '\0' B)=w" "$B/parse"
+  expect "C multipart still served after long names" "f:s.txt=5/532(mem);" curl -s -F "f=@$W/s.txt" "$B/parse"
   expect "C multipart (h2c)" "f:s.txt=5/532(mem);" curl -s --http2-prior-knowledge -F "f=@$W/s.txt" "$B/upload"
   expect "C multipart malformed 400 (form route)" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary 'nope' "$B/upload"
   expect "C multipart malformed 400 (buffered)" "400" curl -s -o /dev/null -w "%{http_code}" -H 'content-type: multipart/form-data; boundary=x' --data-binary $'--x\r\nbroken' "$B/parse"
@@ -695,6 +699,8 @@ run_python_kit() { # F-268: FastAPI 互換（Depends 等）・veil-api-kit（exa
     expect "kit OpenAPI: router paths, hidden route, security schemes" "True False ['OAuth2PasswordBearer']" bash -c "curl -s '$B/openapi.json' | $PY3 -I -c 'import json,sys; d=json.load(sys.stdin); ps=d[\"paths\"]; print(\"/v1/items/{item_id}\" in ps, \"/internal\" in ps, sorted(d[\"components\"][\"securitySchemes\"]))'"
     if "$PY" -I -c 'import strawberry' 2>/dev/null; then
       expect "kit GraphQL query (strawberry)" '{"data":{"hello":"hello kit"}}' curl -s -X POST "$B/graphql" -H 'content-type: application/json' -d '{"query":"{ hello(name: \"kit\") }"}'
+      # B-449: JSON でない POST は 415
+      expect "kit GraphQL non-JSON is 415 (strawberry)" "415" curl -s -o /dev/null -w '%{http_code}' -X POST "$B/graphql" -H 'content-type: text/plain' -d '{"query":"{ hello }"}'
     fi
     if "$PY" -I -c 'import fastapi' 2>/dev/null; then
       expect "kit FastAPI mounted at /legacy (ASGI)" '"from":"fastapi"' curl -s "$B/legacy/hello/x?q=2"
@@ -884,6 +890,7 @@ print(*[x[\"kind\"] for x in k], k[0].get(\"requestType\"), \"/grpc.health.v1.He
       local QB="http://127.0.0.1:$QP/graphql" J='content-type: application/json'
       expect "py GraphQL query" '{"data":{"add":3}}' curl -s -X POST "$QB" -H "$J" -d '{"query":"{ add(a:1,b:2) }"}'
       expect "py GraphQL mutation" '{"data":{"increment":5}}' curl -s -X POST "$QB" -H "$J" -d '{"query":"mutation { increment(by:5) }"}'
+      expect "py GraphQL GET mutation is 405" "405" curl -s -o /dev/null -w '%{http_code}' -G --data-urlencode 'query=mutation { increment(by:1) }' "$QB"
       expect "py GraphQL subscription (SSE)" "event: complete" curl -s -N -X POST "$QB" -H "$J" -H 'accept: text/event-stream' -d '{"query":"subscription { countdown(start: 2) }"}'
     else
       bad "python-graphql start"; cat "$W/q.log"
@@ -1412,6 +1419,9 @@ while True:
     else: out.append(m["type"]); break
 print("next " + " ".join(out))
 PY
+  # B-447: 別のオリジンの WebSocket のハンドシェイクは 403。B-448: 文書の無い GET は実行しない
+  expect "graphql WebSocket cross-site Origin is 403 ($label)" "403" curl -s -o /dev/null -w '%{http_code}' -H 'Upgrade: websocket' -H 'Connection: Upgrade' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Protocol: graphql-transport-ws' -H 'Origin: https://evil.example' "$B/graphql"
+  expect "graphql GET without a document is 400 ($label)" "400" curl -s -o /dev/null -w '%{http_code}' "$B/graphql?extensions=%7B%7D"
   kill "$PID"; for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
   kill -0 "$PID" 2>/dev/null && bad "kit graceful shutdown with app tasks ($label)" || ok "kit graceful shutdown with app tasks ($label)"
 }
@@ -1500,6 +1510,9 @@ run_c_kit() { # F-291: C の helpers kit（libveil_kit・examples/api/c-kit）�
     "curl -s -i -H 'x-request-id: req-7' '$B/mw/echo' | tr -d '\r' | tr A-Z a-z | grep -E '^x-(request-id|mw):' | paste -sd'|' -"
   expect "C middleware stop" "stopped by middleware 418" curl -s -w ' %{http_code}' "$B/mw/stop"
   expect "C header_next + version (HTTP/1.1)" "multi=a;b; version=11 tls=0" curl -s -H 'x-multi: a' -H 'x-multi: b' "$B/headers"
+  # B-453: 長い値でも 512 バイトの buf を越えて書かない（切り詰めて返し、落ちない）
+  expect "C header_next long value is truncated" "multi=AAAA" curl -s -H "x-multi: $(head -c 2000 /dev/zero | tr '\0' A)" "$B/headers"
+  expect "C kit still serves after a long header" "multi=a; version=11" curl -s -H 'x-multi: a' "$B/headers"
   expect "C version (h2c)" "version=20" curl -s --http2-prior-knowledge "$B/headers"
   expect "C add_header twice" "2" bash -c "curl -s -i '$B/headers' | grep -ci '^x-twice:'"
   # Cookie: 2 個の Set-Cookie・読み取り
@@ -1579,6 +1592,7 @@ run_c_kit() { # F-291: C の helpers kit（libveil_kit・examples/api/c-kit）�
   expect "C kit GraphQL POST" '{"data":{"hello":"world"}}' curl -s -H 'content-type: application/json' --data '{"query":"{ hello }"}' "$B/graphql"
   expect "C kit GraphQL GET" '{"data":{"hello":"world"}}' curl -s -G --data-urlencode 'query={ hello }' "$B/graphql"
   expect "C kit GraphQL GET mutation is 405" "405" curl -s -o /dev/null -w '%{http_code}' -G --data-urlencode 'query=mutation { bump }' "$B/graphql"
+  expect "C kit GraphQL GET without an operation is 400" "400" curl -s -o /dev/null -w '%{http_code}' "$B/graphql?extensions=%7B%7D"
   expect "C kit GraphQL POST mutation" '{"data":{"bump":1}}' curl -s -H 'content-type: application/json' --data '{"query":"mutation { bump }"}' "$B/graphql"
   expect "C kit GraphQL non-JSON is 415" "415" curl -s -o /dev/null -w '%{http_code}' -H 'content-type: text/plain' --data '{"query":"{ hello }"}' "$B/graphql"
   expect "C kit GraphQL batch" '[{"data":{"hello":"world"}},{"data":{"bump":2}}]' curl -s -H 'content-type: application/json' \

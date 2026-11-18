@@ -147,8 +147,9 @@ App::new()
   runs first.
 - `Jwt<C>` (feature `jwt`) verifies `Authorization: Bearer` with the `JwtVerifier` in `App::state`: `HS256/384/512`,
   `RS256/384/512`, `PS256/384/512`, `ES256`, `ES384`, `EdDSA`. Each key fixes its algorithm (a token whose `alg`
-  differs is rejected; `none` never passes), `kid` selects the key, `exp`/`nbf` have 60 s leeway, `iss`/`aud` are
-  checked when configured. `exp` is required (a token without it fails with `JwtError::MissingClaim("exp")`;
+  differs is rejected; `none` never passes), `kid` selects the key, `exp`/`nbf` have 60 s leeway, `iss` is checked
+  when configured, and `aud` must contain the configured audience; without one, a token that carries `aud` is rejected
+  as `BadAudience` (it was issued for another service, as in PyJWT; `.verify_audience(false)` turns the check off). `exp` is required (a token without it fails with `JwtError::MissingClaim("exp")`;
   `.require_exp(false)` accepts it) and a non-numeric `exp`/`nbf` is `Malformed`. Keys come from secrets, PEM (`PUBLIC KEY`, `RSA PUBLIC KEY`), JWKs or a JWK Set;
   `verifier.refresh_jwks(&client, url).await` replaces them (schedule it with `Tasks::every`). `encode_hmac` issues
   HMAC tokens. No `jsonwebtoken` dependency: verification uses the TLS provider crate.
@@ -238,9 +239,16 @@ App::new().with(veil_kit::graphql::mount("/graphql", schema))
 
 `POST` (single and batch; the `Content-Type` must be `application/json`, otherwise 415) and `GET` (queries and
 subscriptions; a mutation over `GET` gives 405 with `Allow: POST`, so a cross-site link or a `SameSite=Lax` cookie
-cannot trigger one), `application/graphql-response+json` when accepted, subscriptions over SSE
-(`Accept: text/event-stream`) and over WebSocket (`graphql-transport-ws` and `graphql-ws`, HTTP/1.1), and GraphiQL for
-a browser `GET` with the `graphiql` feature (the page loads its scripts from a CDN). The kit pins async-graphql 7.
+cannot trigger one, and a `GET` without a document that parses gives 400, so send persisted-query hashes by `POST`),
+`application/graphql-response+json` when accepted, subscriptions over SSE (`Accept: text/event-stream`) and over
+WebSocket (`graphql-transport-ws` and `graphql-ws`, HTTP/1.1), and GraphiQL for a browser `GET` with the `graphiql`
+feature (the page loads its scripts from a CDN). The kit pins async-graphql 7.
+
+A browser sends its cookies with a cross-site WebSocket handshake and the page can read the results, so a WebSocket
+handshake that carries an `Origin` is accepted only from the same host and port as `Host` (others get 403; clients that
+send no `Origin`, which are not browsers, are accepted). A front end on another origin is listed with
+`veil_kit::graphql::mount_with_origins("/graphql", schema, &["https://app.example"])`. The `Cors` plugin does not
+apply to WebSocket handshakes.
 
 ## Dependency injection
 
@@ -323,7 +331,7 @@ cc app.c -Icrates/veil-capi/include -Icrates/veil-capi-helpers/include -Ltarget/
 | Sessions | `veil_kit_sessions_install` (`veil_kit_sessions_t`: prefix, cookie name, TTL, memory store), `veil_kit_session_get / get_str / set / set_str / remove / clear / destroy / cycle_id` |
 | Credentials | `veil_kit_basic_auth`, `veil_kit_basic_matches`, `veil_kit_bearer`, `veil_kit_api_key`, `veil_kit_api_key_matches` (constant-time), `veil_kit_unauthorized` |
 | Principal | `veil_kit_principal_new / add_scope / add_role / set_attributes / free`, `veil_kit_set_principal`, `veil_kit_principal`, `veil_kit_principal_subject / has_scope / has_role / attributes`, `veil_kit_require_scope` |
-| JWT | `veil_kit_jwt_verifier_new / add_hmac / add_pem / add_jwks / set_jwks / issuer / audience / require_exp / leeway / free`, `veil_kit_jwt_verify`, `veil_kit_jwt_encode_hmac`, `veil_kit_jwt_authenticate` |
+| JWT | `veil_kit_jwt_verifier_new / add_hmac / add_pem / add_jwks / set_jwks / issuer / audience / verify_audience / require_exp / leeway / free`, `veil_kit_jwt_verify`, `veil_kit_jwt_encode_hmac`, `veil_kit_jwt_authenticate` |
 | Redirects and files | `veil_kit_redirect`, `veil_kit_redirect_safe` (against open redirects), `veil_kit_send_file` |
 | Small helpers | `veil_kit_form_get`, `veil_kit_error` (`{"detail": ...}`), `veil_kit_json_string`, `veil_kit_oauth2_security_scheme`, `veil_kit_free`, `veil_kit_version` |
 | Tasks | `veil_kit_every`, `veil_kit_cron` (app tasks on the handler pool; after-response work is `veil_response_after_send` in `libveil`) |
@@ -364,10 +372,12 @@ reflection are in `libveil` itself (`veil_config_cors`, `veil_config_serve_dir`,
 - GraphQL: there is no GraphQL engine in C, so `veil_kit_graphql` is the HTTP transport of the Rust kit's `mount`
   and the executor is your callback (it receives the query, the operation name and the variables as JSON text and
   sets the result JSON). The HTTP rules are the same: `POST` takes JSON only (415 otherwise) and batches, `GET`
-  takes the query string and a mutation gets 405, `Accept` picks `application/graphql-response+json`,
+  takes the query string and a mutation gets 405 (a document that selects no operation gets 400), `Accept` picks
+  `application/graphql-response+json`,
   `text/event-stream` gets the result as GraphQL over SSE, and GraphiQL is served when enabled. Subscriptions need a
   stream of results from the executor, so the closest equivalent is the `upgrade` option: WebSocket upgrades on the
-  path go to your handler, which accepts `graphql-transport-ws` with `veil_ws_accept_ex` and sends the results.
+  path go to your handler, which accepts `graphql-transport-ws` with `veil_ws_accept_ex` and sends the results (set
+  `origins` in its options when you authenticate with cookies: a browser sends them with a cross-site handshake).
 - The JSON writer is header-only (no allocation in the library): it escapes strings, inserts commas and reports
   allocation failure, too deep nesting or an unbalanced `end` in `failed`.
 - Distribution: the library archive (`packaging/scripts/build-lib.sh`) ships `libveil_kit` and `veil_kit.h` next to

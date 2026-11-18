@@ -393,6 +393,59 @@ class TestGraphQL(unittest.TestCase):
         self.assertIn('data: {"data":{"count":1}}', r.text)
         self.assertIn("event: complete", r.text)
 
+    # B-449: GET は query（と subscription）だけ、POST は JSON の Content-Type だけ
+    def test_csrf_rules(self):
+        from veil_kit.graphql import mount
+
+        state = {"n": 0}
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            def n(self) -> int:
+                return state["n"]
+
+        @strawberry.type
+        class Mutation:
+            @strawberry.mutation
+            def bump(self) -> int:
+                state["n"] += 1
+                return state["n"]
+
+        app = veil.App()
+        mount(app, "/graphql", strawberry.Schema(query=Query, mutation=Mutation))
+        cl = TestClient(app)
+        r = cl.get("/graphql", params={"query": "mutation { bump }"})
+        self.assertEqual(r.status_code, 405)
+        self.assertEqual(r.headers.get("allow"), "POST")
+        doc = "query Q { n } mutation M { bump }"
+        self.assertEqual(cl.get("/graphql", params={"query": doc, "operationName": "Q"}).status_code, 200)
+        self.assertEqual(cl.get("/graphql", params={"query": doc, "operationName": "M"}).status_code, 405)
+        self.assertEqual(cl.get("/graphql", params={"query": doc}).status_code, 400)
+        self.assertEqual(cl.get("/graphql", params={"query": "{"}).status_code, 400)
+        body = json.dumps({"query": "mutation { bump }"})
+        r = cl.post("/graphql", content=body, headers={"content-type": "text/plain"})
+        self.assertEqual(r.status_code, 415)
+        self.assertEqual(cl.post("/graphql", content=body).status_code, 415)
+        self.assertEqual(state["n"], 0)
+        r = cl.post("/graphql", content=body, headers={"content-type": "application/json; charset=utf-8"})
+        self.assertEqual(r.json(), {"data": {"bump": 1}})
+
+    # B-447: WebSocket のハンドシェイクは同じオリジン（または許可したオリジン）からだけ受ける
+    def test_websocket_origin(self):
+        from veil_kit.graphql import _ws_origin_allowed
+
+        allowed = ("https://spa.example",)
+        self.assertTrue(_ws_origin_allowed(None, "app.example", allowed))
+        self.assertTrue(_ws_origin_allowed("https://app.example", "app.example", allowed))
+        self.assertTrue(_ws_origin_allowed("https://APP.example", "app.example:443", allowed))
+        self.assertTrue(_ws_origin_allowed("http://127.0.0.1:8080", "127.0.0.1:8080", allowed))
+        self.assertTrue(_ws_origin_allowed("https://spa.example", "app.example", allowed))
+        self.assertFalse(_ws_origin_allowed("https://evil.example", "app.example", allowed))
+        self.assertFalse(_ws_origin_allowed("https://app.example:8443", "app.example", allowed))
+        self.assertFalse(_ws_origin_allowed("null", "app.example", allowed))
+        self.assertFalse(_ws_origin_allowed("https://app.example", None, allowed))
+
 
 class TestGrpcClientShape(unittest.TestCase):
     def test_rpc_error(self):

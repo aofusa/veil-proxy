@@ -135,6 +135,15 @@ pub(crate) async fn call_with(
     // F-261: アップグレードの応答のときだけ検査する（通常の応答は `Option` の確認 1 回）
     if resp.upgrade.is_some() {
         super::upgrade::check_response(&mut resp, cache.upgrade_allowed && !head);
+    } else if resp.stream.is_none() {
+        // B-464: 溜めた本文の応答のフレーミングは本文から決める。ハンドラが付けた Transfer-Encoding は落とし、HEAD 以外は
+        // Content-Length も落として本文の長さで付け直す（HTTP/1.1 の head を書くとき）。上流の応答のヘッダをそのまま返す
+        // ハンドラ・tower のサービスは `transfer-encoding: chunked` を残したまま復号した本文を返し、HTTP/1.1 では本文が
+        // chunk の見出し・終わりとして読まれた（本文の中の応答が次の要求への応答になった）。確保は無い
+        resp.headers.retain(|(n, _)| {
+            !(n.eq_ignore_ascii_case(b"transfer-encoding")
+                || (!head && n.eq_ignore_ascii_case(b"content-length")))
+        });
     }
     // F-267: ストリーミング応答の after_send は本文のストリームと一緒に持ち回す（ストリームを送り終えて捨てたときに呼ぶ）
     if resp.stream.is_some() && resp.after_send.is_some() {
@@ -319,8 +328,8 @@ pub(crate) fn lowercase_names(fields: &mut [(Bytes, Bytes)]) {
 
 // F-197: ストリーミング応答は chunked。
 /// Builds the HTTP/1.1 response head (status line through the blank line). `Content-Length` is set from the body
-/// length (the handler's own value is used if present; for HEAD, `call` sets it). A streaming response uses
-/// `Transfer-Encoding: chunked`.
+/// length (`call` removes a handler's own value except for HEAD, where it carries the length of the dropped body). A
+/// streaming response uses `Transfer-Encoding: chunked`.
 pub(crate) fn http1_head(resp: &Response, keep_alive: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(128 + resp.headers.len() * 32);
     write_http1_head(&mut out, resp, keep_alive);
@@ -331,10 +340,13 @@ pub(crate) fn http1_head(resp: &Response, keep_alive: bool) -> Vec<u8> {
 /// Writes [`http1_head`] to the end of `out` (the caller supplies a pooled buffer).
 /// Whether the response is chunked is decided by `resp.stream`, so call this before taking the stream out.
 pub(crate) fn write_http1_head(out: &mut Vec<u8>, resp: &Response, keep_alive: bool) {
+    // ヘッダの `transfer-encoding: chunked` は、`call` が HEAD でストリームを落としたときの印（本文は空）だけ。
+    // 本文のある応答を chunked と書くと、本文がフレーミングとして読まれる（B-464）
     let chunked = resp.stream.is_some()
-        || resp.headers.iter().any(|(n, v)| {
-            n.eq_ignore_ascii_case(b"transfer-encoding") && v.eq_ignore_ascii_case(b"chunked")
-        });
+        || (resp.body.is_empty()
+            && resp.headers.iter().any(|(n, v)| {
+                n.eq_ignore_ascii_case(b"transfer-encoding") && v.eq_ignore_ascii_case(b"chunked")
+            }));
     out.extend_from_slice(b"HTTP/1.1 ");
     let mut buf = itoa::Buffer::new();
     out.extend_from_slice(buf.format(resp.status).as_bytes());
@@ -452,6 +464,67 @@ mod tests {
         assert!(!resp.is_streaming());
         let h = String::from_utf8(http1_head(&resp, true)).unwrap();
         assert!(h.contains("Transfer-Encoding: chunked\r\n"), "{}", h);
+    }
+
+    // B-464: 溜めた本文の応答にハンドラが付けた Transfer-Encoding・食い違う Content-Length は使わない
+    #[test]
+    fn buffered_body_framing_ignores_handler_te_and_length() {
+        let entry = crate::api::handler::HandlerEntry::new(
+            "te",
+            "/",
+            &["GET", "HEAD"],
+            std::sync::Arc::new(|_req: Request| -> crate::api::handler::HandlerFuture {
+                Box::pin(async {
+                    Response::text("0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nevil")
+                        .with_header("transfer-encoding", "chunked")
+                        .with_header("content-length", "3")
+                })
+            }),
+            Default::default(),
+        )
+        .unwrap();
+        let req = |m: &'static [u8]| {
+            build_request(
+                Bytes::from_static(m),
+                Bytes::from_static(b"/"),
+                Vec::new(),
+                Bytes::new(),
+                "127.0.0.1",
+                HttpVersion::Http11,
+            )
+        };
+        let resp = futures::executor::block_on(call(&entry, req(b"GET"), None));
+        let h = String::from_utf8(http1_head(&resp, true)).unwrap();
+        assert!(
+            !h.to_ascii_lowercase().contains("transfer-encoding"),
+            "{}",
+            h
+        );
+        assert!(
+            h.contains(&format!("Content-Length: {}\r\n", resp.body.len())),
+            "{}",
+            h
+        );
+        assert_eq!(
+            h.to_ascii_lowercase().matches("content-length").count(),
+            1,
+            "{}",
+            h
+        );
+        // HEAD はハンドラの長さ（落とした本文の長さを示すもの）を残し、chunked にはしない
+        let resp = futures::executor::block_on(call(&entry, req(b"HEAD"), None));
+        let h = String::from_utf8(http1_head(&resp, true)).unwrap();
+        assert!(
+            !h.to_ascii_lowercase().contains("transfer-encoding"),
+            "{}",
+            h
+        );
+        assert!(h.contains("content-length: 3\r\n"), "{}", h);
+        // 本文のある応答はヘッダが chunked と言っても chunked と書かない
+        let r = Response::text("abc").with_header("transfer-encoding", "chunked");
+        let h = String::from_utf8(http1_head(&r, true)).unwrap();
+        assert!(!h.contains("Transfer-Encoding"), "{}", h);
+        assert!(h.contains("Content-Length: 3\r\n"), "{}", h);
     }
 
     #[test]

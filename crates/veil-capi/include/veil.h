@@ -405,7 +405,10 @@ int veil_response_after_send(veil_response_t *resp, veil_free_fn func, void *use
 
 /* Lifecycle. Startup functions run in order on the thread of veil_run before the listeners open; a non-zero
  * result stops startup (veil_run returns VEIL_ERR_RUNTIME). Shutdown functions run in reverse order on the same
- * thread after the server stopped, only when it had started. */
+ * thread after the server stopped, only when it had started. veil_run first waits for the jobs the server gave the
+ * handler pool (handlers, middleware, after-send functions) to finish; if some are still running after
+ * [server] graceful_shutdown_timeout_secs (at least one second), the shutdown functions are not called, so that
+ * the state they free stays valid. */
 int veil_config_on_startup(veil_config_t *cfg, int (*func)(void *user_data), void *user_data);
 int veil_config_on_shutdown(veil_config_t *cfg, veil_free_fn func, void *user_data);
 /* Information about a worker thread (valid during the call). */
@@ -609,7 +612,8 @@ int veil_grpc_client_recv(veil_grpc_client_call_t *c, const uint8_t **data, size
 int veil_grpc_client_finish(veil_grpc_client_call_t *c);
 /* After finish: the status message (not NUL-terminated). */
 const char *veil_grpc_client_status_message(const veil_grpc_client_call_t *c, size_t *len);
-/* Response metadata (headers, then trailers after finish); not NUL-terminated, or NULL. */
+/* Response metadata (headers, then trailers after finish); not NUL-terminated, or NULL. The value stays valid until
+ * the call is freed (it does not invalidate a message from veil_grpc_client_recv). */
 const char *veil_grpc_client_metadata(veil_grpc_client_call_t *c, const char *name, size_t *len);
 /* The status becomes CANCELLED (1) unless the call already ended. */
 void veil_grpc_client_cancel(veil_grpc_client_call_t *c);

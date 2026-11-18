@@ -442,6 +442,7 @@ pub struct JwtVerifier {
     keys: ArcSwap<Vec<JwtKey>>,
     issuer: Option<String>,
     audience: Option<String>,
+    verify_audience: bool,
     leeway: u64,
     require_exp: bool,
 }
@@ -463,6 +464,7 @@ impl JwtVerifier {
             keys: ArcSwap::from_pointee(keys.into_iter().collect()),
             issuer: None,
             audience: None,
+            verify_audience: true,
             leeway: 60,
             require_exp: true,
         }
@@ -479,9 +481,18 @@ impl JwtVerifier {
         self
     }
 
-    /// Requires `aud` to contain `audience`.
+    /// Requires `aud` to contain `audience`. Without an audience, a token that carries `aud` is rejected (it was
+    /// issued for another service), as in PyJWT; see [`JwtVerifier::verify_audience`].
     pub fn audience(mut self, audience: impl Into<String>) -> JwtVerifier {
         self.audience = Some(audience.into());
+        self
+    }
+
+    // B-451: 既定で aud を検査する（PyJWT・Python の kit の B-201 と同じ）。外すときは明示する
+    /// Whether `aud` is checked (default `true`). Turn it off only when the issuer's tokens are not shared between
+    /// services: a token for another service is then accepted.
+    pub fn verify_audience(mut self, on: bool) -> JwtVerifier {
+        self.verify_audience = on;
         self
     }
 
@@ -578,13 +589,17 @@ impl JwtVerifier {
                 return Err(JwtError::BadIssuer);
             }
         }
-        if let Some(aud) = &self.audience {
-            let ok = match claims.get("aud") {
-                Some(serde_json::Value::String(a)) => a == aud,
-                Some(serde_json::Value::Array(a)) => {
-                    a.iter().any(|x| x.as_str() == Some(aud.as_str()))
+        // B-451: 期待する受け手を設定していなくても、aud の付いたトークン（別の受け手のもの）は断る。以前は設定した
+        // ときだけ検査し、同じ発行者・鍵で別のサービスへ出したトークンを受けていた
+        if self.verify_audience {
+            let aud = claims.get("aud").filter(|v| !v.is_null());
+            let ok = match (&self.audience, aud) {
+                (Some(want), Some(serde_json::Value::String(a))) => a == want,
+                (Some(want), Some(serde_json::Value::Array(a))) => {
+                    a.iter().any(|x| x.as_str() == Some(want.as_str()))
                 }
-                _ => false,
+                (Some(_), _) => false,
+                (None, aud) => aud.is_none(),
             };
             if !ok {
                 return Err(JwtError::BadAudience);
@@ -770,6 +785,22 @@ mod tests {
         assert_eq!(v2.verify::<Claims>(&t).unwrap_err(), JwtError::BadIssuer);
         let v3 = JwtVerifier::new([key.clone()]).audience("nope");
         assert_eq!(v3.verify::<Claims>(&t).unwrap_err(), JwtError::BadAudience);
+        // B-451: 受け手を設定していなければ aud の付いたトークンは断る（明示して外せる）
+        let v4 = JwtVerifier::new([key.clone()]);
+        assert_eq!(v4.verify::<Claims>(&t).unwrap_err(), JwtError::BadAudience);
+        let v5 = JwtVerifier::new([key.clone()]).verify_audience(false);
+        assert!(v5.verify::<Claims>(&t).is_ok());
+        let no_aud = encode_hmac(
+            &key,
+            &serde_json::json!({"sub": "alice", "exp": now() + 300}),
+        )
+        .unwrap();
+        assert!(v4.verify::<Claims>(&no_aud).is_ok());
+        let wants_api = JwtVerifier::new([key.clone()]).audience("api");
+        assert_eq!(
+            wants_api.verify::<Claims>(&no_aud).unwrap_err(),
+            JwtError::BadAudience
+        );
         let mut parts: Vec<&str> = t.split('.').collect();
         let forged = crate::b64::encode(br#"{"sub":"admin","exp":99999999999}"#);
         parts[1] = &forged;
@@ -871,7 +902,9 @@ mod tests {
         );
         let jwk = serde_json::json!({"kty":"EC","crv":"P-256","kid":"ec",
             "x": crate::b64::encode(&point[1..33]), "y": crate::b64::encode(&point[33..])});
-        let v = JwtVerifier::from_jwks(&serde_json::json!({"keys":[jwk]})).unwrap();
+        let v = JwtVerifier::from_jwks(&serde_json::json!({"keys":[jwk]}))
+            .unwrap()
+            .audience("api");
         assert_eq!(
             v.verify::<Claims>(&t).unwrap().sub.as_deref(),
             Some("alice")
@@ -891,6 +924,7 @@ mod tests {
             .with_kid("ec");
         assert_eq!(
             JwtVerifier::new([k])
+                .audience("api")
                 .verify::<Claims>(&t)
                 .unwrap()
                 .sub
@@ -903,7 +937,9 @@ mod tests {
         let kp = sig::Ed25519KeyPair::from_pkcs8(pk.as_ref()).unwrap();
         let t = sign_with("EdDSA", |m| kp.sign(m).as_ref().to_vec(), "ed");
         let jwk = serde_json::json!({"kty":"OKP","crv":"Ed25519","kid":"ed","x": crate::b64::encode(kp.public_key().as_ref())});
-        let v = JwtVerifier::from_jwks(&serde_json::json!({"keys":[jwk]})).unwrap();
+        let v = JwtVerifier::from_jwks(&serde_json::json!({"keys":[jwk]}))
+            .unwrap()
+            .audience("api");
         assert!(v.verify::<Claims>(&t).is_ok());
 
         // RS256・PS256（PKCS#1 の DER から n・e を取り出す）
@@ -927,7 +963,10 @@ mod tests {
                 .unwrap()
                 .with_kid("rsa");
             assert!(
-                JwtVerifier::new([k]).verify::<Claims>(&t).is_ok(),
+                JwtVerifier::new([k])
+                    .audience("api")
+                    .verify::<Claims>(&t)
+                    .is_ok(),
                 "{}",
                 alg
             );

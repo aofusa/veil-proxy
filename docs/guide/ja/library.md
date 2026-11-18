@@ -935,7 +935,7 @@ App::new()
 | 上限 | 受信メッセージ 1 つあたり `[api] grpc_max_message_size`（既定 4MiB）。超えたら `RESOURCE_EXHAUSTED`。圧縮されたメッセージは解凍後の大きさに掛かり、超えた時点で解凍を打ち切る |
 | gRPC-Web | `application/grpc-web`・`application/grpc-web+proto` と base64 の `application/grpc-web-text(+proto)` を同じメソッドで受ける（HTTP/1.1・HTTP/2・HTTP/3）。トレーラは本文の最後の枠（フラグ `0x80`）で返すので、ブラウザ（grpc-web・Connect）から変換用のプロキシ無しで veil を直接呼べる。`OPTIONS` のプリフライトは `[api] grpc_web_cors_origins` で答える |
 | エラー | `content-type` が `application/grpc*` 以外は 415、HTTP/1.1 の gRPC（gRPC-Web を除く）は `grpc-status: 13`、登録済みサービスの未定義メソッドと、どのルートにも当たらないパスへの gRPC は `UNIMPLEMENTED` |
-| ヘルスチェック | `App::grpc_health()` が `grpc.health.v1.Health`（`Check`・`Watch`）を登録する。サーバ全体（`""`）は `SERVING`、`veil::api::grpc::health::set_serving_status(service, status)` で変える |
+| ヘルスチェック | `App::grpc_health()` が `grpc.health.v1.Health`（`Check`・`Watch`）を登録する。サーバ全体（`""`）は `SERVING`、`veil::api::grpc::health::set_serving_status(service, status)` で変える。`Watch` は 1024 バイトより長いサービス名を `INVALID_ARGUMENT` で断り、アプリが置いていない名前は待つ相手が居なくなれば忘れる |
 | リフレクション | `App::grpc_reflection(&[hello::greeter_server::FILE_DESCRIPTOR_SET])` で `grpc.reflection.v1` と `v1alpha`（`ServerReflectionInfo`）を登録する。grpcurl・Postman・grpcui が `.proto` 無しでサービスの一覧と型を取得できる。`FILE_DESCRIPTOR_SET` は `veil-build` が生成する（コンパイルしたパッケージごとに渡す）。`list_services` は登録したすべての gRPC サービスを返す。組み込みのヘルスチェックとリフレクション自身の型は返さない |
 
 完全なサンプルは `examples/api/rust-grpc`（単項・3 種のストリーミング・期限・エラー・ヘルスチェック）で、
@@ -1152,7 +1152,9 @@ Operation Object を JSON で渡すと説明が反映されます）。設定は
 - 応答の後: `veil_response_after_send(resp, fn, ud)` は応答を送り終えてから（ストリーミングでは本文の終わりの後）
   ハンドラ用プールで `fn(ud)` を呼びます。
 - ライフサイクル: `veil_config_on_startup`（リスナーを開く前。0 以外を返すと起動を止め、`veil_run` は `VEIL_ERR_RUNTIME` を返す）、`veil_config_on_worker_start`
-  （`veil_worker_info_t`）、`veil_config_on_shutdown`（サーバが止まった後）。
+  （`veil_worker_info_t`）、`veil_config_on_shutdown`（サーバが止まり、その要求のハンドラ用プールの仕事が終わった後。
+  `[server] graceful_shutdown_timeout_secs`（最低 1 秒）を過ぎても仕事が残っていれば、解放する状態を使い続けられる
+  ように停止の関数は呼ばない）。
 - `veil_config_cors(cfg, &veil_cors_t)`（プリフライトにも答える CORS）、`veil_config_serve_dir(cfg, prefix, dir,
   &veil_serve_options_t)`（veil のファイルサーバ）、`veil_grpc_reflection(cfg, data, len)`（`FileDescriptorSet` からの
   gRPC サーバリフレクション）。
@@ -1257,7 +1259,9 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
   プロトコルへアップグレードできます（`veil.Protocol` か `veil.AsyncProtocol`）。
 - **ストリーミング（F-210）。** ジェネレータ・非同期ジェネレータを返す（`text/plain` で断片ごとに送る）か、
   `veil.StreamingResponse(iterable, media_type=..., trailers=[...])`、Server-Sent Events なら `veil.EventSourceResponse(iterable)`
-  （要素は文字列・JSON にできる値・`{"event", "data", "id", "retry"}` の dict）。`@veil.post(..., stream_body=True)` は本文が
+  （要素は文字列・JSON にできる値・`{"event", "data", "id", "retry"}` の dict。CR・LF・CRLF のどれも `data:` の行の終わりに
+  なり、改行を含む `event`・`id` と負でない整数でない `retry` は `ValueError`。中継した文字列でフィールドやイベントを
+  差し込ませない）。`@veil.post(..., stream_body=True)` は本文が
   届く前にハンドラを呼び、`for chunk in request.stream()` で届いた順に読みます（`async def` でも使えます。断片ごとにプールの
   スレッドで待ちます）。
 - **gRPC（F-210）** は `veil.grpc`（依存なし）: `@veil.grpc.unary_unary("/pkg.Svc/Method",
@@ -1291,7 +1295,9 @@ veil.run(listen_cleartext="0.0.0.0:8080")               # ブロックする（�
   定期・cron のタスク。
 - **GraphQL:** 好きなライブラリを普通のルートとして載せます。[examples/api/python-graphql/](../../../examples/api/python-graphql/)
   は strawberry（クエリ・ミューテーション・SSE のサブスクリプション）。`veil_kit.graphql.mount` は同じことを WebSocket の
-  サブスクリプションと GraphiQL 付きで行います。
+  サブスクリプションと GraphiQL 付きで行います。どちらも別のサイトからの要求について Rust の kit と同じ規則です: `GET` は
+  問い合わせだけ（mutation は 405）、`POST` は `application/json` だけ（他は 415）、kit は `Origin` の付いた WebSocket の
+  ハンドシェイクを `Host` と同じホストか `mount(..., origins=[...])` からだけ受けます。
 - 設定: `veil.run(config_path=None, *, listen_cleartext, listen, tls_cert, tls_key, http3, listeners, threads, overrides={"server.threads": 4}, openapi=True)`。`VEIL_OVERRIDE_<n>` も通常どおり効きます。
 
 文書全体（入門・FastAPI からの移行の対応表・API 一覧）は <https://veil-api.readthedocs.io> にあります（英語が正。日本語版は gettext で作る。手順は crates/veil-python/docs/conf.py の冒頭）。

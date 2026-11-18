@@ -182,6 +182,9 @@ int veil_kit_jwt_verifier_add_jwks(veil_kit_jwt_verifier_t *v, const char *jwks_
 int veil_kit_jwt_verifier_set_jwks(veil_kit_jwt_verifier_t *v, const char *jwks_json);
 int veil_kit_jwt_verifier_issuer(veil_kit_jwt_verifier_t *v, const char *issuer);
 int veil_kit_jwt_verifier_audience(veil_kit_jwt_verifier_t *v, const char *audience);
+/* Whether "aud" is checked (default 1): without an audience, a token that carries "aud" (issued for another
+ * service) is rejected. 0 accepts any "aud" (only when the issuer's tokens are not shared between services). */
+int veil_kit_jwt_verifier_verify_audience(veil_kit_jwt_verifier_t *v, int on);
 int veil_kit_jwt_verifier_require_exp(veil_kit_jwt_verifier_t *v, int on);
 int veil_kit_jwt_verifier_leeway(veil_kit_jwt_verifier_t *v, uint64_t secs);
 /* VEIL_OK with the claims as JSON in *claims_json (NULL to skip; free with veil_kit_free), or

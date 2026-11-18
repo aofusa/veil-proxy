@@ -68,14 +68,21 @@ static int mw_echo(const veil_request_t *req, veil_response_t *resp, void *ud) {
 
 /* ---- ヘッダ・プロトコル ---- */
 
+/* snprintf の続きを buf に足す（切り詰めたら off を末尾で止める。返り値をそのまま足すと off が buf を越え、
+ * 次の大きさ sizeof buf - off が折り返して範囲外に書く。B-453） */
+static size_t append(char *buf, size_t cap, size_t off, int n) {
+    if (n < 0) return off;
+    return (size_t)n >= cap - off ? cap - 1 : off + (size_t)n;
+}
+
 static int headers(const veil_request_t *req, veil_response_t *resp, void *ud) {
     (void)ud;
     char buf[512];
     size_t off = 0, it = 0, len = 0;
     const char *v;
-    off += (size_t)snprintf(buf, sizeof buf, "n=%zu multi=", veil_request_header_count(req));
+    off = append(buf, sizeof buf, off, snprintf(buf, sizeof buf, "n=%zu multi=", veil_request_header_count(req)));
     while ((v = veil_request_header_next(req, "x-multi", &it, &len)) != NULL && off < sizeof buf - 64)
-        off += (size_t)snprintf(buf + off, sizeof buf - off, "%.*s;", (int)len, v);
+        off = append(buf, sizeof buf, off, snprintf(buf + off, sizeof buf - off, "%.*s;", (int)len, v));
     snprintf(buf + off, sizeof buf - off, " version=%d tls=%d", veil_request_version(req), veil_request_is_tls(req));
     /* 同名のヘッダを 2 個 */
     veil_response_add_header(resp, "x-twice", "1");

@@ -301,6 +301,13 @@ impl ClientBuilder {
 
 static NEXT_CLIENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+// B-465: オリジンの表の上限。超えたら空にして作り直す（`Origin` は `Arc` なので使用中の要求は自分の分を持ち続け、接続の
+// プールは `pool_key` の文字列で引くので、作り直したオリジンも同じ接続を使う）。要求から作った URL を 1 つのクライアントへ
+// 渡すアプリ（Webhook・リンクのプレビュー）で、別々のホスト名ごとに表が増え続けた
+const MAX_ORIGINS: usize = 1024;
+// B-465: HTTP/1.1 の空き接続の表のオリジンの数の上限（ワーカーごと）。超えたら新しいオリジンの接続はプールせずに閉じる
+const MAX_POOLED_ORIGINS: usize = 1024;
+
 struct Inner {
     id: u64,
     cfg: ClientBuilder,
@@ -462,7 +469,14 @@ impl Client {
         if let Some(o) = self.inner.origins.lock().unwrap().get(origin_str) {
             return Ok((o.clone(), target));
         }
+        // B-465: DNS の名前は 253 バイトまで（IP のリテラル・Unix ソケットのパスはもっと短い）。長い名前で表を膨らませない
+        if origin_str.len() > 1024 {
+            return Err(bad());
+        }
         let mut t = ProxyTarget::parse(origin_str).ok_or_else(bad)?;
+        if t.host.len() > 253 {
+            return Err(bad());
+        }
         t.path_prefix = "/".into();
         t.http2 = match self.inner.cfg.http2 {
             Http2::Auto => UpstreamHttp2::Auto,
@@ -499,11 +513,12 @@ impl Client {
             target: t,
             pool_key,
         });
-        self.inner
-            .origins
-            .lock()
-            .unwrap()
-            .insert(origin_str.to_string(), o.clone());
+        let mut origins = self.inner.origins.lock().unwrap();
+        if origins.len() >= MAX_ORIGINS {
+            origins.clear();
+        }
+        origins.insert(origin_str.to_string(), o.clone());
+        drop(origins);
         Ok((o, target))
     }
 
@@ -896,6 +911,8 @@ fn pool_take(key: &str) -> Option<Conn> {
                 return Some(c);
             }
         }
+        // B-465: 空いた鍵は消す（この後は新しい接続を張るので、鍵を作り直す確保はそれに比べて小さい）
+        p.remove(key);
         None
     })
 }
@@ -903,6 +920,17 @@ fn pool_take(key: &str) -> Option<Conn> {
 fn pool_put(key: &str, c: Conn, idle: Duration) {
     H1_POOL.with(|p| {
         let mut p = p.borrow_mut();
+        if !p.contains_key(key) {
+            // B-465: 新しいオリジンを足す前に、期限の切れた接続と空いた鍵を全部捨てる（同じオリジンへ二度と要求しないと、
+            // その接続は表に残って fd を持ち続けた）。それでも上限なら、この接続はプールせずに閉じる
+            p.retain(|_, v| {
+                v.retain(|(_, at, idle)| at.elapsed() < *idle);
+                !v.is_empty()
+            });
+            if p.len() >= MAX_POOLED_ORIGINS {
+                return;
+            }
+        }
         let v = match p.get_mut(key) {
             Some(v) => v,
             None => p.entry(key.to_string()).or_default(),
@@ -1428,6 +1456,25 @@ mod tests {
             assert_eq!(t, "/v1/x");
         }
         assert_eq!(c.resolve("ftp://x").unwrap_err().kind(), ErrorKind::Url);
+    }
+
+    // B-465: 長いホスト名は断り、オリジンの表は上限を超えて増えない
+    #[test]
+    fn origin_cache_is_bounded() {
+        let c = Client::new();
+        let long = format!("http://{}.example/", "a".repeat(300));
+        assert_eq!(c.resolve(&long).unwrap_err().kind(), ErrorKind::Url);
+        let ok = format!("http://{}.example/", "a".repeat(200));
+        assert!(c.resolve(&ok).is_ok());
+        for i in 0..(MAX_ORIGINS + 10) {
+            c.resolve(&format!("http://h{}.example/", i)).unwrap();
+        }
+        assert!(c.inner.origins.lock().unwrap().len() <= MAX_ORIGINS);
+        // 表を作り直しても同じオリジンは同じプールの鍵になる
+        let (a, _) = c.resolve("http://h1.example/").unwrap();
+        c.inner.origins.lock().unwrap().clear();
+        let (b, _) = c.resolve("http://h1.example/").unwrap();
+        assert_eq!(a.pool_key, b.pool_key);
     }
 
     // B-324: 方式ごとにプールを分ける・ホスト名 unix を UDS にしない・利用者へ詳細を返さない

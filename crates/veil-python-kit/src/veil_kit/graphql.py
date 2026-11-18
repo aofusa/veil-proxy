@@ -8,9 +8,13 @@
     schema = strawberry.Schema(query=Query, mutation=Mutation, subscription=Subscription)
     mount(app, "/graphql", schema)
 
-One path serves ``POST`` (JSON, batches too) and ``GET`` (query string), GraphQL over SSE for subscriptions
-(``Accept: text/event-stream``), WebSocket subscriptions (``graphql-transport-ws`` and the older ``graphql-ws``) and
-GraphiQL for a browser ``GET`` (``graphiql=False`` turns it off; the page loads its scripts from a CDN).
+One path serves ``POST`` (``Content-Type: application/json``, batches too; another type gives 415) and ``GET``
+(query string; queries and subscriptions only: a mutation gives 405 so that a cross-site link cannot run one),
+GraphQL over SSE for subscriptions (``Accept: text/event-stream``), WebSocket subscriptions
+(``graphql-transport-ws`` and the older ``graphql-ws``) and GraphiQL for a browser ``GET`` (``graphiql=False`` turns
+it off; the page loads its scripts from a CDN). A browser sends cookies with a cross-site WebSocket handshake and the
+page can read the results, so a handshake with an ``Origin`` is accepted only from the same host as ``Host`` or from
+``origins`` (others are rejected with 403).
 ``context_getter(request)`` builds the context passed to resolvers (default: ``{"request": request}``).
 """
 
@@ -24,6 +28,50 @@ import veil
 __all__ = ["mount", "GraphQLRoutes"]
 
 _GRAPHQL_RESPONSE = "application/graphql-response+json"
+_JSON_TYPES = ("application/json", _GRAPHQL_RESPONSE, "application/graphql+json")
+
+
+def _is_json(content_type):
+    # B-449: JSON 以外（text/plain のフォーム等、CORS の事前確認の要らない要求）は受けない（Rust の kit の B-196 と同じ）
+    media = (content_type or "").split(";", 1)[0].strip().lower()
+    return media in _JSON_TYPES
+
+
+def _operation_type(query, operation_name):
+    """The type of the operation a request would run (``"query"``, ``"mutation"`` or ``"subscription"``), or
+    ``None`` if the document does not parse or does not select one operation."""
+    from graphql import GraphQLError, OperationDefinitionNode, parse  # noqa: PLC0415 (graphql-core comes with strawberry)
+
+    try:
+        doc = parse(query)
+    except GraphQLError:
+        return None
+    ops = [d for d in doc.definitions if isinstance(d, OperationDefinitionNode)]
+    if operation_name:
+        ops = [o for o in ops if o.name is not None and o.name.value == operation_name]
+    if len(ops) != 1:
+        return None
+    return ops[0].operation.value
+
+
+def _ws_origin_allowed(origin, host, allowed):
+    """Whether a WebSocket handshake may use the endpoint: no ``Origin`` (not a browser), an ``Origin`` with the same
+    host and port as ``Host``, or one of ``allowed``."""
+    # B-447: ブラウザは別のサイトの WebSocket のハンドシェイクにも Cookie を付け、ページは結果を読めるので、Origin を確かめる
+    if origin is None:
+        return True
+    if any(a.lower() == origin.lower() for a in allowed):
+        return True
+    scheme, sep, authority = origin.partition("://")
+    default_port = {"https": ":443", "http": ":80"}.get(scheme.lower())
+    if not host or not sep or not authority or default_port is None:
+        return False
+
+    def bare(a):
+        a = a.strip().lower()
+        return a[: -len(default_port)] if a.endswith(default_port) else a
+
+    return bare(authority) == bare(host)
 
 
 def _result(r):
@@ -63,12 +111,13 @@ def _graphiql_html(path):
 class GraphQLRoutes:
     """The routes of one schema (created by :func:`mount`)."""
 
-    def __init__(self, schema, path, graphiql=True, context_getter=None, keep_alive=None):
+    def __init__(self, schema, path, graphiql=True, context_getter=None, keep_alive=None, origins=()):
         self.schema = schema
         self.path = path
         self.graphiql = graphiql
         self.context_getter = context_getter or (lambda request: {"request": request})
         self.keep_alive = keep_alive
+        self.origins = tuple(origins)
 
     async def _execute(self, body, request):
         ctx = self.context_getter(request)
@@ -104,11 +153,22 @@ class GraphQLRoutes:
             except ValueError:
                 raise veil.HTTPException(400, "variables is not valid JSON")
             body = {"query": q.get("query"), "variables": variables, "operationName": q.get("operationName")}
-        else:
+            # B-449: GET では mutation を実行しない（Lax の Cookie はトップレベルの GET 遷移に付く。Rust の kit の B-196）。
+            # 解析できない文書も実行しない
+            op = _operation_type(body["query"], body["operationName"])
+            if op is None:
+                raise veil.HTTPException(400, "the query does not parse or does not select one operation")
+            if op == "mutation":
+                raise veil.HTTPException(405, "mutations require POST", headers={"allow": "POST"})
+        elif request.method == "POST":
+            if not _is_json(request.headers.get("content-type")):
+                raise veil.HTTPException(415, "GraphQL requests must be application/json")
             try:
                 body = json.loads(request.body or b"null")
             except ValueError:
                 raise veil.HTTPException(400, "the body is not valid JSON")
+        else:
+            raise veil.HTTPException(405, headers={"allow": "GET, POST"})
         if "text/event-stream" in accept:
             if not isinstance(body, dict):
                 raise veil.HTTPException(400, "subscriptions over SSE take one operation")
@@ -130,6 +190,9 @@ class GraphQLRoutes:
 
     async def websocket(self, websocket: veil.WebSocket):
         """Subscriptions over WebSocket (``graphql-transport-ws`` and ``graphql-ws``)."""
+        if not _ws_origin_allowed(websocket.headers.get("origin"), websocket.headers.get("host"), self.origins):
+            await websocket.close(1008)
+            return
         offered = websocket.subprotocols
         proto = next((p for p in ("graphql-transport-ws", "graphql-ws") if p in offered), None)
         if proto is None:
@@ -196,9 +259,12 @@ class GraphQLRoutes:
                 task.cancel()
 
 
-def mount(app, path, schema, *, graphiql=True, context_getter=None, websocket=True):
-    """Serve ``schema`` (a ``strawberry.Schema``) at ``path`` on ``app``; returns the :class:`GraphQLRoutes`."""
-    routes = GraphQLRoutes(schema, path, graphiql, context_getter)
+def mount(app, path, schema, *, graphiql=True, context_getter=None, websocket=True, origins=()):
+    """Serve ``schema`` (a ``strawberry.Schema``) at ``path`` on ``app``; returns the :class:`GraphQLRoutes`.
+
+    ``origins`` lists other origins (such as ``"https://app.example"``) whose WebSocket handshakes are accepted.
+    """
+    routes = GraphQLRoutes(schema, path, graphiql, context_getter, origins=origins)
 
     async def graphql_http(request: veil.Request):
         return await routes.http(request)

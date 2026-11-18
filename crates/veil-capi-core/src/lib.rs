@@ -840,7 +840,10 @@ fn make_handler(
                 // B-418: JSON の本文を宣言したルートは Content-Type が JSON の要求だけを受ける（別サイトの text/plain の
                 // フォーム・型の無い Blob の fetch は CORS の事前確認無しに利用者の Cookie を付けて届く）
                 if !veil::api::__private::is_json_content_type(req.header("content-type")) {
-                    return veil::api::Response::error(415, "Content-Type must be application/json");
+                    return veil::api::Response::error(
+                        415,
+                        "Content-Type must be application/json",
+                    );
                 }
                 if let Err(e) = validate::check_body(s, req.body()) {
                     return e.into_response();
@@ -892,7 +895,7 @@ pub unsafe extern "C" fn veil_run(cfg: *mut veil_config_t) -> c_int {
         Err(_) => fail(VEIL_ERR_RUNTIME, "server panicked"),
     };
     if started.load(std::sync::atomic::Ordering::Acquire) {
-        hooks::run_shutdown(shutdown);
+        hooks::run_shutdown_after_jobs(shutdown);
     }
     rc
 }

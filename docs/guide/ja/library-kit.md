@@ -142,7 +142,8 @@ App::new()
   `require` を `authenticate` より先に登録します。
 - `Jwt<C>`（feature `jwt`）は `App::state` の `JwtVerifier` で `Authorization: Bearer` を検証します: `HS256/384/512`・
   `RS256/384/512`・`PS256/384/512`・`ES256`・`ES384`・`EdDSA`。鍵ごとにアルゴリズムが決まり（`alg` が違うトークンは拒否。`none` は
-  通らない）、`kid` で鍵を選び、`exp`・`nbf` は 60 秒の猶予、`iss`・`aud` は設定したときに検査します。
+  通らない）、`kid` で鍵を選び、`exp`・`nbf` は 60 秒の猶予、`iss` は設定したときに検査し、`aud` は設定した受け手を含むこと（受け手を設定していなければ `aud` の付いた
+  トークンは別のサービス向けとして `BadAudience`。PyJWT と同じ。`.verify_audience(false)` で検査を外す）。
   `exp` は必須（無ければ `JwtError::MissingClaim("exp")`。`.require_exp(false)` で受ける）で、数値でない `exp`・`nbf` は `Malformed` です。鍵は秘密・PEM（`PUBLIC KEY`・
   `RSA PUBLIC KEY`）・JWK・JWK Set から作れ、`verifier.refresh_jwks(&client, url).await` で入れ替えます（`Tasks::every` で定期に）。
   `encode_hmac` は HMAC のトークンを発行します。`jsonwebtoken` に依存せず、検証は TLS のプロバイダの crate で行います。
@@ -227,9 +228,16 @@ App::new().with(veil_kit::graphql::mount("/graphql", schema))
 ```
 
 `POST`（単発とバッチ。`Content-Type` は `application/json` に限り、他は 415）と `GET`（問い合わせとサブスクリプション。
-`GET` の mutation は `Allow: POST` 付きの 405。他サイトのリンクや `SameSite=Lax` の Cookie で mutation を実行させない）、受け付けるなら `application/graphql-response+json`、SSE（`Accept: text/event-stream`）と
-WebSocket（`graphql-transport-ws`・`graphql-ws`、HTTP/1.1）のサブスクリプション、`graphiql` feature ではブラウザの `GET` に GraphiQL
-（ページはスクリプトを CDN から読む）。kit は async-graphql 7 に固定しています。
+`GET` の mutation は `Allow: POST` 付きの 405。他サイトのリンクや `SameSite=Lax` の Cookie で mutation を実行させない。
+解析できる文書の無い `GET` は 400 なので、persisted query のハッシュは `POST` で送る）、受け付けるなら
+`application/graphql-response+json`、SSE（`Accept: text/event-stream`）と WebSocket（`graphql-transport-ws`・
+`graphql-ws`、HTTP/1.1）のサブスクリプション、`graphiql` feature ではブラウザの `GET` に GraphiQL（ページはスクリプトを CDN から
+読む）。kit は async-graphql 7 に固定しています。
+
+ブラウザは別のサイトの WebSocket のハンドシェイクにも Cookie を付け、ページは結果を読めるので、`Origin` の付いた WebSocket の
+ハンドシェイクは `Host` と同じホスト・ポートからだけ受けます（他は 403。`Origin` を送らないブラウザ以外のクライアントは
+受ける）。別のオリジンのフロントエンドは `veil_kit::graphql::mount_with_origins("/graphql", schema, &["https://app.example"])`
+で並べます。`Cors` のプラグインは WebSocket のハンドシェイクには効きません。
 
 ## 依存性注入
 
@@ -308,7 +316,7 @@ cc app.c -Icrates/veil-capi/include -Icrates/veil-capi-helpers/include -Ltarget/
 | セッション | `veil_kit_sessions_install`（`veil_kit_sessions_t`: 接頭辞・Cookie 名・寿命・メモリ保存）、`veil_kit_session_get / get_str / set / set_str / remove / clear / destroy / cycle_id` |
 | 資格情報 | `veil_kit_basic_auth`、`veil_kit_basic_matches`、`veil_kit_bearer`、`veil_kit_api_key`、`veil_kit_api_key_matches`（定数時間）、`veil_kit_unauthorized` |
 | 主体（Principal） | `veil_kit_principal_new / add_scope / add_role / set_attributes / free`、`veil_kit_set_principal`、`veil_kit_principal`、`veil_kit_principal_subject / has_scope / has_role / attributes`、`veil_kit_require_scope` |
-| JWT | `veil_kit_jwt_verifier_new / add_hmac / add_pem / add_jwks / set_jwks / issuer / audience / require_exp / leeway / free`、`veil_kit_jwt_verify`、`veil_kit_jwt_encode_hmac`、`veil_kit_jwt_authenticate` |
+| JWT | `veil_kit_jwt_verifier_new / add_hmac / add_pem / add_jwks / set_jwks / issuer / audience / verify_audience / require_exp / leeway / free`、`veil_kit_jwt_verify`、`veil_kit_jwt_encode_hmac`、`veil_kit_jwt_authenticate` |
 | リダイレクト・ファイル | `veil_kit_redirect`、`veil_kit_redirect_safe`（オープンリダイレクト対策）、`veil_kit_send_file` |
 | 小物 | `veil_kit_form_get`、`veil_kit_error`（`{"detail": ...}`）、`veil_kit_json_string`、`veil_kit_oauth2_security_scheme`、`veil_kit_free`、`veil_kit_version` |
 | タスク | `veil_kit_every`、`veil_kit_cron`（ハンドラ用プールで動くアプリのタスク。応答の後の処理は `libveil` の `veil_response_after_send`） |
@@ -345,11 +353,13 @@ CORS・静的ディレクトリ・ミドルウェア・要求ごとの値・ラ�
   1 回まで次へ）。メッセージはバイト列なのでコーデックの引数はありません。`pick` はストリーミングの呼び出し用のチャネルを返します。
 - GraphQL: C には GraphQL の実行器が無いので、`veil_kit_graphql` は Rust の kit の `mount` の HTTP のトランスポートで、
   実行器はコールバックです（クエリ・操作名・変数の JSON のテキストを受け取り、結果の JSON を設定する）。HTTP の規則は
-  同じです: `POST` は JSON だけ（違えば 415）でバッチも受け、`GET` はクエリ文字列で mutation は 405、`Accept` で
+  同じです: `POST` は JSON だけ（違えば 415）でバッチも受け、`GET` はクエリ文字列で mutation は 405（操作を選べない文書は
+  400）、`Accept` で
   `application/graphql-response+json` を選び、`text/event-stream` には GraphQL over SSE で結果を返し、有効にすれば
   GraphiQL を出します。サブスクリプションには実行器からの結果の列が要るので、いちばん近いものとして `upgrade` を
   用意しました: そのパスの WebSocket のアップグレードを C のハンドラへ回し、`veil_ws_accept_ex` で
-  `graphql-transport-ws` を受けて結果を送ります。
+  `graphql-transport-ws` を受けて結果を送ります（Cookie で認証するならオプションの `origins` を設定する。ブラウザは
+  別のサイトのハンドシェイクにも Cookie を付ける）。
 - JSON の書き出しはヘッダだけ（ライブラリは確保しない）で、文字列をエスケープし、カンマを入れ、確保の失敗・深すぎる入れ子・
   対応しない `end` を `failed` で知らせます。
 - 配布: ライブラリのアーカイブ（`packaging/scripts/build-lib.sh`）は `libveil` の隣に `libveil_kit` と `veil_kit.h` を入れ、

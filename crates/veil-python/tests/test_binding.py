@@ -286,6 +286,26 @@ class TestConstraints(Base):
         self.assertEqual(r.status, 422)
         self.assertEqual(self.j(r)["detail"][0]["type"], "dict_type")
 
+    # B-469: NaN は範囲の外（どの比較も偽になるのを、範囲の内側を確かめる形で断る）
+    def test_nan_is_out_of_range(self):
+        self.assertEqual(
+            self.types(self.post({"name": "abc", "age": 1, "score": float("nan")})),
+            [("score", "greater_than"), ("score", "less_than")],
+        )
+        r = self.req(self.route, body=b'{"name": "abc", "age": NaN}')
+        self.assertEqual(self.types(r), [("age", "integer_type")])
+
+        @self.app.get("/q")
+        def g(x: float = veil.Query(ge=0, le=10)):
+            return {"x": x}
+
+        self.assertEqual(self.req(self.last(), query="x=5").status, 200)
+        r = self.req(self.last(), query="x=nan")
+        self.assertEqual(r.status, 422)
+        self.assertEqual(
+            [e["type"] for e in self.j(r)["detail"]], ["greater_than_equal", "less_than_equal"]
+        )
+
     def test_constraints_without_body_param(self):
         @self.app.post("/v", body_constraints={"age": {"minimum": 0}})
         def g():
@@ -470,6 +490,23 @@ class TestCompressFlags(Base):
         self.assertFalse(veil.JSONResponse({"a": 1}, compress=False).compress)
         self.assertFalse(veil.StreamingResponse(iter([b"x"]), compress=False).compress)
         self.assertTrue(veil.EventSourceResponse(iter([])).compress)
+
+
+class TestServerSentEvents(unittest.TestCase):
+    # B-450: CR・LF・CRLF のどれも行の終わり。event・id・retry には行の終わりを入れない
+    def test_line_breaks_cannot_inject_fields(self):
+        body = veil.EventSourceResponse(iter(["a\rb\r\nc\nd", {"data": "x\ry", "event": "m", "id": "7", "retry": 10}])).body
+        self.assertEqual(
+            body.decode(),
+            "data: a\ndata: b\ndata: c\ndata: d\n\nevent: m\nid: 7\nretry: 10\ndata: x\ndata: y\n\n",
+        )
+        self.assertNotIn(b"\r", body)
+        for bad in ({"data": "", "event": "m\rdata: forged"}, {"data": "", "id": "1\n"}, {"data": "", "id": "1\0"},
+                    {"data": "", "retry": "1\r"}, {"data": "", "retry": -1}, {"data": "", "retry": True},
+                    {"data": "", "retry": "1.5"}):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                veil.EventSourceResponse(iter([bad])).body
+        self.assertEqual(veil.EventSourceResponse(iter([{"data": 1, "retry": "300"}])).body, b"retry: 300\ndata: 1\n\n")
 
 
 class TestForms(Base):

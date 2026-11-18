@@ -882,6 +882,48 @@ where
 }
 
 /// ブロッキングなハンドラ `f` をハンドラ用プールで実行し、結果を非同期に受け取る。
+// B-467: ハンドラ用プールへ渡してまだ終わっていない仕事の数（キューにある分と実行中の分）。C の `veil_run` は
+// サーバが止まった後、停止の関数（C の状態を解放する）を呼ぶ前にこれが 0 になるのを待つ。プールはプロセスに 1 つで
+// キューを捨てないので、止めた後もキューに残った要求のハンドラ・ミドルウェア（`veil_kit_jwt_authenticate` 等）が
+// 解放済みの状態で動いていた。数えるのはハンドラ用プールの仕事だけ（FS 用のプールは数えない）
+#[cfg(feature = "handler-pool")]
+static HANDLER_JOBS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 仕事が終わった（実行した閉包を捨てた）ら [`HANDLER_JOBS`] を減らす印。閉包へ移して持たせる（大きさ 0）。
+#[cfg(feature = "handler-pool")]
+struct HandlerJob;
+
+#[cfg(feature = "handler-pool")]
+impl HandlerJob {
+    fn start() -> HandlerJob {
+        HANDLER_JOBS.fetch_add(1, Ordering::Relaxed);
+        HandlerJob
+    }
+}
+
+#[cfg(feature = "handler-pool")]
+impl Drop for HandlerJob {
+    fn drop(&mut self) {
+        HANDLER_JOBS.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Waits until every job given to the handler pool (queued or running) has finished, for at most `timeout`.
+/// Returns `false` when jobs were still left at the deadline. For use after the server stopped, off the data plane.
+#[cfg(feature = "handler-pool")]
+// 理由付き allow: サーバが止まった後に呼び出し元（`veil_run`）のスレッドで待つ（データプレーンの外）
+#[allow(clippy::disallowed_methods)]
+pub fn wait_handler_jobs(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while HANDLER_JOBS.load(Ordering::Acquire) != 0 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    true
+}
+
 /// `f` が panic したら `None`。
 #[cfg(feature = "handler-pool")]
 pub async fn offload_handler<F, R>(f: F) -> Option<R>
@@ -889,7 +931,9 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    let job = HandlerJob::start();
     await_completion(move |completer: Completer<R>| {
+        let _job = job;
         HANDLER_POOL.submit(Box::new(move || {
             // panic しても Completer の Drop が待機側を起こす（None）。
             if let Ok(v) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
@@ -903,7 +947,9 @@ where
 #[cfg(test)]
 mod b226_tests {
     /// B-226: 閉包が panic してもプールのスレッドは残り、要求はその panic で終わる（永久に待たない）。
+        let job = HandlerJob::start();
     /// ワーカーの本数（2〜8）より多く panic させても、次の `offload` が結果を返す。
+            let _job = job;
     #[test]
     fn panicking_job_does_not_kill_pool_or_hang() {
         #[cfg(all(veil_rt_uring, target_os = "linux"))]
@@ -913,6 +959,34 @@ mod b226_tests {
         }
         crate::runtime::block_on(async {
             for _ in 0..16 {
+// B-467: ハンドラ用プールの仕事が終わるまで待てる（他の試験の仕事も数えるので、待ち切る側の期限は長く取る）
+#[cfg(all(test, feature = "handler-pool"))]
+mod b467_tests {
+    // 理由付き allow: 試験のプールの仕事で時間を掛ける
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn wait_handler_jobs_waits_for_queued_and_running_jobs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        super::spawn_handler(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            d.store(true, Ordering::Release);
+        });
+        assert!(!super::wait_handler_jobs(Duration::from_millis(20)));
+        assert!(super::wait_handler_jobs(Duration::from_secs(60)));
+        assert!(
+            done.load(Ordering::Acquire),
+            "returned before the job finished"
+        );
+        // panic した仕事も終わりとして数える
+        super::spawn_handler(|| panic!("handler job panicked on purpose"));
+        assert!(super::wait_handler_jobs(Duration::from_secs(60)));
+    }
+}
+
                 let r = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
                     super::offload(|| -> u32 { panic!("offload job panicked on purpose") }),
                 ))

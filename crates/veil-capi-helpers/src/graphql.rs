@@ -224,7 +224,15 @@ unsafe fn handle(ep: &Endpoint, r: &Request, req: *const veil_request_t) -> Resp
             match parse_get(r) {
                 Ok(op) => {
                     // B-196: GET で mutation を実行しない
-                    if is_mutation(&op.0, op.1.as_deref()) {
+                    // B-448: 操作を選べない文書（空・persisted query の参照等）も実行しない（実行するコードが空の文書を
+                    // 保存した文書へ差し替えると、mutation かどうかを実行の前に確かめられない）
+                    let kinds = selected_kinds(&op.0, op.1.as_deref());
+                    if kinds.is_empty() {
+                        return Response::bad_request(
+                            "a GET request needs a query document that selects an operation",
+                        );
+                    }
+                    if kinds.contains(&"mutation") {
                         return Response::error(405, "mutations require POST")
                             .with_header("allow", "POST");
                     }
@@ -572,12 +580,19 @@ fn operations(src: &str) -> Vec<(Option<&str>, &str)> {
     ops
 }
 
-/// Whether the operation a request would run is a mutation (operations named `operation_name`, or all of them).
-fn is_mutation(query: &str, operation_name: Option<&str>) -> bool {
+/// The kinds of the operations a request would run (operations named `operation_name`, or all of them).
+fn selected_kinds<'a>(query: &'a str, operation_name: Option<&str>) -> Vec<&'a str> {
     operations(query)
-        .iter()
+        .into_iter()
         .filter(|(n, _)| operation_name.is_none_or(|want| *n == Some(want)))
-        .any(|(_, kind)| *kind == "mutation")
+        .map(|(_, kind)| kind)
+        .collect()
+}
+
+/// Whether the operation a request would run is a mutation (operations named `operation_name`, or all of them).
+#[cfg(test)]
+fn is_mutation(query: &str, operation_name: Option<&str>) -> bool {
+    selected_kinds(query, operation_name).contains(&"mutation")
 }
 
 #[cfg(test)]
@@ -603,6 +618,11 @@ mod tests {
             operations("fragment F on T { x } subscription S { y }"),
             vec![(Some("S"), "subscription")]
         );
+        // B-448: 操作を選べない文書（GET は実行しない）
+        assert!(selected_kinds("", None).is_empty());
+        assert!(selected_kinds("fragment F on T { x }", None).is_empty());
+        assert!(selected_kinds(doc, Some("C")).is_empty());
+        assert_eq!(selected_kinds(doc, Some("A")), vec!["query"]);
     }
 
     #[test]

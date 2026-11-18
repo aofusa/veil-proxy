@@ -169,7 +169,8 @@ pub unsafe extern "C" fn veil_test_free(t: *mut veil_test_t) {
         let t = Box::from_raw(t);
         let veil_test_t { client, shutdown } = *t;
         drop(client);
-        hooks::run_shutdown(shutdown);
+        // B-467: after_send の関数等、ハンドラ用プールに残った仕事が終わってから
+        hooks::run_shutdown_after_jobs(shutdown);
     }
 }
 

@@ -58,11 +58,31 @@ def _result(r):
     return out
 
 
+def _operation_type(query):
+    """GET で実行する操作の種類（解析できない・操作を 1 つに決められない文書は None）"""
+    from graphql import GraphQLError, OperationDefinitionNode, parse
+
+    try:
+        ops = [d for d in parse(query).definitions if isinstance(d, OperationDefinitionNode)]
+    except GraphQLError:
+        return None
+    return ops[0].operation.value if len(ops) == 1 else None
+
+
 @veil.route("/graphql", methods=["GET", "POST"])
 def graphql(req: veil.Request):
     if req.method == "GET":
         query, variables = req.query_params.get("query", ""), None
+        # GET で mutation を実行しない（SameSite=Lax の Cookie はトップレベルの GET 遷移に付く。B-449）
+        op = _operation_type(query)
+        if op is None:
+            raise veil.HTTPException(400, "the query does not parse or does not select one operation")
+        if op == "mutation":
+            raise veil.HTTPException(405, "mutations require POST", headers={"allow": "POST"})
     else:
+        # JSON 以外（text/plain のフォーム等、CORS の事前確認の要らない要求）は受けない（B-449）
+        if (req.headers.get("content-type") or "").split(";")[0].strip().lower() != "application/json":
+            raise veil.HTTPException(415, "GraphQL requests must be application/json")
         body = req.json()
         query, variables = body.get("query", ""), body.get("variables")
     if "text/event-stream" in (req.headers.get("accept") or ""):

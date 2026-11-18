@@ -396,11 +396,14 @@ static int list_parts(const veil_request_t *req, veil_response_t *resp) {
     int rc;
     while ((rc = veil_multipart_next(req, &part)) == 1 && off < sizeof out - 256) {
         uint64_t h = part.fd >= 0 ? sum_fd(part.fd) : byte_sum(0, (const uint8_t *)part.data, part.data_len);
-        off += (size_t)snprintf(out + off, sizeof out - off, "%.*s%s%.*s=%llu/%llu(%s);",
-                                (int)part.name_len, part.name ? part.name : "", part.filename ? ":" : "",
-                                (int)part.filename_len, part.filename ? part.filename : "",
-                                (unsigned long long)part.size, (unsigned long long)h,
-                                part.fd >= 0 ? "disk" : "mem");
+        int n = snprintf(out + off, sizeof out - off, "%.*s%s%.*s=%llu/%llu(%s);",
+                         (int)part.name_len, part.name ? part.name : "", part.filename ? ":" : "",
+                         (int)part.filename_len, part.filename ? part.filename : "",
+                         (unsigned long long)part.size, (unsigned long long)h,
+                         part.fd >= 0 ? "disk" : "mem");
+        /* 切り詰めたら off を末尾で止める（返り値をそのまま足すと out を越え、out[off] = 0 が範囲外に書く。B-453） */
+        if (n < 0) break;
+        off = (size_t)n >= sizeof out - off ? sizeof out - 1 : off + (size_t)n;
     }
     if (rc < 0) {
         /* 壊れた本文は 400、上限超えは 413 */

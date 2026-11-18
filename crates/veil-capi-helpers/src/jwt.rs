@@ -17,6 +17,7 @@ struct Settings {
     keys: Vec<JwtKey>,
     issuer: Option<String>,
     audience: Option<String>,
+    verify_audience: Option<bool>,
     require_exp: Option<bool>,
     leeway: Option<u64>,
 }
@@ -40,6 +41,9 @@ impl veil_kit_jwt_verifier_t {
                 }
                 if let Some(a) = s.audience {
                     v = v.audience(a);
+                }
+                if let Some(on) = s.verify_audience {
+                    v = v.verify_audience(on);
                 }
                 if let Some(on) = s.require_exp {
                     v = v.require_exp(on);
@@ -246,6 +250,23 @@ pub unsafe extern "C" fn veil_kit_jwt_verifier_audience(
     };
     let a = tryc!(cstr(audience)).to_string();
     v.configure(|s| s.audience = Some(a))
+}
+
+/// Whether `aud` is checked (default 1): without an audience, a token that carries `aud` is rejected.
+///
+/// # Safety
+///
+/// `v` is a valid verifier.
+// B-451: 既定で aud を検査する。外すときは明示する
+#[no_mangle]
+pub unsafe extern "C" fn veil_kit_jwt_verifier_verify_audience(
+    v: *mut veil_kit_jwt_verifier_t,
+    on: c_int,
+) -> c_int {
+    let Some(v) = v.as_ref() else {
+        return fail(VEIL_ERR_INVALID_ARG, "NULL verifier");
+    };
+    v.configure(|s| s.verify_audience = Some(on != 0))
 }
 
 /// Whether tokens without `exp` are rejected (default 1).

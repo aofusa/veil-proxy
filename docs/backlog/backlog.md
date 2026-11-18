@@ -785,6 +785,7 @@
 | B-420 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-420-h1-to-h2c-partial-body-smuggling.md](bugs/B-420-h1-to-h2c-partial-body-smuggling.md) | HTTP/1.1 で受けて上流の h2c へ送る要求が、見出しと一緒に読めた本文だけを送って END_STREAM にし、残りの本文をクライアントの接続の次の要求として読んでいた（要求の密輸。chunked はフレーミングごと送っていた）。残りの本文を読んで（chunked は復号）から送る |
 | B-421 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-421-l4-udp-handler-blocked-ips.md](bugs/B-421-l4-udp-handler-blocked-ips.md) | ライブラリの L4 の UDP のハンドラ（`l4-handler`）が `[security] blocked_ips` を当てずにデータグラムを渡して応答も返していた。データグラムごとに拒否リストを見る |
 | B-422 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-422-route-source-ip-fails-open.md](bugs/B-422-route-source-ip-fails-open.md) | ルートの条件の `source_ip` が読めない項目を黙って捨て、設定の全部の項目が読めないとルーターが IP の条件を丸ごと飛ばして、IP を絞ったルートがどのクライアントにも一致した。読めない項目は設定の誤りにし、ルーターも閉じる側に倒す |
+| B-423 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-423-grpc-health-watch-unbounded-registry.md](bugs/B-423-grpc-health-watch-unbounded-registry.md) | ライブラリの gRPC のヘルスの `Watch` が、クライアントの選んだ名前ごとの項目と送り口を表に入れて二度と消さず、メモリが際限なく増えた。待つ相手の居ない項目を掃除し、長い名前を断る |
 | B-424 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-424-traffic-split-drops-jwt-credential-header.md](bugs/B-424-traffic-split-drops-jwt-credential-header.md) | `[route.traffic] split` の分割先が `[route.jwt]` のヘッダを落とし、キャッシュがそのヘッダで認証した利用者の応答を共有した（B-390 の取りこぼし）。分割先でも `jwt` を残す |
 | B-425 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-425-cache-key-headers-duplicate-or-non-utf8.md](bugs/B-425-cache-key-headers-duplicate-or-non-utf8.md) | プロキシのキャッシュのキーが `key_headers` のヘッダの 2 つ目以降と UTF-8 でない値を落とし、上流は全部を受け取るので、攻撃者のセッションの応答を別の利用者のキーへ入れられた。そうした要求はキャッシュを使わない |
 | B-426 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-426-route-path-trailing-slash-not-prefix.md](bugs/B-426-route-path-trailing-slash-not-prefix.md) | 末尾が `/` のルートのパス（`/admin/`）がそのパスにしか一致せず、`/admin/users` がより広いルートへ落ちて `[route.security]`・`[route.jwt]` を外れた。セグメントの境界での前方一致にする |
@@ -808,9 +809,21 @@
 | B-444 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-444-mesh-h1-early-reply-keeps-undiscarded-body.md](bugs/B-444-mesh-h1-early-reply-keeps-undiscarded-body.md) | メッシュの HTTP/1.1 の 503 等のローカル応答が、本文を読み捨てられなくても接続を続け、残りの本文を次の要求として読んでいた |
 | B-445 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-445-linkerd-inbound-self-relay.md](bugs/B-445-linkerd-inbound-self-relay.md) | Linkerd の inbound が自分の inbound のポートへ中継し、送信元を Pod 自身の IP に見せてネットワークでの認可を外せた |
 | B-446 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-446-linkerd-admin-port-ignores-policy.md](bugs/B-446-linkerd-admin-port-ignores-policy.md) | Linkerd の管理ポート（4191）が inbound のポリシーを見ず、/metrics・/proxy-log-level を誰にでも返していた |
+| B-447 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-447-kit-graphql-websocket-any-origin.md](bugs/B-447-kit-graphql-websocket-any-origin.md) | kit の GraphQL の WebSocket が別のオリジンのハンドシェイクも受け、別のサイトのページが利用者の資格情報で GraphQL を実行できた |
+| B-448 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-448-graphql-get-guard-fails-open.md](bugs/B-448-graphql-get-guard-fails-open.md) | GraphQL の GET の mutation の検査が、空・解析できない文書を通し、persisted query で保存した mutation を GET で実行できた |
+| B-449 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-449-python-kit-graphql-csrf.md](bugs/B-449-python-kit-graphql-csrf.md) | Python の kit の GraphQL が GET の mutation を実行し、POST は Content-Type を見ず、別のサイトから mutation を実行させられた |
+| B-450 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-450-python-sse-field-injection.md](bugs/B-450-python-sse-field-injection.md) | Python の EventSourceResponse が単独の CR・event/id/retry の改行をそのまま書き、SSE のフィールド・イベントを差し込めた |
+| B-451 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-451-kit-jwt-audience-unchecked-by-default.md](bugs/B-451-kit-jwt-audience-unchecked-by-default.md) | kit の JWT の検証が、受け手を設定しないと aud を見ず、別のサービス向けのトークンを受けていた |
+| B-452 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-452-capi-grpc-metadata-frees-message.md](bugs/B-452-capi-grpc-metadata-frees-message.md) | C の veil_grpc_client_metadata が、veil_grpc_client_recv で渡したメッセージのバッファを解放していた（解放後の使用） |
+| B-453 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-453-c-examples-snprintf-offset-overflow.md](bugs/B-453-c-examples-snprintf-offset-overflow.md) | C の例（c-kit の /headers・c-features の multipart の一覧）が snprintf の返り値をそのまま足し、長い入力で buf を越えて書いた |
 | B-454 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-454-wasm-proxy-log-unescaped.md](bugs/B-454-wasm-proxy-log-unescaped.md) | Proxy-Wasm の proxy_log がゲストの文字列を制御文字のままアプリのログへ書いていた |
 | B-455 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-455-http3-migration-keeps-handshake-ip.md](bugs/B-455-http3-migration-keeps-handshake-ip.md) | HTTP/3 の接続が別の IP へ移っても、IP で見る検査はハンドシェイクの IP のまま行っていた |
+| B-464 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-464-handler-te-chunked-buffered-body.md](bugs/B-464-handler-te-chunked-buffered-body.md) | ハンドラの溜めた本文の応答に Transfer-Encoding: chunked のヘッダがあると、HTTP/1.1 で本文を chunk に符号化せずに chunked と書いていた |
+| B-465 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-465-api-client-origin-cache-unbounded.md](bugs/B-465-api-client-origin-cache-unbounded.md) | API の HTTP クライアントが URL のオリジンを上限なく表に持ち続け、期限の切れた空き接続も残していた |
 | B-466 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-466-zipkin-spans-cleartext.md](bugs/B-466-zipkin-spans-cleartext.md) | メッシュの Zipkin のスパンを、コレクタのクラスタの TLS を使わずに平文で送っていた |
+| B-467 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-467-capi-shutdown-frees-state-in-use.md](bugs/B-467-capi-shutdown-frees-state-in-use.md) | C の veil_run が、ハンドラ用プールに残った要求の仕事が動いている間に停止の関数で状態を解放していた |
+| B-468 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-468-capi-l4-session-no-on-close.md](bugs/B-468-capi-l4-session-no-on-close.md) | C の L4・アップグレードの接続で、最初の送信に失敗すると on_close を呼ばずにセッションを捨てていた |
+| B-469 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-469-python-nan-range-bypass.md](bugs/B-469-python-nan-range-bypass.md) | Python の数の範囲の検査（ge・gt・le・lt、minimum・maximum）を NaN が通っていた |
 
 ---
 

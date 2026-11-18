@@ -19,12 +19,15 @@
 //! One path serves:
 //!
 //! - `POST` (`Content-Type: application/json`, batches too; another type gives 415) and `GET` (query string; queries
-//!   and subscriptions only, a mutation gives 405 so that a cross-site link cannot run one): GraphQL over HTTP. The
+//!   and subscriptions only, a mutation gives 405 so that a cross-site link cannot run one, and a `GET` without a
+//!   document that parses gives 400, so persisted-query hashes are sent by `POST`): GraphQL over HTTP. The
 //!   response type is `application/graphql-response+json` when the client accepts it, `application/json` otherwise.
 //! - `Accept: text/event-stream`: GraphQL over SSE (distinct connections mode): `event: next` per result, then
 //!   `event: complete`.
 //! - A WebSocket upgrade with `Sec-WebSocket-Protocol: graphql-transport-ws` (or the older `graphql-ws`):
-//!   subscriptions over WebSocket (HTTP/1.1).
+//!   subscriptions over WebSocket (HTTP/1.1). A browser sends cookies with a cross-site WebSocket handshake and the
+//!   page can read the results, so a handshake with an `Origin` is accepted only from the same host as `Host`, or
+//!   from the origins given to [`mount_with_origins`] (others get 403). The CORS plugin does not cover WebSocket.
 //! - A browser `GET` (`Accept: text/html`, no query): GraphiQL (`graphiql` feature). The page loads its scripts from
 //!   a CDN.
 
@@ -39,20 +42,38 @@ use veil::api::{App, BodyChunk, FromRequest, HandlerFn, OperationMeta, Request, 
 /// The GraphQL over HTTP media type.
 const GRAPHQL_RESPONSE: &str = "application/graphql-response+json";
 
-/// A plugin that serves `schema` at `path` (`GET` and `POST`).
+/// A plugin that serves `schema` at `path` (`GET` and `POST`). WebSocket handshakes are accepted from the same
+/// origin only.
 pub fn mount<Q, M, S>(path: &str, schema: Schema<Q, M, S>) -> impl FnOnce(App) -> App
 where
     Q: ObjectType + 'static,
     M: ObjectType + 'static,
     S: SubscriptionType + 'static,
 {
+    mount_with_origins(path, schema, &[])
+}
+
+/// Like [`mount`], and also accepts WebSocket handshakes whose `Origin` is one of `origins` (such as
+/// `"https://app.example"`; compared without regard to case).
+pub fn mount_with_origins<Q, M, S>(
+    path: &str,
+    schema: Schema<Q, M, S>,
+    origins: &[&str],
+) -> impl FnOnce(App) -> App
+where
+    Q: ObjectType + 'static,
+    M: ObjectType + 'static,
+    S: SubscriptionType + 'static,
+{
     let path = path.to_string();
+    let origins: Arc<[String]> = origins.iter().map(|o| o.to_string()).collect();
     move |app: App| {
         let endpoint: Arc<str> = Arc::from(path.as_str());
         let func: HandlerFn = Arc::new(move |req: Request| {
             let schema = schema.clone();
             let endpoint = endpoint.clone();
-            Box::pin(async move { execute(&schema, &endpoint, req).await })
+            let origins = origins.clone();
+            Box::pin(async move { execute(&schema, &endpoint, &origins, req).await })
         });
         let name = format!("graphql{}", path.replace(['/', '{', '}', '*'], "_"));
         let meta = OperationMeta {
@@ -78,21 +99,68 @@ fn json_content_type(ct: Option<&str>) -> bool {
     .any(|m| media.eq_ignore_ascii_case(m))
 }
 
-/// Whether the operation a `GET` request would run is a mutation (a document that does not parse is left to the
-/// executor, which reports the error).
-fn is_mutation(r: &mut async_graphql::Request) -> bool {
+/// Whether the operation a `GET` request would run is a mutation. An empty document or one that does not parse is
+/// an error: an extension such as persisted queries replaces an empty document with a stored one, which may be a
+/// mutation.
+// B-448: 以前は解析できない文書を mutation でないとして実行へ回し、persisted query の拡張が空の文書を保存した
+// mutation に差し替えて、別のサイトのリンク（Lax の Cookie が付く）から実行できた
+fn is_mutation(r: &mut async_graphql::Request) -> Result<bool, async_graphql::ServerError> {
     use async_graphql::parser::types::{DocumentOperations, OperationType};
     let name = r.operation_name.clone();
-    let Ok(doc) = r.parsed_query() else {
-        return false;
-    };
-    match &doc.operations {
+    let doc = r.parsed_query()?;
+    Ok(match &doc.operations {
         DocumentOperations::Single(op) => op.node.ty == OperationType::Mutation,
         DocumentOperations::Multiple(ops) => ops
             .iter()
             .filter(|(n, _)| name.as_deref().is_none_or(|want| n.as_str() == want))
             .any(|(_, op)| op.node.ty == OperationType::Mutation),
+    })
+}
+
+/// A request error as a GraphQL response (400).
+fn request_error(req: &Request, e: async_graphql::ServerError) -> Response {
+    let resp = async_graphql::Response::from_errors(vec![e]);
+    let ct = if accepts(req, GRAPHQL_RESPONSE) {
+        GRAPHQL_RESPONSE
+    } else {
+        "application/json"
+    };
+    match serde_json::to_vec(&resp) {
+        Ok(body) => Response::new(400)
+            .with_header("content-type", ct)
+            .with_body(body),
+        Err(e) => Response::error(500, &e.to_string()),
     }
+}
+
+/// Whether a WebSocket handshake may use the endpoint: no `Origin` (not a browser), an `Origin` with the same host
+/// and port as `Host`, or one of `allowed`.
+// B-447: ブラウザは別のサイトの WebSocket のハンドシェイクにも Cookie を付け、ページは結果を読めるので、Origin を確かめる
+fn ws_origin_allowed(origin: Option<&str>, host: Option<&str>, allowed: &[String]) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    if allowed.iter().any(|a| a.eq_ignore_ascii_case(origin)) {
+        return true;
+    }
+    let (Some(host), Some((scheme, authority))) = (host, origin.split_once("://")) else {
+        return false;
+    };
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        ":443"
+    } else if scheme.eq_ignore_ascii_case("http") {
+        ":80"
+    } else {
+        return false;
+    };
+    let bare = |a: &'_ str| -> String {
+        let a = a.trim().to_ascii_lowercase();
+        match a.strip_suffix(default_port) {
+            Some(b) => b.to_string(),
+            None => a,
+        }
+    };
+    !authority.is_empty() && bare(authority) == bare(host)
 }
 
 fn accepts(req: &Request, media: &str) -> bool {
@@ -101,7 +169,12 @@ fn accepts(req: &Request, media: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn execute<Q, M, S>(schema: &Schema<Q, M, S>, endpoint: &str, req: Request) -> Response
+async fn execute<Q, M, S>(
+    schema: &Schema<Q, M, S>,
+    endpoint: &str,
+    origins: &[String],
+    req: Request,
+) -> Response
 where
     Q: ObjectType + 'static,
     M: ObjectType + 'static,
@@ -111,6 +184,9 @@ where
         .upgrade_protocol()
         .is_some_and(|p| p.eq_ignore_ascii_case(b"websocket"))
     {
+        if !ws_origin_allowed(req.header("origin"), req.header("host"), origins) {
+            return Response::error(403, "Forbidden: origin not allowed");
+        }
         return websocket(schema.clone(), &req);
     }
     let gql_req = match req.method() {
@@ -121,9 +197,13 @@ where
             match async_graphql::http::parse_query_string(req.query()) {
                 Ok(mut r) => {
                     // B-196: GET で mutation を実行しない（Lax の Cookie はトップレベルの GET 遷移に付く）
-                    if is_mutation(&mut r) {
-                        return Response::error(405, "mutations require POST")
-                            .with_header("allow", "POST");
+                    match is_mutation(&mut r) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            return Response::error(405, "mutations require POST")
+                                .with_header("allow", "POST")
+                        }
+                        Err(e) => return request_error(&req, e),
                     }
                     async_graphql::BatchRequest::Single(r)
                 }
@@ -291,7 +371,7 @@ mod tests {
             headers,
             body.to_string(),
         );
-        futures::executor::block_on(execute(&schema, "/graphql", req))
+        futures::executor::block_on(execute(&schema, "/graphql", &[], req))
     }
 
     // B-196: GET は query だけ、POST は JSON の Content-Type だけ
@@ -339,6 +419,71 @@ mod tests {
             "",
         );
         assert_eq!(r.status_code(), 405);
+        // B-448: 文書の無い GET（persisted query の参照）・解析できない GET は実行しない
+        let apq =
+            "%7B%22persistedQuery%22%3A%7B%22version%22%3A1%2C%22sha256Hash%22%3A%22ab%22%7D%7D";
+        let r = run("GET", &format!("/graphql?extensions={apq}"), None, "");
+        assert_eq!(r.status_code(), 400);
+        assert!(String::from_utf8_lossy(r.body()).contains("errors"));
+        assert_eq!(
+            run("GET", "/graphql?query=%7B", None, "").status_code(),
+            400
+        );
+    }
+
+    // B-447: WebSocket のハンドシェイクは同じオリジン（または許可したオリジン）からだけ受ける
+    #[test]
+    fn websocket_origin_is_checked() {
+        let allowed = vec!["https://spa.example".to_string()];
+        let ok = |o: Option<&str>, h: Option<&str>| ws_origin_allowed(o, h, &allowed);
+        assert!(ok(None, Some("app.example")));
+        assert!(ok(Some("https://app.example"), Some("app.example")));
+        assert!(ok(Some("https://APP.example"), Some("app.example:443")));
+        assert!(ok(Some("http://127.0.0.1:8080"), Some("127.0.0.1:8080")));
+        assert!(ok(Some("https://spa.example"), Some("app.example")));
+        assert!(!ok(Some("https://evil.example"), Some("app.example")));
+        assert!(!ok(Some("https://app.example:8443"), Some("app.example")));
+        assert!(!ok(Some("http://app.example"), Some("app.example:443")));
+        assert!(!ok(Some("null"), Some("app.example")));
+        assert!(!ok(Some("https://app.example"), None));
+
+        let schema = Schema::new(Query, Mutation, EmptySubscription);
+        let handshake = |origin: &'static str| {
+            let h = |n: &'static str, v: &'static str| {
+                (
+                    Bytes::from_static(n.as_bytes()),
+                    Bytes::from_static(v.as_bytes()),
+                )
+            };
+            Request::new(
+                "GET",
+                "/graphql",
+                vec![
+                    h("host", "app.example"),
+                    h("origin", origin),
+                    h("upgrade", "websocket"),
+                    h("connection", "Upgrade"),
+                    h("sec-websocket-version", "13"),
+                    h("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+                    h("sec-websocket-protocol", "graphql-transport-ws"),
+                ],
+                "",
+            )
+        };
+        let r = futures::executor::block_on(execute(
+            &schema,
+            "/graphql",
+            &[],
+            handshake("https://evil.example"),
+        ));
+        assert_eq!(r.status_code(), 403);
+        let r = futures::executor::block_on(execute(
+            &schema,
+            "/graphql",
+            &[],
+            handshake("https://app.example"),
+        ));
+        assert_eq!(r.status_code(), 101);
     }
 
     #[test]

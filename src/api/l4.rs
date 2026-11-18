@@ -347,6 +347,43 @@ async fn blocking<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> 
     crate::runtime::offload::offload_handler(f).await
 }
 
+type SharedSession = Arc<Mutex<Box<dyn L4Session>>>;
+
+fn lock_session(s: &SharedSession) -> std::sync::MutexGuard<'_, Box<dyn L4Session>> {
+    // on_data が panic して毒が付いても on_close は呼ぶ（利用者が接続の状態を解放する場所）
+    s.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// B-468: セッションができた後は、どの出口でも on_close をハンドラ用プールで 1 回だけ呼ぶ。最初の送信（on_connect が
+// 書いたデータ）の失敗・停止で接続のタスクが捨てられたときに呼ばず、C の利用者が veil_l4_set_conn_data で付けた
+// 状態が接続ごとに漏れていた
+/// Calls the session's `on_close` exactly once on the handler pool: [`SessionCloser::close`] waits for it, and
+/// dropping the closer (an early return or a dropped connection task) hands it to the pool without waiting.
+pub(crate) struct SessionCloser(Option<SharedSession>);
+
+impl SessionCloser {
+    /// The closer and the shared session (for the `on_data` calls).
+    pub(crate) fn new(s: Box<dyn L4Session>) -> (SessionCloser, SharedSession) {
+        let s = Arc::new(Mutex::new(s));
+        (SessionCloser(Some(s.clone())), s)
+    }
+
+    /// Calls `on_close` on the handler pool and waits for it.
+    pub(crate) async fn close(mut self) {
+        if let Some(s) = self.0.take() {
+            let _ = blocking(move || lock_session(&s).on_close()).await;
+        }
+    }
+}
+
+impl Drop for SessionCloser {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            crate::runtime::offload::spawn_handler(move || lock_session(&s).on_close());
+        }
+    }
+}
+
 async fn flush(conn: &mut L4Connection, out: &mut L4Out) -> Result<(), L4Error> {
     for b in out.writes.drain(..) {
         conn.write_bytes(b).await?;
@@ -376,13 +413,12 @@ impl App {
                 else {
                     return Ok(());
                 };
-                flush(conn, &mut out).await?;
                 let Some(session) = session else {
-                    return Ok(());
+                    return flush(conn, &mut out).await;
                 };
-                let session = Arc::new(Mutex::new(session));
-                let mut result = Ok(());
-                if !out.close {
+                let (closer, session) = SessionCloser::new(session);
+                let mut result = flush(conn, &mut out).await;
+                if result.is_ok() && !out.close {
                     loop {
                         let data = match conn.read_bytes(L4_READ_CHUNK).await {
                             Ok(d) if d.is_empty() => break,
@@ -395,7 +431,7 @@ impl App {
                         let s = session.clone();
                         let Some(mut out) = blocking(move || {
                             let mut out = L4Out::default();
-                            s.lock().unwrap().on_data(&data, &mut out);
+                            lock_session(&s).on_data(&data, &mut out);
                             out
                         })
                         .await
@@ -411,8 +447,7 @@ impl App {
                         }
                     }
                 }
-                let s = session.clone();
-                let _ = blocking(move || s.lock().unwrap().on_close()).await;
+                closer.close().await;
                 result
             })
         })
@@ -516,5 +551,39 @@ pub(crate) async fn serve_udp(handler: L4UdpFn, listen_addr: SocketAddr, listene
                 let _ = socket.send_to(&reply, peer).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counting(Arc<AtomicUsize>);
+
+    impl L4Session for Counting {
+        fn on_data(&mut self, _data: &[u8], _out: &mut L4Out) {}
+        fn on_close(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // B-468: on_close は close を待っても、閉じる前に捨てても（最初の送信の失敗・タスクの破棄）1 回だけ呼ばれる
+    #[test]
+    fn session_closer_calls_on_close_once_on_every_exit() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let (closer, session) = SessionCloser::new(Box::new(Counting(n.clone())));
+        futures::executor::block_on(closer.close());
+        drop(session);
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+
+        let n = Arc::new(AtomicUsize::new(0));
+        let (closer, session) = SessionCloser::new(Box::new(Counting(n.clone())));
+        drop(closer);
+        drop(session);
+        assert!(crate::runtime::offload::wait_handler_jobs(
+            Duration::from_secs(60)
+        ));
+        assert_eq!(n.load(Ordering::SeqCst), 1);
     }
 }

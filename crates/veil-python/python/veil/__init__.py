@@ -439,27 +439,46 @@ class StreamingResponse(Response):
         self._body = None if v == b"" else v
 
 
+# B-450: SSE の行の終わりは CRLF・LF・CR のどれでもある（WHATWG HTML の event-stream の解釈）
+_SSE_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+def _sse_field(name, value):
+    # B-450: event・id・retry の値に行の終わりを入れない（以前はそのまま書き、別のフィールド・イベントを差し込めた）
+    if name == "retry":
+        if isinstance(value, bool) or not (isinstance(value, int) or (isinstance(value, str) and value.isdigit()
+                                                                      and value.isascii())) or int(value) < 0:
+            raise ValueError("an SSE retry must be a non-negative integer")
+        return "retry: %d\n" % int(value)
+    value = str(value)
+    if "\r" in value or "\n" in value or (name == "id" and "\0" in value):
+        raise ValueError("an SSE %s must not contain a line break%s" % (name, " or NUL" if name == "id" else ""))
+    return "%s: %s\n" % (name, value)
+
+
+def _sse_data(data):
+    return "".join("data: %s\n" % line for line in _SSE_LINE_BREAK.split(data))
+
+
 def _sse_event(item):
     if isinstance(item, dict) and set(item) <= {"event", "data", "id", "retry"} and "data" in item:
-        out = []
-        for k in ("event", "id", "retry"):
-            if k in item:
-                out.append("%s: %s\n" % (k, item[k]))
+        out = [_sse_field(k, item[k]) for k in ("event", "id", "retry") if k in item]
         data = item["data"]
         if not isinstance(data, str):
             data = _dumps(data).decode()
-        out.extend("data: %s\n" % line for line in data.split("\n"))
-        return "".join(out) + "\n"
+        return "".join(out) + _sse_data(data) + "\n"
     if not isinstance(item, str):
         item = _dumps(item).decode()
-    return "".join("data: %s\n" % line for line in item.split("\n")) + "\n"
+    return _sse_data(item) + "\n"
 
 
 class EventSourceResponse(StreamingResponse):
     """Server-Sent Events (``text/event-stream``).
 
-    Each item is a ``str`` (a ``data:`` line), a JSON-serialisable value, or a dict with the keys
-    ``event``, ``data``, ``id`` and ``retry``.
+    Each item is a ``str`` (``data:`` lines, one per line of the text; CR, LF and CRLF all end a line), a
+    JSON-serialisable value, or a dict with the keys ``event``, ``data``, ``id`` and ``retry``. ``event`` and ``id``
+    must not contain a line break (nor ``id`` a NUL) and ``retry`` must be a non-negative integer: other values raise
+    ``ValueError``, which ends the stream.
     """
 
     def __init__(self, content, status=200, headers=None, background=None, status_code=None):
@@ -965,13 +984,15 @@ def _check_value(v, rules, loc):
     if "enum" in rules and v not in rules["enum"]:
         errs.append(_err(loc, "Input should be one of %s" % (", ".join(repr(e) for e in rules["enum"]),), "enum"))
     if _is_num(v):
-        if "minimum" in rules and v < rules["minimum"]:
+        # B-469: NaN はどの比較も偽なので、範囲の内側にあることを確かめる形で書く（外側かを見る形では NaN が通った。
+        # pydantic と同じく、範囲の付いた値の NaN は断る）
+        if "minimum" in rules and not (v >= rules["minimum"]):
             errs.append(_err(loc, "Input should be greater than or equal to %s" % rules["minimum"], "greater_than_equal"))
-        if "maximum" in rules and v > rules["maximum"]:
+        if "maximum" in rules and not (v <= rules["maximum"]):
             errs.append(_err(loc, "Input should be less than or equal to %s" % rules["maximum"], "less_than_equal"))
-        if "exclusiveMinimum" in rules and v <= rules["exclusiveMinimum"]:
+        if "exclusiveMinimum" in rules and not (v > rules["exclusiveMinimum"]):
             errs.append(_err(loc, "Input should be greater than %s" % rules["exclusiveMinimum"], "greater_than"))
-        if "exclusiveMaximum" in rules and v >= rules["exclusiveMaximum"]:
+        if "exclusiveMaximum" in rules and not (v < rules["exclusiveMaximum"]):
             errs.append(_err(loc, "Input should be less than %s" % rules["exclusiveMaximum"], "less_than"))
     if isinstance(v, str):
         if "minLength" in rules and len(v) < rules["minLength"]:

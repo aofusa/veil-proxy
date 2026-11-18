@@ -597,6 +597,8 @@ struct CSession {
     cb: veil_l4_tcp_callbacks_t,
     ud: UserData,
     conn: Box<veil_l4_conn_t>,
+    /// `on_close` を呼んだ（B-468: 呼ばずに捨てない。`CWsSession` と同じ最後の守り）
+    closed: bool,
 }
 
 // SAFETY: conn.data は C の利用者の値で、同じ接続のコールバックは 1 つずつ順に呼ばれる（並行しない）。
@@ -630,11 +632,22 @@ impl L4Session for CSession {
     }
 
     fn on_close(&mut self) {
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
         if let Some(f) = self.cb.on_close {
             let ud = self.ud.get();
             let c: *mut veil_l4_conn_t = &mut *self.conn;
             let _ = catch_unwind(AssertUnwindSafe(|| unsafe { f(c, ud) }));
         }
+    }
+}
+
+// B-468: on_close が呼ばれないまま捨てられる経路の最後の守り（ドライバはどの出口でもハンドラ用プールで on_close を
+// 呼ぶので、ふつうはここでは何もしない）
+impl Drop for CSession {
+    fn drop(&mut self) {
+        L4Session::on_close(self);
     }
 }
 
@@ -677,6 +690,7 @@ pub unsafe extern "C" fn veil_register_l4_tcp(
                     data: ptr::null_mut(),
                     out: ptr::null_mut(),
                 }),
+                closed: false,
             };
             if let Some(f) = cb.on_connect {
                 let rc = s.with_out(out, |c, ud| {
@@ -727,6 +741,7 @@ pub unsafe extern "C" fn veil_response_upgrade(
                     data: ptr::null_mut(),
                     out: ptr::null_mut(),
                 }),
+                closed: false,
             };
             if let Some(f) = cb.on_connect {
                 let rc = s.with_out(out, |c, ud| {
