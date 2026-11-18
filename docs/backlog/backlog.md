@@ -818,12 +818,17 @@
 | B-453 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-453-c-examples-snprintf-offset-overflow.md](bugs/B-453-c-examples-snprintf-offset-overflow.md) | C の例（c-kit の /headers・c-features の multipart の一覧）が snprintf の返り値をそのまま足し、長い入力で buf を越えて書いた |
 | B-454 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-454-wasm-proxy-log-unescaped.md](bugs/B-454-wasm-proxy-log-unescaped.md) | Proxy-Wasm の proxy_log がゲストの文字列を制御文字のままアプリのログへ書いていた |
 | B-455 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-455-http3-migration-keeps-handshake-ip.md](bugs/B-455-http3-migration-keeps-handshake-ip.md) | HTTP/3 の接続が別の IP へ移っても、IP で見る検査はハンドシェイクの IP のまま行っていた |
+| B-460 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-460-listen-sockets-reuseaddr-cobind.md](bugs/B-460-listen-sockets-reuseaddr-cobind.md) | 待ち受けのソケットが SO_REUSEADDR を付けており、同じ端末の他の利用者が同じポートへ重ねて bind できた（Windows の TCP・UDP、Linux の UDP） |
+| B-461 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-461-windows-offload-notify-pair-peer.md](bugs/B-461-windows-offload-notify-pair-peer.md) | Windows のオフロードの完了通知のソケットの対が、一時リスナーへ最初に接続した相手を確かめずに使っていた |
+| B-462 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-462-acme-temp-key-shared-handle.md](bugs/B-462-acme-temp-key-shared-handle.md) | Windows で ACME の秘密鍵の一時ファイルを共有を許して作り、DACL を絞る前に他の利用者がハンドルを開けた |
+| B-463 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-463-windows-programdata-config-precreated.md](bugs/B-463-windows-programdata-config-precreated.md) | Windows で特権の無い利用者が先に作った %ProgramData%\veil と config.toml を、MSI が残し veil が読んでいた |
 | B-464 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-464-handler-te-chunked-buffered-body.md](bugs/B-464-handler-te-chunked-buffered-body.md) | ハンドラの溜めた本文の応答に Transfer-Encoding: chunked のヘッダがあると、HTTP/1.1 で本文を chunk に符号化せずに chunked と書いていた |
 | B-465 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-465-api-client-origin-cache-unbounded.md](bugs/B-465-api-client-origin-cache-unbounded.md) | API の HTTP クライアントが URL のオリジンを上限なく表に持ち続け、期限の切れた空き接続も残していた |
 | B-466 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-466-zipkin-spans-cleartext.md](bugs/B-466-zipkin-spans-cleartext.md) | メッシュの Zipkin のスパンを、コレクタのクラスタの TLS を使わずに平文で送っていた |
 | B-467 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-467-capi-shutdown-frees-state-in-use.md](bugs/B-467-capi-shutdown-frees-state-in-use.md) | C の veil_run が、ハンドラ用プールに残った要求の仕事が動いている間に停止の関数で状態を解放していた |
 | B-468 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-468-capi-l4-session-no-on-close.md](bugs/B-468-capi-l4-session-no-on-close.md) | C の L4・アップグレードの接続で、最初の送信に失敗すると on_close を呼ばずにセッションを捨てていた |
 | B-469 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-469-python-nan-range-bypass.md](bugs/B-469-python-nan-range-bypass.md) | Python の数の範囲の検査（ge・gt・le・lt、minimum・maximum）を NaN が通っていた |
+| B-474 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-474-windows-wasm-reuse-test-copy-mtime.md](bugs/B-474-windows-wasm-reuse-test-copy-mtime.md) | Windows で WASM のエンジンの再利用の試験が、mtime を写したコピーへの置き換えを見分けられずに失敗していた（印は大きさと mtime だけ。印を見るのは seccomp のある Linux のリロードだけなので試験の不具合） |
 
 ---
 

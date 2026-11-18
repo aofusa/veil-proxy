@@ -77,6 +77,9 @@ pub use self::loaded::*;
 mod cli;
 pub use self::cli::*;
 mod listeners;
+// B-463: Windows の既定の設定ファイルの所有者・DACL の検査
+#[cfg(windows)]
+mod win_trust;
 pub use self::listeners::*;
 // ====================
 // WASM Response Filter Context
@@ -2337,9 +2340,6 @@ mod admin_config_tests {
         }
         assert!(!cfg.check_auth_from(ip, Some("Bearer topsecret")));
         assert!(cfg.check_auth_from("198.51.100.232", Some("Bearer topsecret")));
-        // 長さの違う秘密・前方一致は通らない
-        assert!(!cfg.check_auth(Some("topsecre")));
-        assert!(!cfg.check_auth(Some("topsecretx")));
         // B-434: IPv6 は /64 ごとに数える（/64 の中で送信元を替えても上限は外れない）。IPv4 射影は IPv4 と同じ枠
         for i in 0..crate::config::prometheus::ADMIN_AUTH_FAILURES_PER_MINUTE {
             let ip = format!("2001:db8:434:1::{:x}", i + 1);
@@ -2348,6 +2348,9 @@ mod admin_config_tests {
         assert!(!cfg.check_auth_from("2001:db8:434:1::ffff", Some("Bearer topsecret")));
         assert!(cfg.check_auth_from("2001:db8:434:2::1", Some("Bearer topsecret")));
         assert!(!cfg.check_auth_from("::ffff:198.51.100.231", Some("Bearer topsecret")));
+        // 長さの違う秘密・前方一致は通らない
+        assert!(!cfg.check_auth(Some("topsecre")));
+        assert!(!cfg.check_auth(Some("topsecretx")));
     }
 
     #[test]

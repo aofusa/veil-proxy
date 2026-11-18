@@ -67,5 +67,30 @@ $rc = Install-Msi
 if ((Get-Content "$data\config.toml" -Raw) -match 'edited by test') { Ok "reinstall keeps an existing configuration" } else { Bad "reinstall replaced an existing configuration" }
 Uninstall-Msi | Out-Null
 
+# 5. B-463: 特権の無い利用者が入れる前に作ったフォルダ・設定・ページを信用しない（所有者を BUILTIN\Users にして模す。
+#    icacls /setowner は管理者の SeRestorePrivilege で任意の所有者を付けられる）
+Remove-Item -Recurse -Force $data
+New-Item -ItemType Directory "$data\www" | Out-Null
+Set-Content "$data\config.toml" "[server]`nlisten_cleartext = `"127.0.0.1:8081`"`n# planted"
+Set-Content "$data\www\index.html" 'planted page'
+& icacls $data /setowner '*S-1-5-32-545' /T /C | Out-Null
+& icacls "$data\config.toml" /grant '*S-1-1-0:(F)' | Out-Null
+function Owner-Sid($p) { (Get-Acl $p).GetOwner([System.Security.Principal.SecurityIdentifier]).Value }
+if ((Owner-Sid $data) -eq 'S-1-5-32-545') { Ok "planted %ProgramData%\veil owned by Users" } else { Bad "could not plant the folder (owner $(Owner-Sid $data))" }
+$rc = Install-Msi; if ($rc -eq 0) { Ok "install over a pre-created folder" } else { Bad "install over a pre-created folder exit $rc"; Get-Content "$env:RUNNER_TEMP\msi.log" -Tail 60 | Write-Host }
+foreach ($d in $data, "$data\www") {
+  $o = Owner-Sid $d
+  if ($o -eq 'S-1-5-32-544') { Ok "the installer makes Administrators the owner of $d" } else { Bad "$d is still owned by $o" }
+  $acl = Get-Acl $d
+  $weak = $acl.Access | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference -match 'Users$|Everyone|Authenticated Users|CREATOR OWNER' -and ($_.FileSystemRights.ToString() -match 'Write|Modify|FullControl|CreateFiles|AppendData|Delete') }
+  if (-not $weak -and $acl.AreAccessRulesProtected) { Ok "only administrators can change $d" } else { Bad "$d keeps weak or inherited permissions" }
+}
+if ((Get-Content "$data\www\index.html" -Raw) -notmatch 'planted') { Ok "the installer replaces a planted default page" } else { Bad "a planted default page was kept" }
+# 先にあった config.toml は残る（NeverOverwrite）が、veil は読まない
+$out = (& $exe -t 2>&1 | Out-String); $code = $LASTEXITCODE
+if ($code -ne 0 -and $out -match 'refusing to read') { Ok "veil refuses a configuration owned by another account" } else { Bad "veil accepted a planted configuration (exit $code): $out" }
+Uninstall-Msi | Out-Null
+Remove-Item -Recurse -Force $data
+
 if ($fails -gt 0) { Write-Host "MSI TEST: $fails failure(s)"; exit 1 }
 Write-Host "MSI TEST: ALL OK"

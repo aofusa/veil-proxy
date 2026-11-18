@@ -261,6 +261,8 @@ fn write_atomic(path: &Path, data: &[u8], secret: bool) -> Result<(), String> {
     f.write_all(data)
         .and_then(|_| f.sync_all())
         .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    // B-462: Windows では共有しないハンドル（create_temp）なので、閉じてから rename する
+    drop(f);
     std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {}", path.display(), e))
 }
 
@@ -296,7 +298,17 @@ fn create_temp(dir: &Path, path: &Path, secret: bool) -> Result<(PathBuf, std::f
             opts.mode(if secret { 0o600 } else { 0o644 })
                 .custom_flags(libc::O_NOFOLLOW);
         }
-        #[cfg(not(unix))]
+        // B-462: Windows では他のハンドルと共有しない。作った直後のファイルは親ディレクトリから継承した DACL
+        // （ProgramData 等では Users に読める）で、所有者だけの DACL にするまでの間に開かれたハンドルは、その後も
+        // 鍵を読めた（アクセスはハンドルを開いたときに検査する）。共有しなければ、このハンドルを閉じるまで誰も
+        // データを読み書きするハンドルを開けず、閉じる前に DACL を絞る（write_atomic）
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            opts.share_mode(0);
+            let _ = secret;
+        }
+        #[cfg(not(any(unix, windows)))]
         let _ = secret;
         match opts.open(&tmp) {
             Ok(f) => return Ok((tmp, f)),
@@ -434,6 +446,24 @@ mod tests {
         // 書き直せる（所有者が DACL で締め出されない）
         write_atomic(&key, b"secret2", true).unwrap();
         assert_eq!(read(&key).as_deref(), Some(&b"secret2"[..]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B-462: Windows では一時ファイルを他のハンドルと共有しない（DACL を絞って閉じるまで、誰もデータを読めるハンドルを
+    // 開けない）
+    // 理由付き allow: 試験でファイルを作る（データプレーン外）
+    #[cfg(windows)]
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn temp_files_are_not_shared_on_windows() {
+        let dir = std::env::temp_dir().join(format!("veil-acme-b462-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_dir(&dir).unwrap();
+        let (tmp, f) = create_temp(&dir, &dir.join("key.pem"), true).unwrap();
+        let e = std::fs::File::open(&tmp).expect_err("a second handle must not open the temp file");
+        // ERROR_SHARING_VIOLATION
+        assert_eq!(e.raw_os_error(), Some(32), "{e}");
+        drop(f);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

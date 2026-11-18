@@ -416,7 +416,16 @@ pub(crate) fn read_config_text(path: &Path) -> io::Result<String> {
     if crate::config_override::library_mode() && !path.exists() {
         return Ok(String::new());
     }
-    fs::read_to_string(path)
+    // B-463: Windows の既定のパスは特権の無い利用者も先に作れる場所（%ProgramData%）にあるので、所有者が管理者・
+    // SYSTEM・veil を動かす利用者で、他に書き換えを許していないファイルだけを読む（起動・リロードのたびに）
+    #[cfg(windows)]
+    {
+        super::win_trust::read_config(path, &default_config_path())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::read_to_string(path)
+    }
 }
 
 /// リロードでは反映できない待ち受け関連の設定の写し（起動時の値と比べる）。
@@ -2350,11 +2359,16 @@ mod b383_wasm_section_tests {
         let changed = parse("[defaults]\nmax_execution_time_ms = 7\n");
         assert!(change(Some(&current), &changed).contains("[wasm] section"));
         assert!(change(None, &changed).contains("[wasm] was enabled"));
-        // モジュールのファイルを置き換えた
-        let tmp = dir.path().join("m.wasm.new");
-        std::fs::copy(fixture, &tmp).unwrap();
-        std::fs::rename(&tmp, &module).unwrap();
-        assert!(change(Some(&current), &start).contains("m.wasm"));
+        // モジュールのファイルを置き換えた（unix は inode で見分ける）。B-474: Windows の印は大きさと mtime だけで、
+        // CopyFile は mtime を写すので同じ中身のコピーは見分けない。印を見るのは seccomp で実行可能なメモリを
+        // 断った Linux のリロードだけ（`reload_wasm_engine`。Windows は毎回作り直す）
+        #[cfg(unix)]
+        {
+            let tmp = dir.path().join("m.wasm.new");
+            std::fs::copy(fixture, &tmp).unwrap();
+            std::fs::rename(&tmp, &module).unwrap();
+            assert!(change(Some(&current), &start).contains("m.wasm"));
+        }
         // WASM を使わない・Pulley: 作り直してよい
         assert!(compiled_wasm_engine(Some(&current), None).is_none());
         let mut disabled = start.clone();

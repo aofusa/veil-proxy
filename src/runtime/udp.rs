@@ -29,7 +29,7 @@ use windows_sys::Win32::Networking::WinSock::{
     recv as ws_recv, recvfrom as ws_recvfrom, send as ws_send, sendto as ws_sendto,
     setsockopt as ws_setsockopt, socket as ws_socket, WSAGetLastError, WSAStartup, AF_INET,
     AF_INET6, FIONBIO, INVALID_SOCKET, IPPROTO_UDP, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
-    SOCKET_ERROR, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, WSADATA,
+    SOCKET_ERROR, SOCK_DGRAM, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, WSADATA,
 };
 
 #[cfg(unix)]
@@ -294,25 +294,11 @@ impl UdpSocket {
 
         let fd = new_nonblocking_dgram_socket(domain)?;
 
+        // B-460: SO_REUSEADDR は付けない。UDP に TIME_WAIT は無く、L4 の UDP のリスナーは 1 本のスレッドで受ける。
+        // Linux では両方のソケットに SO_REUSEADDR があると利用者（UID）を問わず同じアドレス・ポートへ bind でき、
+        // 別の利用者がリスナー・上流のセッションのポートへ重ねて bind してデータグラムを奪えた
         #[cfg(unix)]
         {
-            let optval: libc::c_int = 1;
-            // SAFETY: fd は new_nonblocking_dgram_socket が返した有効なソケット。optval は c_int を指し長さはその大きさ。
-            let ret = unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_REUSEADDR,
-                    &optval as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                )
-            };
-            if ret < 0 {
-                let e = io::Error::last_os_error();
-                // SAFETY: 所有している fd を 1 回だけ閉じる（errno は先に読んだ）
-                unsafe { libc::close(fd) };
-                return Err(e);
-            }
             let (storage, len) = sockaddr_to_storage(&addr);
             // SAFETY: fd は有効なソケット。storage は sockaddr_to_storage が len バイト分を初期化した sockaddr_storage。
             let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
@@ -328,12 +314,14 @@ impl UdpSocket {
         {
             let sock = crate::runtime::handle::win::to_socket(fd);
             let optval: i32 = 1;
+            // B-460: SO_EXCLUSIVEADDRUSE（以前は SO_REUSEADDR で、Windows では SO_REUSEADDR を付けた別の利用者の
+            // ソケットが同じポートへ重ねて bind でき、届くデータグラムを奪えた）
             // SAFETY: sock は有効なソケット。optval は i32 を指し長さはその大きさ。
             let ret = unsafe {
                 ws_setsockopt(
                     sock,
                     SOL_SOCKET,
-                    SO_REUSEADDR,
+                    SO_EXCLUSIVEADDRUSE,
                     &optval as *const _ as *const u8,
                     std::mem::size_of::<i32>() as i32,
                 )

@@ -9,6 +9,9 @@
   - 「インストールされているアプリ」・winget の一覧のアイコン（ARPPRODUCTICON。packaging/icons/veil.ico。F-290）
   - %ProgramData%\veil の ACL は Administrators・SYSTEM が書き込み、Users は読み取りだけ
     （%ProgramData% の既定では Users が新しいファイルを作れるので、設定を書き換えられないように絞る）
+  - B-463: %ProgramData%\veil と www の所有者を Administrators にする（%ProgramData% には特権の無い利用者も先に
+    フォルダを作れて、作った利用者が所有者として権限を戻せた）。先にあった既定のページは入れ直す。先にあった
+    config.toml は残すが、veil は所有者が管理者・SYSTEM でないか他の利用者が書き換えられる既定の設定を読まない
   UpgradeCode は版をまたいで変えない（MajorUpgrade で前の版を消して入れ直す）。
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
@@ -43,22 +46,33 @@
         <Component Id="VeilDataDirAcl" Guid="99D3920B-C6DA-44F6-90A2-CB21CCE74DC0" KeyPath="yes" Permanent="yes">
           <CreateFolder>
             <!-- 継承を切って（P）DACL を置き換える（MsiLockPermissionsEx）。SYSTEM・Administrators は全権、Users は読み取りと
-                 実行だけ（0x1200a9）。%ProgramData% から継承する「Users は作成・書き込みできる」を残さない。SID の略号なので言語に依らない -->
-            <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+                 実行だけ（0x1200a9）。%ProgramData% から継承する「Users は作成・書き込みできる」を残さない。SID の略号なので言語に依らない。
+                 B-463: 所有者も Administrators にする（O:BA。先に作った利用者が所有者のまま DACL を戻せないように） -->
+            <PermissionEx Sddl="O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
           </CreateFolder>
         </Component>
         <Component Id="VeilConfig" Guid="4BC85004-5A97-4BD8-BF36-46E25B9FD9F9" NeverOverwrite="yes" Permanent="yes">
           <File Id="ConfigToml" Source="$(var.DefaultsDir)\config.toml" KeyPath="yes" />
         </Component>
         <Directory Id="WWWDIR" Name="www">
+          <!-- B-463: www も所有者を Administrators にして DACL を置き換える（先に作られたフォルダを残さない） -->
+          <Component Id="VeilWwwDirAcl" Guid="0C669768-4AAA-402A-AB37-664053D9FB24" KeyPath="yes">
+            <CreateFolder>
+              <PermissionEx Sddl="O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+            </CreateFolder>
+          </Component>
+          <!-- B-463: 既定のページは先にあったもの（日付で利用者のものと見なされて残る）を消してから入れる -->
           <Component Id="VeilIndexHtml">
             <File Id="IndexHtml" Source="$(var.DefaultsDir)\www\index.html" KeyPath="yes" />
+            <RemoveFile Id="RemoveOldIndexHtml" Name="index.html" On="install" />
           </Component>
           <Component Id="VeilQuickstartHtml">
             <File Id="QuickstartHtml" Source="$(var.DefaultsDir)\www\quickstart.html" KeyPath="yes" />
+            <RemoveFile Id="RemoveOldQuickstartHtml" Name="quickstart.html" On="install" />
           </Component>
           <Component Id="VeilFaviconIco">
             <File Id="FaviconIco" Source="$(var.DefaultsDir)\www\favicon.ico" KeyPath="yes" />
+            <RemoveFile Id="RemoveOldFaviconIco" Name="favicon.ico" On="install" />
           </Component>
         </Directory>
       </Directory>
@@ -70,6 +84,7 @@
       <ComponentRef Id="VeilLicenseMit" />
       <ComponentRef Id="VeilDataDirAcl" />
       <ComponentRef Id="VeilConfig" />
+      <ComponentRef Id="VeilWwwDirAcl" />
       <ComponentRef Id="VeilIndexHtml" />
       <ComponentRef Id="VeilQuickstartHtml" />
       <ComponentRef Id="VeilFaviconIco" />

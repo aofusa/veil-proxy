@@ -192,24 +192,9 @@ impl QuicUdpSocket {
 
         set_dont_fragment(fd, addr.is_ipv4());
 
-        // SO_REUSEADDR を設定
-        let reuseaddr: libc::c_int = 1;
-        // SAFETY: fd は直前に作った有効なソケット。optval は c_int を指し、長さはその大きさ
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &reuseaddr as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if ret < 0 {
-            let e = io::Error::last_os_error();
-            // SAFETY: 所有している fd を 1 回だけ閉じる（以降この fd は使わない）
-            unsafe { libc::close(fd) };
-            return Err(e);
-        }
+        // B-460: SO_REUSEADDR は付けない（ワーカーで同じポートを分けるのは SO_REUSEPORT で足り、Linux はそれを同じ
+        // UID に限る）。UDP では両方のソケットに SO_REUSEADDR があると UID を問わず重ねて bind でき、別の利用者が
+        // HTTP/3 のポートへ重ねてデータグラムを奪えた
 
         // SO_REUSEPORT を設定
         let reuseport: libc::c_int = 1;

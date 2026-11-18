@@ -123,7 +123,17 @@ veil                            # in a new terminal; then open http://127.0.0.1:
 
 The MSI installs `C:\Program Files\veil\veil.exe` (added to `PATH`), the configuration
 `%ProgramData%\veil\config.toml` and the page `%ProgramData%\veil\www\`. Only administrators can change files
-in `%ProgramData%\veil`. Upgrades and `winget uninstall` keep the configuration. veil is not registered as a
+in `%ProgramData%\veil`: the MSI makes Administrators the owner of `%ProgramData%\veil` and `www`, replaces their
+permissions, and reinstalls the default pages even when the folder existed before. Upgrades and `winget uninstall`
+keep the configuration.
+
+On Windows, veil reads the configuration at the default path only when the file is owned by Administrators, SYSTEM
+or the account running veil, and no other account is allowed to change it. Any user can create folders in
+`%ProgramData%`, so a file there that another account owns or can modify could otherwise configure a veil run by an
+administrator or as a service. veil refuses such a file at startup and on reload (`refusing to read ...`). The check
+also applies when `-c` or `VEIL_CONFIG` names the same file. Fix the owner and permissions, for example
+`icacls "%ProgramData%\veil\config.toml" /setowner *S-1-5-32-544` followed by
+`icacls "%ProgramData%\veil\config.toml" /reset`, or keep the configuration somewhere else and pass it with `-c`. veil is not registered as a
 Windows service; to run it as one, use `sc.exe create veil binPath= "C:\Program Files\veil\veil.exe"` or a
 service wrapper.
 

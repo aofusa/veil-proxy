@@ -185,7 +185,20 @@ fn windows_notify_pair() -> Option<(RawFd, RawFd)> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
     let addr = listener.local_addr().ok()?;
     let client = TcpStream::connect(addr).ok()?;
-    let (accepted, _) = listener.accept().ok()?;
+    let client_addr = client.local_addr().ok()?;
+    // B-461: 一時リスナーへは同じ端末の他のプロセス（他の利用者）も接続できる。相手のアドレスが自分の client の
+    // ローカルアドレスである接続だけを読み取り側にし、他は閉じる（以前は最初に受けた接続を使っており、先に接続した
+    // 他のプロセスが通知を握って、このワーカーのオフロードの完了を止めたり空回りさせたりできた。CPython の
+    // CVE-2024-3219 と同じ）。自分の接続は connect が返った時点でバックログにある
+    let mut accepted = None;
+    for _ in 0..64 {
+        let (s, peer) = listener.accept().ok()?;
+        if peer == client_addr {
+            accepted = Some(s);
+            break;
+        }
+    }
+    let accepted = accepted?;
 
     // std の TcpStream/TcpListener は Drop で close するため、生ソケットの所有権を
     // こちら側へ移した上で `into_raw_socket()` で取り出す（Drop による二重 close を防ぐ）。
@@ -869,19 +882,6 @@ pub fn handler_pool_threads() -> usize {
     }
 }
 
-/// ブロッキングな処理 `f` をハンドラ用プールで実行し、完了を待たない（結果は呼び出し側が
-/// `api::bridge` のキュー等で受け取る。F-210）。`f` の panic はプールのスレッドで捕まえる。
-#[cfg(feature = "handler-pool")]
-pub fn spawn_handler<F>(f: F)
-where
-    F: FnOnce() + Send + 'static,
-{
-    HANDLER_POOL.submit(Box::new(move || {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    }));
-}
-
-/// ブロッキングなハンドラ `f` をハンドラ用プールで実行し、結果を非同期に受け取る。
 // B-467: ハンドラ用プールへ渡してまだ終わっていない仕事の数（キューにある分と実行中の分）。C の `veil_run` は
 // サーバが止まった後、停止の関数（C の状態を解放する）を呼ぶ前にこれが 0 になるのを待つ。プールはプロセスに 1 つで
 // キューを捨てないので、止めた後もキューに残った要求のハンドラ・ミドルウェア（`veil_kit_jwt_authenticate` 等）が
@@ -924,6 +924,21 @@ pub fn wait_handler_jobs(timeout: std::time::Duration) -> bool {
     true
 }
 
+/// ブロッキングな処理 `f` をハンドラ用プールで実行し、完了を待たない（結果は呼び出し側が
+/// `api::bridge` のキュー等で受け取る。F-210）。`f` の panic はプールのスレッドで捕まえる。
+#[cfg(feature = "handler-pool")]
+pub fn spawn_handler<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let job = HandlerJob::start();
+    HANDLER_POOL.submit(Box::new(move || {
+        let _job = job;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    }));
+}
+
+/// ブロッキングなハンドラ `f` をハンドラ用プールで実行し、結果を非同期に受け取る。
 /// `f` が panic したら `None`。
 #[cfg(feature = "handler-pool")]
 pub async fn offload_handler<F, R>(f: F) -> Option<R>
@@ -931,10 +946,10 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let job = HandlerJob::start();
     await_completion(move |completer: Completer<R>| {
-        let _job = job;
+        let job = HandlerJob::start();
         HANDLER_POOL.submit(Box::new(move || {
+            let _job = job;
             // panic しても Completer の Drop が待機側を起こす（None）。
             if let Ok(v) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
                 completer.complete(v);
@@ -944,21 +959,6 @@ where
     .await
 }
 
-#[cfg(test)]
-mod b226_tests {
-    /// B-226: 閉包が panic してもプールのスレッドは残り、要求はその panic で終わる（永久に待たない）。
-        let job = HandlerJob::start();
-    /// ワーカーの本数（2〜8）より多く panic させても、次の `offload` が結果を返す。
-            let _job = job;
-    #[test]
-    fn panicking_job_does_not_kill_pool_or_hang() {
-        #[cfg(all(veil_rt_uring, target_os = "linux"))]
-        if crate::runtime::ring::IoUring::new(8, 0).is_err() {
-            eprintln!("io_uring unavailable; skipping");
-            return;
-        }
-        crate::runtime::block_on(async {
-            for _ in 0..16 {
 // B-467: ハンドラ用プールの仕事が終わるまで待てる（他の試験の仕事も数えるので、待ち切る側の期限は長く取る）
 #[cfg(all(test, feature = "handler-pool"))]
 mod b467_tests {
@@ -987,6 +987,19 @@ mod b467_tests {
     }
 }
 
+#[cfg(test)]
+mod b226_tests {
+    /// B-226: 閉包が panic してもプールのスレッドは残り、要求はその panic で終わる（永久に待たない）。
+    /// ワーカーの本数（2〜8）より多く panic させても、次の `offload` が結果を返す。
+    #[test]
+    fn panicking_job_does_not_kill_pool_or_hang() {
+        #[cfg(all(veil_rt_uring, target_os = "linux"))]
+        if crate::runtime::ring::IoUring::new(8, 0).is_err() {
+            eprintln!("io_uring unavailable; skipping");
+            return;
+        }
+        crate::runtime::block_on(async {
+            for _ in 0..16 {
                 let r = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
                     super::offload(|| -> u32 { panic!("offload job panicked on purpose") }),
                 ))

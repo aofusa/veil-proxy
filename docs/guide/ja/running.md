@@ -119,8 +119,17 @@ veil                            # 新しい端末で。http://127.0.0.1:8080/ �
 ```
 
 MSI は `C:\Program Files\veil\veil.exe`（`PATH` に足す）、設定 `%ProgramData%\veil\config.toml`、ページ
-`%ProgramData%\veil\www\` を入れます。`%ProgramData%\veil` のファイルを変えられるのは管理者だけです。上げても
-`winget uninstall` しても、設定は残ります。Windows のサービスには登録しません。サービスとして動かすときは
+`%ProgramData%\veil\www\` を入れます。`%ProgramData%\veil` のファイルを変えられるのは管理者だけです。MSI は
+`%ProgramData%\veil` と `www` の所有者を Administrators にして権限を置き換え、フォルダが前からあっても既定のページを
+入れ直します。上げても `winget uninstall` しても、設定は残ります。
+
+Windows の veil は、既定のパスの設定ファイルを、所有者が Administrators・SYSTEM・veil を動かしているアカウントの
+どれかで、他のアカウントに書き換えを許していないときだけ読みます。`%ProgramData%` には誰でもフォルダを作れるので、
+他のアカウントが所有する・書き換えられるファイルがそこにあると、管理者やサービスとして動かした veil の設定に
+されてしまいます。veil はそのようなファイルを起動時とリロード時に断ります（`refusing to read ...`）。`-c` や
+`VEIL_CONFIG` で同じファイルを指しても同じです。所有者と権限を直す（例: `icacls "%ProgramData%\veil\config.toml"
+/setowner *S-1-5-32-544` の後に `icacls "%ProgramData%\veil\config.toml" /reset`）か、設定を別の場所に置いて
+`-c` で渡してください。Windows のサービスには登録しません。サービスとして動かすときは
 `sc.exe create veil binPath= "C:\Program Files\veil\veil.exe"` か、サービスの wrapper を使ってください。
 
 ##### Rust（`cargo binstall`・`cargo install`）

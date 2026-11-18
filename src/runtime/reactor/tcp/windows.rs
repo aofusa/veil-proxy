@@ -14,16 +14,19 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once, Weak};
 use std::task::{Context, Poll};
 
 use windows_sys::Win32::Networking::WinSock::{
     self, closesocket, connect as ws_connect, getpeername, getsockname, getsockopt, ioctlsocket,
-    recv, send, setsockopt, shutdown as ws_shutdown, socket, WSAGetLastError, WSAStartup, AF_INET,
-    AF_INET6, FIONBIO, INVALID_SOCKET, IPPROTO_TCP, SD_BOTH, SD_RECEIVE, SD_SEND, SOCKADDR,
-    SOCKADDR_IN, SOCKADDR_IN6, SOCKET, SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_ERROR,
-    SO_REUSEADDR, TCP_NODELAY as WIN_TCP_NODELAY, WSADATA, WSAEINPROGRESS, WSAEWOULDBLOCK,
+    recv, send, setsockopt, shutdown as ws_shutdown, socket, WSADuplicateSocketW, WSAGetLastError,
+    WSASocketW, WSAStartup, AF_INET, AF_INET6, FIONBIO, FROM_PROTOCOL_INFO, INVALID_SOCKET,
+    IPPROTO_TCP, SD_BOTH, SD_RECEIVE, SD_SEND, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKET,
+    SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_ERROR, SO_EXCLUSIVEADDRUSE,
+    TCP_NODELAY as WIN_TCP_NODELAY, WSADATA, WSAEINPROGRESS, WSAEWOULDBLOCK, WSAPROTOCOL_INFOW,
+    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
 };
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::executor::{coop_proceed, register_read, register_write, unregister};
@@ -144,18 +147,101 @@ pub(crate) fn create_nonblocking_socket(domain: i32) -> io::Result<RawFd> {
     Ok(win::from_socket(sock))
 }
 
-fn set_reuseaddr(sock: SOCKET) {
+/// 待ち受けのソケットを作る（`SO_EXCLUSIVEADDRUSE` → bind → listen）。
+///
+/// B-460: 以前は `SO_REUSEADDR` を付けてワーカーごとに同じポートへ bind していた。Windows では `SO_REUSEADDR` を
+/// 付けたソケットのポートへ、同じく `SO_REUSEADDR` を付けた他の利用者のソケットも（特権なしで）bind でき、届く接続が
+/// どちらかへ定まらずに渡るので、平文のリスナーの要求（Cookie・Authorization）を奪えた。`SO_EXCLUSIVEADDRUSE` は
+/// 誰の重ねた bind も断る（Windows の既定ではポートの再利用に TIME_WAIT を待たない）
+fn listen_exclusive(addr: &SocketAddr) -> io::Result<SOCKET> {
+    let domain = if addr.is_ipv6() { AF_INET6 } else { AF_INET };
+    let sock = win::to_socket(create_nonblocking_socket(domain as i32)?);
     let optval: i32 = 1;
-    unsafe {
+    // SAFETY: sock は直前に作った有効なソケット。optval は i32 を指し長さはその大きさ
+    let ret = unsafe {
         setsockopt(
             sock,
             SOL_SOCKET,
-            SO_REUSEADDR,
+            SO_EXCLUSIVEADDRUSE,
             &optval as *const _ as *const u8,
             std::mem::size_of::<i32>() as i32,
-        );
+        )
+    };
+    if ret == SOCKET_ERROR {
+        let e = last_wsa_error();
+        // SAFETY: 所有しているソケットを 1 回だけ閉じる（誤りは先に読んだ）
+        unsafe { closesocket(sock) };
+        return Err(e);
+    }
+    let (storage, len) = sockaddr_to_storage(addr);
+    // SAFETY: sock は有効なソケット。storage は sockaddr_to_storage が作った len バイトの SOCKADDR
+    let ret = unsafe { WinSock::bind(sock, storage.as_ptr() as *const SOCKADDR, len) };
+    if ret == SOCKET_ERROR {
+        let e = last_wsa_error();
+        // SAFETY: 同上
+        unsafe { closesocket(sock) };
+        return Err(e);
+    }
+    // SAFETY: sock は bind 済みの有効なソケット
+    let ret = unsafe { WinSock::listen(sock, 1024) };
+    if ret == SOCKET_ERROR {
+        let e = last_wsa_error();
+        // SAFETY: 同上
+        unsafe { closesocket(sock) };
+        return Err(e);
+    }
+    Ok(sock)
+}
+
+/// 同じソケットを指す別の記述子を作る（ワーカーごとのリスナー。各々が自分の記述子を閉じ、最後の 1 つが閉じたときに
+/// ソケットが閉じる）。ノンブロッキングにして返す
+fn duplicate_listen_socket(base: SOCKET) -> io::Result<SOCKET> {
+    // SAFETY: WSAPROTOCOL_INFOW は整数と配列だけの POD で、全ビット 0 が有効な初期値
+    let mut info: WSAPROTOCOL_INFOW = unsafe { std::mem::zeroed() };
+    // SAFETY: base は生きている待ち受けのソケット。info は WSADuplicateSocketW が書く出力の領域。複製先は自分のプロセス
+    if unsafe { WSADuplicateSocketW(base, GetCurrentProcessId(), &mut info) } == SOCKET_ERROR {
+        return Err(last_wsa_error());
+    }
+    // SAFETY: info は直前の WSADuplicateSocketW が満たした値。子プロセスへ継承させない
+    let sock = unsafe {
+        WSASocketW(
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            &info,
+            0,
+            WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if sock == INVALID_SOCKET {
+        return Err(last_wsa_error());
+    }
+    let mut nonblocking: u32 = 1;
+    // SAFETY: sock は直前に作った有効なソケット
+    if unsafe { ioctlsocket(sock, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
+        let e = last_wsa_error();
+        // SAFETY: 所有しているソケットを 1 回だけ閉じる（誤りは先に読んだ）
+        unsafe { closesocket(sock) };
+        return Err(e);
+    }
+    Ok(sock)
+}
+
+/// 同じアドレスの全ワーカーのリスナーが複製元にする待ち受けのソケット（最後のリスナーが落ちたら閉じる。B-460）
+struct SharedListenSocket {
+    sock: SOCKET,
+}
+
+impl Drop for SharedListenSocket {
+    fn drop(&mut self) {
+        // SAFETY: sock はこの値だけが所有する複製元の記述子。ワーカーのリスナーは自分の複製を別に閉じる
+        unsafe { closesocket(self.sock) };
     }
 }
+
+/// アドレスごとの複製元（起動・リロード時のリスナー作成だけが触るコールドパス）
+static SHARED_LISTEN_SOCKETS: Mutex<Vec<(SocketAddr, Weak<SharedListenSocket>)>> =
+    Mutex::new(Vec::new());
 
 // ====================
 // TcpListener
@@ -164,45 +250,53 @@ fn set_reuseaddr(sock: SOCKET) {
 /// 非同期 TCP リスナー。
 pub struct TcpListener {
     fd: RawFd,
+    /// `bind_reuse_port` のリスナーが複製元を生かしておく（B-460）
+    _shared: Option<Arc<SharedListenSocket>>,
 }
 
 impl TcpListener {
     pub fn bind(addr: impl std::net::ToSocketAddrs) -> io::Result<Self> {
-        Self::bind_impl(addr, false)
+        let addr = resolve_listen_addr(addr)?;
+        Ok(Self {
+            fd: win::from_socket(listen_exclusive(&addr)?),
+            _shared: None,
+        })
     }
 
-    /// Windows には Linux 的な `SO_REUSEPORT`（カーネル分散）が無いため、
-    /// `SO_REUSEADDR` のみを設定する（thread-per-core の accept 分散は保証されない。
-    /// F-125 設計ドキュメント参照。ビルド通過のみが目的で実機性能検証は対象外）。
+    /// Windows には Linux 的な `SO_REUSEPORT`（カーネル分散）が無いため、同じアドレスの全ワーカーで 1 本の
+    /// 待ち受けのソケット（`SO_EXCLUSIVEADDRUSE`）を共有し、各ワーカーにはその複製を返す。接続はその時に
+    /// 受理したワーカーへ渡る（thread-per-core の accept 分散は保証されない。F-125）。B-460: 以前は各ワーカーが
+    /// `SO_REUSEADDR` で同じポートへ bind しており、他の利用者のソケットも重ねて bind できた
     pub fn bind_reuse_port(addr: impl std::net::ToSocketAddrs) -> io::Result<Self> {
-        Self::bind_impl(addr, true)
-    }
-
-    #[allow(clippy::disallowed_methods)] // 起動・リロード時のリスナー作成のみ（ホットパス外）
-    fn bind_impl(addr: impl std::net::ToSocketAddrs, _reuse_port: bool) -> io::Result<Self> {
-        let addr = addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address"))?;
-        let domain = if addr.is_ipv6() { AF_INET6 } else { AF_INET };
-        let fd = create_nonblocking_socket(domain as i32)?;
-        let sock = win::to_socket(fd);
-        set_reuseaddr(sock);
-
-        let (storage, len) = sockaddr_to_storage(&addr);
-        let ret = unsafe { WinSock::bind(sock, storage.as_ptr() as *const SOCKADDR, len) };
-        if ret == SOCKET_ERROR {
-            let e = last_wsa_error();
-            unsafe { closesocket(sock) };
-            return Err(e);
+        let addr = resolve_listen_addr(addr)?;
+        // ポート 0 は呼び出しごとに別のポート（共有しない）
+        if addr.port() == 0 {
+            return Self::bind(addr);
         }
-        let ret = unsafe { WinSock::listen(sock, 1024) };
-        if ret == SOCKET_ERROR {
-            let e = last_wsa_error();
-            unsafe { closesocket(sock) };
-            return Err(e);
-        }
-        Ok(Self { fd })
+        let shared = {
+            let mut table = SHARED_LISTEN_SOCKETS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            table.retain(|(_, w)| w.strong_count() > 0);
+            match table
+                .iter()
+                .find(|(a, _)| *a == addr)
+                .and_then(|(_, w)| w.upgrade())
+            {
+                Some(s) => s,
+                None => {
+                    let s = Arc::new(SharedListenSocket {
+                        sock: listen_exclusive(&addr)?,
+                    });
+                    table.push((addr, Arc::downgrade(&s)));
+                    s
+                }
+            }
+        };
+        Ok(Self {
+            fd: win::from_socket(duplicate_listen_socket(shared.sock)?),
+            _shared: Some(shared),
+        })
     }
 
     pub fn accept(&self) -> Accept<'_> {
@@ -265,8 +359,17 @@ impl TcpListener {
 impl Drop for TcpListener {
     fn drop(&mut self) {
         unregister(self.fd);
+        // 自分の記述子だけを閉じる（共有の複製元は `_shared` の最後の参照が落ちたときに閉じる）
         unsafe { closesocket(win::to_socket(self.fd)) };
     }
+}
+
+/// リスナーのアドレスを 1 つに決める
+#[allow(clippy::disallowed_methods)] // 起動・リロード時のリスナー作成のみ（ホットパス外。呼び出し側は解決済みの SocketAddr を渡す）
+fn resolve_listen_addr(addr: impl std::net::ToSocketAddrs) -> io::Result<SocketAddr> {
+    addr.to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address"))
 }
 
 impl AsRawFd for TcpListener {
@@ -957,4 +1060,97 @@ pub fn wait_readable_fd(fd: RawFd) -> ReadableFd {
 
 pub fn wait_writable_fd(fd: RawFd) -> WritableFd {
     WritableFd { fd }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B-460: 同じアドレスの `bind_reuse_port` は 1 本の待ち受けを共有し（どの複製でも受理でき）、他のソケットは
+    /// `SO_REUSEADDR` を付けても重ねて bind できない。全部閉じたらポートは空く
+    // 理由付き allow: 試験で空いているポートを探し、受け手の無い同期の接続を張る（データプレーン外）
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn reuse_port_listeners_share_one_exclusive_socket() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let a = TcpListener::bind_reuse_port(addr).expect("first worker listener");
+        let b = TcpListener::bind_reuse_port(addr).expect("second worker listener");
+        assert_ne!(a.fd, b.fd, "each worker gets its own descriptor");
+        assert_eq!(a.local_addr().unwrap(), addr);
+        assert_eq!(b.local_addr().unwrap(), addr);
+
+        // 別のソケットは SO_REUSEADDR を付けても重ねて bind できない
+        let other = win::to_socket(create_nonblocking_socket(AF_INET as i32).unwrap());
+        let optval: i32 = 1;
+        // SAFETY: other は有効なソケット。optval は i32 を指し長さはその大きさ
+        unsafe {
+            setsockopt(
+                other,
+                SOL_SOCKET,
+                windows_sys::Win32::Networking::WinSock::SO_REUSEADDR,
+                &optval as *const _ as *const u8,
+                std::mem::size_of::<i32>() as i32,
+            )
+        };
+        let (storage, len) = sockaddr_to_storage(&addr);
+        // SAFETY: other は有効なソケット。storage は len バイトの SOCKADDR
+        let ret = unsafe { WinSock::bind(other, storage.as_ptr() as *const SOCKADDR, len) };
+        let err = last_wsa_error();
+        // SAFETY: 所有しているソケットを 1 回だけ閉じる
+        unsafe { closesocket(other) };
+        assert_eq!(ret, SOCKET_ERROR, "a co-bind must be refused");
+        assert!(
+            matches!(err.raw_os_error(), Some(10013) | Some(10048)),
+            "WSAEACCES or WSAEADDRINUSE: {err}"
+        );
+
+        // どちらの複製でも受理できる（同じ待ち受けのソケット）
+        let c1 = std::net::TcpStream::connect(addr).unwrap();
+        let mut got = 0;
+        for _ in 0..200 {
+            got += a.accept_batch(4, |_, _| {}).unwrap();
+            if got > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(got, 1, "the first duplicate accepts");
+        let c2 = std::net::TcpStream::connect(addr).unwrap();
+        got = 0;
+        for _ in 0..200 {
+            got += b.accept_batch(4, |_, _| {}).unwrap();
+            if got > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(got, 1, "the second duplicate accepts from the same socket");
+
+        drop(c1);
+        drop(c2);
+
+        // 1 本だけ閉じても待ち受けは残り、全部閉じたらポートが空く
+        drop(a);
+        let c3 = std::net::TcpStream::connect(addr).expect("the other duplicate still listens");
+        drop(c3);
+        drop(b);
+        // 受理した接続が閉じ終えるまで SO_EXCLUSIVEADDRUSE の bind は断られ得る
+        let mut again = None;
+        for _ in 0..100 {
+            if let Ok(l) = TcpListener::bind(addr) {
+                again = Some(l);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            again.is_some(),
+            "the port is free after every listener closed"
+        );
+    }
 }
