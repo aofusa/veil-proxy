@@ -2507,6 +2507,24 @@ mod b186_overflow_tests {
         // SAFETY: fds は 2 要素の有効な配列
         let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         assert_eq!(rc, 0);
+        // B-477: 試験は同じスレッドで本文を先に全部書いてから読む。AF_UNIX の送受信バッファの既定が 8KiB の BSD・macOS
+        // （Linux は 200KiB ほど）では 20〜30KiB の本文の書き込みが読み手を待って止まるので、両端のバッファを広げる
+        for fd in fds {
+            for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+                let size: libc::c_int = 256 * 1024;
+                // SAFETY: fd は socketpair が返した有効なソケット。size は c_int を指し長さはその大きさ
+                let rc = unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        opt,
+                        &size as *const libc::c_int as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    )
+                };
+                assert_eq!(rc, 0, "setsockopt: {}", std::io::Error::last_os_error());
+            }
+        }
         // SAFETY: socketpair が返した有効な fd
         unsafe {
             let fl = libc::fcntl(fds[0], libc::F_GETFL);
