@@ -4,7 +4,7 @@
 # ==========================================
 # 1. 最小設定ファイルやツールを用意する共通ステージ
 # ==========================================
-FROM messense/cargo-zigbuild:latest@sha256:eb5578cfc06e070a09deb7b5852474bd128a4e561f9f123261b5ed2405e478b1 AS tool-builder
+FROM messense/cargo-zigbuild:latest@sha256:3abe26afb5537ea225c223c6790c1bf056271ef51ea52d2c4e343c569c8f129a AS tool-builder
 
 WORKDIR /app
 
