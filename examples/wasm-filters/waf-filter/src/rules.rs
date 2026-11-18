@@ -408,51 +408,23 @@ impl RuleEngine {
     }
 
     /// Inspect targets and return violations
+    ///
+    /// Immediate mode returns the first `block` match. A `log` or `allow` match does not stop the inspection: the
+    /// remaining rules, the decoded value and the other targets are still checked, and the first such match is
+    /// returned only when nothing blocks.
+    // B-435: 以前は即時モードで最初に当たったルールを動作に関係なく返していて、`log` のルール（crs-913110 等）に当たる
+    // 文字列を足すだけで、デコード後の値・他の対象の検査を飛ばしてブロックを外せた
     pub fn inspect(&self, targets: &HashMap<String, String>) -> Option<Violation> {
         let mut total_score = 0u32;
         let mut violations = Vec::new();
+        let mut first_non_block: Option<Violation> = None;
 
         for (target_name, target_value) in targets {
             let decoded = self.url_decode(target_value);
-            
-            // デコード前の文字列をチェック（エンコードされた攻撃パターン）
+            // デコード前の文字列（エンコードされた攻撃パターン）とデコード後の文字列の両方を見る。
             // `RegexSet::matches` は 1 回の走査で当たったルールを返す（ルールの順）
-            let mut matched_in_encoded = false;
-            for rule in self.set.matches(target_value.as_bytes()).iter().map(|i| &self.rules[i]) {
-                // Check if rule applies to this target
-                if !rule.matches_target(target_name) {
-                    continue;
-                }
-
-                let violation = Violation {
-                    rule_id: rule.id.clone(),
-                    category: rule.category.clone(),
-                    target: target_name.clone(),
-                    matched_value: target_value.clone(),
-                    action: rule.action.clone(),
-                    severity: rule.severity,
-                };
-
-                if self.anomaly_scoring {
-                    total_score += rule.severity.score();
-                    violations.push(violation);
-
-                    if total_score >= self.anomaly_threshold {
-                        // Return the most severe violation
-                        return violations.into_iter()
-                            .max_by_key(|v| v.severity.score());
-                    }
-                } else {
-                    // Immediate mode: return first match
-                    return Some(violation);
-                }
-                matched_in_encoded = true;
-            }
-            
-            // デコード後の文字列をチェック（デコード後の攻撃パターン）
-            // デコード前でマッチした場合はスキップ（immediate modeの場合）
-            if !matched_in_encoded || self.anomaly_scoring {
-                for rule in self.set.matches(decoded.as_bytes()).iter().map(|i| &self.rules[i]) {
+            for value in [target_value, &decoded] {
+                for rule in self.set.matches(value.as_bytes()).iter().map(|i| &self.rules[i]) {
                     // Check if rule applies to this target
                     if !rule.matches_target(target_name) {
                         continue;
@@ -462,7 +434,7 @@ impl RuleEngine {
                         rule_id: rule.id.clone(),
                         category: rule.category.clone(),
                         target: target_name.clone(),
-                        matched_value: decoded.clone(),
+                        matched_value: value.clone(),
                         action: rule.action.clone(),
                         severity: rule.severity,
                     };
@@ -473,18 +445,19 @@ impl RuleEngine {
 
                         if total_score >= self.anomaly_threshold {
                             // Return the most severe violation
-                            return violations.into_iter()
-                                .max_by_key(|v| v.severity.score());
+                            return violations.into_iter().max_by_key(|v| v.severity.score());
                         }
-                    } else {
-                        // Immediate mode: return first match
+                    } else if violation.action == WafAction::Block {
+                        // Immediate mode: the first blocking match decides
                         return Some(violation);
+                    } else if first_non_block.is_none() {
+                        first_non_block = Some(violation);
                     }
                 }
             }
         }
 
-        None
+        first_non_block
     }
 
     /// Enhanced URL decoding with multiple encoding support
@@ -638,6 +611,28 @@ mod tests {
         assert!(result.is_some());
         let violation = result.unwrap();
         assert!(violation.rule_id.starts_with("crs-921"));
+    }
+
+    /// B-435: 即時モードで `log` のルールに当たっても検査を続け、デコード後の値の `block` のルールで止める
+    #[test]
+    fn log_match_does_not_end_immediate_inspection() {
+        let config = WafConfig {
+            crs_level: CrsLevel::Level2,
+            ..Default::default()
+        };
+        let engine = RuleEngine::with_config(&config);
+        let mut targets = HashMap::new();
+        targets.insert(
+            "query".to_string(),
+            "x=python-requests-bot&q=%3Cscript%3Ealert(1)%3C/script%3E".to_string(),
+        );
+        let v = engine.inspect(&targets).expect("the XSS payload must be detected");
+        assert_eq!(v.action, WafAction::Block, "got {}", v.rule_id);
+        // `log` のルールだけに当たる要求は記録のための違反を返す（ブロックしない）
+        let mut targets = HashMap::new();
+        targets.insert("query".to_string(), "x=python-requests-bot".to_string());
+        let v = engine.inspect(&targets).expect("the log rule must match");
+        assert_eq!(v.action, WafAction::Log);
     }
 
     #[test]

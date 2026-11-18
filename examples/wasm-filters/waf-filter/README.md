@@ -131,7 +131,7 @@ Level 2に加えて、高度な攻撃手法を検出します。
 | `id` | string | ルールID（必須） |
 | `pattern` | string | 正規表現パターン（必須） |
 | `targets` | array | 検査対象（"uri", "query", "body", "user-agent"など） |
-| `action` | string | アクション（"block", "log", "allow"） |
+| `action` | string | アクション（"block", "log", "allow"）。`log`・`allow` は記録するだけでブロックせず、他のルールの検査は続けます（要求を許可リストに入れるものではありません。許可リストは `whitelist_ips`・`whitelist_paths`） |
 | `message` | string | 検出時のメッセージ |
 
 ## 動作フロー
@@ -151,7 +151,7 @@ Level 2に加えて、高度な攻撃手法を検出します。
    - URI/パス
    - クエリ文字列
    - ヘッダ（User-Agent、Referer、Cookie）
-   - ボディ（`inspect_body=true`かつPOSTリクエストの場合）
+   - ボディ（`inspect_body=true`かつPOSTリクエストの場合）。UTF-8 でないバイトは U+FFFD に置き換えて検査します
 
 4. **ルール検査**
    - 選択されたCRSレベル（1/2/3）のルールを適用
@@ -159,7 +159,8 @@ Level 2に加えて、高度な攻撃手法を検出します。
    - URLデコードを自動的に実行
 
 5. **結果判定**
-   - **anomaly_scoring=false（即座モード）**: 最初のマッチで判定
+   - **anomaly_scoring=false（即座モード）**: `block` のルールに当たった時点でブロック。`log`・`allow` のルールに当たっても
+     残りのルール・デコード後の値・他の検査対象の検査は続けます
    - **anomaly_scoring=true（スコアリングモード）**: スコアを累積し、閾値に達したら判定
    - **block モード**: 403レスポンスを返却（`X-WAF-Block`、`X-WAF-Category`ヘッダ付き）
    - **detect モード**: ログ出力のみ（リクエストは継続）

@@ -162,7 +162,7 @@ impl HttpContext for WafFilter {
                 violation.rule_id,
                 violation.severity,
                 violation.target,
-                &violation.matched_value[..std::cmp::min(50, violation.matched_value.len())]
+                truncate_on_char_boundary(&violation.matched_value, 50)
             );
 
             let action = if self.config.mode == WafMode::Detect {
@@ -201,7 +201,10 @@ impl HttpContext for WafFilter {
         }
 
         if let Some(body) = self.get_http_request_body(0, body_size) {
-            if let Ok(body_str) = String::from_utf8(body) {
+            // B-436: UTF-8 でない本文も検査する（不正なバイトは U+FFFD に置き換える）。以前は UTF-8 として読めない本文の
+            // 検査を飛ばして通していて、1 バイトの 0xFF を足すだけで本文のルールを全部外せた
+            {
+                let body_str = String::from_utf8_lossy(&body).into_owned();
                 let mut targets = HashMap::new();
                 targets.insert("body".to_string(), body_str);
 
@@ -233,5 +236,33 @@ impl HttpContext for WafFilter {
 
     fn on_log(&mut self) {
         log::debug!("[waf:{}] Request completed", self.context_id);
+    }
+}
+
+/// The longest prefix of `s` that is at most `max` bytes and ends on a character boundary
+// B-437: 以前はバイト 50 で切っていて、デコードした値の 2 バイトの文字が境界をまたぐと panic し、フィルタが落ちた
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_on_char_boundary;
+
+    #[test]
+    fn truncation_keeps_char_boundaries() {
+        let s = format!("/?a{}", "\u{c3}".repeat(30));
+        for max in 0..s.len() + 2 {
+            let t = truncate_on_char_boundary(&s, max);
+            assert!(t.len() <= max && s.starts_with(t));
+        }
+        assert_eq!(truncate_on_char_boundary("abc", 50), "abc");
     }
 }

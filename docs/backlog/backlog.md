@@ -796,6 +796,13 @@
 | B-432 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-432-static-canonicalize-then-open-race.md](bugs/B-432-static-canonicalize-then-open-race.md) | 静的配信の canonicalize の経路が、正規化したパスで封じ込めを判定した後に名前で開き直し、その間に途中の段をシンボリックリンクへ入れ替えるとルートの外のファイルを開けた。ルートから 1 段ずつシンボリックリンクをたどらずに開く |
 | B-433 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-433-h3-retry-token-address-family.md](bugs/B-433-h3-retry-token-address-family.md) | HTTP/3 の Retry トークンのタグがアドレスの族を区別せず、IPv6 の送信元に出したトークンを IPv4 の送信元の期限の無いトークンへ作り直せた。アドレスは常に 16 バイトで入れる |
 | B-434 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-434-admin-auth-lockout-ipv6-rotation.md](bugs/B-434-admin-auth-lockout-ipv6-rotation.md) | 管理 API の認証の失敗の上限が送信元のアドレス（/128）ごとで、IPv6 の /64 の中でアドレスを替えるだけで外れた。IPv6 は /64 ごとに数える |
+| B-435 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-435-waf-log-match-ends-inspection.md](bugs/B-435-waf-log-match-ends-inspection.md) | WAF の例の即時モードが、最初に当たったルールが記録だけ（log）でもそれを返して検査を終え、ブロックのルールを外せた |
+| B-436 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-436-waf-non-utf8-body-skips-inspection.md](bugs/B-436-waf-non-utf8-body-skips-inspection.md) | WAF の例が UTF-8 として読めない要求の本文を検査せずに通していた |
+| B-437 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-437-waf-log-truncation-panic.md](bugs/B-437-waf-log-truncation-panic.md) | WAF の例が検出の記録で値をバイト 50 で切り、多バイト文字の途中で panic してフィルタが落ちた |
+| B-438 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-438-jwt-filter-skip-paths-prefix.md](bugs/B-438-jwt-filter-skip-paths-prefix.md) | JWT の例の skip_paths が文字列の前方一致で、関係の無い保護されたパスの認証を飛ばしていた |
+| B-439 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-439-jwt-filter-client-claim-headers.md](bugs/B-439-jwt-filter-client-claim-headers.md) | JWT の例がクレームを写すヘッダをクライアントの送った値を消さずに足し、X-User-ID 等を偽れた |
+| B-440 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-440-cache-filter-shares-credentialed-responses.md](bugs/B-440-cache-filter-shares-credentialed-responses.md) | キャッシュの例のフィルタが Vary・Authorization・Cookie を見ず、利用者ごとの応答を他の利用者へ返していた |
+| B-441 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-441-cache-filter-weak-key-hash.md](bugs/B-441-cache-filter-weak-key-hash.md) | キャッシュの例のフィルタのキーが 64 ビットの FNV-1a とキーの先頭 15 バイトで、別の要求で同じキーを作って共有の項目を差し替えられた |
 | B-454 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-454-wasm-proxy-log-unescaped.md](bugs/B-454-wasm-proxy-log-unescaped.md) | Proxy-Wasm の proxy_log がゲストの文字列を制御文字のままアプリのログへ書いていた |
 | B-455 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-455-http3-migration-keeps-handshake-ip.md](bugs/B-455-http3-migration-keeps-handshake-ip.md) | HTTP/3 の接続が別の IP へ移っても、IP で見る検査はハンドシェイクの IP のまま行っていた |
 

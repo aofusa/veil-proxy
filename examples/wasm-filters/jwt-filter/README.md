@@ -77,7 +77,7 @@ cargo build --target wasm32-wasip1 --release
 | `issuer` | string | null | 期待される発行者（`iss`クレーム） |
 | `audience` | string | null | 期待される対象者（`aud`クレーム） |
 | `claims_to_headers` | object | {} | JWTクレームをHTTPヘッダにマッピング（クレーム名 → ヘッダ名） |
-| `skip_paths` | array | ["/health", "/metrics"] | 認証をスキップするパス |
+| `skip_paths` | array | ["/health", "/metrics"] | 認証をスキップするパス。パスそのものとその下だけ（`/public` は `/public/a` を含み、`/publications` は含まない。クエリ文字列は見ない）。`%` の符号化・`;`・`\`・`.`・`..` の区切りを含むパスはスキップしません |
 
 ## トークン形式
 
@@ -140,6 +140,10 @@ JWTに`sub: "user123"`と`email: "user@example.com"`が含まれている場合�
 - `X-User-Email: user@example.com`
 
 がリクエストヘッダに追加されます。
+
+`claims_to_headers` に挙げたヘッダは、クライアントが送ったものをすべての要求（`skip_paths` の要求を含む）で先に取り除きます。
+トークンに該当するクレームが無ければ、そのヘッダは上流へ届きません。ヘッダの書き換えにはモジュールの
+`allow_request_headers_write = true` が要ります（取り除けないときは 500 を返します）。
 
 ## 動作フロー
 

@@ -117,8 +117,28 @@ impl Default for JwtConfig {
 }
 
 impl JwtConfig {
+    /// Whether the request path skips authentication. The query string is not part of the match, and a skip path
+    /// matches only itself and the paths below it (`/public` matches `/public` and `/public/a`, not `/publications`).
+    /// A path with characters outside `A-Z a-z 0-9 / - . _ ~` (percent-encoding, `;` parameters, backslashes) or
+    /// with `.` / `..` segments is never skipped, because an upstream may decode or normalize it into a path outside
+    /// the skip path.
+    // B-438: 以前は文字列の前方一致で、`/public` が `/publications` 等も認証なしで通していた（waf-filter の
+    // `is_path_whitelisted` と同じ判定にする）
     pub fn should_skip(&self, path: &str) -> bool {
-        self.skip_paths.iter().any(|p| path.starts_with(p))
+        let path = path.split(['?', '#']).next().unwrap_or("");
+        let plain = path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'_' | b'~'));
+        if !plain || path.split('/').any(|seg| seg == "." || seg == "..") {
+            return false;
+        }
+        self.skip_paths.iter().any(|p| {
+            !p.is_empty()
+                && (path == p
+                    || path
+                        .strip_prefix(p.as_str())
+                        .is_some_and(|rest| p.ends_with('/') || rest.starts_with('/')))
+        })
     }
 }
 
@@ -261,6 +281,17 @@ impl Context for JwtFilter {
 
 impl HttpContext for JwtFilter {
     fn on_http_request_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
+        // B-439: クレームを写すヘッダは、クライアントが送ったものを先に消す（認証を飛ばすパスでも）。以前は検証した値を
+        // 足すだけで、クライアントの `X-User-ID: alice` 等が先頭の値（クレームが無ければ唯一の値）として上流へ届いた
+        if !self.strip_claim_headers() {
+            self.send_http_response(
+                500,
+                vec![("content-type", "text/plain")],
+                Some(b"Internal Server Error"),
+            );
+            return Action::Pause;
+        }
+
         // Check skip paths
         if let Some(path) = self.get_http_request_header(":path") {
             if self.config.should_skip(&path) {
@@ -545,6 +576,25 @@ impl JwtFilter {
         }
     }
 
+    /// Remove every header named in `claims_to_headers` from the request. False when the host refuses (the
+    /// request must not go on with headers the client may have set).
+    fn strip_claim_headers(&self) -> bool {
+        for header in self.config.claims_to_headers.values() {
+            if let Err(e) =
+                proxy_wasm::hostcalls::set_map_value(MapType::HttpRequestHeaders, header, None)
+            {
+                log::error!(
+                    "[jwt:{}] Failed to remove the request header {}: {:?}",
+                    self.context_id,
+                    header,
+                    e
+                );
+                return false;
+            }
+        }
+        true
+    }
+
     fn add_claims_headers(&self, claims: &JwtClaims) {
         for (claim, header) in &self.config.claims_to_headers {
             let value = match claim.as_str() {
@@ -560,7 +610,19 @@ impl JwtFilter {
             };
 
             if let Some(v) = value {
-                self.add_http_request_header(header, &v);
+                // 同じ名前のヘッダを置き換える（クライアントの値は `strip_claim_headers` で消してある）
+                if let Err(e) = proxy_wasm::hostcalls::set_map_value(
+                    MapType::HttpRequestHeaders,
+                    header,
+                    Some(&v),
+                ) {
+                    log::error!(
+                        "[jwt:{}] Failed to set the request header {}: {:?}",
+                        self.context_id,
+                        header,
+                        e
+                    );
+                }
             }
         }
     }
@@ -886,6 +948,28 @@ mod tests {
         assert!(config.should_skip("/health"));
         assert!(config.should_skip("/health/check"));
         assert!(!config.should_skip("/api/users"));
+    }
+
+    /// B-438: 認証を飛ばすパスはセグメントの境界で比べ、符号化・`.`・`..` を含むパスは飛ばさない
+    #[test]
+    fn skip_paths_respect_segment_boundaries() {
+        let config = JwtConfig {
+            skip_paths: vec!["/health".to_string(), "/public".to_string(), "/static/".to_string()],
+            ..Default::default()
+        };
+        assert!(config.should_skip("/public"));
+        assert!(config.should_skip("/public/a.css?v=1"));
+        assert!(config.should_skip("/static/app.js"));
+        assert!(config.should_skip("/health?probe=1"));
+        assert!(!config.should_skip("/publications/drafts"));
+        assert!(!config.should_skip("/healthz-admin"));
+        assert!(!config.should_skip("/health/../admin"));
+        assert!(!config.should_skip("/public/./../admin"));
+        assert!(!config.should_skip("/public/%2e%2e/admin"));
+        assert!(!config.should_skip("/public;x/../admin"));
+        assert!(!config.should_skip("/public\\..\\admin"));
+        assert!(!config.should_skip("/static"));
+        assert!(!config.should_skip("/admin?next=/public"));
     }
 }
 

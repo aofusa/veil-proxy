@@ -14,6 +14,7 @@ use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use serde::{Deserialize, Serialize};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 mod memcached;
@@ -248,6 +249,7 @@ impl RootContext for CacheFilterRoot {
             if_none_match: None,
             cache_ttl: None,
             vary_headers: None,
+            request_headers: Vec::new(),
         }))
     }
 }
@@ -262,6 +264,9 @@ struct CacheFilter {
     if_none_match: Option<String>,
     cache_ttl: Option<u64>,
     vary_headers: Option<Vec<String>>,
+    /// The request headers, captured when the request arrives (the cache key, the `Vary` check and the
+    /// shared-cache rules read them)
+    request_headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +276,10 @@ struct CachedResponse {
     body: String, // Base64エンコードされた文字列として保存
     #[serde(skip_serializing_if = "Option::is_none")]
     vary_headers: Option<Vec<String>>,
+    /// The values the stored request had for `vary_headers` (in the same order; `None` = absent). A hit is served
+    /// only to a request with the same values
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vary_values: Option<Vec<Option<String>>>,
 }
 
 impl Context for CacheFilter {
@@ -290,7 +299,10 @@ impl Context for CacheFilter {
                             self.context_id, self.cache_key);
                         
                         // Parse cached response and serve it
-                        if let Some(cached) = self.parse_cached_response(&value) {
+                        if let Some(cached) = self
+                            .parse_cached_response(&value)
+                            .filter(|c| self.vary_matches(c))
+                        {
                             // ETagを取得
                             let cached_etag = cached.headers.iter()
                                 .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
@@ -356,6 +368,7 @@ impl HttpContext for CacheFilter {
         // Get method and path
         let method = self.get_http_request_header(":method").unwrap_or_default();
         let path = self.get_http_request_header(":path").unwrap_or_default();
+        self.request_headers = self.get_http_request_headers();
 
         // キャッシュ無効化のチェック
         if self.config.invalidate_enabled {
@@ -401,30 +414,37 @@ impl HttpContext for CacheFilter {
     fn on_http_response_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
         // Add cache status header
         self.add_http_response_header("X-Cache", "MISS");
-        
-        // Check if response is cacheable
-        if let Some(cache_control) = self.get_http_response_header("cache-control") {
-            if cache_control.contains("no-store") || cache_control.contains("private") {
-                log::debug!("[cache:{}] Response not cacheable (Cache-Control)", self.context_id);
-                self.cache_key = None;
-                return Action::Continue;
-            }
-            
-            // TTLを計算（Cache-Controlから抽出）
-            let ttl = Self::parse_cache_control(&cache_control)
-                .unwrap_or(self.config.default_ttl_secs);
-            self.cache_ttl = Some(ttl);
+
+        let cache_control = self.get_http_response_header("cache-control");
+        // Varyヘッダを解析
+        let vary = if self.config.vary_enabled {
+            self.get_http_response_header("vary")
+                .map(|v| Self::parse_vary_header(&v))
         } else {
-            self.cache_ttl = Some(self.config.default_ttl_secs);
+            None
+        };
+        // B-440: 共有のキャッシュに入れてよい応答だけを保存する（資格情報付きの要求・Set-Cookie・`Vary: *`）
+        let shared = SharedCacheInput {
+            cache_control: cache_control.as_deref(),
+            request_authorization: self.request_value("authorization").is_some(),
+            request_cookie: self.request_value("cookie").is_some(),
+            response_set_cookie: self.get_http_response_header("set-cookie").is_some(),
+            vary_any: vary.as_ref().is_some_and(|v| v.iter().any(|n| n == "*")),
+        };
+        if !shared.storable() {
+            log::debug!("[cache:{}] Response not cacheable (shared cache rules)", self.context_id);
+            self.cache_key = None;
+            return Action::Continue;
         }
 
-        // Varyヘッダを解析
-        if self.config.vary_enabled {
-            if let Some(vary_value) = self.get_http_response_header("vary") {
-                let vary_headers = Self::parse_vary_header(&vary_value);
-                self.vary_headers = Some(vary_headers);
-            }
-        }
+        // TTLを計算（Cache-Controlから抽出）
+        self.cache_ttl = Some(
+            cache_control
+                .as_deref()
+                .and_then(Self::parse_cache_control)
+                .unwrap_or(self.config.default_ttl_secs),
+        );
+        self.vary_headers = vary;
 
         // Only cache successful responses
         if let Some(status) = self.get_http_response_header(":status") {
@@ -457,11 +477,16 @@ impl HttpContext for CacheFilter {
                 // BodyをBase64エンコード
                 let body_b64 = base64_encode(&body);
 
-                let cached = CachedResponse { 
-                    status, 
-                    headers, 
+                let vary_values = self
+                    .vary_headers
+                    .as_ref()
+                    .map(|names| names.iter().map(|n| self.request_value(n)).collect());
+                let cached = CachedResponse {
+                    status,
+                    headers,
                     body: body_b64,
                     vary_headers: self.vary_headers.clone(),
+                    vary_values,
                 };
                 
                 // Store in cache
@@ -582,40 +607,47 @@ impl CacheFilter {
         headers
     }
     
-    /// Generate cache key from request (with collision prevention)
+    /// Generate the cache key of a request (see `cache_key`)
     fn generate_cache_key(&self, method: &str, path: &str) -> String {
-        let mut key_parts = vec![method.to_string(), path.to_string()];
-        
-        // Add configured headers to key
-        for header_name in &self.config.key_headers {
-            if let Some(value) = self.get_http_request_header(header_name) {
-                // ヘッダ値が長すぎる場合は切り詰める
-                let truncated_value = if value.len() > 100 {
-                    &value[..100]
-                } else {
-                    &value
-                };
-                key_parts.push(format!("{}={}", header_name, truncated_value));
+        let authority = self.request_value(":authority").unwrap_or_default();
+        let key_headers: Vec<(String, Option<String>)> = self
+            .config
+            .key_headers
+            .iter()
+            .map(|name| (name.to_ascii_lowercase(), self.request_value(name)))
+            .collect();
+        cache_key(method, &authority, path, &key_headers)
+    }
+
+    /// Every value of a request header (case-insensitive name), joined with `\n` (a header value cannot contain
+    /// one); `None` when the request has none
+    fn request_value(&self, name: &str) -> Option<String> {
+        let mut out: Option<String> = None;
+        for (k, v) in &self.request_headers {
+            if k.eq_ignore_ascii_case(name) {
+                match out.as_mut() {
+                    Some(o) => {
+                        o.push('\n');
+                        o.push_str(v);
+                    }
+                    None => out = Some(v.clone()),
+                }
             }
         }
-        
-        let key_str = key_parts.join("|");
-        let hash = simple_hash(&key_str);
-        
-        // ハッシュとキー文字列の短縮版を組み合わせ（衝突対策）
-        let key_suffix = if key_str.len() > 50 {
-            base64_encode(&key_str.as_bytes()[..50])
-                .chars()
-                .take(20)
-                .collect::<String>()
-        } else {
-            base64_encode(key_str.as_bytes())
-                .chars()
-                .take(20)
-                .collect::<String>()
-        };
-        
-        format!("veil:cache:{}:{}", hash, key_suffix)
+        out
+    }
+
+    /// Whether a stored response may be served to this request: the request must have the same values for every
+    /// header the response's `Vary` named
+    fn vary_matches(&self, cached: &CachedResponse) -> bool {
+        match (&cached.vary_headers, &cached.vary_values) {
+            (None, _) => true,
+            (Some(names), Some(values)) if names.len() == values.len() => names
+                .iter()
+                .zip(values)
+                .all(|(n, v)| self.request_value(n) == *v),
+            _ => false,
+        }
     }
 
     /// Fetch from cache backend
@@ -696,8 +728,8 @@ impl CacheFilter {
         let cache_key = if pattern.starts_with("veil:cache:") {
             pattern.to_string()
         } else {
-            // パターンからキーを生成（簡易実装）
-            format!("veil:cache:{}", simple_hash(pattern))
+            // パターンをパスとして、この要求と同じホスト・キーのヘッダの GET のキーを作る
+            self.generate_cache_key("GET", pattern)
         };
         
         match self.config.backend {
@@ -754,14 +786,68 @@ impl CacheFilter {
     }
 }
 
-/// Simple hash function for cache keys
-fn simple_hash(s: &str) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
-    for byte in s.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+/// The cache key: SHA-256 over a length-prefixed encoding of the method, the authority, the path and each key
+/// header's name and every value (`veil:cache:v2:<64 hex digits>`)
+// B-441: 以前は 64 ビットの FNV-1a とキー文字列の先頭 15 バイトで、別のパスで同じキーを作って共有の項目を
+// 差し替えられた。ヘッダの値を 100 バイトで切っていたので、先頭の同じ値どうしも同じキーになった
+fn cache_key(method: &str, authority: &str, path: &str, key_headers: &[(String, Option<String>)]) -> String {
+    fn put(h: &mut Sha256, b: &[u8]) {
+        h.update((b.len() as u64).to_be_bytes());
+        h.update(b);
     }
-    hash
+    let mut h = Sha256::new();
+    put(&mut h, b"veil-cache-v2");
+    put(&mut h, method.as_bytes());
+    put(&mut h, authority.as_bytes());
+    put(&mut h, path.as_bytes());
+    for (name, value) in key_headers {
+        put(&mut h, name.as_bytes());
+        match value {
+            Some(v) => {
+                put(&mut h, b"1");
+                put(&mut h, v.as_bytes());
+            }
+            None => put(&mut h, b"0"),
+        }
+    }
+    let mut out = String::with_capacity(14 + 64);
+    out.push_str("veil:cache:v2:");
+    for b in h.finalize() {
+        out.push(char::from(b"0123456789abcdef"[usize::from(b >> 4)]));
+        out.push(char::from(b"0123456789abcdef"[usize::from(b & 0xf)]));
+    }
+    out
+}
+
+/// What decides whether a response may go into the shared cache (RFC 9111 §3 and §3.5)
+struct SharedCacheInput<'a> {
+    cache_control: Option<&'a str>,
+    request_authorization: bool,
+    request_cookie: bool,
+    response_set_cookie: bool,
+    vary_any: bool,
+}
+
+impl SharedCacheInput<'_> {
+    /// `no-store`・`private`, a `Set-Cookie` response and `Vary: *` are never stored. A response to a request with
+    /// `Authorization` or `Cookie` is stored only when `Cache-Control` says it may be shared (`public` or `s-maxage`)
+    fn storable(&self) -> bool {
+        let mut public = false;
+        if let Some(cc) = self.cache_control {
+            for d in cc.split(',') {
+                let name = d.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+                match name.as_str() {
+                    "no-store" | "private" => return false,
+                    "public" | "s-maxage" => public = true,
+                    _ => {}
+                }
+            }
+        }
+        if self.response_set_cookie || self.vary_any {
+            return false;
+        }
+        public || !(self.request_authorization || self.request_cookie)
+    }
 }
 
 /// Base64 encoding using standard library
@@ -772,4 +858,61 @@ fn base64_encode(data: &[u8]) -> String {
 /// Base64 decoding using standard library
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     STANDARD.decode(s).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_separates_fields() {
+        let k = |m: &str, a: &str, p: &str, h: &[(&str, Option<&str>)]| {
+            let h: Vec<(String, Option<String>)> =
+                h.iter().map(|(n, v)| (n.to_string(), v.map(str::to_string))).collect();
+            cache_key(m, a, p, &h)
+        };
+        let base = k("GET", "a.example", "/products/123", &[("accept", Some("*/*"))]);
+        assert!(base.starts_with("veil:cache:v2:") && base.len() == 14 + 64);
+        assert_eq!(base, k("GET", "a.example", "/products/123", &[("accept", Some("*/*"))]));
+        assert_ne!(base, k("GET", "b.example", "/products/123", &[("accept", Some("*/*"))]));
+        assert_ne!(base, k("HEAD", "a.example", "/products/123", &[("accept", Some("*/*"))]));
+        assert_ne!(base, k("GET", "a.example", "/products/124", &[("accept", Some("*/*"))]));
+        assert_ne!(base, k("GET", "a.example", "/products/123", &[("accept", None)]));
+        assert_ne!(base, k("GET", "a.example", "/products/123", &[("accept", Some(""))]));
+        // フィールドの区切りをまたいでも同じにならない
+        assert_ne!(k("GET", "a", "|b", &[]), k("GET", "a|", "b", &[]));
+        // 長い値も全部を見る
+        let long_a = "x".repeat(200) + "a";
+        let long_b = "x".repeat(200) + "b";
+        assert_ne!(
+            k("GET", "h", "/", &[("accept", Some(&long_a))]),
+            k("GET", "h", "/", &[("accept", Some(&long_b))])
+        );
+    }
+
+    #[test]
+    fn shared_cache_rules() {
+        let input = |cc: Option<&'static str>, authz: bool, cookie: bool, set_cookie: bool, vary_any: bool| {
+            SharedCacheInput {
+                cache_control: cc,
+                request_authorization: authz,
+                request_cookie: cookie,
+                response_set_cookie: set_cookie,
+                vary_any,
+            }
+            .storable()
+        };
+        assert!(input(None, false, false, false, false));
+        assert!(input(Some("max-age=60"), false, false, false, false));
+        assert!(!input(Some("max-age=60, private"), false, false, false, false));
+        assert!(!input(Some("No-Store"), false, false, false, false));
+        // 資格情報付きの要求は共有してよいと書かれたときだけ
+        assert!(!input(None, true, false, false, false));
+        assert!(!input(Some("max-age=60"), false, true, false, false));
+        assert!(input(Some("public, max-age=60"), true, false, false, false));
+        assert!(input(Some("s-maxage=60"), false, true, false, false));
+        // Set-Cookie と Vary: * は保存しない
+        assert!(!input(Some("public"), false, false, true, false));
+        assert!(!input(Some("public"), false, false, false, true));
+    }
 }
