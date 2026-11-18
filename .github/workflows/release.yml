@@ -208,7 +208,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: create manifests, tag and sign
         env:
           TAG: ${{ needs.verify.outputs.tag }}
@@ -492,7 +492,7 @@ jobs:
         env:
           TAG: ${{ needs.verify.outputs.tag }}
         run: tools/release/helm-kind-test.sh "$IMAGE:musl-$TAG"
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: package, push and sign
         env:
           VERSION: ${{ needs.verify.outputs.version }}
@@ -559,7 +559,7 @@ jobs:
           ls -l
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         if: ${{ steps.state.outputs.published != 'true' }}
       - name: sign the checksums (Sigstore keyless)
         if: ${{ steps.state.outputs.published != 'true' }}
