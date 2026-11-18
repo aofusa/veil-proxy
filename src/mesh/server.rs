@@ -182,11 +182,17 @@ async fn accept_loop<F, Fut>(
     Fut: std::future::Future<Output = ()> + 'static,
 {
     let pool = crate::runtime::TaskPool::new();
+    // B-475: 1 秒の区切りで受理の要求を取り消さない（取り消しと行き違って受理された接続を閉じていた）
+    let mut accept = std::pin::pin!(l.accept());
     loop {
         if stop.get() || crate::config::SHUTDOWN_FLAG.load(Ordering::Relaxed) {
             return;
         }
-        match crate::runtime::timeout(Duration::from_secs(1), l.accept()).await {
+        let r = crate::runtime::timeout(Duration::from_secs(1), accept.as_mut()).await;
+        if r.is_ok() {
+            accept.set(l.accept());
+        }
+        match r {
             Ok(Ok((stream, peer))) => {
                 // B-314: 接続タスクの panic をタスクの中で止める（データプレーンの accept と同じ）。
                 // 止めないと 1 つの要求の panic でワーカーと、その上の全接続が落ちる

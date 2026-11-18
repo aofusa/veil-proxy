@@ -2121,4 +2121,81 @@ mod tests {
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
         }
     }
+
+    /// B-475: 待ちの区切り（timeout）が先に来ても、同じ Accept を poll し続ければ区切りと行き違って来た接続を
+    /// 受け取れる。accept のループはこれを頼りに、停止の確認の区切りで受理の要求を取り消さない。ここで Accept を
+    /// 落とすと（修正前のループ）、提出された ACCEPT がバックログの接続をすぐに受理し、後始末がその fd を閉じる。
+    #[test]
+    // 理由付き allow: テストのクライアント（ループバックの connect はその場で終わる）。
+    #[allow(clippy::disallowed_methods)]
+    fn test_b475_accept_kept_across_a_timeout_delivers_the_connection() {
+        if !io_uring_available() {
+            eprintln!(
+                "io_uring unavailable; skipping test_b475_accept_kept_across_a_timeout_delivers_the_connection"
+            );
+            return;
+        }
+        use futures::FutureExt as _;
+        crate::runtime::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("local_addr");
+            let mut accept = std::pin::pin!(listener.accept());
+            for _ in 0..3 {
+                // timeout と同じ順（内側の accept が先）に poll し、区切りの枝が勝つ直前に接続が来る
+                let client = futures::select_biased! {
+                    _ = accept.as_mut().fuse() => panic!("accepted before any client connected"),
+                    c = async { std::net::TcpStream::connect(addr).expect("connect") }.fuse() => c,
+                };
+                let (stream, peer) =
+                    crate::runtime::timeout(std::time::Duration::from_secs(5), accept.as_mut())
+                        .await
+                        .expect("the connection that raced the timeout was lost")
+                        .expect("accept");
+                assert_eq!(peer, client.local_addr().expect("client addr"));
+                drop(stream);
+                accept.set(listener.accept());
+            }
+        });
+    }
+
+    /// B-475: 提出した Accept を落とすと、行き違ってカーネルが受理した接続は後始末が閉じる（fd を漏らさない）。
+    /// 修正前の accept のループ（区切りのたびに Accept を落とす）で接続が応答無しで切られた形をそのまま再現する。
+    #[test]
+    // 理由付き allow: テストのクライアント（ループバックの connect はその場で終わる）。
+    #[allow(clippy::disallowed_methods)]
+    fn test_b475_dropping_an_in_flight_accept_closes_the_raced_connection() {
+        if !io_uring_available() {
+            eprintln!(
+                "io_uring unavailable; skipping test_b475_dropping_an_in_flight_accept_closes_the_raced_connection"
+            );
+            return;
+        }
+        use futures::FutureExt as _;
+        let mut client = crate::runtime::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("local_addr");
+            let client = futures::select_biased! {
+                _ = listener.accept().fuse() => panic!("accepted before any client connected"),
+                c = async { std::net::TcpStream::connect(addr).expect("connect") }.fuse() => c,
+            };
+            // 落とした Accept の ACCEPT は取り消しと一緒に提出され、バックログの接続をその場で受理していた
+            let next =
+                crate::runtime::timeout(std::time::Duration::from_millis(300), listener.accept())
+                    .await;
+            assert!(
+                next.is_err(),
+                "the raced connection was not consumed by the dropped accept"
+            );
+            client
+        });
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).expect("read"),
+            0,
+            "the accepted fd was not closed"
+        );
+    }
 }

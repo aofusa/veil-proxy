@@ -829,6 +829,7 @@
 | B-468 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-468-capi-l4-session-no-on-close.md](bugs/B-468-capi-l4-session-no-on-close.md) | C の L4・アップグレードの接続で、最初の送信に失敗すると on_close を呼ばずにセッションを捨てていた |
 | B-469 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-469-python-nan-range-bypass.md](bugs/B-469-python-nan-range-bypass.md) | Python の数の範囲の検査（ge・gt・le・lt、minimum・maximum）を NaN が通っていた |
 | B-474 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-474-windows-wasm-reuse-test-copy-mtime.md](bugs/B-474-windows-wasm-reuse-test-copy-mtime.md) | Windows で WASM のエンジンの再利用の試験が、mtime を写したコピーへの置き換えを見分けられずに失敗していた（印は大きさと mtime だけ。印を見るのは seccomp のある Linux のリロードだけなので試験の不具合） |
+| B-475 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-475-uring-accept-loop-cancel-race.md](bugs/B-475-uring-accept-loop-cancel-race.md) | io_uring の accept のループが停止の確認の 1 秒の区切りで受理の要求を取り消し、行き違ってカーネルが受理した接続を後始末が閉じていた（区切りの直後の接続が応答無しで切られる。Accept を区切りをまたいで持ち越す） |
 
 ---
 

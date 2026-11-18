@@ -318,6 +318,10 @@ fn spawn_workers<S, Fut>(
                 // F-46: 接続ハンドラの型付きタスクプール（spawn ごとの Box 確保を排除）
                 let conn_pool = crate::runtime::TaskPool::new();
                 let mut backoff = AcceptBackoff::new();
+                // B-475: 停止の確認のために 1 秒で待ちを区切っても、受理の要求は取り消さずに次の周回へ持ち越す。
+                // io_uring では取り消しとカーネルの受理が行き違うと、受理済みの接続を Accept の後始末が閉じていた
+                // （区切りの直後に来た接続が応答無しで切られる）。ワーカーにつき 1 回の確保（停止の後に落とすため Box）
+                let mut accept = Box::pin(listener.accept());
 
                 loop {
                     // Shutdown チェック
@@ -327,7 +331,11 @@ fn spawn_workers<S, Fut>(
                     }
 
                     // タイムアウト付きaccept（Graceful Shutdown対応）
-                    let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
+                    let accept_result = timeout(Duration::from_secs(1), accept.as_mut()).await;
+                    if accept_result.is_ok() {
+                        // 終わった受理の次を用意する（提出は次に poll したとき）
+                        accept.set(listener.accept());
+                    }
 
                     let (stream, peer_addr) = match accept_result {
                         Ok(Ok(s)) => {
@@ -418,6 +426,8 @@ fn spawn_workers<S, Fut>(
                         }
                     }
                 }
+                // 停止の後は受理しない（待っている受理を取り消す。従来と同じく排出の間は受理の要求を出さない）
+                drop(accept);
 
                 // グレースフルシャットダウン: 既存接続の完了を待機
                 drain_connections(&label, thread_id).await;

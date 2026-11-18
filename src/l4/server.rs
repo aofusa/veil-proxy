@@ -223,6 +223,9 @@ pub fn spawn_l4_listeners(
                                     let conn_pool = crate::runtime::TaskPool::new();
                                     let mut backoff = crate::listener_workers::AcceptBackoff::new();
                                     let backoff_label = format!("L4:{} Worker", config.name);
+                                    // B-475: 1 秒の区切りで受理の要求を取り消さない（HTTP のワーカーと同じ。
+                                    // 取り消しと行き違って受理された接続を閉じていた）
+                                    let mut accept = std::pin::pin!(listener.accept());
 
                                     loop {
                                         if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
@@ -234,8 +237,10 @@ pub fn spawn_l4_listeners(
                                         }
 
                                         let accept_result =
-                                            timeout(Duration::from_secs(1), listener.accept())
-                                                .await;
+                                            timeout(Duration::from_secs(1), accept.as_mut()).await;
+                                        if accept_result.is_ok() {
+                                            accept.set(listener.accept());
+                                        }
 
                                         let (stream, peer_addr) = match accept_result {
                                             Ok(Ok(s)) => {
@@ -408,16 +413,18 @@ fn spawn_l4_handler_listener(
                             let conn_pool = crate::runtime::TaskPool::new();
                             let mut backoff = crate::listener_workers::AcceptBackoff::new();
                             let backoff_label = format!("L4:{} Worker", listener_name);
+                            // B-475: 1 秒の区切りで受理の要求を取り消さない
+                            let mut accept = std::pin::pin!(listener.accept());
                             loop {
                                 if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
                                     break;
                                 }
-                                let (stream, peer) = match timeout(
-                                    Duration::from_secs(1),
-                                    listener.accept(),
-                                )
-                                .await
-                                {
+                                let accept_result =
+                                    timeout(Duration::from_secs(1), accept.as_mut()).await;
+                                if accept_result.is_ok() {
+                                    accept.set(listener.accept());
+                                }
+                                let (stream, peer) = match accept_result {
                                     Ok(Ok(s)) => {
                                         backoff.on_success();
                                         s
