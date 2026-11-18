@@ -744,8 +744,6 @@ impl Client {
 
     /// 同期版（専用スレッド用: ヘルスチェック・WASM の外部呼び出し・OpenTelemetry）。
     /// 接続完了まで `timeout` 以内で待ち、接続済みの非ブロッキングソケットを返す。
-    // 理由付き allow: 専用スレッド（イベントループ外）からのみ呼ぶ同期 API。
-    #[allow(clippy::disallowed_methods)]
     pub fn connect_blocking(&self, idx: u32, timeout: Duration) -> io::Result<RawFd> {
         let deadline = Instant::now() + timeout;
         let remaining = |d: Instant| -> io::Result<i32> {
@@ -760,7 +758,9 @@ impl Client {
                 Ok(fd) => break fd,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     remaining(deadline)?;
-                    std::thread::sleep(Duration::from_millis(1));
+                    // B-478: ブローカーは capability mode のときだけ動くので、ここは常に capability mode の中。
+                    // std の sleep（clock_nanosleep）は ECAPMODE で panic する
+                    crate::server::cap_safe_sleep(Duration::from_millis(1));
                 }
                 Err(e) => return Err(e),
             }

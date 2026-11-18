@@ -219,7 +219,7 @@ pub(crate) fn perform_health_check(
 ) -> bool {
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, ClientConnection};
-    use std::io::{ErrorKind, Read, Write};
+    use std::io::{Read, Write};
     use std::sync::Arc;
 
     // F-170: TCP/UDS 共通の接続入口（パース失敗は false へ変換）。
@@ -306,16 +306,13 @@ pub(crate) fn perform_health_check(
             Err(_) => return false,
         };
 
-        // ハンドシェイクを実行（同期）
+        // ハンドシェイクを実行（同期）。B-478: プローブのソケットはブロッキングで、読み書きに `timeout` を掛けてある
+        // （`connect_probe`）ので、`WouldBlock` はその時間切れ。失敗にする（以前は 10ms 眠って繰り返し、ハンドシェイクの
+        // 途中で黙る上流で、全部の上流を順に確かめる 1 本のスレッドが止まり続けた。FreeBSD の capability mode では
+        // `std::thread::sleep` が panic してスレッドが終わっていた）
         while tls_conn.is_handshaking() {
-            match tls_conn.complete_io(&mut tcp_stream) {
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    // 非ブロッキングI/Oの場合は短い待機
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(_) => return false,
+            if tls_conn.complete_io(&mut tcp_stream).is_err() {
+                return false;
             }
         }
 
@@ -676,14 +673,10 @@ pub(crate) fn perform_grpc_health_check(
             Ok(c) => c,
             Err(_) => return false,
         };
-        use std::io::ErrorKind;
+        // B-478: `WouldBlock` は読み書きの時間切れ（`perform_health_check` と同じ）。眠って繰り返さない
         while tls_conn.is_handshaking() {
-            match tls_conn.complete_io(&mut tcp_stream) {
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => return false,
+            if tls_conn.complete_io(&mut tcp_stream).is_err() {
+                return false;
             }
         }
         let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp_stream);
@@ -1283,16 +1276,16 @@ fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
     if pattern.contains('{') {
         return crate::api::pattern::route_pattern_matches(pattern, path);
     }
-    // B-426: 末尾が `/` のパターン（`/admin/`）も前方一致（`/admin`・`/admin/`・`/admin/...`。ルーターの
-    // `PathRouter::matches_pattern` と同じ）。以前は `/admin/users` に一致しなかった
-    let pattern = pattern.strip_suffix('/').unwrap_or(pattern);
-
 
     // ワイルドカードパターン: "/api/*"
     if let Some(prefix) = pattern.strip_suffix("/*") {
         return path_str.starts_with(prefix)
             && (path_str.len() == prefix.len() || path_str.as_bytes()[prefix.len()] == b'/');
     }
+
+    // B-426: 末尾が `/` のパターン（`/admin/`）も前方一致（`/admin`・`/admin/`・`/admin/...`。ルーターの
+    // `PathRouter::matches_pattern` と同じ）。以前は `/admin/users` に一致しなかった
+    let pattern = pattern.strip_suffix('/').unwrap_or(pattern);
 
     // プレフィックス一致（末尾スラッシュなしでもマッチ）
     if let Some(remaining) = path_str.strip_prefix(pattern) {
@@ -1378,11 +1371,6 @@ mod tests {
     #[test]
     fn test_b96_root_path_pattern_matches_every_path() {
         assert!(matches_path_pattern("/", b"/"));
-        // B-426: 末尾が `/` のパターンも前方一致
-        assert!(matches_path_pattern("/api/", b"/api/v1"));
-        assert!(matches_path_pattern("/api/", b"/api"));
-        assert!(matches_path_pattern("/api/", b"/api/"));
-        assert!(!matches_path_pattern("/api/", b"/apix"));
         assert!(matches_path_pattern("/", b"/small.html"));
         assert!(matches_path_pattern("/", b"/a/b/c"));
         // 既存の意味論は不変
@@ -1390,6 +1378,11 @@ mod tests {
         assert!(!matches_path_pattern("/api/*", b"/apix"));
         assert!(matches_path_pattern("/api", b"/api/v1"));
         assert!(!matches_path_pattern("/api", b"/apix"));
+        // B-426: 末尾が `/` のパターンも前方一致
+        assert!(matches_path_pattern("/api/", b"/api/v1"));
+        assert!(matches_path_pattern("/api/", b"/api"));
+        assert!(matches_path_pattern("/api/", b"/api/"));
+        assert!(!matches_path_pattern("/api/", b"/apix"));
 
         let conditions = crate::config::RouteConditions {
             path: Some("/".to_string()),
@@ -1661,6 +1654,36 @@ mod tests {
         let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
         let mut sink = [0u8; 512];
         while matches!(conn.read(&mut sink), Ok(n) if n > 0) {}
+    }
+
+    /// B-478: TLS のハンドシェイクの途中で黙る上流は `timeout` で失敗にする（以前は 10ms 眠って繰り返し、全部の上流を
+    /// 確かめる 1 本のスレッドが止まり続けた。FreeBSD の capability mode では sleep が panic した）
+    #[test]
+    fn test_health_check_gives_up_on_a_stalled_tls_handshake() {
+        // TLS のクライアント設定はプロセスの既定の暗号プロバイダを使う（本番は起動時に入れる）
+        let _ = crate::tls_provider::provider::default_provider().install_default();
+        // 接続は受ける（カーネルの待ち行列）が、ClientHello に何も返さない
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let t = Duration::from_millis(200);
+            let http = perform_health_check(&addr, "localhost", "/", true, false, t, &[200]);
+            let grpc = perform_grpc_health_check(&addr, "", true, false, t);
+            let _ = tx.send((http, grpc));
+        });
+        let (http, grpc) = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the health check kept waiting for a stalled TLS handshake");
+        assert!(
+            !http,
+            "an upstream that never answers the handshake must be unhealthy"
+        );
+        assert!(
+            !grpc,
+            "an upstream that never answers the handshake must be unhealthy"
+        );
+        drop(listener);
     }
 
     #[test]
