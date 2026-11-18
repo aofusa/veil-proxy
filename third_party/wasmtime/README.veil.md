@@ -2,8 +2,16 @@
 
 ## 由来
 
-crates.io の [`wasmtime` 36.0.20](https://crates.io/crates/wasmtime/36.0.20)（LTS）をそのままコピー
+crates.io の [`wasmtime` 36.0.21](https://crates.io/crates/wasmtime/36.0.21)（LTS）をそのままコピー
 （36.0.19 までは `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasmtime-<版>/` から）。
+
+> **2026-11-18: 36.0.20 → 36.0.21（B-479）。** GHSA-hj27-mpw9-ff4c（low、2026-11-16 公開。WebAssembly から呼ばれて
+> いないホスト関数で `Caller::get_module_export` が panic する）の修正版。veil は `get_module_export` を呼ばないが、同じ LTS の
+> 修正版に揃えた（container-security の nightly の `cargo_audit` が、この vendoring の版を上流の勧告と照合して落ちていた）。
+> 36.0.20 との差は `src/runtime/instance.rs` の 1 行と `Cargo.toml`（依存の版）だけなので、crates.io の
+> `wasmtime-36.0.21.crate`（sha256 が crates.io の索引の `cksum` と一致することを確かめた）から `instance.rs` を取り込み、
+> `Cargo.toml` の版（`36.0.20` → `36.0.21`、Cranelift の `0.123.20` → `0.123.21`）を書き換えた。下の差分はそのまま残っている
+> （上流の 36.0.21 との差が、上流の 36.0.20 との差と同じであることを確かめた）。
 
 > **2026-11-01: 36.0.19 → 36.0.20（v0.10.0、B-263）。** GHSA-6fr9-xmw9-5352（component model で自分が定義した資源の
 > `borrow` を受け取るたびにホストのメモリが数えられずに増える）の修正版。veil は core module しか使わないが、同じ LTS の
@@ -29,7 +37,7 @@ crates.io の [`wasmtime` 36.0.20](https://crates.io/crates/wasmtime/36.0.20)（
 > MSRV 1.86 の LTS 36 系を選んだ。veil が使う API（core module・async + fuel yield・
 > epoch 割り込み・プーリングアロケータ・Cranelift / Pulley）は 36 でもそのまま使える。
 > 本体の crates.io 依存（Linux / macOS / Windows / FreeBSD x86_64 / OpenBSD x86_64）も
-> 同じ版に揃えてある（現在 36.0.19）。
+> 同じ版に揃えてある（現在 36.0.21）。
 `Cargo.toml` / `Cargo.toml.orig` / `LICENSE` / `README.md` / `build.rs` / `src/` を取り込み、
 `Cargo.lock` / `.cargo-ok` / `tests/` / `proptest-regressions/` は取り込んでいない
 （veil のワークスペースビルドには不要で、`tests/` は crates.io 公開物とは無関係の

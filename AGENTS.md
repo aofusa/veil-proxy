@@ -381,7 +381,7 @@ cargo test --test standalone_e2e --features full                   # 自己完�
 | `docs/perf/` | 最新のベンチマーク結果 |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
 | `docs/artifacts/` | AI 成果物・一時ファイル（git 管理外） |
-| `third_party/wasmtime/` | wasmtime 36.0.20（LTS）の vendoring（B-55 / B-79 / B-155 / B-157 / B-263。`profiling` は外した。B-158） |
+| `third_party/wasmtime/` | wasmtime 36.0.21（LTS）の vendoring（B-55 / B-79 / B-155 / B-157 / B-263 / B-479。`profiling` は外した。B-158） |
 | `third_party/quiche/` | quiche 0.24.9 の vendoring（F-172、STREAM フレーム coalescing） |
 | `third_party/quinn-udp/` | テスト用 HTTP/3 クライアントの quinn-udp 0.5.16 の vendoring（NetBSD/aarch64 の CMSG アラインメント。B-62/F-176/B-400） |
 | `docker/` | コンテナイメージ・Windows/macOS クロスビルド用 Dockerfile・共有アセット |
