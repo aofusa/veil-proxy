@@ -75,7 +75,8 @@ docker build -f docker/Dockerfile.mesh-linkerd -t veil.local/linkerd-proxy:edge-
   - veil が評価できない RBAC の規則（CEL の条件、permission の `metadata`・`matcher`）は安全側に倒す: ALLOW のポリシーでは
     一致させず、DENY のポリシーでは常に一致させる（`not_rule`・`not_id` の下では反転）。そのようなポリシーを受け取ると
     ポリシー名付きで警告を出す。
-- 観測: Istio の標準メトリクス（pilot-agent の統合メトリクス経由の `istio_requests_total` 等）、Telemetry API の
+- 観測: Istio の標準メトリクス（pilot-agent の統合メトリクス経由の `istio_requests_total` 等。ワーカーごとにラベルの組は
+  2,048 までで、それを超えた新しい相手はワークロード・プリンシパルを `unknown` にして数える）、Telemetry API の
   アクセスログ（Envoy の既定の書式）、分散トレース（Zipkin・B3）。
 - WasmPlugin（ECDS → veil の Proxy-Wasm。C++ SDK 製のモジュールも動く）。リソースの `failStrategy`（既定の `FAIL_CLOSE` か
   `FAIL_OPEN`。Envoy の `failure_policy` では `FAIL_CLOSED`・`FAIL_OPEN`・`FAIL_RELOAD`）は veil の `failure_policy` になる
@@ -112,6 +113,13 @@ init コンテナ（`linkerd-init`）も同じイメージで動くので、veil
 - 観測: `/metrics` は linkerd2-proxy と同じ名前とラベル（`request_total`・`response_total`・`response_latency_ms`・
   `tcp_*`・`control_identity_cert_expiration_timestamp_seconds`）なので `linkerd viz stat`・`edges` が動く。4190 の
   tap（`linkerd viz tap` / `top`。tap サービスの ID からだけ受ける）。emojivoto・booksapp を全 Pod veil で動かせる。
+- 管理ポート（4191。linkerd2-proxy と同じ）: `/live`・`/ready` は誰にでも答える（kubelet のプローブ）。`/shutdown`・
+  `/env.json`・`/proxy-log-level` は Pod の中（ループバック）からだけ答える。Pod の外からの `/metrics` は管理ポートの
+  inbound のポリシーで認可する（既定のポリシーを絞ったクラスタでは、本家のプロキシと同じく
+  `linkerd viz allow-scrapes` でスクレイプを許可する）。
+- inbound のポートはプロキシ自身のポートへ中継しない。inbound のポート（4143）へ直接来た接続は、mTLS のクライアントの
+  ID と transport header があるときだけ受け、transport header がプロキシのポート（4143・4140・4190・4191）を指すものは
+  断る。
 
 ## 環境変数
 
@@ -134,6 +142,10 @@ init コンテナ（`linkerd-init`）も同じイメージで動くので、veil
   証明書を検査する（IP のホストも）。サーバ名にならないホストは接続を失敗にする。`override_auto_sni_header` は未対応
   （`Host`・`:authority` を使う）。
 - 証明書の失効リスト（検証コンテキストの `crl`）は未対応。含む設定・SDS の秘密は、失効を検査せずに適用せず拒否（NACK）する。
+- veil が検査しない他の検証の設定も同じく拒否する: インラインでない `trusted_ca`（ファイル・環境変数。SDS の秘密は可）、
+  証明書のピン留め（`verify_certificate_hash`・`verify_certificate_spki`）、`require_signed_certificate_timestamp`、
+  `system_root_certs`、`ca_certificate_provider_instance`、`watched_directory`、`custom_validator_config`。信頼アンカーの
+  無い下流の TLS コンテキストの `require_client_certificate` も拒否する。
 - 受けた `x-forwarded-client-cert` ヘッダは、相手が TLS でクライアント証明書を出したときだけ残す（`ALWAYS_FORWARD_ONLY` は
   常に残す。Envoy と同じ）。
 - Linkerd: inbound のポートのポリシーが 3 秒で届かないときは、既定のポリシー（`LINKERD2_PROXY_INBOUND_DEFAULT_POLICY`）で

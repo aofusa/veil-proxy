@@ -1540,6 +1540,24 @@ pub struct SdsSecretConfig {
 pub struct CertificateValidationContext {
     #[prost(message, optional, tag = "1")]
     pub trusted_ca: Option<DataSource>,
+    /// 証明書のハッシュ・SPKI のピン留め。検査しないので、あれば拒否する（黙って捨てると検証が外れる。B-442）
+    #[prost(string, repeated, tag = "2")]
+    pub verify_certificate_hash: Vec<String>,
+    #[prost(string, repeated, tag = "3")]
+    pub verify_certificate_spki: Vec<String>,
+    /// 証明書の透明性（SCT）の要求。検査しないので、真なら拒否する（B-442）
+    #[prost(message, optional, tag = "6")]
+    pub require_signed_certificate_timestamp: Option<BoolValue>,
+    /// 信頼アンカーの他の与え方（ディレクトリの監視・独自の検証器・証明書の提供者・システムのルート）。扱わないので、
+    /// あれば拒否する（中身は見ないので空のメッセージとして読む。B-442）
+    #[prost(message, optional, tag = "11")]
+    pub watched_directory: Option<Empty>,
+    #[prost(message, optional, tag = "12")]
+    pub custom_validator_config: Option<Empty>,
+    #[prost(message, optional, tag = "13")]
+    pub ca_certificate_provider_instance: Option<Empty>,
+    #[prost(message, optional, tag = "17")]
+    pub system_root_certs: Option<Empty>,
     /// 失効リスト。検査を実装していないので、あれば拒否する（黙って捨てない。B-323）
     #[prost(message, optional, tag = "7")]
     pub crl: Option<DataSource>,

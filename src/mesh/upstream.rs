@@ -484,7 +484,7 @@ fn request_server_name(host: &[u8]) -> Option<rustls::pki_types::ServerName<'sta
     rustls::pki_types::ServerName::try_from(s.to_string()).ok()
 }
 
-fn server_name(sni: &str, addr: SocketAddr) -> rustls::pki_types::ServerName<'static> {
+pub(crate) fn server_name(sni: &str, addr: SocketAddr) -> rustls::pki_types::ServerName<'static> {
     if !sni.is_empty() {
         if let Ok(n) = rustls::pki_types::ServerName::try_from(sni.to_string()) {
             return n;

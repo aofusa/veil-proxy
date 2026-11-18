@@ -93,6 +93,8 @@ pub struct TracerCfg {
     pub collector: Arc<ClusterSlot>,
     pub path: String,
     pub host: String,
+    /// コレクタの URI が `https://`（クラスタに TLS が無ければ送らない。B-466）
+    pub https: bool,
     pub trace_id_128: bool,
     /// サンプリング（百万分率）
     pub sampling: u32,
@@ -122,6 +124,7 @@ pub fn from_full(
         return None;
     }
     // uri は "http://host/path" か "/path"
+    let https = uri.starts_with("https://");
     let (host, path) = match uri
         .strip_prefix("http://")
         .or_else(|| uri.strip_prefix("https://"))
@@ -160,6 +163,7 @@ pub fn from_full(
         collector: reg.cluster_slot(&cluster),
         path,
         host,
+        https,
         trace_id_128: z.trace_id_128bit,
         sampling: full
             .random_sampling
@@ -361,9 +365,10 @@ fn reporter(cfg: &Arc<TracerCfg>) -> Option<SyncSender<String>> {
     let slot = cfg.collector.clone();
     let host = cfg.host.clone();
     let path = cfg.path.clone();
+    let https = cfg.https;
     std::thread::Builder::new()
         .name("veil-tracing".into())
-        .spawn(move || report_loop(rx, slot, host, path))
+        .spawn(move || report_loop(rx, slot, host, path, https))
         .ok()?;
     g.push((key, tx.clone()));
     Some(tx)
@@ -376,8 +381,16 @@ fn report_loop(
     slot: Arc<ClusterSlot>,
     host: String,
     path: String,
+    https: bool,
 ) {
     use std::io::{Read, Write};
+    fn send(s: &mut (impl Read + Write), head: &[u8], body: &[u8]) {
+        if s.write_all(head).is_ok() && s.write_all(body).is_ok() && s.flush().is_ok() {
+            let mut buf = [0u8; 512];
+            let _ = s.read(&mut buf);
+        }
+    }
+    let mut warned = false;
     loop {
         let first = match rx.recv() {
             Ok(s) => s,
@@ -400,21 +413,50 @@ fn report_loop(
         let Some(ep) = eps.healthy.first().and_then(|&i| eps.endpoints.get(i)) else {
             continue;
         };
-        let Ok(mut s) =
+        // B-466: コレクタのクラスタの TLS（transport_socket・transport_socket_matches。Istio の auto-mTLS）を
+        // HTTP/1.1 の要求と同じく使う。スパンは要求の URL（クエリのトークンを含む）・ヘッダのタグを運ぶので、
+        // クラスタが TLS を求めるのに平文で送っていた。https の URI でクラスタに TLS が無ければ送らない
+        let cluster = slot.cfg.load_full();
+        let tls = cluster
+            .as_ref()
+            .as_ref()
+            .and_then(|c| c.tls_for(ep).cloned());
+        if tls.is_none() && https {
+            if !warned {
+                warned = true;
+                ftlog::warn!(
+                    "[mesh] not sending Zipkin spans to cluster '{}': the collector URI is https but the cluster has no TLS transport socket",
+                    slot.name
+                );
+            }
+            continue;
+        }
+        let Ok(s) =
             std::net::TcpStream::connect_timeout(&ep.addr, std::time::Duration::from_secs(2))
         else {
             continue;
         };
         let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(5)));
         let req = format!(
             "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             path,
             host,
             body.len()
         );
-        if s.write_all(req.as_bytes()).is_ok() && s.write_all(body.as_bytes()).is_ok() {
-            let mut buf = [0u8; 512];
-            let _ = s.read(&mut buf);
+        match tls {
+            None => {
+                let mut s = s;
+                send(&mut s, req.as_bytes(), body.as_bytes());
+            }
+            Some(t) => {
+                let name = super::upstream::server_name(&t.sni, ep.addr);
+                let Ok(conn) = rustls::ClientConnection::new(t.h1.clone(), name) else {
+                    continue;
+                };
+                let mut ts = rustls::StreamOwned::new(conn, s);
+                send(&mut ts, req.as_bytes(), body.as_bytes());
+            }
         }
     }
 }
@@ -428,10 +470,132 @@ mod tests {
             collector: Arc::new(ClusterSlot::new("c")),
             path: "/api/v2/spans".into(),
             host: "c".into(),
+            https: false,
             trace_id_128: true,
             sampling: 1_000_000,
             tags: vec![],
             header_tags: vec![],
+        }
+    }
+
+    fn collector_slot(
+        addr: std::net::SocketAddr,
+        tls: Option<Arc<super::super::model::UpstreamTls>>,
+    ) -> Arc<ClusterSlot> {
+        use super::super::model::*;
+        let slot = Arc::new(ClusterSlot::new("zipkin"));
+        slot.cfg.store(Arc::new(Some(Arc::new(ClusterCfg {
+            name: "zipkin".into(),
+            kind: ClusterKind::Eds,
+            lb: LbPolicy::RoundRobin,
+            connect_timeout: std::time::Duration::from_secs(1),
+            bind: None,
+            tls_matches: Vec::new(),
+            tls_default: tls,
+            auto_sni: false,
+            proto: UpstreamProto::Http1,
+            idle_timeout: std::time::Duration::from_secs(60),
+            max_requests_per_conn: 0,
+            outlier: None,
+            max_connections: 1024,
+            max_pending: 1024,
+            max_requests: 1024,
+            max_retries: 3,
+            service_host: Default::default(),
+            service_name: Default::default(),
+            service_namespace: Default::default(),
+            eds_name: "zipkin".into(),
+            svc_labels: None,
+            port_override: None,
+        }))));
+        slot.endpoints
+            .store(Arc::new(EndpointSet::new(vec![MeshEndpoint::new(addr)])));
+        slot
+    }
+
+    // B-466: コレクタのクラスタに TLS があればスパンは TLS で送り、https の URI でクラスタに TLS が無ければ送らない
+    // 理由付き allow: テストのスレッドで接続が来ないことを一定時間見る
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn spans_use_the_collector_cluster_tls() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["zipkin.test".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let provider = Arc::new(crate::tls_provider::provider::default_provider());
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+                )
+                .unwrap(),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client = Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let tls = Arc::new(super::super::model::UpstreamTls {
+            sni: "zipkin.test".into(),
+            san_matchers: Vec::new(),
+            tcp: client.clone(),
+            h1: client.clone(),
+            h2: client,
+            mesh_mtls: false,
+            transport: None,
+            principal: None,
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = sync_channel::<String>(4);
+        let slot = collector_slot(addr, Some(tls));
+        std::thread::spawn(move || {
+            report_loop(rx, slot, "zipkin".into(), "/api/v2/spans".into(), false)
+        });
+        tx.send("{\"id\":\"1\"}".into()).unwrap();
+        let (sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut s = rustls::StreamOwned::new(rustls::ServerConnection::new(server).unwrap(), sock);
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !got.ends_with(b"{\"id\":\"1\"}]") {
+            let n = s.read(&mut buf).unwrap();
+            assert!(
+                n > 0,
+                "connection closed early: {:?}",
+                String::from_utf8_lossy(&got)
+            );
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert!(got.starts_with(b"POST /api/v2/spans HTTP/1.1\r\n"));
+        let _ = s.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
+        drop(tx);
+
+        // https の URI でクラスタに TLS が無い: 繋がない
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (tx, rx) = sync_channel::<String>(4);
+        let slot = collector_slot(listener.local_addr().unwrap(), None);
+        std::thread::spawn(move || {
+            report_loop(rx, slot, "zipkin".into(), "/api/v2/spans".into(), true)
+        });
+        tx.send("{}".into()).unwrap();
+        let until = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < until {
+            assert!(listener.accept().is_err(), "spans were sent in cleartext");
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 

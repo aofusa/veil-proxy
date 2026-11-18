@@ -113,21 +113,91 @@ struct Entry {
     tcp_received: u64,
     tcp_opened: u64,
     tcp_closed: u64,
-    /// 生かしておく（キーのポインタが他の値に再利用されないように）
-    _hold: (
-        Option<Arc<Workload>>,
-        Option<Arc<str>>,
-        Option<Arc<ServiceLabels>>,
-    ),
 }
 
-type Table = Arc<Mutex<HashMap<Key, Entry>>>;
+/// キーのポインタの元を生かしておく（キーが表にある間、ポインタが他の値に再利用されないように）
+type Hold = (
+    Option<Arc<Workload>>,
+    Option<Arc<str>>,
+    Option<Arc<ServiceLabels>>,
+);
+
+/// ワーカーの系列の上限。超えたら相手の属性（ワークロード・SPIFFE ID）を unknown にした系列へまとめる
+// B-443: 以前はポインタのキーごとに系列を作って捨てず、要求ごとに作り直される相手の属性（クライアントが書ける
+// `x-envoy-peer-metadata-id`）で表が際限なく伸びた
+const MAX_SERIES: usize = 2048;
+/// 上限の後にまとめる先の系列（相手の属性を unknown にしたもの）の枠。これも尽きたら記録しない
+const OVERFLOW_SERIES: usize = 512;
+/// ポインタのキーの引き当ての上限。超えたら捨てて作り直す（系列は残る）
+const MAX_PTR_KEYS: usize = 8192;
+
+/// ワーカーの表。要求ごとはポインタのキーで系列を引き、初めてのキーだけラベルの文字列を作って同じ内容の系列に
+/// まとめる（内容が同じなら同じ系列。相手の属性の `Arc` が作り直されても系列は増えない）
+#[derive(Default)]
+struct Series {
+    by_ptr: HashMap<Key, (usize, Hold)>,
+    by_labels: HashMap<Arc<str>, usize>,
+    entries: Vec<Entry>,
+}
+
+impl Series {
+    /// ラベルの組の系列の添字（無ければ作る）。上限に達していれば相手の属性を unknown にした系列へまとめ、
+    /// それも作れなければ `None`
+    fn resolve(
+        &mut self,
+        l: &ReqLabels,
+        code: u16,
+        grpc: Option<u32>,
+        flag: ResponseFlag,
+    ) -> Option<usize> {
+        let labels = render_labels(l, code, grpc, flag);
+        if let Some(&i) = self.by_labels.get(labels.as_str()) {
+            return Some(i);
+        }
+        if self.entries.len() < MAX_SERIES {
+            return Some(self.push(labels));
+        }
+        let anon = ReqLabels {
+            peer: None,
+            peer_principal: None,
+            ..l.clone()
+        };
+        let labels = render_labels(&anon, code, grpc, flag);
+        if let Some(&i) = self.by_labels.get(labels.as_str()) {
+            return Some(i);
+        }
+        if self.entries.len() < MAX_SERIES + OVERFLOW_SERIES {
+            return Some(self.push(labels));
+        }
+        None
+    }
+
+    fn push(&mut self, labels: String) -> usize {
+        let labels: Arc<str> = Arc::from(labels);
+        let i = self.entries.len();
+        self.entries.push(Entry {
+            labels: labels.clone(),
+            requests: 0,
+            duration: Hist::new(),
+            req_bytes: Hist::new(),
+            resp_bytes: Hist::new(),
+            tcp_sent: 0,
+            tcp_received: 0,
+            tcp_opened: 0,
+            tcp_closed: 0,
+        });
+        self.by_labels.insert(labels, i);
+        i
+    }
+}
+
+type Table = Arc<Mutex<Series>>;
 
 static TABLES: Lazy<Mutex<Vec<Table>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 thread_local! {
     static LOCAL: Table = {
-        let t: Table = Arc::new(Mutex::new(HashMap::new()));
+        let t: Table = Arc::new(Mutex::new(Series::default()));
         if let Ok(mut v) = TABLES.lock() {
             v.push(t.clone());
         }
@@ -296,19 +366,21 @@ fn with_entry(
     let k = key(l, code, grpc, flag);
     LOCAL.with(|t| {
         let Ok(mut t) = t.lock() else { return };
-        let e = t.entry(k).or_insert_with(|| Entry {
-            labels: Arc::from(render_labels(l, code, grpc, flag)),
-            requests: 0,
-            duration: Hist::new(),
-            req_bytes: Hist::new(),
-            resp_bytes: Hist::new(),
-            tcp_sent: 0,
-            tcp_received: 0,
-            tcp_opened: 0,
-            tcp_closed: 0,
-            _hold: (l.peer.clone(), l.peer_principal.clone(), l.service.clone()),
-        });
-        f(e);
+        let i = match t.by_ptr.get(&k) {
+            Some(&(i, _)) => i,
+            None => {
+                let Some(i) = t.resolve(l, code, grpc, flag) else {
+                    return;
+                };
+                if t.by_ptr.len() >= MAX_PTR_KEYS {
+                    t.by_ptr.clear();
+                }
+                let hold = (l.peer.clone(), l.peer_principal.clone(), l.service.clone());
+                t.by_ptr.insert(k, (i, hold));
+                i
+            }
+        };
+        f(&mut t.entries[i]);
     });
 }
 
@@ -460,7 +532,7 @@ pub fn prometheus_text() -> String {
     if let Ok(tables) = TABLES.lock() {
         for t in tables.iter() {
             let Ok(t) = t.lock() else { continue };
-            for e in t.values() {
+            for e in &t.entries {
                 match merged.get_mut(&e.labels) {
                     Some(m) => {
                         m.requests += e.requests;
@@ -621,5 +693,52 @@ mod tests {
             "{t}"
         );
         assert!(t.contains("istio_request_duration_milliseconds_bucket{"));
+    }
+
+    /// B-443: 相手の属性の `Arc` が要求ごとに作り直されても、内容が同じなら系列は増えない。内容の違う相手が
+    /// 上限を超えたら unknown の系列へまとめ、表は伸びない
+    #[test]
+    fn series_are_keyed_by_content_and_capped() {
+        let labels = |name: &str| ReqLabels {
+            reporter: Reporter::Destination,
+            peer: Some(Arc::new(Workload {
+                name: name.into(),
+                ..Default::default()
+            })),
+            peer_principal: Some(Arc::from("spiffe://cluster.local/ns/b443/sa/client")),
+            service: None,
+            proto: Proto::Http,
+            mtls: false,
+        };
+        let len = || LOCAL.with(|t| t.lock().map(|t| (t.entries.len(), t.by_ptr.len())).unwrap());
+        // このスレッドの表（他の試験と別のスレッドで走る）
+        std::thread::spawn(move || {
+            for _ in 0..100 {
+                record_request(&labels("same"), 200, None, ResponseFlag::None, 1.0, 1, 1);
+            }
+            let (entries, _) = len();
+            assert_eq!(entries, 1);
+            for i in 0..(MAX_SERIES + OVERFLOW_SERIES + 100) {
+                record_request(
+                    &labels(&format!("w{i}")),
+                    200,
+                    None,
+                    ResponseFlag::None,
+                    1.0,
+                    1,
+                    1,
+                );
+            }
+            let (entries, ptrs) = len();
+            assert!(entries <= MAX_SERIES + OVERFLOW_SERIES, "{entries}");
+            assert!(ptrs <= MAX_PTR_KEYS);
+            let t = prometheus_text();
+            assert!(
+                t.contains("source_workload=\"unknown\""),
+                "overflow series missing"
+            );
+        })
+        .join()
+        .unwrap();
     }
 }

@@ -3,8 +3,17 @@
 //!
 //! メッシュの Pod（viz の Prometheus 等）は相手のプロキシ経由で mTLS（HTTP/2 に昇格することもある）で来るので、
 //! データプレーンのワーカーで受ける（自分の ID の TLS を終端し、HTTP/1.1・HTTP/2 の両方に答える）。
+//!
+//! 認可（linkerd2-proxy と同じ）: `/live`・`/ready` は誰にでも答える（kubelet のプローブ）。`/shutdown`・`/env.json`・
+//! `/proxy-log-level` はポッドの中（ループバック）からだけ受ける。それ以外（`/metrics`）は、ポッドの外からなら管理ポートの
+//! inbound のポリシー（Server・HTTPRoute・AuthorizationPolicy。届かなければ既定のポリシー）で認可する。
+// B-446: 以前は管理ポートのポリシーを見ず、`/metrics`・`/proxy-log-level` を誰にでも返していた（既定のポリシーが
+// deny・all-authenticated のクラスタでも、Pod の IP へ届けば要求の宛先・相手の ID・宛先の Pod のラベルが読めた）
 
+use super::discovery::{InCfg, InProto};
 use crate::mesh::detect::{self, Detected};
+use crate::mesh::l7::ReqView;
+use crate::mesh::model::Direction;
 use crate::mesh::server::DownStream;
 use crate::proxy::{H2RequestCtx, H2RespMsg, H2Service};
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -13,15 +22,16 @@ use crate::stream_channel::{Notify, Receiver, Sender};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 管理ポートへの接続。
-pub async fn serve(cfg: &super::env::Config, stream: TcpStream, peer: SocketAddr) {
+pub async fn serve(cfg: &super::env::Config, stream: TcpStream, peer: SocketAddr, dst: SocketAddr) {
     let (det, initial) = detect::sniff(&stream, Some(Duration::from_secs(10))).await;
-    let (mut ds, acc) = match det {
+    let (mut ds, acc, client_id) = match det {
         Detected::Closed => return,
         Detected::Tls { sni: Some(sni), .. } if sni == cfg.local_name => {
-            let Some((mut ds, _id)) = super::conn::accept_tls(stream, initial, peer).await else {
+            let Some((mut ds, id)) = super::conn::accept_tls(stream, initial, peer).await else {
                 return;
             };
             let rest = if ds.alpn_protocol() == Some(super::proto::TRANSPORT_ALPN) {
@@ -32,22 +42,123 @@ pub async fn serve(cfg: &super::env::Config, stream: TcpStream, peer: SocketAddr
             } else {
                 Vec::new()
             };
-            (ds, rest)
+            (ds, rest, id)
         }
         _ => match crate::mesh::server::plain(stream, initial).await {
-            Ok(ds) => (ds, Vec::new()),
+            Ok(ds) => (ds, Vec::new(), None),
             Err(_) => return,
         },
     };
+    let who = Arc::new(AdminPeer {
+        peer,
+        dst,
+        client_id,
+    });
     let (det, acc) = super::conn::read_classify(&mut ds, acc).await;
     match det {
-        Detected::H2c => serve_h2(ds, acc, peer).await,
-        Detected::Http1 => serve_h1(ds, acc, peer.ip()).await,
+        Detected::H2c => serve_h2(ds, acc, who).await,
+        Detected::Http1 => serve_h1(ds, acc, &who).await,
         _ => {}
     }
 }
 
-async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>, peer: std::net::IpAddr) {
+/// ポッドの中（ループバック。IPv4 射影も含む）からの接続か
+fn is_local(ip: std::net::IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
+/// ポッドの中からだけ受けるパス
+fn loopback_only(path: &str) -> bool {
+    matches!(path, "/shutdown" | "/env.json" | "/proxy-log-level")
+}
+
+/// 管理ポートの接続の相手（要求の認可に使う）
+struct AdminPeer {
+    peer: SocketAddr,
+    dst: SocketAddr,
+    /// mTLS の相手の ID（平文は `None`）
+    client_id: Option<String>,
+}
+
+impl AdminPeer {
+    /// 要求を管理ポートのポリシーで認可しなければならないか（プローブ・ループバック専用のパス・ポッドの中からは要らない）
+    fn needs_policy(&self, path: &str) -> bool {
+        !matches!(path, "/live" | "/ready") && !loopback_only(path) && !is_local(self.peer.ip())
+    }
+
+    /// 管理ポートの inbound のポリシーで要求を認可する（3 秒で届かなければ既定のポリシー）
+    async fn policy_allows(
+        &self,
+        method: &[u8],
+        target: &[u8],
+        authority: &[u8],
+        headers: &[(Bytes, Bytes)],
+    ) -> bool {
+        let Some(cfg) = super::conn::CONFIG.get() else {
+            return false;
+        };
+        let port = cfg.admin_addr.port();
+        let ic = match super::discovery::inbound(port).await {
+            Some(ic) => ic,
+            None => Arc::new(super::discovery::default_inbound(cfg, port)),
+        };
+        self.allowed_by(&ic, method, target, authority, headers)
+    }
+
+    /// ポリシーの判定。HTTP の Server はルート（HTTPRoute）の認可、opaque・TLS の Server は接続の認可で見る
+    fn allowed_by(
+        &self,
+        ic: &InCfg,
+        method: &[u8],
+        target: &[u8],
+        authority: &[u8],
+        headers: &[(Bytes, Bytes)],
+    ) -> bool {
+        if matches!(ic.proto, InProto::Opaque | InProto::Tls) {
+            return super::conn::tcp_authorized(ic, self.dst, self.peer, self.client_id.as_deref());
+        }
+        let ctx = super::conn::ctx(
+            ic.hcm.clone(),
+            Direction::Inbound,
+            self.dst,
+            self.peer,
+            self.client_id.clone(),
+        );
+        let req = ReqView {
+            method,
+            path: target,
+            authority,
+            headers,
+            scheme: b"http",
+        };
+        crate::mesh::l7::route_authorized(&ctx, &req)
+    }
+}
+
+/// HTTP/1.1 の要求のヘッダ（`Host`, その他）。ポリシーのルートの一致に使う
+fn admin_head_fields(head: &[u8]) -> (Bytes, Vec<(Bytes, Bytes)>) {
+    let mut hb = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut hb);
+    let _ = req.parse(head);
+    let mut authority = Bytes::new();
+    let mut headers = Vec::with_capacity(req.headers.len());
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("host") {
+            authority = Bytes::copy_from_slice(h.value);
+        }
+        headers.push((
+            Bytes::copy_from_slice(h.name.as_bytes()),
+            Bytes::copy_from_slice(h.value),
+        ));
+    }
+    (authority, headers)
+}
+
+fn forbidden() -> (u16, &'static str, String) {
+    (403, "text/plain", "forbidden\n".into())
+}
+
+async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>, who: &AdminPeer) {
     loop {
         let head_end = loop {
             if let Some(i) = memchr::memmem::find(&acc, b"\r\n\r\n") {
@@ -93,9 +204,20 @@ async fn serve_h1(mut ds: DownStream, mut acc: Vec<u8>, peer: std::net::IpAddr) 
                 Ok(n) => acc.extend_from_slice(&buf[..n]),
             }
         }
-        acc.drain(..head_end + body_len);
         let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
-        let (status, ctype, body) = route(&method, path, query, peer);
+        let permitted = if who.needs_policy(path) {
+            let (authority, headers) = admin_head_fields(&acc[..head_end]);
+            who.policy_allows(method.as_bytes(), target.as_bytes(), &authority, &headers)
+                .await
+        } else {
+            true
+        };
+        acc.drain(..head_end + body_len);
+        let (status, ctype, body) = if permitted {
+            route(&method, path, query, who.peer.ip())
+        } else {
+            forbidden()
+        };
         let head = format!(
             "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\n{}\r\n",
             status,
@@ -160,9 +282,9 @@ fn parse_admin_head(head: &[u8]) -> Result<(String, String, bool, usize), Option
     ))
 }
 
-/// HTTP/2 の管理ポートの要求の処理（`/shutdown`・`/env.json` の判定に接続の相手を使う）
+/// HTTP/2 の管理ポートの要求の処理（要求の認可に接続の相手を使う）
 struct AdminH2 {
-    peer: std::net::IpAddr,
+    who: Arc<AdminPeer>,
 }
 
 impl H2Service for AdminH2 {
@@ -192,10 +314,30 @@ impl H2Service for AdminH2 {
             .headers
             .iter()
             .any(|h| h.name.eq_ignore_ascii_case(b"l5d-orig-proto"));
-        let peer = self.peer;
+        let who = self.who.clone();
+        let path = target.split_once('?').map_or(target.as_str(), |(p, _)| p);
+        let policy_req = who.needs_policy(path).then(|| {
+            let headers: Vec<(Bytes, Bytes)> = ctx
+                .headers
+                .iter()
+                .map(|h| (h.name.clone(), h.value.clone()))
+                .collect();
+            (ctx.authority.clone(), headers)
+        });
         crate::runtime::spawn(async move {
             let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
-            let (status, ctype, body) = route(&method, path, query, peer);
+            let permitted = match &policy_req {
+                Some((authority, headers)) => {
+                    who.policy_allows(method.as_bytes(), target.as_bytes(), authority, headers)
+                        .await
+                }
+                None => true,
+            };
+            let (status, ctype, body) = if permitted {
+                route(&method, path, query, who.peer.ip())
+            } else {
+                forbidden()
+            };
             let mut headers = vec![
                 (
                     Bytes::from_static(b"content-type"),
@@ -232,7 +374,7 @@ impl H2Service for AdminH2 {
     }
 }
 
-async fn serve_h2(ds: DownStream, acc: Vec<u8>, peer: SocketAddr) {
+async fn serve_h2(ds: DownStream, acc: Vec<u8>, who: Arc<AdminPeer>) {
     let settings = crate::config::CURRENT_CONFIG
         .load()
         .http2_config
@@ -242,8 +384,8 @@ async fn serve_h2(ds: DownStream, acc: Vec<u8>, peer: SocketAddr) {
         return;
     }
     let mut metric = crate::metrics::ActiveConnectionMetric::new(false);
-    let ip = peer.ip().to_string();
-    let svc = AdminH2 { peer: peer.ip() };
+    let ip = who.peer.ip().to_string();
+    let svc = AdminH2 { who };
     let _ = crate::proxy::handle_http2_requests_with(&mut conn, &ip, &mut metric, None, &svc).await;
 }
 
@@ -254,12 +396,11 @@ pub fn route(
     peer: std::net::IpAddr,
 ) -> (u16, &'static str, String) {
     let cfg = super::conn::CONFIG.get();
-    // `/shutdown`・`/env.json` はポッドの中（ループバック）からだけ受ける（linkerd2-proxy と同じ）。
+    // `/shutdown`・`/env.json`・`/proxy-log-level` はポッドの中（ループバック）からだけ受ける（linkerd2-proxy と同じ）。
     // 管理ポートは 0.0.0.0 で待つので、以前はクラスタ内のどこからでも止め・設定を読めた
-    // （F-236 の再走査の F8）。IPv4 射影のループバックもループバックとして扱う。
-    let local = peer.to_canonical().is_loopback();
+    // （F-236 の再走査の F8。`/proxy-log-level` は B-446）。IPv4 射影のループバックもループバックとして扱う。
     match path {
-        "/shutdown" | "/env.json" if !local => (403, "text/plain", "forbidden\n".into()),
+        p if loopback_only(p) && !is_local(peer) => forbidden(),
         "/ready" => {
             if super::identity::READY.load(Ordering::Relaxed) {
                 (200, "text/plain", "ready\n".into())
@@ -352,8 +493,43 @@ mod admin_access_tests {
         let remote: std::net::IpAddr = "10.1.2.3".parse().unwrap();
         assert_eq!(route("POST", "/shutdown", "", remote).0, 403);
         assert_eq!(route("GET", "/env.json", "", remote).0, 403);
+        assert_eq!(route("GET", "/proxy-log-level", "", remote).0, 403);
         let mapped: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
         assert_eq!(route("GET", "/env.json", "", mapped).0, 200);
+        assert_eq!(route("GET", "/proxy-log-level", "", mapped).0, 200);
         assert_eq!(route("GET", "/live", "", remote).0, 200);
+    }
+
+    /// B-446: ポッドの外からの `/metrics` は管理ポートのポリシーで認可する（プローブ・ループバックは見ない）
+    #[test]
+    fn admin_policy_gates_metrics() {
+        let dst: SocketAddr = "10.0.0.5:4191".parse().unwrap();
+        let peer = |ip: &str, id: Option<&str>| AdminPeer {
+            peer: SocketAddr::new(ip.parse().unwrap(), 40000),
+            dst,
+            client_id: id.map(str::to_string),
+        };
+        let remote = peer("10.1.2.3", None);
+        let meshed = peer(
+            "10.1.2.3",
+            Some("prometheus.linkerd-viz.serviceaccount.identity.linkerd.cluster.local"),
+        );
+        assert!(remote.needs_policy("/metrics"));
+        assert!(!remote.needs_policy("/live") && !remote.needs_policy("/ready"));
+        // ループバック専用のパスは route が断る
+        assert!(!remote.needs_policy("/shutdown") && !remote.needs_policy("/proxy-log-level"));
+        assert!(!peer("127.0.0.1", None).needs_policy("/metrics"));
+        assert!(!peer("::ffff:127.0.0.1", None).needs_policy("/metrics"));
+
+        let check = |policy: &str, who: &AdminPeer| {
+            let cfg = super::super::env::Config::for_test(policy);
+            let ic = super::super::discovery::default_inbound(&cfg, 4191);
+            who.allowed_by(&ic, b"GET", b"/metrics", b"10.0.0.5:4191", &[])
+        };
+        assert!(check("all-unauthenticated", &remote));
+        assert!(!check("all-authenticated", &remote));
+        assert!(check("all-authenticated", &meshed));
+        assert!(!check("deny", &meshed));
+        assert!(!check("deny", &remote));
     }
 }

@@ -258,7 +258,7 @@ fn inner_type(any: &p::Any) -> String {
 fn san_matchers(v: Option<&p::CertificateValidationContext>) -> R<Vec<StringMatcher>> {
     let mut out = Vec::new();
     if let Some(v) = v {
-        reject_crl(v)?;
+        reject_unsupported_validation(v)?;
         for m in &v.match_subject_alt_names {
             out.push(string_matcher(m)?);
         }
@@ -271,10 +271,37 @@ fn san_matchers(v: Option<&p::CertificateValidationContext>) -> R<Vec<StringMatc
     Ok(out)
 }
 
-/// 失効リスト（`crl`）は検査しないので、受けた設定を拒否する（黙って捨てると失効した証明書を通す。B-323）。
-pub(crate) fn reject_crl(v: &p::CertificateValidationContext) -> R<()> {
+/// 検査を実装していない検証の設定を拒否する（黙って捨てると、設定した検証が外れたまま接続を通す）。
+/// 失効リスト（`crl`。B-323）、証明書のハッシュ・SPKI のピン留め・SCT の要求・インラインでない信頼アンカー
+/// （ファイル・環境変数・ディレクトリの監視・証明書の提供者・システムのルート）・独自の検証器（B-442）。
+pub(crate) fn reject_unsupported_validation(v: &p::CertificateValidationContext) -> R<()> {
     if v.crl.is_some() {
         return Err("certificate revocation lists (crl) are not supported".into());
+    }
+    if !v.verify_certificate_hash.is_empty() || !v.verify_certificate_spki.is_empty() {
+        return Err("certificate pinning (verify_certificate_hash/spki) is not supported".into());
+    }
+    if v.require_signed_certificate_timestamp
+        .as_ref()
+        .is_some_and(|b| b.value)
+    {
+        return Err("require_signed_certificate_timestamp is not supported".into());
+    }
+    if v.trusted_ca.as_ref().is_some_and(|d| d.inline().is_none()) {
+        return Err(
+            "trusted_ca must be inline (file and environment variable sources are not supported)"
+                .into(),
+        );
+    }
+    if v.watched_directory.is_some()
+        || v.ca_certificate_provider_instance.is_some()
+        || v.system_root_certs.is_some()
+        || v.custom_validator_config.is_some()
+    {
+        return Err(
+            "only an inline trusted_ca or an SDS validation context is supported as a trust anchor"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -309,6 +336,9 @@ fn common_tls(c: &p::CommonTlsContext) -> R<(Option<String>, Option<String>, Vec
         ),
         Some(V::ValidationContextSdsSecretConfig(s)) => (Some(s.name.clone()), Vec::new()),
         Some(V::ValidationContext(v)) => {
+            // 扱えない検証の設定（インラインでない trusted_ca 等）は先に拒否する（B-442。以前は信頼アンカー無しとして
+            // 扱い、どの証明書も通していた）
+            let sans = san_matchers(Some(v))?;
             // インラインの信頼アンカー（ゲートウェイの DestinationRule 等）
             let name = match v.trusted_ca.as_ref().and_then(|d| d.inline()) {
                 Some(pem) => {
@@ -318,7 +348,7 @@ fn common_tls(c: &p::CommonTlsContext) -> R<(Option<String>, Option<String>, Vec
                 }
                 None => None,
             };
-            (name, san_matchers(Some(v))?)
+            (name, sans)
         }
         None => (None, Vec::new()),
     };
@@ -338,6 +368,10 @@ fn downstream_tls(ctx: &p::DownstreamTlsContext) -> R<Arc<DownstreamTls>> {
         .as_ref()
         .map(|b| b.value)
         .unwrap_or(false);
+    // B-442: クライアント証明書を必須にするのに信頼アンカーが無ければ拒否する（以前は証明書を求めずに受けていた）
+    if require && roots.is_none() {
+        return Err("require_client_certificate needs a trusted CA (validation context)".into());
+    }
     // istio-peer-exchange（TCP の metadata exchange）は交渉しない（交換を実装するまで。交渉すると
     // Envoy のクライアントがストリームの先頭に交換のヘッダを書く）
     let alpn: Vec<Vec<u8>> = common
@@ -1582,6 +1616,74 @@ fn resolve(host: &str, port: u16) -> Vec<SocketAddr> {
 mod tests {
     use super::*;
     use crate::mesh::state::Registry;
+
+    /// B-442: 扱えない検証の設定（インラインでない trusted_ca・ピン留め・他の信頼アンカー）は、信頼アンカー無し
+    /// （どの証明書も通す）として受けずに拒否する。必須のクライアント証明書に信頼アンカーが無いのも拒否する
+    #[test]
+    fn unsupported_validation_is_rejected() {
+        use p::common_tls_context::ValidationContextType as V;
+        let ctx = |v: p::CertificateValidationContext| p::CommonTlsContext {
+            validation_context_type: Some(V::ValidationContext(v)),
+            ..Default::default()
+        };
+        let source = |s: p::data_source::Specifier| p::DataSource { specifier: Some(s) };
+        let bad = [
+            p::CertificateValidationContext {
+                trusted_ca: Some(source(p::data_source::Specifier::Filename(
+                    "/etc/ssl/certs/ca-certificates.crt".into(),
+                ))),
+                ..Default::default()
+            },
+            p::CertificateValidationContext {
+                trusted_ca: Some(source(p::data_source::Specifier::EnvironmentVariable(
+                    "CA_BUNDLE".into(),
+                ))),
+                ..Default::default()
+            },
+            p::CertificateValidationContext {
+                verify_certificate_hash: vec!["00".repeat(32)],
+                ..Default::default()
+            },
+            p::CertificateValidationContext {
+                verify_certificate_spki: vec!["A".repeat(44)],
+                ..Default::default()
+            },
+            p::CertificateValidationContext {
+                require_signed_certificate_timestamp: Some(p::BoolValue { value: true }),
+                ..Default::default()
+            },
+            p::CertificateValidationContext {
+                system_root_certs: Some(p::Empty {}),
+                ..Default::default()
+            },
+            p::CertificateValidationContext {
+                ca_certificate_provider_instance: Some(p::Empty {}),
+                ..Default::default()
+            },
+        ];
+        for v in bad {
+            assert!(common_tls(&ctx(v.clone())).is_err(), "{v:?}");
+            // 結合した検証の既定の側にあっても同じ
+            let combined = p::CommonTlsContext {
+                validation_context_type: Some(V::CombinedValidationContext(
+                    p::CombinedCertificateValidationContext {
+                        default_validation_context: Some(v),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            };
+            assert!(common_tls(&combined).is_err());
+        }
+        // 検証の設定が空なら従来どおり信頼アンカー無し
+        let (_, roots, _) = common_tls(&ctx(Default::default())).unwrap();
+        assert!(roots.is_none());
+        let downstream = |require: bool| p::DownstreamTlsContext {
+            common_tls_context: Some(ctx(Default::default())),
+            require_client_certificate: Some(p::BoolValue { value: require }),
+        };
+        assert!(downstream_tls(&downstream(true)).is_err());
+    }
 
     /// B-375: `upstream_http_protocol_options` の auto_sni・auto_san_validation を読む
     #[test]

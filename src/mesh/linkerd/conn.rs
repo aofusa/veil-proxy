@@ -6,7 +6,7 @@
 //!   `transport.l5d.io/v1` なら最初の transport header で本来のポートを知る。ポートのポリシーの認可を
 //!   見て、アプリ（元の宛先）へ送る。それ以外（平文・アプリ自身の TLS）はそのまま。
 
-use super::discovery::{self, InProto, OutCfg};
+use super::discovery::{self, InCfg, InProto, OutCfg};
 use super::env::Config;
 use super::proto as p;
 use crate::mesh::detect::{self, Detected};
@@ -40,7 +40,7 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
     if laddr.port() == cfg.outbound_addr.port() {
         outbound(&cfg, stream, peer, dst).await;
     } else if laddr.port() == cfg.admin_addr.port() {
-        super::admin::serve(&cfg, stream, peer).await;
+        super::admin::serve(&cfg, stream, peer, dst).await;
     } else if laddr.port() == cfg.control_addr.port() {
         super::tap::serve(&cfg, stream, peer).await;
     } else {
@@ -48,7 +48,7 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
     }
 }
 
-fn ctx(
+pub(super) fn ctx(
     hcm: Arc<HttpCm>,
     direction: Direction,
     dst: SocketAddr,
@@ -251,7 +251,29 @@ fn server_config() -> Arc<rustls::ServerConfig> {
     .clone()
 }
 
+/// プロキシ自身が受けるポート（inbound・outbound・管理・tap）
+fn proxy_ports(cfg: &Config) -> [u16; 4] {
+    [
+        cfg.inbound_addr.port(),
+        cfg.outbound_addr.port(),
+        cfg.admin_addr.port(),
+        cfg.control_addr.port(),
+    ]
+}
+
+/// transport のヘッダの宛先のポート。0・範囲外・プロキシ自身のポートは `None`（中継しない）
+fn transport_target_port(proxy_ports: &[u16], port: i32) -> Option<u16> {
+    u16::try_from(port)
+        .ok()
+        .filter(|p| *p != 0 && !proxy_ports.contains(p))
+}
+
 async fn inbound(cfg: &Config, stream: TcpStream, peer: SocketAddr, dst: SocketAddr) {
+    // B-445: 中継先をプロキシ自身のポートにしない。以前は直接来た接続（宛先が inbound のポート）や transport のヘッダの
+    // ポートが自分のポートでも中継し、入れ子の接続の送信元が Pod 自身の IP になってネットワークでの認可を外せた。
+    // 直接来た接続は、ID のある mTLS で transport のヘッダを付けたものだけを受ける（linkerd2-proxy の direct と同じ）
+    let ports = proxy_ports(cfg);
+    let direct = ports.contains(&dst.port());
     let (det, initial) = detect::sniff(&stream, Some(DETECT_TIMEOUT)).await;
     match det {
         Detected::Closed => {}
@@ -260,16 +282,25 @@ async fn inbound(cfg: &Config, stream: TcpStream, peer: SocketAddr, dst: SocketA
                 return;
             };
             if ds.alpn_protocol() == Some(p::TRANSPORT_ALPN) {
+                if direct && client_id.is_none() {
+                    ftlog::debug!("[linkerd] direct connection from {} without identity", peer);
+                    return;
+                }
                 let Some((h, rest)) = read_transport_header(&mut ds).await else {
                     return;
                 };
-                let target = SocketAddr::new(dst.ip(), h.port as u16);
+                let Some(port) = transport_target_port(&ports, h.port) else {
+                    ftlog::debug!("[linkerd] transport header port {} refused", h.port);
+                    return;
+                };
+                let target = SocketAddr::new(dst.ip(), port);
                 let session = h.session_protocol.and_then(|s| s.kind);
                 serve_port(cfg, ds, rest, peer, target, client_id, session.is_some()).await;
-            } else {
+            } else if !direct {
                 serve_port(cfg, ds, Vec::new(), peer, dst, client_id, true).await;
             }
         }
+        _ if direct => {}
         _ => {
             // 平文・アプリ自身の TLS（SNI が自分ではない）
             let Ok(ds) = crate::mesh::server::plain(stream, initial).await else {
@@ -278,6 +309,29 @@ async fn inbound(cfg: &Config, stream: TcpStream, peer: SocketAddr, dst: SocketA
             serve_port(cfg, ds, Vec::new(), peer, dst, None, !det.is_tls()).await;
         }
     }
+}
+
+/// 接続を Server の認可（L4）で認可する
+pub(super) fn tcp_authorized(
+    ic: &InCfg,
+    dst: SocketAddr,
+    peer: SocketAddr,
+    client: Option<&str>,
+) -> bool {
+    let header = |_: &str| None;
+    let md = |_: &str, _: &[String]| None;
+    let input = crate::mesh::xds::rbac::RbacInput {
+        header: &header,
+        path: b"",
+        dst: Some(dst),
+        sni: None,
+        principal: client,
+        direct_remote: Some(peer.ip()),
+        remote: None,
+        metadata: &md,
+        http: false,
+    };
+    crate::mesh::xds::rbac::allowed(&ic.tcp_rbac, &input)
 }
 
 /// ポートのポリシーで HTTP / L4 を処理する（`http_ok` が false なら検出せず L4）。
@@ -297,22 +351,7 @@ async fn serve_port(
         Some(ic) => ic,
         None => std::sync::Arc::new(discovery::default_inbound(cfg, dst.port())),
     };
-    let tcp_allowed = |client: Option<&str>| {
-        let header = |_: &str| None;
-        let md = |_: &str, _: &[String]| None;
-        let input = crate::mesh::xds::rbac::RbacInput {
-            header: &header,
-            path: b"",
-            dst: Some(dst),
-            sni: None,
-            principal: client,
-            direct_remote: Some(peer.ip()),
-            remote: None,
-            metadata: &md,
-            http: false,
-        };
-        crate::mesh::xds::rbac::allowed(&ic.tcp_rbac, &input)
-    };
+    let tcp_allowed = |client: Option<&str>| tcp_authorized(&ic, dst, peer, client);
     let detect_http =
         http_ok && matches!(ic.proto, InProto::Detect | InProto::Http1 | InProto::Http2);
     if detect_http {
@@ -380,4 +419,19 @@ async fn relay_with_prefix(
     }
     let _ = crate::mesh::tcp::relay(ds, &mut up, Duration::from_secs(3600)).await;
     picked.end(false, false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B-445: transport のヘッダの宛先はプロキシ自身のポート・0・範囲外を受けない（i32 を u16 へ切り詰めない）
+    #[test]
+    fn transport_target_port_refuses_proxy_ports() {
+        let ports = [4143, 4140, 4191, 4190];
+        assert_eq!(transport_target_port(&ports, 8080), Some(8080));
+        for bad in [4143, 4140, 4191, 4190, 0, -1, 65536 + 4143, i32::MAX] {
+            assert_eq!(transport_target_port(&ports, bad), None, "{bad}");
+        }
+    }
 }

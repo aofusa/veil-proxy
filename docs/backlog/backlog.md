@@ -803,8 +803,14 @@
 | B-439 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-439-jwt-filter-client-claim-headers.md](bugs/B-439-jwt-filter-client-claim-headers.md) | JWT の例がクレームを写すヘッダをクライアントの送った値を消さずに足し、X-User-ID 等を偽れた |
 | B-440 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-440-cache-filter-shares-credentialed-responses.md](bugs/B-440-cache-filter-shares-credentialed-responses.md) | キャッシュの例のフィルタが Vary・Authorization・Cookie を見ず、利用者ごとの応答を他の利用者へ返していた |
 | B-441 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-441-cache-filter-weak-key-hash.md](bugs/B-441-cache-filter-weak-key-hash.md) | キャッシュの例のフィルタのキーが 64 ビットの FNV-1a とキーの先頭 15 バイトで、別の要求で同じキーを作って共有の項目を差し替えられた |
+| B-442 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-442-mesh-non-inline-trusted-ca-fails-open.md](bugs/B-442-mesh-non-inline-trusted-ca-fails-open.md) | メッシュの xDS の検証の設定のうち扱えないもの（ファイルの trusted_ca・ピン留め等）を信頼アンカー無しとして受け、どの証明書も通していた |
+| B-443 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-443-mesh-istio-stats-unbounded-series.md](bugs/B-443-mesh-istio-stats-unbounded-series.md) | メッシュの Istio のメトリクスの表が、クライアントが書ける peer metadata の id ごとに系列を作って捨てず、際限なく伸びた |
+| B-444 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-444-mesh-h1-early-reply-keeps-undiscarded-body.md](bugs/B-444-mesh-h1-early-reply-keeps-undiscarded-body.md) | メッシュの HTTP/1.1 の 503 等のローカル応答が、本文を読み捨てられなくても接続を続け、残りの本文を次の要求として読んでいた |
+| B-445 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-445-linkerd-inbound-self-relay.md](bugs/B-445-linkerd-inbound-self-relay.md) | Linkerd の inbound が自分の inbound のポートへ中継し、送信元を Pod 自身の IP に見せてネットワークでの認可を外せた |
+| B-446 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-446-linkerd-admin-port-ignores-policy.md](bugs/B-446-linkerd-admin-port-ignores-policy.md) | Linkerd の管理ポート（4191）が inbound のポリシーを見ず、/metrics・/proxy-log-level を誰にでも返していた |
 | B-454 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-454-wasm-proxy-log-unescaped.md](bugs/B-454-wasm-proxy-log-unescaped.md) | Proxy-Wasm の proxy_log がゲストの文字列を制御文字のままアプリのログへ書いていた |
 | B-455 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-455-http3-migration-keeps-handshake-ip.md](bugs/B-455-http3-migration-keeps-handshake-ip.md) | HTTP/3 の接続が別の IP へ移っても、IP で見る検査はハンドシェイクの IP のまま行っていた |
+| B-466 | P3 | 修正済み（fix/security-scan-fable-max） | [bugs/B-466-zipkin-spans-cleartext.md](bugs/B-466-zipkin-spans-cleartext.md) | メッシュの Zipkin のスパンを、コレクタのクラスタの TLS を使わずに平文で送っていた |
 
 ---
 

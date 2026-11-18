@@ -484,6 +484,26 @@ async fn wait_ecds(slot: &EcdsSlot) -> Option<Arc<HttpFilterCfg>> {
     None
 }
 
+/// ルートを選び、その認可だけを見る（行き先は使わない）。ルートが無ければ断る。
+// B-446: Linkerd の管理ポートの要求を、そのポートの Server・HTTPRoute・AuthorizationPolicy で認可する
+pub fn route_authorized(ctx: &ConnCtx, req: &ReqView<'_>) -> bool {
+    let table = ctx.hcm.routes.load();
+    let Some(vh) = table.select_vhost(req.authority) else {
+        return false;
+    };
+    let (path, query) = req.path_and_query();
+    let header = |n: &str| req.header(n);
+    let is_grpc = req.is_grpc();
+    vh.routes
+        .iter()
+        .find(|r| r.matches(path, query, &header, is_grpc))
+        .is_some_and(|r| {
+            r.rbac
+                .as_ref()
+                .is_none_or(|rb| rbac_allows(ctx, req, rb, &[]))
+        })
+}
+
 /// 要求からルートを選ぶ（フォルト・CORS のプリフライトも含む）。認証・認可は [`request_filters`] で済ませておく。
 pub fn decide(
     ctx: &ConnCtx,

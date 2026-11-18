@@ -442,6 +442,10 @@ pub fn server_config(
             san,
             mandatory: require_client_cert,
         })),
+        // B-442: 必須のクライアント証明書を信頼アンカー無しで受けない（以前は証明書を求めずに受けていた）
+        None if require_client_cert => {
+            return Err("require_client_certificate needs a trusted CA".to_string())
+        }
         None => builder.with_no_client_auth(),
     };
     let mut cfg = builder.with_cert_resolver(Arc::new(NamedServerCert(cert_name.to_string())));

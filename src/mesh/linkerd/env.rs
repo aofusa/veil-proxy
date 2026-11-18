@@ -158,6 +158,39 @@ impl Config {
 }
 
 #[cfg(test)]
+impl Config {
+    /// 試験用の設定（注入テンプレートの既定のポート。制御プレーンには繋がない）
+    pub(crate) fn for_test(default_policy: &str) -> Self {
+        Config {
+            inbound_addr: "0.0.0.0:4143".parse().unwrap(),
+            outbound_addr: "127.0.0.1:4140".parse().unwrap(),
+            admin_addr: "0.0.0.0:4191".parse().unwrap(),
+            control_addr: "0.0.0.0:4190".parse().unwrap(),
+            tap_name: None,
+            dst_addr: String::new(),
+            dst_name: String::new(),
+            policy_addr: String::new(),
+            policy_name: String::new(),
+            identity_addr: String::new(),
+            identity_name: String::new(),
+            local_name: "web.default.serviceaccount.identity.linkerd.cluster.local".into(),
+            identity_dir: String::new(),
+            token_file: String::new(),
+            trust_anchors: String::new(),
+            workload: String::new(),
+            dst_context: String::new(),
+            default_policy: default_policy.into(),
+            opaque_ports: Vec::new(),
+            cores: 1,
+            shutdown_enabled: false,
+            outbound_connect_timeout: Duration::from_secs(1),
+            inbound_connect_timeout: Duration::from_millis(100),
+            log: "warn".into(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

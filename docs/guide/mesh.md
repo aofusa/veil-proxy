@@ -79,7 +79,8 @@ Supported (checked with `tools/k8s/mesh-e2e.sh`, stock / veil / mixed):
   - RBAC rules veil cannot evaluate (CEL conditions, `metadata` and `matcher` permissions) fail closed: in an ALLOW
     policy they never match, in a DENY policy they always match (inverted under `not_rule`/`not_id`). veil logs a
     warning with the policy name when it receives such a policy.
-- Telemetry: Istio's standard metrics (`istio_requests_total` etc. through pilot-agent's merged metrics),
+- Telemetry: Istio's standard metrics (`istio_requests_total` etc. through pilot-agent's merged metrics; each worker
+  keeps at most 2,048 label sets, then counts new peers under `unknown` workload and principal labels),
   Telemetry API access logs (Envoy's default format), distributed tracing (Zipkin / B3).
 - WasmPlugin (ECDS → veil's Proxy-Wasm, including C++ SDK modules). The resource's `failStrategy` (`FAIL_CLOSE`,
   the default, or `FAIL_OPEN`; Envoy's `failure_policy` `FAIL_CLOSED`/`FAIL_OPEN`/`FAIL_RELOAD`) maps to veil's
@@ -120,6 +121,13 @@ Supported (checked with `tools/k8s/linkerd-e2e.sh`, stock / veil / mixed):
   `response_latency_ms`, `tcp_*`, `control_identity_cert_expiration_timestamp_seconds`), so `linkerd viz stat` and
   `edges` work; tap on 4190 (`linkerd viz tap` / `top`), accepted only from the tap service identity.
   emojivoto and booksapp run with every Pod on veil.
+- Admin port (4191), as in linkerd2-proxy: `/live` and `/ready` answer anyone (kubelet probes); `/shutdown`,
+  `/env.json` and `/proxy-log-level` answer only from inside the Pod (loopback); `/metrics` from outside the Pod is
+  authorized by the inbound policy of the admin port (with a restrictive default policy, allow the scrapes with
+  `linkerd viz allow-scrapes`, as for stock proxies).
+- The inbound port does not relay to the proxy's own ports. A connection made directly to the inbound port
+  (4143) is accepted only with an mTLS client identity and a transport header, and a transport header that names a
+  proxy port (4143, 4140, 4190, 4191) is refused.
 
 ## Environment variables
 
@@ -149,6 +157,11 @@ Supported (checked with `tools/k8s/linkerd-e2e.sh`, stock / veil / mixed):
   fails the connection. `override_auto_sni_header` is not supported (the `Host` / `:authority` is used).
 - Certificate revocation lists (`crl` in a validation context) are not supported; configurations and SDS secrets that
   carry one are rejected (NACK) instead of being applied without revocation checks.
+- The same goes for the other validation settings veil does not check: a `trusted_ca` that is not inline (a file or an
+  environment variable; SDS secrets are fine), certificate pinning (`verify_certificate_hash` /
+  `verify_certificate_spki`), `require_signed_certificate_timestamp`, `system_root_certs`,
+  `ca_certificate_provider_instance`, `watched_directory` and `custom_validator_config`. A downstream TLS context with
+  `require_client_certificate` and no trust anchor is rejected too.
 - An inbound `x-forwarded-client-cert` header is kept only when the client presented a certificate over TLS
   (`ALWAYS_FORWARD_ONLY` keeps it regardless), as with Envoy.
 - Linkerd: when the inbound port policy has not arrived within 3 seconds, the connection is authorized with the

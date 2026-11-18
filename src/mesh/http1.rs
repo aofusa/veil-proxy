@@ -573,6 +573,26 @@ fn chunked_end(dec: &mut ChunkedDecoder, data: &[u8]) -> io::Result<Option<usize
 }
 
 /// 本文を読み捨てる（ローカル応答のあと接続を保つため）。
+/// 要求の本文を読み終える前に返すローカルの応答。本文を読み捨ててから返し、読み捨てられなければ（大きすぎる・壊れた
+/// chunked・止まった）接続を閉じる。返り値はキープアライブを続けるか
+// B-444: 以前は読み捨ての失敗を見ずにキープアライブを続け、残りの本文を同じ接続の次の要求として読んでいた（前段が接続を
+// 使い回すと、本文に隠した要求が前段の検査を通らずに届き、応答の列もずれる）
+async fn reply_before_body<S: AsyncReadRent + AsyncWriteRentExt>(
+    io: &mut S,
+    acc: &mut BytesMut,
+    framing: Framing,
+    lr: &LocalReply,
+    is_grpc: bool,
+    ctx: &ConnCtx,
+    keep_alive: bool,
+) -> bool {
+    // 閉じるときも読み捨てる（未読のデータを残して閉じると RST になり、相手は応答を読めない）
+    let discarded = discard_body(io, acc, framing).await.is_ok();
+    let keep = keep_alive && discarded;
+    let _ = write_local(io, lr, is_grpc, ctx, !keep).await;
+    keep
+}
+
 async fn discard_body<S: AsyncReadRent>(
     io: &mut S,
     acc: &mut BytesMut,
@@ -877,8 +897,8 @@ where
                 let lr = fail(503, flag);
                 out.status = 503;
                 out.flag = flag;
-                let _ = discard_body(io, acc, framing).await;
-                let _ = write_local(io, &lr, is_grpc, ctx, !keep_alive).await;
+                out.keep_alive =
+                    reply_before_body(io, acc, framing, &lr, is_grpc, ctx, keep_alive).await;
                 return out;
             }
         };
@@ -905,8 +925,9 @@ where
             Err(flag) => {
                 out.status = 503;
                 out.flag = flag;
-                let _ = discard_body(io, acc, framing).await;
-                let _ = write_local(io, &fail(503, flag), is_grpc, ctx, !keep_alive).await;
+                out.keep_alive =
+                    reply_before_body(io, acc, framing, &fail(503, flag), is_grpc, ctx, keep_alive)
+                        .await;
                 return out;
             }
         };
@@ -984,8 +1005,9 @@ where
                         flag
                     };
                     out.peer = l7::peer_workload(ctx, peer_req, None, picked.endpoint());
-                    let _ = discard_body(io, acc, framing).await;
-                    let _ = write_local(io, &fail(503, out.flag), is_grpc, ctx, !keep_alive).await;
+                    let lr = fail(503, out.flag);
+                    out.keep_alive =
+                        reply_before_body(io, acc, framing, &lr, is_grpc, ctx, keep_alive).await;
                     return out;
                 }
             },
@@ -1300,15 +1322,9 @@ where
             }
             out.status = 503;
             out.flag = ResponseFlag::UpstreamConnectFailure;
-            let _ = discard_body(io, acc, framing).await;
-            let _ = write_local(
-                io,
-                &LocalReply::new(503, out.flag),
-                is_grpc,
-                ctx,
-                !keep_alive,
-            )
-            .await;
+            let lr = LocalReply::new(503, out.flag);
+            out.keep_alive =
+                reply_before_body(io, acc, framing, &lr, is_grpc, ctx, keep_alive).await;
             return H2Result::Done(out);
         }
     };
@@ -1323,14 +1339,9 @@ where
         picked.end(false, true);
         out.status = 503;
         out.flag = ResponseFlag::UpstreamConnectFailure;
-        let _ = write_local(
-            io,
-            &LocalReply::new(503, out.flag),
-            is_grpc,
-            ctx,
-            !keep_alive,
-        )
-        .await;
+        // B-444: 本文を読み捨ててから返す（以前は読まずに返し、残りの本文を次の要求として読んだ）
+        let lr = LocalReply::new(503, out.flag);
+        out.keep_alive = reply_before_body(io, acc, framing, &lr, is_grpc, ctx, keep_alive).await;
         return H2Result::Done(out);
     };
     // 本文: リトライできるときは読み込み済みの本文を複製して送る（応答を見るまで手元に残す）
@@ -1619,6 +1630,107 @@ async fn dechunk_into<S: AsyncReadRent>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-444: 本文を読み終える前のローカル応答は、本文を読み捨てられなければ接続を閉じる（残りの本文を次の要求として
+    /// 読まない）。読み捨てられればキープアライブを続ける
+    #[test]
+    // 理由付き allow: 試験の前提を同期のソケットで作る（データプレーンの外）
+    #[allow(clippy::disallowed_methods)]
+    fn early_reply_closes_unless_the_body_is_discarded() {
+        use crate::mesh::model::{Codec, Direction, HttpCm, RouteRef, RouteTable, XfccMode};
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        #[cfg(veil_rt_uring)]
+        if crate::runtime::IoUring::new(8, 0).is_err() {
+            return;
+        }
+        let table = RouteTable {
+            name: String::new(),
+            vhosts: Vec::new(),
+            exact: Default::default(),
+            suffix: Vec::new(),
+            prefix: Vec::new(),
+            catch_all: None,
+            ignore_port: false,
+            request_ops: Default::default(),
+            response_ops: Default::default(),
+        };
+        let hcm = Arc::new(HttpCm {
+            stat_prefix: String::new(),
+            routes: RouteRef::Inline(Arc::new(table)),
+            codec: Codec::Auto,
+            server_name: Bytes::new(),
+            xfcc: XfccMode::AlwaysForwardOnly,
+            xfcc_subject: false,
+            xfcc_uri: false,
+            xfcc_dns: false,
+            generate_request_id: false,
+            use_remote_address: false,
+            xff_num_trusted_hops: 0,
+            path_normalization: Default::default(),
+            websocket: false,
+            filters: Vec::new(),
+            peer_metadata: false,
+            istio_alpn: false,
+            direction: Direction::Inbound,
+            stream_idle_timeout: None,
+            trace_sampling: 0,
+            access_logs: Vec::new(),
+            tracer: None,
+            linkerd: false,
+        });
+        let run = |framing: Framing, sent: &'static [u8]| -> (bool, String) {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            let (s, peer) = l.accept().unwrap();
+            c.write_all(sent).unwrap();
+            s.set_nonblocking(true).unwrap();
+            let ctx = ConnCtx {
+                hcm: hcm.clone(),
+                direction: Direction::Inbound,
+                orig_dst: None,
+                peer,
+                tls: false,
+                peer_principal: None,
+                peer_cert_hash: None,
+                peer_dns: Vec::new(),
+                sni: None,
+                relookup: None,
+                table_version: 0,
+                stats: false,
+            };
+            let keep = crate::runtime::block_on(async move {
+                // SAFETY: 所有権を移す
+                let mut io =
+                    unsafe { crate::runtime::tcp::TcpStream::from_raw_fd(s.into_raw_fd()) };
+                let mut acc = BytesMut::new();
+                let lr = LocalReply::new(503, ResponseFlag::NoHealthyUpstream);
+                reply_before_body(&mut io, &mut acc, framing, &lr, false, &ctx, true).await
+            });
+            let mut resp = String::new();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = c.read_to_string(&mut resp);
+            (keep, resp.to_ascii_lowercase())
+        };
+        // 1MiB を超える本文は読み捨てずに閉じる
+        let (keep, resp) = run(Framing::Length(2 * 1024 * 1024), b"");
+        assert!(!keep);
+        assert!(
+            resp.starts_with("http/1.1 503") && resp.contains("connection: close"),
+            "{resp}"
+        );
+        // 壊れた chunked も閉じる
+        let (keep, resp) = run(Framing::Chunked, b"zz\r\nGET /smuggled HTTP/1.1\r\n\r\n");
+        assert!(!keep);
+        assert!(resp.contains("connection: close"), "{resp}");
+        // 読み捨てられればキープアライブを続ける
+        let (keep, resp) = run(Framing::Length(5), b"hello");
+        assert!(keep);
+        assert!(
+            resp.starts_with("http/1.1 503") && !resp.contains("connection: close"),
+            "{resp}"
+        );
+    }
 
     // B-392: HTTP/2 の上流へ送る chunked の本文は、読んだ分を捨てながら中身だけを取り出し、改行の無い
     // フレーミングは上限で打ち切る（溜め続けない）
