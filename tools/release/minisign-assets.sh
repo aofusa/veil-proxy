@@ -5,7 +5,7 @@
 #
 #   tools/release/minisign-assets.sh <tag>
 #
-# 先に SHA256SUMS の cosign の署名とハッシュを確かめ、CI が作ったものだけに署名する。
+# 先に SHA256SUMS の cosign の署名とハッシュを確かめ、SHA256SUMS に載っている（CI が作った）アーカイブだけに署名する。
 # 要る環境変数: MINISIGN_SECRET_KEY（minisign の秘密鍵ファイルの中身。パスワード無し）、GH_TOKEN
 set -euo pipefail
 TAG="${1:?tag}"
@@ -23,7 +23,18 @@ case "${MINISIGN_SECRET_KEY:?}" in
     "untrusted comment:"*) printf '%s\n' "$MINISIGN_SECRET_KEY" > "$W/minisign.key" ;;
     *) printf 'untrusted comment: veil release signing\n%s\n' "$(printf '%s' "$MINISIGN_SECRET_KEY" | tr -d '\r\n ')" > "$W/minisign.key" ;;
 esac
+# B-459: 署名するのは、確かめた SHA256SUMS に載っているアーカイブだけ。載っていないアーカイブがリリースにあれば止める
+# （以前はダウンロードした全部に署名し、リリースへ資産を足せる者が足した CI の作っていないアーカイブ（ビルドしていない
+# ターゲットの名前）にもプロジェクトの鍵で署名して、cargo binstall に入れさせられた）
+mapfile -t listed < <(awk '{ n = $2; sub(/^\*/, "", n); if (n ~ /\.(tar\.gz|zip)$/) print n }' SHA256SUMS)
+[ "${#listed[@]}" -gt 0 ] || { echo "SHA256SUMS lists no archives" >&2; exit 1; }
 for f in *.tar.gz *.zip; do
+    [ -e "$f" ] || continue
+    printf '%s\n' "${listed[@]}" | grep -Fxq -- "$f" \
+        || { echo "release asset $f is not listed in SHA256SUMS; refusing to sign" >&2; rm -f "$W/minisign.key"; exit 1; }
+done
+for f in "${listed[@]}"; do
+    [ -f "$f" ] || { echo "skip $f: listed in SHA256SUMS but not on the release"; continue; }
     minisign -S -s "$W/minisign.key" -m "$f" -x "$f.sig" -t "veil $TAG $f" </dev/null
 done
 rm -f "$W/minisign.key"

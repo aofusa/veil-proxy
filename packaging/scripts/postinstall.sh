@@ -27,9 +27,13 @@ if ! getent passwd veil >/dev/null 2>&1; then
 fi
 
 install -d -m 0750 -o veil -g veil /var/log/veil /var/cache/veil /var/tmp/veil
-# 新しく入れたときだけ、設定を root:veil 0640 にする（降格後の veil が読める・他の利用者は読めない）
-if [ "$ACTION" = 1 ] || { [ "$ACTION" = configure ] && [ -z "$FROM_VERSION" ]; }; then
-    if [ -f /etc/veil/config.toml ]; then
+# 設定を root:veil 0640 にする（降格後の veil が読める・他の利用者は読めない）。新しく入れたときに加えて、deb の
+# パッケージの権限（root:root 0644）のままなら上げるときも直す。利用者が自分で決めた所有者・権限は変えない。
+# B-472: 0.8.x から上げると /etc/veil/config.toml の conffile は上げるときに初めて入り、0644 のまま残った
+# （[admin] secret 等を書き移すと他の利用者が読めた）。dpkg が手の入っていない conffile を入れ替えたときも 0644 に戻る
+if [ -f /etc/veil/config.toml ]; then
+    if [ "$ACTION" = 1 ] || { [ "$ACTION" = configure ] && [ -z "$FROM_VERSION" ]; } \
+        || [ "$(stat -c '%a %u:%g' /etc/veil/config.toml 2>/dev/null)" = "644 0:0" ]; then
         chown root:veil /etc/veil/config.toml
         chmod 0640 /etc/veil/config.toml
     fi

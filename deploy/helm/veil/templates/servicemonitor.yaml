@@ -1,4 +1,7 @@
 {{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+{{- if not .Values.metrics.allowedIps }}
+{{- fail "metrics.serviceMonitor.enabled needs metrics.allowedIps: list the addresses of the Prometheus pods (your pod CIDR, for example 10.244.0.0/16). The empty default allows loopback only. Do not list node, load balancer or ingress addresses." }}
+{{- end }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:

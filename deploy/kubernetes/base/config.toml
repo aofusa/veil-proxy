@@ -44,7 +44,10 @@ reload_interval_secs = 5
 [prometheus]
 enabled = true
 path = "/__metrics"
-allowed_ips = ["127.0.0.1/32", "10.0.0.0/8"]
+# B-458: ループバック（kubectl port-forward）だけ。クラスタの Prometheus には Pod の CIDR（kind は 10.244.0.0/16）を足す。
+# ノード・ロードバランサ・イングレスのアドレスやそれを含む 10.0.0.0/8 は書かない（サイトと同じポートで返すので、
+# LoadBalancer/NodePort・イングレス越しのクラスタの外からの要求がそのアドレスで届いて通る）
+allowed_ips = ["127.0.0.1/32"]
 
 [vds]
 enabled = false

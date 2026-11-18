@@ -16,5 +16,8 @@ HTTP/3: UDP port {{ .Values.service.tlsPort }} of the Service {{ include "veil.f
 {{- end }}
 {{- if .Values.metrics.enabled }}
 Metrics: http://{{ include "veil.fullname" . }}:{{ .Values.service.port }}/__metrics
+{{- if .Values.metrics.allowedIps }} (from {{ join ", " .Values.metrics.allowedIps }} only)
+{{- else }} (loopback only, e.g. through kubectl port-forward; set metrics.allowedIps for Prometheus)
+{{- end }}
 {{- end }}
 Guide: https://github.com/aofusa/veil-proxy/blob/main/docs/guide/kubernetes.md#helm

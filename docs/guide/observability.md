@@ -162,7 +162,11 @@ allowed_ips = [
 
 ### Access Control
 
-When `allowed_ips` is configured, only the specified IP addresses/CIDRs can access the metrics endpoint.
+When `allowed_ips` is configured, only the specified IP addresses/CIDRs can access the metrics endpoint. The check
+sees the TCP peer. Behind a reverse proxy, an ingress, or a Kubernetes LoadBalancer/NodePort Service with
+`externalTrafficPolicy: Cluster`, requests from the Internet arrive from the proxy's or the node's private address, so
+a private range such as `10.0.0.0/8` lets them through: list the scraper's addresses (for Kubernetes, the pod CIDR
+of the Prometheus pods) and keep the metrics path from being forwarded by the proxy.
 When empty (the default), only loopback clients (and Unix-socket listeners) can access it; before v0.10.0 every IP could. Write `["0.0.0.0/0", "::/0"]` to allow everyone. `[admin] allowed_ips` behaves the same way.
 
 | Format | Example |

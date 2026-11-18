@@ -32,6 +32,7 @@ Landlock を足します。設定を変えると Pod が入れ替わります（
 | `tls.secretName` | — | `kubernetes.io/tls` の Secret。TLS のリスナー（8443 番、Service は `service.tlsPort`）を足す |
 | `http3.enabled` | `false` | UDP 8443 の QUIC。別の Service `<release>-veil-h3`（`tls.secretName` が要る） |
 | `metrics.enabled` / `metrics.serviceMonitor.enabled` | `false` | `/__metrics` と Prometheus Operator の ServiceMonitor |
+| `metrics.allowedIps` | `[]` | `/__metrics` を読めるアドレス。空はループバックだけ（`kubectl port-forward`）。ServiceMonitor には Prometheus の Pod のアドレス（Pod の CIDR。port-forward も使うなら `127.0.0.1/32` も）が要る。ノード・ロードバランサ・イングレスのアドレスは書かない（クラスタの外からの要求はそこから届く） |
 | `grafanaDashboard.enabled` | `false` | [ダッシュボードの例](observability.md) を Grafana の sidecar 向けの ConfigMap にする |
 | `extraVolumes` / `extraVolumeMounts` | — | 自分のファイル。例: `/var/www` にマウントした ConfigMap |
 | `autoscaling` / `podDisruptionBudget` / `networkPolicy` | 無効 | |

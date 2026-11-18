@@ -83,7 +83,9 @@ EOF
 cmd_up() {
     _write_boot
     docker rm -f "${NAME}" 2>/dev/null || true
-    docker run -d --name "${NAME}" -p "${SSH_PORT}:${SSH_PORT}" -p "${CON_PORT}:${CON_PORT}" \
+    # B-457: コンソール（認証なしの telnet。ローダから single-user でパスワード無しの root になれる）と SSH は
+    # ループバックにだけ公開する（ホスト IP を付けない -p は全インタフェースで受け、ホストのファイアウォールも迂回する）
+    docker run -d --name "${NAME}" -p "127.0.0.1:${SSH_PORT}:${SSH_PORT}" -p "127.0.0.1:${CON_PORT}:${CON_PORT}" \
         -v "${WORKDIR}:/w" -w /w "${HELPER_IMG}" bash /w/boot-fbsd-arm64.sh >/dev/null
     log "起動: console=telnet 127.0.0.1:${CON_PORT}, ssh=127.0.0.1:${SSH_PORT}（TCG のため multi-user 到達に数分）"
 }

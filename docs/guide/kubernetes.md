@@ -33,6 +33,7 @@ restarts the pods (a checksum annotation). The chart is signed with cosign (keyl
 | `tls.secretName` | — | a `kubernetes.io/tls` Secret: adds the TLS listener (port 8443, Service port `service.tlsPort`) |
 | `http3.enabled` | `false` | QUIC on UDP 8443, as a separate Service `<release>-veil-h3` (needs `tls.secretName`) |
 | `metrics.enabled` / `metrics.serviceMonitor.enabled` | `false` | `/__metrics` and a Prometheus Operator ServiceMonitor |
+| `metrics.allowedIps` | `[]` | who may read `/__metrics`; empty allows loopback only (`kubectl port-forward`). The ServiceMonitor needs the Prometheus pods' addresses (the pod CIDR; add `127.0.0.1/32` to keep port-forward working). Do not list node, load balancer or ingress addresses: requests from outside the cluster arrive from them |
 | `grafanaDashboard.enabled` | `false` | the [example dashboard](observability.md#grafana-dashboard) as a ConfigMap for the Grafana sidecar |
 | `extraVolumes` / `extraVolumeMounts` | — | your files, e.g. a ConfigMap mounted on `/var/www` |
 | `autoscaling` / `podDisruptionBudget` / `networkPolicy` | off | |

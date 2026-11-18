@@ -40,8 +40,13 @@ http3:
 # Prometheus metrics on /__metrics (port 8080), and a ServiceMonitor for the Prometheus Operator.
 metrics:
   enabled: false
-  # Source addresses allowed to scrape (the pod network by default).
-  allowedIps: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1/32"]
+  # Source addresses allowed to read /__metrics. Empty (the default) allows loopback only, which is enough for
+  # `kubectl port-forward`. A ServiceMonitor needs the addresses of the Prometheus pods: list your pod CIDR (for example
+  # 10.244.0.0/16 on kind), plus 127.0.0.1/32 to keep port-forward working (a non-empty list replaces the loopback
+  # default). Do not list node, load balancer or ingress addresses, or a range such as 10.0.0.0/8 that
+  # contains them: /__metrics is served on the same port as the site, and requests from outside the cluster that come
+  # through a LoadBalancer or NodePort Service (externalTrafficPolicy: Cluster) or an ingress arrive from those addresses.
+  allowedIps: []
   serviceMonitor:
     enabled: false
     interval: 30s

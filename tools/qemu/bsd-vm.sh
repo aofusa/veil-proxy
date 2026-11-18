@@ -272,6 +272,32 @@ _make_cidata_iso() {
 # ---------------------------------------------------------------------------
 # イメージ URL
 # ---------------------------------------------------------------------------
+# ファイルの SHA-256（16 進）。Linux は sha256sum、macOS（native）は shasum
+_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# B-473: FreeBSD の VM-IMAGE を、取得した URL と同じディレクトリの CHECKSUM.SHA256（https）と照らす。
+# 合わない・載っていないなら消して止める（壊れた・差し替えられたイメージで VM を作らない）
+_verify_freebsd_image() {
+    local file="$1" url="$2"
+    local name dir sums want got
+    name="$(basename "${url}")"
+    dir="${url%/*}"
+    sums="$(curl -fsSL --retry 3 "${dir}/CHECKSUM.SHA256")" \
+        || { rm -f "${file}"; die "CHECKSUM.SHA256 を取得できない: ${dir}"; }
+    want="$(printf '%s\n' "${sums}" | awk -v n="(${name})" '$1 == "SHA256" && $2 == n {print $4}')"
+    [[ -n "${want}" ]] || { rm -f "${file}"; die "CHECKSUM.SHA256 に ${name} が無い"; }
+    got="$(_sha256 "${file}")"
+    [[ "${got}" == "${want}" ]] \
+        || { rm -f "${file}"; die "${name} の SHA-256 が CHECKSUM.SHA256 と一致しない（${got} != ${want}）"; }
+    log "SHA-256 を確認: ${name}"
+}
+
 _image_url() {
     case "${OS_NAME}-${ARCH}" in
         # **BASIC-CLOUDINIT 版**を使う。cloud-init が入っているので、NoCloud シード
@@ -345,13 +371,17 @@ cmd_setup() {
         if [[ ! -f "${base}" ]]; then
             log "FreeBSD VM-IMAGE（BASIC-CLOUDINIT）を DL + 展開: ${url}"
             # サポートが終わったリリースは download.freebsd.org から消えて
-            # ftp-archive の old-releases へ移る（14.3-RELEASE は 2026-10 に 404 化を実測）。
+            # アーカイブの old-releases へ移る（14.3-RELEASE は 2026-10 に 404 化を実測）。
             # 本家が 404 なら同じパスのアーカイブへフォールバックする。
+            # B-473: アーカイブも https（archive.freebsd.org。ftp-archive.freebsd.org は平文の http でしか取れず、
+            # 証明書の名前が合わない）で取り、取ったイメージは CHECKSUM.SHA256 と照らしてから展開する
+            local got_url="${url}"
             if ! curl -fL --retry 3 -o "${base}.xz" "${url}"; then
-                local archive_url="${url/https:\/\/download.freebsd.org\/releases/http:\/\/ftp-archive.freebsd.org\/pub\/FreeBSD-Archive\/old-releases}"
-                log "本家ミラーに無いためアーカイブから取得: ${archive_url}"
-                curl -fL --retry 3 -o "${base}.xz" "${archive_url}"
+                got_url="${url/https:\/\/download.freebsd.org\/releases/https:\/\/archive.freebsd.org\/old-releases}"
+                log "本家ミラーに無いためアーカイブから取得: ${got_url}"
+                curl -fL --retry 3 -o "${base}.xz" "${got_url}"
             fi
+            _verify_freebsd_image "${base}.xz" "${got_url}"
             xz -dc "${base}.xz" > "${base}"
             rm -f "${base}.xz"
         fi
@@ -486,6 +516,9 @@ _write_openbsd_autoinstall() {
     # ディスクは miniroot が sd0、インストール先の qcow2 が sd1（_write_boot 参照）。
     local parttable="whole"
     [[ "${ARCH}" == "aarch64" ]] && parttable="GPT"
+    # B-473: sets は SHA256.sig（miniroot に入っているリリースの鍵で signify）で必ず確かめる。署名が無ければ
+    # 既定の答え（no）でインストールを止める（「確かめずに続ける」に yes を答えていたので、http へ落とされた経路で
+    # 署名を消されると改変した sets が入った）。https が使えないときの http への切り替えは、署名で確かめるので残す
     cat > "${WORKDIR}/auto_install.conf" <<EOF
 System hostname = veil-${OS_NAME}-${ARCH}
 Password for root = ${VM_ROOT_PASSWORD}
@@ -502,7 +535,6 @@ Location of sets = http
 HTTP Server = cdn.openbsd.org
 Unable to connect using https. Use http instead = yes
 Set name(s) = -game* -x*
-Directory does not contain SHA256.sig. Continue without verification = yes
 EOF
     log "auto_install.conf を生成: ${WORKDIR}/auto_install.conf"
 }

@@ -43,7 +43,9 @@ websocket_idle_timeout_secs = 120    # close WebSockets that sent nothing for 2 
 [prometheus]
 enabled = true
 path = "/metrics"
-allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+# Loopback only. Add the address of your Prometheus server, not a private range: requests that the TLS terminator or
+# an ingress forwards arrive from its address, so a range that contains it lets every client read the metrics.
+allowed_ips = ["127.0.0.1", "::1"]
 
 [tls_client]
 ca = "system"                        # outgoing TLS (veil::api::client, gRPC channels) trusts the OS store
@@ -242,8 +244,10 @@ FreeBSD では veil がワーカーのアイドル時にアロケータへ解放
 - ヘルスチェックは I/O をしない普通のルートで書きます（`ok` を返す `GET /healthz`）。依存先を確かめる必要があるなら、
   別に readiness のルートを作ります。ロードバランサや Kubernetes のプローブをそこへ向けます。
 - `[prometheus] enabled = true` は、全リスナーの `path`（既定 `/__metrics`）でメトリクスを返します。`allowed_ips` の
-  アドレスだけで、他のクライアントには 403 を返します。要求の数・遅延のヒストグラム・接続数は
-  [observability.md](observability.md) にあります。
+  アドレスだけで、他のクライアントには 403 を返します。検査は TCP の相手のアドレスを見ます。TLS の終端・イングレス・
+  Kubernetes の LoadBalancer/NodePort の Service の後ろでは、インターネットからの要求もそのプロキシやノードの
+  プライベートなアドレスから届きます。Prometheus のサーバ自身のアドレスを書き、前段のプロキシを含む範囲は書かないで
+  ください。要求の数・遅延のヒストグラム・接続数は [observability.md](observability.md) にあります。
 
 ## セキュリティのサンドボックス
 

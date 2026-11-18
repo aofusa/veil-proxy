@@ -158,6 +158,10 @@ allowed_ips = [
 ### アクセス制御
 
 `allowed_ips` を設定すると、指定したIPアドレス/CIDRからのみメトリクスエンドポイントにアクセス可能になります。
+検査は TCP の相手のアドレスを見ます。リバースプロキシ・イングレス・`externalTrafficPolicy: Cluster` の Kubernetes の
+LoadBalancer/NodePort の Service の後ろでは、インターネットからの要求もプロキシやノードのプライベートなアドレスから届くので、
+`10.0.0.0/8` のようなプライベートの範囲はそれを通します。スクレイパーのアドレス（Kubernetes なら Prometheus の Pod の
+CIDR）を書き、メトリクスのパスはプロキシに転送させないでください。
 空の場合（デフォルト）は loopback（と UDS のリスナー）からだけアクセスできます（v0.10.0 より前は全ての IP）。全てを許可するには `["0.0.0.0/0", "::/0"]` と書きます。`[admin] allowed_ips` も同じです。
 
 | 形式 | 例 |

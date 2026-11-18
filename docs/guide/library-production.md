@@ -41,7 +41,9 @@ websocket_idle_timeout_secs = 120    # close WebSockets that sent nothing for 2 
 [prometheus]
 enabled = true
 path = "/metrics"
-allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+# Loopback only. Add the address of your Prometheus server, not a private range: requests that the TLS terminator or
+# an ingress forwards arrive from its address, so a range that contains it lets every client read the metrics.
+allowed_ips = ["127.0.0.1", "::1"]
 
 [tls_client]
 ca = "system"                        # outgoing TLS (veil::api::client, gRPC channels) trusts the OS store
@@ -252,8 +254,10 @@ pages are returned at once (`dirty_decay_ms:0`).
   readiness route if the application must check its dependencies. Point the load balancer or the Kubernetes
   probes at them.
 - `[prometheus] enabled = true` serves the metrics at `path` (default `/__metrics`) on every listener, for the
-  addresses in `allowed_ips` only (other clients get 403). The request counters, latency histograms and connection
-  gauges are described in [observability.md](observability.md).
+  addresses in `allowed_ips` only (other clients get 403). The check sees the TCP peer: behind a TLS terminator, an
+  ingress or a Kubernetes LoadBalancer/NodePort Service, requests from the Internet arrive from that proxy's or node's
+  private address. List the Prometheus server's own address, never a range that contains the proxy in front. The
+  request counters, latency histograms and connection gauges are described in [observability.md](observability.md).
 
 ## Security sandbox
 

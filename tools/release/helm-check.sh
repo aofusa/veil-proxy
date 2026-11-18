@@ -21,7 +21,7 @@ declare -A SETS=(
   [default]=""
   [tls]="--set tls.secretName=veil-tls"
   [tls-http3]="--set tls.secretName=veil-tls --set http3.enabled=true"
-  [metrics]="--set metrics.enabled=true --set metrics.serviceMonitor.enabled=true --set grafanaDashboard.enabled=true"
+  [metrics]="--set metrics.enabled=true --set metrics.serviceMonitor.enabled=true --set metrics.allowedIps={10.244.0.0/16} --set grafanaDashboard.enabled=true"
   [scale]="--set autoscaling.enabled=true --set podDisruptionBudget.enabled=true --set networkPolicy.enabled=true"
 )
 for name in "${!SETS[@]}"; do
@@ -43,4 +43,8 @@ PY
         /veil -t -c /etc/veil/conf.d/config.toml >"$W/$name.t" 2>&1; then ok "$name: veil -t"
     else bad "$name: veil -t: $(tail -3 "$W/$name.t")"; fi
 done
+# B-458: ServiceMonitor は metrics.allowedIps を求める（既定の空はループバックだけで、Prometheus から読めない）
+if helm template t "$CHART" --set metrics.enabled=true --set metrics.serviceMonitor.enabled=true >/dev/null 2>"$W/sm.err"; then
+    bad "metrics.serviceMonitor without metrics.allowedIps must fail"
+else grep -q "needs metrics.allowedIps" "$W/sm.err" && ok "serviceMonitor needs metrics.allowedIps" || bad "serviceMonitor error: $(cat "$W/sm.err")"; fi
 [ "$FAILS" = 0 ] && echo "HELM CHECK: ALL OK" || { echo "HELM CHECK: $FAILS failure(s)"; exit 1; }

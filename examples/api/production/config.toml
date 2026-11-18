@@ -24,7 +24,9 @@ websocket_idle_timeout_secs = 120    # close WebSockets that sent nothing for 2 
 [prometheus]
 enabled = true
 path = "/metrics"
-allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+# Loopback only. Add the address of your Prometheus server, not a private range: requests that the TLS terminator or
+# an ingress forwards arrive from its address, so a range that contains it lets every client read the metrics.
+allowed_ips = ["127.0.0.1", "::1"]
 
 [tls_client]
 ca = "system"                        # outgoing TLS (veil::api::client, gRPC channels) trusts the OS store

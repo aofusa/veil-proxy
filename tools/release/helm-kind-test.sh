@@ -50,7 +50,8 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyou
 kubectl create secret tls veil-tls --cert "$W/c" --key "$W/k" >/dev/null
 old="$(kubectl get pod -l app.kubernetes.io/instance=veil -o jsonpath='{.items[0].metadata.name}')"
 helm upgrade veil "$CHART" "${H[@]}" --set tls.secretName=veil-tls --set http3.enabled=true --set metrics.enabled=true \
-    --set metrics.serviceMonitor.enabled=true --set grafanaDashboard.enabled=true --wait --timeout 180s >/dev/null \
+    --set metrics.serviceMonitor.enabled=true --set 'metrics.allowedIps={10.244.0.0/16,127.0.0.1/32}' --set grafanaDashboard.enabled=true \
+    --wait --timeout 180s >/dev/null \
     && ok "upgrade (tls, http3, metrics)" || bad "upgrade (tls, http3, metrics)"
 kubectl rollout status deploy/veil --timeout 120s >/dev/null
 kubectl wait --for=delete "pod/$old" --timeout=90s >/dev/null 2>&1 && ok "the pod was replaced on a configuration change" || bad "the pod was not replaced"
