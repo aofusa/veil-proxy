@@ -82,7 +82,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         warn,
                         "[wasm:{}] HTTP call to '{}' denied: not in allowed_upstreams",
                         state.http_ctx.plugin_name,
-                        upstream
+                        super::logging::LogSafe(&upstream)
                     );
                     return PROXY_RESULT_BAD_ARGUMENT;
                 }

@@ -2098,6 +2098,28 @@ pub(crate) fn extract_vary_headers_for_cache_key<'a>(
     result
 }
 
+/// `key_headers` の値をそのままキャッシュのキーにできるか。キーに挙げたヘッダが 2 つ以上ある・値が UTF-8 でないと、
+/// キーは最初の値だけ（または値の無いもの）で作られる一方で上流は全部を受け取るので、別の要求の応答を共有し得る。
+/// できなければその要求ではキャッシュを使わない
+// B-425
+pub(crate) fn cache_key_headers_usable(
+    request_headers: &[(bytes::Bytes, bytes::Bytes)],
+    key_header_names: &[String],
+) -> bool {
+    key_header_names.iter().all(|k| {
+        let mut seen = false;
+        for (name, value) in request_headers {
+            if name.eq_ignore_ascii_case(k.as_bytes()) {
+                if seen || std::str::from_utf8(value).is_err() {
+                    return false;
+                }
+                seen = true;
+            }
+        }
+        true
+    })
+}
+
 /// 304 Not Modified レスポンスを構築
 pub(crate) fn build_304_response(
     cached_entry: &cache::CacheEntry,
@@ -2430,14 +2452,55 @@ mod idempotent_method_tests {
         assert!(!super::is_plain_relative_subpath("/abs"));
     }
 
+    /// B-425: キーに挙げたヘッダが 2 つ以上ある・値が UTF-8 でない要求はキャッシュを使わない
+    #[test]
+    fn cache_key_headers_must_be_single_utf8() {
+        use super::cache_key_headers_usable;
+        let h = |v: &[(&str, &str)]| -> Vec<(bytes::Bytes, bytes::Bytes)> {
+            v.iter()
+                .map(|(n, v)| {
+                    (
+                        bytes::Bytes::copy_from_slice(n.as_bytes()),
+                        bytes::Bytes::copy_from_slice(v.as_bytes()),
+                    )
+                })
+                .collect()
+        };
+        let keys = vec!["Cookie".to_string()];
+        assert!(cache_key_headers_usable(&h(&[("cookie", "a=1")]), &keys));
+        assert!(cache_key_headers_usable(&h(&[("accept", "*/*")]), &keys));
+        assert!(cache_key_headers_usable(&h(&[("cookie", "a=1")]), &[]));
+        assert!(!cache_key_headers_usable(
+            &h(&[("Cookie", "lang=en"), ("cookie", "session=x")]),
+            &keys
+        ));
+        let bad = vec![(
+            bytes::Bytes::from_static(b"cookie"),
+            bytes::Bytes::from_static(b"session=x; z=\xff"),
+        )];
+        assert!(!cache_key_headers_usable(&bad, &keys));
+    }
+
     /// B-419: 静的配信は空のセグメント（`//`）のあるパスを配信しない（クエリの中の `//` は見ない）
     #[test]
     fn static_path_empty_segment() {
         use super::path_has_empty_segment as e;
-        for p in ["//admin/x", "/static//css/a.css", "/a/b//", "//", "/x//?q=1"] {
+        for p in [
+            "//admin/x",
+            "/static//css/a.css",
+            "/a/b//",
+            "//",
+            "/x//?q=1",
+        ] {
             assert!(e(p), "{p}");
         }
-        for p in ["/", "/admin/x", "/static/css/", "/a?u=http://x//y", "/a/b.css?x=//"] {
+        for p in [
+            "/",
+            "/admin/x",
+            "/static/css/",
+            "/a?u=http://x//y",
+            "/a/b.css?x=//",
+        ] {
             assert!(!e(p), "{p}");
         }
     }

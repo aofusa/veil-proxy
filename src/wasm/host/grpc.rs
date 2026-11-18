@@ -275,7 +275,7 @@ fn proxy_grpc_call_impl(
                 warn,
                 "[wasm:{}] gRPC call to '{}' denied: not in allowed_upstreams",
                 state.http_ctx.plugin_name,
-                upstream
+                super::logging::LogSafe(&upstream)
             );
             return PROXY_RESULT_BAD_ARGUMENT;
         }
@@ -328,8 +328,8 @@ fn proxy_grpc_call_impl(
     ftlog::info!(
         "WASM: proxy_grpc_call - upstream={}, service={}, method={}, message_size={}, timeout_ms={}",
         upstream,
-        String::from_utf8_lossy(&service),
-        String::from_utf8_lossy(&method),
+        super::logging::LogSafe(&String::from_utf8_lossy(&service)),
+        super::logging::LogSafe(&String::from_utf8_lossy(&method)),
         message.len(),
         timeout_ms
     );
@@ -455,7 +455,7 @@ fn proxy_grpc_stream_impl(
                 warn,
                 "[wasm:{}] gRPC stream to '{}' denied: not in allowed_upstreams",
                 state.http_ctx.plugin_name,
-                upstream
+                super::logging::LogSafe(&upstream)
             );
             return PROXY_RESULT_BAD_ARGUMENT;
         }
@@ -521,8 +521,8 @@ fn proxy_grpc_stream_impl(
         "WASM: proxy_grpc_stream opened stream_id={} to {}/{}/{}",
         stream_id,
         upstream,
-        service,
-        method
+        super::logging::LogSafe(&service),
+        super::logging::LogSafe(&method)
     );
     PROXY_RESULT_OK
 }

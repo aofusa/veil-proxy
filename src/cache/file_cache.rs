@@ -513,8 +513,17 @@ impl OpenFileCache {
             }
             // フォールバック: パスを正規化（シンボリックリンク解決・パストラバーサル防止）
             let canonical = path.canonicalize().ok()?;
+            // B-432: 正規化したパスを名前で開き直すと、その間に途中の段をシンボリックリンクへ入れ替えられたとき、呼び出し側が
+            // 正規化したパスの文字列で封じ込めを判定しても fd はルートの外を指していた。設定の静的ルートの下は、ルートから
+            // どの段でもシンボリックリンクをたどらずに開き、属性も開いた fd から取る
+            #[cfg(unix)]
+            let (metadata, opened) = {
+                let file = super::resolve::open_canonical(&canonical).ok()?;
+                (file.metadata().ok()?, Some(file))
+            };
             // メタデータを取得
-            let metadata = std::fs::metadata(&canonical).ok()?;
+            #[cfg(not(unix))]
+            let (metadata, opened) = (std::fs::metadata(&canonical).ok()?, None::<std::fs::File>);
             // MIMEタイプを推測
             let mime_type: std::sync::Arc<str> = crate::static_response::intern_mime(
                 mime_guess::from_path(&canonical)
@@ -525,9 +534,12 @@ impl OpenFileCache {
             let is_file = metadata.is_file();
             // 通常ファイルは配信に使う fd も保持する（開けなければ配信時に開き直す）。
             let shared_file = if is_file {
-                std::fs::File::open(&canonical)
-                    .ok()
-                    .map(std::sync::Arc::new)
+                match opened {
+                    Some(file) => Some(std::sync::Arc::new(file)),
+                    None => std::fs::File::open(&canonical)
+                        .ok()
+                        .map(std::sync::Arc::new),
+                }
             } else {
                 None
             };

@@ -2916,6 +2916,121 @@ mod tests {
         );
     }
 
+    /// B-455: 確立した接続へ別の IP から届いたパケットは quiche へ渡さない（接続を移させず、要求の検査は
+    /// ハンドシェイクの IP のまま正しい）。同じ IP のポート違い（NAT の付け替え）は受けて、アドレスを新しいポートにする。
+    #[test]
+    fn test_b455_packets_from_another_ip_do_not_migrate_the_connection() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.pem();
+        let key = ck.signing_key.serialize_pem();
+        let mut server_cfg =
+            new_quic_config_with_certs(cert.as_bytes(), key.as_bytes()).expect("server config");
+        server_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_cfg.set_initial_max_data(1 << 20);
+        let quic_config = Rc::new(RefCell::new(server_cfg));
+        let server_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let mut conns: ConnMapInner = HashMap::with_hasher(conn_map_hasher());
+        let notify = crate::http3_stream::H3Notify::new();
+        let spawner = crate::http3_stream::backend_task_spawner();
+        let wake_queue: crate::http3_stream::WakeQueue = Default::default();
+        let mut dirty = VecDeque::new();
+        let cid_key = hmac::Key::new(hmac::HMAC_SHA256, &[42u8; 32]);
+        let mut feed = |conns: &mut ConnMapInner, pkt: &mut [u8], from: SocketAddr| {
+            process_datagram_segments(
+                conns,
+                pkt,
+                from,
+                None,
+                &cid_key,
+                &quic_config,
+                server_addr,
+                &notify,
+                &spawner,
+                &wake_queue,
+                &mut dirty,
+                Instant::now(),
+            )
+            .unwrap();
+        };
+        let mut client_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_cfg.verify_peer(false);
+        // サーバの HTTP/3 の層は単方向のストリームを 3 本開くので、上限を渡さないと接続を閉じる
+        client_cfg.set_initial_max_data(1 << 20);
+        client_cfg.set_initial_max_stream_data_bidi_local(1 << 16);
+        client_cfg.set_initial_max_stream_data_uni(1 << 16);
+        client_cfg.set_initial_max_streams_bidi(16);
+        client_cfg.set_initial_max_streams_uni(16);
+        let mut buf = vec![0u8; 1500];
+        let addr: SocketAddr = "127.0.0.1:40031".parse().unwrap();
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[31; 16]),
+            addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .unwrap();
+        let info = quiche::RecvInfo {
+            from: server_addr,
+            to: addr,
+        };
+        for _ in 0..10 {
+            while let Ok((len, _)) = client.send(&mut buf) {
+                feed(&mut conns, &mut buf[..len], addr);
+            }
+            for h in conns.values_mut() {
+                while let Ok((len, _)) = h.conn.send(&mut buf) {
+                    let _ = client.recv(&mut buf[..len], info);
+                }
+            }
+        }
+        assert!(client.is_established());
+        assert!(!client.is_closed() && !client.is_draining());
+        let recv_before = conns.values().next().unwrap().conn.stats().recv;
+
+        // 別の IP から（PING を載せた非プロービングのパケット。そのまま渡すと quiche は接続を移す）
+        client.send_ack_eliciting().unwrap();
+        let (len, _) = client.send(&mut buf).unwrap();
+        let other_ip: SocketAddr = "127.0.0.2:40031".parse().unwrap();
+        feed(&mut conns, &mut buf[..len], other_ip);
+        let h = conns.values().next().unwrap();
+        assert_eq!(
+            h.conn.stats().recv,
+            recv_before,
+            "a packet from another IP must not reach quiche"
+        );
+        assert_eq!(h.conn.path_stats().count(), 1);
+        assert_eq!(h.peer_addr, addr);
+        assert_eq!(h.client_ip.as_str(), "127.0.0.1");
+
+        // 同じ IP のポート違いは受けて移る
+        client.send_ack_eliciting().unwrap();
+        let (len, _) = client.send(&mut buf).unwrap();
+        let rebound: SocketAddr = "127.0.0.1:40032".parse().unwrap();
+        feed(&mut conns, &mut buf[..len], rebound);
+        let h = conns.values().next().unwrap();
+        assert_eq!(h.conn.stats().recv, recv_before + 1);
+        // quiche は新しいパスを確かめて（PATH_CHALLENGE・PATH_RESPONSE）から移ったと知らせる
+        for _ in 0..5 {
+            for h in conns.values_mut() {
+                while let Ok((len, _)) = h.conn.send(&mut buf) {
+                    let _ = client.recv(&mut buf[..len], info);
+                }
+            }
+            while let Ok((len, _)) = client.send(&mut buf) {
+                feed(&mut conns, &mut buf[..len], rebound);
+            }
+        }
+        let h = conns.values().next().unwrap();
+        assert_eq!(h.peer_addr, rebound, "a port-only change must be followed");
+        assert_eq!(h.client_ip.as_str(), "127.0.0.1");
+    }
+
     /// F-280: 0-RTT のデータを受け取っても、ハンドシェイクが終わるまで HTTP/3 の層を作らない（要求を処理しない）。
     /// 0-RTT は再送され得るので、`init_h3` の `is_established()` の検査が再送攻撃を防ぐ不変条件になっている。
     #[test]

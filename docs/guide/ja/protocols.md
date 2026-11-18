@@ -161,7 +161,7 @@ HTTP/3（RFC 9114）をQUIC/UDPベースでサポートします。Cloudflare製
 |------|------|
 | 1-RTT の接続確立 | QUIC はトランスポートと TLS のハンドシェイクを 1 往復にまとめる。0-RTT のデータは受け取るが、要求はハンドシェイクの完了後に処理する（再送攻撃を受けない） |
 | Head-of-Lineブロッキング解消 | パケットロスが他ストリームに影響しない |
-| 接続マイグレーション | ネットワーク切り替え時も接続維持 |
+| NAT の付け替え | クライアントのポートが変わっても接続を続ける。別の IP へは移らない（`disable_active_migration` を送り、ハンドシェイクした IP 以外から届いたパケットは捨てる。IP で見る検査（`blocked_ips`・`allowed_ips`・`source_ip`・レート制限・`X-Forwarded-For`）は常に要求を送っているアドレスを見る）。ネットワークを替えたクライアントは新しい接続を開く |
 | GSO/GRO最適化 | 高パフォーマンスUDP処理（UDP_SEGMENT / UDP_GRO） |
 | 輻輳制御・ペーシング | `[http3]`（`cc_algorithm`・`pacing`・`hystart` 等）で設定。既定は cubic + ペーシング |
 | 楽観的 ACK の検出 | 輻輳窓が前回確かめた窓の 2 倍になるたびにパケット番号を 1 つ飛ばし、クライアントがその番号を ACK したら接続を閉じる（`[http3] skip_packet_numbers`、既定 `"on_growth"`） |

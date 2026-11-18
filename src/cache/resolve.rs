@@ -112,6 +112,231 @@ pub fn register_static_roots(roots: &[PathBuf]) {
         let _ = roots;
         log_registration_result(false);
     }
+    set_configured_roots(roots);
+}
+
+// B-431: 設定の File のルートのうち登録できていないもの（リロードで足した・起動時に開けなかった）。登録済みの
+// ルートの下にあると、その下のパスを外側のルートの dirfd で開いて外側の封じ込めで許してしまい（内側のルートの外を
+// 指すシンボリックリンクが、外側の別のルートの保護された場所へ届く）、内側のルートの検査は開いたパス（生のパス）を
+// そのまま通していた。そうしたパスは外側の dirfd で開かず、canonicalize の経路（正規化したパスで封じ込めを判定）へ回す
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+static UNREGISTERED_ROOTS: arc_swap::ArcSwapOption<Vec<PathBuf>> =
+    arc_swap::ArcSwapOption::const_empty();
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+static HAS_UNREGISTERED_ROOTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 設定ロード（起動・リロード）のたびに、その設定の File のルートを渡す（コールドパス）。登録されていないルートの
+/// 集合が変わって空でなければ `true`（呼び出し側は、外側のルートの dirfd で開いて入れた静的配信のキャッシュを捨てる）
+pub fn set_configured_roots(roots: &[PathBuf]) -> bool {
+    #[cfg(unix)]
+    set_canonical_roots(roots);
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        use std::sync::atomic::Ordering;
+        let mut unregistered: Vec<PathBuf> = Vec::new();
+        for r in roots {
+            if !root_in_table(r) && !unregistered.contains(r) {
+                unregistered.push(r.clone());
+            }
+        }
+        let changed = UNREGISTERED_ROOTS
+            .load()
+            .as_deref()
+            .map_or(!unregistered.is_empty(), |old| *old != unregistered);
+        if unregistered.is_empty() {
+            HAS_UNREGISTERED_ROOTS.store(false, Ordering::Relaxed);
+            UNREGISTERED_ROOTS.store(None);
+            false
+        } else {
+            UNREGISTERED_ROOTS.store(Some(std::sync::Arc::new(unregistered)));
+            HAS_UNREGISTERED_ROOTS.store(true, Ordering::Relaxed);
+            changed
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = roots;
+        false
+    }
+}
+
+// B-432: 設定の File のルート（ディレクトリ）の正規化した形（深い順）。canonicalize の経路で開くファイルは、この
+// ルートからどの段でもシンボリックリンクをたどらずに開く（`open_canonical`）
+#[cfg(unix)]
+static CANONICAL_ROOTS: arc_swap::ArcSwapOption<Vec<PathBuf>> =
+    arc_swap::ArcSwapOption::const_empty();
+
+#[cfg(unix)]
+fn set_canonical_roots(roots: &[PathBuf]) {
+    let mut canonical: Vec<PathBuf> = Vec::new();
+    for r in roots {
+        // 理由付き allow: 設定ロード（起動・リロード）のコールドパス。capability mode 等で解決できないルートは
+        // 入れない（そのルートの下は従来どおり名前で開く）
+        #[allow(clippy::disallowed_methods)]
+        let Ok(c) = std::fs::canonicalize(r) else {
+            continue;
+        };
+        if c.is_dir() && !canonical.contains(&c) {
+            canonical.push(c);
+        }
+    }
+    canonical.sort_by_key(|c| std::cmp::Reverse(c.components().count()));
+    CANONICAL_ROOTS.store((!canonical.is_empty()).then(|| std::sync::Arc::new(canonical)));
+}
+
+/// canonicalize で得たパスを開く（canonicalize の経路の open。offload の中で呼ぶ）。設定の静的ルートの下なら、
+/// ルートからどの段でもシンボリックリンクをたどらずに開く（`canonicalize` と open の間に途中の段をシンボリックリンクへ
+/// 入れ替えられても外を開かない）。どのルートの下でもなければ名前で開く（呼び出し側の封じ込めの検査が断る）
+// 呼び出し元は静的配信のファイルキャッシュ（`cache` feature）だけ
+#[cfg(all(unix, feature = "cache"))]
+pub(crate) fn open_canonical(canonical: &Path) -> io::Result<File> {
+    let roots = CANONICAL_ROOTS.load();
+    if let Some(root) = roots
+        .as_deref()
+        .and_then(|v| v.iter().find(|r| canonical.starts_with(r)))
+    {
+        return open_beneath_no_symlinks(root, canonical);
+    }
+    // 理由付き allow: offload の専用ワーカースレッド内。O_NONBLOCK: 名前付きパイプの open は相手を待って止まる
+    // （以前は属性を見て通常ファイルだけを開いていた）。開いた後で外す
+    use std::os::unix::fs::OpenOptionsExt;
+    #[allow(clippy::disallowed_methods)]
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(canonical)?;
+    clear_nonblock(&file)?;
+    Ok(file)
+}
+
+/// open で付けた O_NONBLOCK を外す（配信の sendfile・pread の振る舞いを従来の fd と揃える）
+#[cfg(unix)]
+fn clear_nonblock(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: fd は開いている有効な fd。F_GETFL・F_SETFL は状態フラグを読み書きするだけ
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if fl < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `start`（正規化したディレクトリ）の下の正規化したパス `canonical` を、`openat(O_NOFOLLOW)` で 1 段ずつ開く（B-432）。
+/// 途中の段も最後の段もシンボリックリンクならたどらずに失敗する
+#[cfg(unix)]
+fn open_beneath_no_symlinks(start: &Path, canonical: &Path) -> io::Result<File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let rel = canonical.strip_prefix(start).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "path resolves outside of the configured static root",
+        )
+    })?;
+    // 理由付き allow: offload の専用ワーカースレッド内（ルートは設定の値）
+    #[allow(clippy::disallowed_methods)]
+    let mut cur = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(start)?;
+    let mut comps = rel.components().peekable();
+    while let Some(c) = comps.next() {
+        let std::path::Component::Normal(name) = c else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unexpected component in a canonical path",
+            ));
+        };
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let last = comps.peek().is_none();
+        // 最後の段は O_NONBLOCK で開く（名前付きパイプの open は相手を待って止まる）。開いた後で外す
+        flags |= if last {
+            libc::O_NONBLOCK
+        } else {
+            libc::O_DIRECTORY
+        };
+        // SAFETY: `cur` は開いているディレクトリの fd、`name` は NUL 終端の 1 段の名前
+        let fd = unsafe { libc::openat(cur.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat が返した所有権のある有効な fd
+        cur = unsafe { File::from_raw_fd(fd) };
+        if last {
+            clear_nonblock(&cur)?;
+        }
+    }
+    Ok(cur)
+}
+
+/// `root` が登録済みのルート（dirfd の表にある）か
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn root_in_table(root: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::in_table(root)
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        crate::security::capsicum::is_static_dir_root(root)
+    }
+}
+
+/// 登録済みのルート `registered` の dirfd で `full_path` を開いてはいけないか: その間にある登録されていないルートの下
+/// （そのルート自身は除く。ルートのパスは設定の値）なら開かない（Linux は canonicalize の経路へ回す）
+#[cfg(target_os = "linux")]
+pub(crate) fn below_unregistered_root(registered: &Path, full_path: &Path) -> bool {
+    if !HAS_UNREGISTERED_ROOTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    UNREGISTERED_ROOTS
+        .load()
+        .as_deref()
+        .is_some_and(|holes| deepest_shadowing(holes, registered, full_path).is_some())
+}
+
+/// 登録済みのルート `registered` と `full_path` の間にある登録されていないルートのうち最も深いものを `f` に渡す
+/// （無ければ `None`）。FreeBSD はそのルートを `registered` の dirfd の下に開いてから、その下に開く（capability mode
+/// では canonicalize の経路を使えない。`security::capsicum` の `resolve_in`）
+#[cfg(target_os = "freebsd")]
+pub(crate) fn with_unregistered_root_below<R>(
+    registered: &Path,
+    full_path: &Path,
+    f: impl FnOnce(Option<&Path>) -> R,
+) -> R {
+    if !HAS_UNREGISTERED_ROOTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return f(None);
+    }
+    let holes = UNREGISTERED_ROOTS.load();
+    f(holes
+        .as_deref()
+        .and_then(|holes| deepest_shadowing(holes, registered, full_path)))
+}
+
+/// `holes`（登録されていないルート）のうち、`registered` より深く `full_path` を含む（`full_path` 自身は除く）もので
+/// 最も深いもの
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn deepest_shadowing<'a>(
+    holes: &'a [PathBuf],
+    registered: &Path,
+    full_path: &Path,
+) -> Option<&'a Path> {
+    holes
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|h| {
+            *h != registered
+                && h.starts_with(registered)
+                && full_path.starts_with(h)
+                && full_path != *h
+        })
+        .max_by_key(|h| h.components().count())
 }
 
 /// リクエスト処理中（`runtime::offload` のワーカースレッド内）から呼ぶ統合エントリ。
@@ -316,12 +541,11 @@ fn fallback_open_beneath(root: &Path, rel: &Path) -> io::Result<(File, Metadata)
             "path resolves outside of the configured static root",
         ));
     }
-    // 理由付き allow: フォールバック経路は offload の専用ワーカースレッド内から
-    // 呼ばれる同期 FS 操作（`register_static_roots`/`open_beneath_for_request` の
-    // 呼び出し元がいずれもホットパス外・offload 内であることを保証している）。
-    #[allow(clippy::disallowed_methods)]
-    #[cfg(not(windows))]
-    let file = File::open(&canonical_full)?;
+    // B-432: 正規化したパスを名前で開き直さない（canonicalize と open の間に途中の段をシンボリックリンクへ入れ替えると、
+    // 判定したのと別の、ルートの外のファイルを開いていた）。正規化したルートから 1 段ずつシンボリックリンクをたどらずに
+    // 開く（フォールバック経路は offload の専用ワーカースレッド内から呼ばれる）
+    #[cfg(unix)]
+    let file = open_beneath_no_symlinks(&canonical_root, &canonical_full)?;
     // Windows の CreateFileW はディレクトリを FILE_FLAG_BACKUP_SEMANTICS 無しでは
     // 開けず ERROR_ACCESS_DENIED を返す。静的ルート直下（`rel` が空）や
     // ディレクトリ URL の解決が PermissionDenied になってしまうため付与する
@@ -533,17 +757,29 @@ mod linux_impl {
         Ok((file, meta))
     }
 
+    /// `root` が dirfd の表にあるか（openat2 の可否は見ない。B-431）
+    pub(super) fn in_table(root: &Path) -> bool {
+        LINUX_ROOTS
+            .get()
+            .is_some_and(|roots| roots.iter().any(|r| r.root == root))
+    }
+
+    /// `full_path` を開くのに使う登録済みのルート（前方一致した最初の = 最も深いもの）。その間にある登録されて
+    /// いないルートの下なら使わない（B-431）
+    fn any_root(full_path: &Path) -> Option<&'static LinuxRoot> {
+        let r = LINUX_ROOTS
+            .get()?
+            .iter()
+            .find(|r| full_path.starts_with(&r.root))?;
+        (!super::below_unregistered_root(&r.root, full_path)).then_some(r)
+    }
+
     /// `full_path` が登録済み静的ルート配下かどうかを syscall なしで判定する（B-65）。
     pub(super) fn is_registered(full_path: &Path) -> bool {
         if openat2_unavailable() {
             return false;
         }
-        match LINUX_ROOTS.get() {
-            Some(roots) => roots
-                .iter()
-                .any(|r| full_path.strip_prefix(&r.root).is_ok()),
-            None => false,
-        }
+        any_root(full_path).is_some()
     }
 
     /// `root` が登録済みルートかどうかを syscall なしで判定する（F-154）。
@@ -605,29 +841,25 @@ mod linux_impl {
         if openat2_unavailable() {
             return None;
         }
-        let roots = LINUX_ROOTS.get()?;
-        for r in roots {
-            if let Ok(rel) = full_path.strip_prefix(&r.root) {
-                let rel_c = match path_to_rel_cstring(rel) {
-                    Ok(c) => c,
-                    Err(e) => return Some(Err(e)),
-                };
-                return Some(match raw_openat2(r.dirfd, &rel_c) {
-                    Ok(fd) => finish(fd),
-                    Err(e) if is_unsupported(&e) => {
-                        mark_openat2_unavailable(&e.to_string());
-                        return None;
-                    }
-                    // EXDEV/ELOOP: このパスだけ openat2 が安全側に拒否した（絶対
-                    // シンボリックリンク等）。恒久フォールバックへは倒さず、1 リクエスト
-                    // 限りで canonicalize + 含有チェックにもう一度だけ判定させる
-                    // （`is_retry_fallback` のコメント参照。フェイルオープンではない）。
-                    Err(e) if is_retry_fallback(&e) => fallback_open_beneath(&r.root, rel),
-                    Err(e) => Err(e),
-                });
+        let r = any_root(full_path)?;
+        let rel = full_path.strip_prefix(&r.root).ok()?;
+        let rel_c = match path_to_rel_cstring(rel) {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(match raw_openat2(r.dirfd, &rel_c) {
+            Ok(fd) => finish(fd),
+            Err(e) if is_unsupported(&e) => {
+                mark_openat2_unavailable(&e.to_string());
+                return None;
             }
-        }
-        None
+            // EXDEV/ELOOP: このパスだけ openat2 が安全側に拒否した（絶対
+            // シンボリックリンク等）。恒久フォールバックへは倒さず、1 リクエスト
+            // 限りで canonicalize + 含有チェックにもう一度だけ判定させる
+            // （`is_retry_fallback` のコメント参照。フェイルオープンではない）。
+            Err(e) if is_retry_fallback(&e) => fallback_open_beneath(&r.root, rel),
+            Err(e) => Err(e),
+        })
     }
 
     /// `RESOLVE_CACHED`（Linux 5.12+）が使えないと分かったか（`EINVAL` を一度でも観測したら true）
@@ -726,12 +958,11 @@ mod linux_impl {
         if openat2_unavailable() || RESOLVE_CACHED_UNAVAILABLE.load(Ordering::Relaxed) {
             return None;
         }
-        let roots = LINUX_ROOTS.get()?;
         let r = match root {
             // ルート指定（`open_in_root` と同じ。そのルートの dirfd だけ）
-            Some(root) => roots.iter().find(|r| r.root == root)?,
-            // `open_for_request` と同じルート（前方一致した最初の = 最も深いもの）
-            None => roots.iter().find(|r| full_path.starts_with(&r.root))?,
+            Some(root) => LINUX_ROOTS.get()?.iter().find(|r| r.root == root)?,
+            // `open_for_request` と同じルート（前方一致した最初の = 最も深いもの。B-431）
+            None => any_root(full_path)?,
         };
         let rel = full_path.strip_prefix(&r.root).ok()?.as_os_str().as_bytes();
         let rel = if rel.is_empty() { b".".as_slice() } else { rel };
@@ -924,6 +1155,41 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
+    /// B-431: 登録されていない内側のルートの下（そのルート自身は除く）は、外側の登録済みのルートの dirfd で開かない
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn unregistered_nested_root_shadows_outer_dirfd() {
+        let holes = vec![PathBuf::from("/srv/public")];
+        let srv = Path::new("/srv");
+        let shadowed = |registered: &Path, full: &str| {
+            deepest_shadowing(&holes, registered, Path::new(full)).is_some()
+        };
+        assert!(shadowed(srv, "/srv/public/shared/secret.txt"));
+        assert!(!shadowed(srv, "/srv/public"));
+        assert!(!shadowed(srv, "/srv/private/x"));
+        assert!(!shadowed(srv, "/srv/publicity/x"));
+        // 内側のより深い登録済みのルートで開くとき・別の木のルートは関係ない
+        assert!(!shadowed(
+            Path::new("/srv/public/deeper"),
+            "/srv/public/deeper/x"
+        ));
+        assert!(!shadowed(Path::new("/var/www"), "/var/www/x"));
+        // 入れ子の登録されていないルートは最も深いものを選ぶ（FreeBSD はそのルートの下へ封じ込めて開く）
+        let nested = vec![
+            PathBuf::from("/srv/public"),
+            PathBuf::from("/srv/public/shared"),
+            PathBuf::from("/srv/other"),
+        ];
+        assert_eq!(
+            deepest_shadowing(&nested, srv, Path::new("/srv/public/shared/x")),
+            Some(Path::new("/srv/public/shared"))
+        );
+        assert_eq!(
+            deepest_shadowing(&nested, srv, Path::new("/srv/public/y")),
+            Some(Path::new("/srv/public"))
+        );
+    }
+
     #[cfg(target_os = "linux")]
     fn reset_openat2_memoization() {
         linux_impl::reset_for_test();
@@ -1070,6 +1336,45 @@ mod tests {
         assert_eq!(meta.len(), 11);
 
         assert_same_verdict(dir.path(), rel);
+    }
+
+    /// B-432: 正規化したパスは 1 段ずつシンボリックリンクをたどらずに開く（判定の後で途中の段をシンボリックリンクへ
+    /// 入れ替えても外を開かない）。名前付きパイプの open で止まらない
+    #[cfg(unix)]
+    #[test]
+    fn open_beneath_no_symlinks_refuses_swapped_components() {
+        use std::io::Read as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(root.join("d")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("d/f.txt"), b"inside").unwrap();
+        fs::write(outside.join("f.txt"), b"outside").unwrap();
+        let root = root.canonicalize().unwrap();
+        let target = root.join("d/f.txt");
+        let mut text = String::new();
+        open_beneath_no_symlinks(&root, &target)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "inside");
+        // 判定の後で途中の段をシンボリックリンクへ入れ替える
+        fs::rename(root.join("d"), root.join("d.real")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("d")).unwrap();
+        assert!(open_beneath_no_symlinks(&root, &target).is_err());
+        // 最後の段のシンボリックリンクもたどらない
+        std::os::unix::fs::symlink(outside.join("f.txt"), root.join("last")).unwrap();
+        assert!(open_beneath_no_symlinks(&root, &root.join("last")).is_err());
+        // ルートの外は開かない
+        assert!(open_beneath_no_symlinks(&root, &outside.join("f.txt")).is_err());
+        // 名前付きパイプの open で止まらない
+        let fifo = root.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c は NUL 終端のパス
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(open_beneath_no_symlinks(&root, &fifo).is_ok());
     }
 
     #[test]

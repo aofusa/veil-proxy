@@ -151,7 +151,7 @@ Supports HTTP/3 (RFC 9114) based on QUIC/UDP. Uses Cloudflare's [quiche](https:/
 |---------|--------|
 | 1-RTT connection establishment | QUIC combines the transport and TLS handshakes; 0-RTT data is accepted but requests are processed only after the handshake completes (no replay) |
 | Head-of-Line Blocking Elimination | Packet loss doesn't affect other streams |
-| Connection Migration | Maintains connection during network switches |
+| NAT rebinding | A connection follows a change of the client's port. It does not move to another client IP: veil sends `disable_active_migration` and drops packets from an IP other than the one that completed the handshake, so IP-based checks (`blocked_ips`, `allowed_ips`, `source_ip`, rate limits, `X-Forwarded-For`) always see the address actually sending the requests. A client that changes networks opens a new connection |
 | GSO/GRO Optimization | High-performance UDP processing (UDP_SEGMENT / UDP_GRO) |
 | Congestion control / pacing | Configurable via `[http3]` (`cc_algorithm`, `pacing`, `hystart`, …); default cubic + pacing |
 | Optimistic ACK detection | Skips a packet number whenever the congestion window has doubled since the last check and closes the connection if the client acknowledges it (`[http3] skip_packet_numbers`, default `"on_growth"`) |

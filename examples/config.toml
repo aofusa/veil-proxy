@@ -2460,7 +2460,7 @@ watch = false
 #   # デフォルト: [200, 301, 302, 304]
 #   cacheable_statuses = [200, 301, 302, 304]
 #   
-#   # キャッシュ除外パスパターン（globパターン）
+#   # キャッシュ除外パスパターン（globパターン。パスに当て、クエリは見ない）
 #   bypass_patterns = ["/cached-api/user/*", "/cached-api/session"]
 #   
 #   # Varyヘッダーを尊重するか

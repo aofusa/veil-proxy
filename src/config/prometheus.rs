@@ -184,6 +184,24 @@ impl AdminConfig {
     }
 }
 
+/// 管理 API の認証の失敗を数える鍵。IPv6 は /64 ごと（1 つの /64 の中で送信元のアドレスを替えても同じ枠）、IPv4 射影は
+/// IPv4 として数える。読めなければそのまま
+// B-434: 以前は送信元のアドレスそのもの（/128）で数えていて、SLAAC 等で /64 の中のアドレスを替えるだけで上限が外れた
+#[cfg(feature = "admin")]
+fn admin_auth_key(client_ip: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match client_ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => Cow::Owned(v4.to_string()),
+            None => {
+                let s = v6.segments();
+                Cow::Owned(format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3]))
+            }
+        },
+        _ => Cow::Borrowed(client_ip),
+    }
+}
+
 #[cfg(feature = "admin")]
 impl AdminConfig {
     /// Authorization ヘッダー値がシークレットと一致するか検証する。
@@ -208,8 +226,8 @@ impl AdminConfig {
     /// `check_auth` に、IP ごとの失敗の回数の上限（1 分あたり `ADMIN_AUTH_FAILURES_PER_MINUTE`）を加えたもの。
     /// 上限を超えた IP は正しい秘密でも拒否する（総当たりを遅くする。B-231）。
     pub fn check_auth_from(&self, client_ip: &str, auth_header: Option<&str>) -> bool {
-        if super::runtime_state::rate_peek(ADMIN_AUTH_ZONE, client_ip)
-            >= ADMIN_AUTH_FAILURES_PER_MINUTE
+        let key = admin_auth_key(client_ip);
+        if super::runtime_state::rate_peek(ADMIN_AUTH_ZONE, &key) >= ADMIN_AUTH_FAILURES_PER_MINUTE
         {
             return false;
         }
@@ -218,7 +236,7 @@ impl AdminConfig {
         }
         super::runtime_state::check_rate_limit(
             ADMIN_AUTH_ZONE,
-            client_ip,
+            &key,
             ADMIN_AUTH_FAILURES_PER_MINUTE,
         );
         false

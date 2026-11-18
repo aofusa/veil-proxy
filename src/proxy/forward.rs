@@ -63,6 +63,8 @@ pub(super) async fn handle_proxy(
         if cache_config.is_cacheable_method(method)
             && !cache_config.should_bypass(path_str)
             && !cache_config.bypass_for_authorization(headers)
+            // B-425: キーに挙げたヘッダが 2 つ以上・UTF-8 でない要求はキャッシュを使わない
+            && cache_key_headers_usable(headers, &cache_config.key_headers)
         {
             // キャッシュキー生成（key_headers を使用）
             let query = path_str.find('?').map(|i| &path_str[i + 1..]);
@@ -294,6 +296,7 @@ pub(super) async fn handle_proxy(
         && cache_config.is_cacheable_method(method)
         && !cache_config.should_bypass(path_str)
         && !cache_config.bypass_for_authorization(headers)
+        && cache_key_headers_usable(headers, &cache_config.key_headers)
     {
         let query = path_str.find('?').map(|i| &path_str[i + 1..]);
         let path_only = path_str
@@ -545,7 +548,8 @@ pub(super) async fn handle_proxy(
                                 413 => ERR_MSG_REQUEST_TOO_LARGE,
                                 _ => ERR_MSG_BAD_REQUEST,
                             };
-                            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err.to_vec())).await;
+                            let _ =
+                                timeout(WRITE_TIMEOUT, client_stream.write_all(err.to_vec())).await;
                             return Some((client_stream, status, 0, true));
                         }
                     }
@@ -1443,7 +1447,12 @@ async fn read_h2c_request_body(
 ) -> Result<(Bytes, bool), u16> {
     // chunked はクライアントが 100 Continue を待つことがある（Content-Length の要求は h1 の経路が先に返している）
     if is_chunked && crate::http_utils::check_expect_continue(headers) {
-        match timeout(WRITE_TIMEOUT, client_stream.write_all(HTTP_100_CONTINUE.to_vec())).await {
+        match timeout(
+            WRITE_TIMEOUT,
+            client_stream.write_all(HTTP_100_CONTINUE.to_vec()),
+        )
+        .await
+        {
             Ok((Ok(_), _)) => {}
             _ => return Err(400),
         }

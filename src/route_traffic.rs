@@ -601,6 +601,12 @@ pub fn resolve(
     }
     let mut split = Vec::with_capacity(t.split.len());
     let mut total: u32 = 0;
+    // B-429: 分割先は親のルートと同じレート制限の枠を使う（以前は分割先ごとに枠が分かれ、上限が分割先の数の倍に
+    // なった）。枠はルートの Backend の設定のアドレス（無ければ最初の分割先のもの）
+    let mut zone = route
+        .resolved_backend
+        .as_ref()
+        .map(|b| rate_limit_zone_of(b.security()));
     for (i, e) in t.split.iter().enumerate() {
         let action = match (&e.upstream, &e.url) {
             (Some(u), None) => BackendConfig::ProxyUpstream {
@@ -627,9 +633,12 @@ pub fn resolve(
         let mut r = route.clone();
         r.action = action;
         r.traffic = None;
-        r.jwt = None;
+        // B-424: `jwt` は残す（JWT の検証は親のポリシーで 1 回だけ行い、分割先の組み立てはキャッシュを素通りさせる
+        // 資格情報のヘッダを `jwt.header` から決める。以前は外していて、分割先のキャッシュが利用者ごとの応答を共有した）
         let b = build(&r, upstream_groups)
             .map_err(|e2| err(format!("[route.traffic] split[{}]: {}", i, e2)))?;
+        let z = *zone.get_or_insert(rate_limit_zone_of(b.security()));
+        let b = with_rate_limit_zone(b, z);
         total = total
             .checked_add(e.weight)
             .ok_or_else(|| err("[route.traffic] split: total weight overflows".into()))?;
@@ -804,6 +813,25 @@ fn resolve_cors(
     })
 }
 
+/// レート制限の表の鍵（`l7::check_security` と同じ。0 なら設定のアドレス）
+fn rate_limit_zone_of(sec: &SecurityConfig) -> usize {
+    if sec.rate_limit_zone != 0 {
+        sec.rate_limit_zone
+    } else {
+        sec as *const SecurityConfig as usize
+    }
+}
+
+/// レート制限の枠を `zone` にした写し（既にその枠なら元のまま）
+fn with_rate_limit_zone(b: Backend, zone: usize) -> Backend {
+    if matches!(b, Backend::Respond(_)) || rate_limit_zone_of(b.security()) == zone {
+        return b;
+    }
+    let mut sec = b.security().clone();
+    sec.rate_limit_zone = zone;
+    b.with_security(Arc::new(sec))
+}
+
 /// `Backend` の、実際の応答に `actual` のヘッダを足す写し（`None` なら元のまま）。
 fn cors_variant(b: &Backend, actual: Option<Arc<crate::route_cors::CorsActual>>) -> Backend {
     let Some(actual) = actual else {
@@ -818,11 +846,7 @@ fn cors_variant(b: &Backend, actual: Option<Arc<crate::route_cors::CorsActual>>)
     let base_sec = b.security();
     let mut sec = base_sec.clone();
     // レート制限の枠は元の設定と共有する（オリジンごとに分けない）
-    sec.rate_limit_zone = if base_sec.rate_limit_zone != 0 {
-        base_sec.rate_limit_zone
-    } else {
-        base_sec as *const SecurityConfig as usize
-    };
+    sec.rate_limit_zone = rate_limit_zone_of(base_sec);
     sec.cors_actual = Some(actual);
     b.with_security(Arc::new(sec))
 }
@@ -936,6 +960,49 @@ mod tests {
             #[cfg(feature = "jwt")]
             jwt: None,
         }
+    }
+
+    /// B-424: 分割先の Backend も親のルートの `[route.jwt]` のヘッダを見て組み立てる（キャッシュを素通りさせる
+    /// 資格情報のヘッダが分割先でも決まる）
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn split_backends_keep_the_route_jwt_header() {
+        let route: Route = toml::from_str(
+            r#"
+[conditions]
+path = "/api/*"
+[action]
+type = "Respond"
+status = 200
+[jwt]
+header = "x-api-token"
+jwks = '{"keys":[{"kty":"EC","crv":"P-256","alg":"ES256","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}]}'
+[traffic]
+split = [{ url = "http://127.0.0.1:1", weight = 1 }, { url = "http://127.0.0.1:2", weight = 1 }]
+"#,
+        )
+        .unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let p = resolve(&route, &HashMap::new(), |r, _| {
+            seen.borrow_mut()
+                .push(r.jwt.as_ref().map(|j| j.header.clone()));
+            Ok(respond_backend(
+                &default_security(),
+                200,
+                vec![],
+                Bytes::new(),
+            ))
+        })
+        .unwrap()
+        .unwrap();
+        assert!(p.jwt.is_some());
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                Some("x-api-token".to_string()),
+                Some("x-api-token".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -1136,6 +1203,51 @@ status = 200
             panic!("expected the action response");
         };
         assert_eq!(r.status, 200);
+    }
+
+    /// B-429: 分割先はルートの Backend と同じレート制限の枠を使う（ルートの Backend が無ければ最初の分割先の枠）
+    #[test]
+    fn split_backends_share_the_route_rate_limit_zone() {
+        let mut route: Route = toml::from_str(
+            r#"
+[conditions]
+path = "/login"
+[action]
+type = "Redirect"
+redirect_url = "https://x.example/"
+[traffic]
+split = [{ url = "http://127.0.0.1:1", weight = 1 }, { url = "http://127.0.0.1:2", weight = 1 }]
+"#,
+        )
+        .unwrap();
+        let redirect = || {
+            Backend::Redirect(
+                Arc::from("https://x.example/"),
+                301,
+                false,
+                None,
+                Arc::new(SecurityConfig::default()),
+            )
+        };
+        let zones = |p: &TrafficPolicy| -> Vec<usize> {
+            p.split
+                .iter()
+                .map(|(_, b)| rate_limit_zone_of(b.security()))
+                .collect()
+        };
+        let p = resolve(&route, &HashMap::new(), |_, _| Ok(redirect()))
+            .unwrap()
+            .unwrap();
+        let z = zones(&p);
+        assert_eq!(z[0], z[1]);
+
+        let base = redirect();
+        let base_zone = rate_limit_zone_of(base.security());
+        route.resolved_backend = Some(base);
+        let p = resolve(&route, &HashMap::new(), |_, _| Ok(redirect()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(zones(&p), vec![base_zone, base_zone]);
     }
 
     /// 固定応答以外の Backend の写しは cors_actual を持ち、レート制限の枠は元の設定と同じ

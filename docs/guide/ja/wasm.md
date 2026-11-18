@@ -313,7 +313,7 @@ Linux で `[security] seccomp_mode = "filter"`・`"strict"` のときは、起�
 
 | Capability | 説明 | デフォルト |
 |-----------|------|----------|
-| `allow_logging` | ログ出力 | false |
+| `allow_logging` | ログ出力（`proxy_log`。メッセージの CR・LF 等の制御文字は `\n`・`\r`・`\u{1b}` の形で書き、ログに書いたクライアントの値で行を足させない） | false |
 | `allow_metrics` | メトリクス操作 | false |
 | `allow_shared_data` | 共有データ（`proxy_set_shared_data`・`proxy_get_shared_data`）。モジュール名ごとに 1 つの表を全要求・全ワーカーで共有し、設定のリロードでも引き継ぐ（Envoy の `vm_id` ごとの共有に当たる）。共有キューにも要る: キューは登録したモジュールのもので、取り出せるのはそのモジュールだけ。他のモジュールは持ち主のモジュール名（`vm_id`）でキューを引いてから積む | false |
 | `allow_request_headers_read` | リクエストヘッダー読み取り | false |

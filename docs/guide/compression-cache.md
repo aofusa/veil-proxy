@@ -214,7 +214,7 @@ url = "http://localhost:8080"
 | `default_ttl_secs` | Default TTL when Cache-Control is absent | 300 |
 | `methods` | HTTP methods to cache | ["GET", "HEAD"] |
 | `cacheable_statuses` | Status codes to cache | [200, 301, 302, 304] |
-| `bypass_patterns` | Glob patterns to skip caching | [] |
+| `bypass_patterns` | Glob patterns to skip caching, matched against the path (the query string is ignored) | [] |
 | `respect_vary` | Honor Vary header for cache separation | true |
 | `enable_etag` | Enable ETag/If-None-Match validation | true |
 | `stale_while_revalidate` | Serve stale while updating in background | false |
@@ -276,6 +276,8 @@ Cache keys are generated from:
 - With `respect_vary = true`, a response whose `Vary` names a header that is not in `key_headers` is not cached
   (the cache key would not tell those requests apart). Add the header to `key_headers` (for example
   `key_headers = ["Accept-Encoding"]`) to cache such responses per value
+- A request that carries a `key_headers` header more than once, or with a value that is not UTF-8, neither reads nor
+  fills the cache (the key could not cover what the upstream receives)
 - Responses carrying `Set-Cookie` are never stored
 - Requests carrying `Authorization` neither read nor fill the cache (RFC 9111 §3.5), unless `key_headers` contains
   `Authorization`, which makes the cache per user. On a route whose `[route.jwt]` reads the token from another

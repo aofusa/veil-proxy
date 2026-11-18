@@ -10,7 +10,7 @@ Routes are evaluated in array order (first-match). All routes use the unified `[
 
 1. **Route conditions** (`[route.conditions]`): Match on host, path, headers, method, query parameters, or source IP
    - `host`: Host header matching (wildcard supported, e.g., "api.example.com", "*.example.com")
-   - `path`: Path pattern matching (wildcard supported, e.g., "/api/*", "/static/*")
+   - `path`: Path pattern matching (wildcard supported, e.g., "/api/*", "/static/*"). A pattern is a prefix on segment boundaries: "/api", "/api/" and "/api/*" all match `/api`, `/api/` and everything below `/api/` (not `/apix`)
    - `header`: HTTP header matching (map for multiple headers, e.g., `{ "X-Version" = "v2" }`)
    - `method`: HTTP request method matching (array for multiple methods, e.g., `["GET", "POST"]`)
    - `query`: Query string parameter matching (map for multiple query params, e.g., `{ "token" = "secret" }`)
@@ -845,7 +845,7 @@ Add a `security` subsection to each route for fine-grained security settings.
 | | `client_body_timeout_secs` | How long the request body may stop arriving before the request is aborted (until the response starts). HTTP/1.1 returns `408`; HTTP/2 resets the stream with `RST_STREAM(CANCEL)`; HTTP/3 resets it with `H3_REQUEST_CANCELLED`. Applies to streamed uploads, buffered bodies and gRPC client streaming | 30s |
 | | `backend_connect_timeout_secs` | Backend connection timeout | 10s |
 | Access Control | `allowed_methods` | Allowed HTTP methods (array) | all allowed |
-| | `rate_limit_requests_per_min` | Request limit per minute **per client IP and route, shared by all workers** (B-31: sliding window over a process-wide 65,536-slot atomic table; requests to one route do not consume another route's limit; keys that hash to the same slot share a count, which can only make the limit stricter) | 0 (unlimited) |
+| | `rate_limit_requests_per_min` | Request limit per minute **per client IP and route, shared by all workers** (B-31: sliding window over a process-wide 65,536-slot atomic table; requests to one route do not consume another route's limit, and all `[route.traffic] split` targets of a route share its limit; keys that hash to the same slot share a count, which can only make the limit stricter) | 0 (unlimited) |
 | | `allowed_ips` | Allowed IP/CIDR (array) | all allowed |
 | | `denied_ips` | Denied IP/CIDR (array, takes priority) | none |
 | Connection Pool | `max_idle_connections_per_host` | Max idle connections per host | 256 |

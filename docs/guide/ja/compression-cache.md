@@ -211,7 +211,7 @@ url = "http://localhost:8080"
 | `default_ttl_secs` | Cache-Controlがない場合のデフォルトTTL | 300 |
 | `methods` | キャッシュ対象HTTPメソッド | ["GET", "HEAD"] |
 | `cacheable_statuses` | キャッシュ対象ステータスコード | [200, 301, 302, 304] |
-| `bypass_patterns` | キャッシュスキップ用globパターン | [] |
+| `bypass_patterns` | キャッシュスキップ用globパターン（パスに当て、クエリは見ない） | [] |
 | `respect_vary` | Varyヘッダーによるキャッシュ分離を尊重 | true |
 | `enable_etag` | ETag/If-None-Match検証を有効化 | true |
 | `stale_while_revalidate` | バックグラウンド更新中にstaleを提供 | false |
@@ -272,6 +272,8 @@ url = "http://localhost:8080"
 - `respect_vary = true` の場合、`Vary: *` レスポンスはキャッシュされません
 - `respect_vary = true` の場合、`Vary` が `key_headers` に無いヘッダを挙げる応答はキャッシュされません（キーでその要求を
   区別できないため）。値ごとにキャッシュするには、そのヘッダを `key_headers` に足します（例: `key_headers = ["Accept-Encoding"]`）
+- `key_headers` に挙げたヘッダが 2 つ以上ある要求・値が UTF-8 でない要求は、キャッシュを引かず保存もしません（上流が受け取る
+  値をキーで表せないため）
 - `Set-Cookie` を持つ応答は保存されません
 - `Authorization` の付いた要求は、キャッシュを引かず保存もしません（RFC 9111 §3.5）。`key_headers` に `Authorization` を
   入れた場合は利用者ごとのキャッシュになるので使います。`[route.jwt]` が別のヘッダからトークンを読むルート

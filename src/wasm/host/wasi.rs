@@ -66,7 +66,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     let text = text.trim_end_matches('\n');
                     if !text.is_empty() {
                         let plugin_name = &caller.data().http_ctx.plugin_name;
-                        ftlog::debug!("[wasm:{}] {}", plugin_name, text);
+                        ftlog::debug!("[wasm:{}] {}", plugin_name, super::logging::LogSafe(text));
                     }
                 }
 

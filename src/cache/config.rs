@@ -221,13 +221,19 @@ impl CacheConfig {
         self.cacheable_statuses.contains(&status)
     }
 
-    /// パスがバイパスパターンにマッチするかチェック
+    /// パスがバイパスパターンにマッチするかチェック（パターンはパスだけに当て、クエリは見ない）
     pub fn should_bypass(&self, _path: &str) -> bool {
         #[cfg(feature = "cache")]
-        for pattern in &self.bypass_patterns {
-            if let Ok(glob) = glob::Pattern::new(pattern) {
-                if glob.matches(_path) {
-                    return true;
+        {
+            // B-428: キャッシュのキーはクエリの前のパス（と、`include_query` ならクエリ）で作るので、パターンも
+            // クエリの前のパスに当てる。以前は要求の対象全体に当てていて、`/x?` は `/x` を除外するパターンに
+            // 一致しないのに `/x` と同じキーで保存・応答された
+            let path = _path.find('?').map_or(_path, |q| &_path[..q]);
+            for pattern in &self.bypass_patterns {
+                if let Ok(glob) = glob::Pattern::new(pattern) {
+                    if glob.matches(path) {
+                        return true;
+                    }
                 }
             }
         }
@@ -311,6 +317,11 @@ mod tests {
         assert!(config.should_bypass("/api/user/profile"));
         assert!(config.should_bypass("/api/session"));
         assert!(!config.should_bypass("/api/products"));
+        // B-428: クエリは見ない（空のクエリ・付け足したクエリで除外を外れない）
+        assert!(config.should_bypass("/api/session?"));
+        assert!(config.should_bypass("/api/session?a=1"));
+        assert!(config.should_bypass("/api/user/1?x=/y"));
+        assert!(!config.should_bypass("/api/products?/api/session"));
     }
 
     #[test]

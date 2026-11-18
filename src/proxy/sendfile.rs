@@ -162,6 +162,19 @@ pub(super) async fn handle_sendfile(
             // インデックスファイルの情報をキャッシュから取得
             match cache::get_file_info_with_config(&index_path, open_file_cache_config).await {
                 Some(idx_info) if idx_info.is_file => {
+                    // B-430: index のファイルにもディレクトリと同じ封じ込めの検査を掛ける（ルートの外を指す
+                    // シンボリックリンクの index を返さない。HTTP/2・HTTP/3 は検査している）
+                    if is_dir
+                        && !cache::sendfile_base_contains(
+                            &idx_info.canonical_path,
+                            canonical_base,
+                            base_path,
+                        )
+                    {
+                        let err_buf = ERR_MSG_FORBIDDEN.to_vec();
+                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                        return Some((tls_stream, 403, 0, true));
+                    }
                     let shared = idx_info.shared_file().cloned();
                     (
                         idx_info.canonical_path,

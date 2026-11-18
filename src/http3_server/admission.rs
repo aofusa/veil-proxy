@@ -150,10 +150,14 @@ fn now_secs() -> u64 {
 fn token_tag(peer: &SocketAddr, body: &[u8]) -> [u8; TOKEN_TAG_LEN] {
     let mut ctx = hmac::Context::with_key(&RETRY_TOKEN_KEY);
     ctx.update(b"veil-h3-retry\0");
-    match peer {
-        SocketAddr::V4(v4) => ctx.update(&v4.ip().octets()),
-        SocketAddr::V6(v6) => ctx.update(&v6.ip().octets()),
-    }
+    // B-433: アドレスは常に 16 バイト（IPv4 は IPv4 射影）で入れる。以前は IPv4 を 4 バイトで入れていて、IPv6 の
+    // 送信元に出したトークンの入力を（IPv4 のアドレス・ポート・期限・元の DCID）と切り直せ、別の IPv4 の送信元で通る
+    // 期限の無いトークンを作れた
+    let ip = match peer {
+        SocketAddr::V4(v4) => v4.ip().to_ipv6_mapped().octets(),
+        SocketAddr::V6(v6) => v6.ip().octets(),
+    };
+    ctx.update(&ip);
     ctx.update(&peer.port().to_be_bytes());
     ctx.update(body);
     let tag = ctx.sign();
@@ -289,6 +293,33 @@ mod tests {
         // 長さの不整合
         assert_eq!(validate_token_at(&peer(4433), &t[..n - 1], 999), None);
         assert_eq!(validate_token_at(&peer(4433), &[], 999), None);
+    }
+
+    /// B-433: IPv6 の送信元に出したトークンを（IPv4 のアドレス・ポート・期限・元の DCID）と切り直しても、IPv4 の
+    /// 送信元では通らない
+    #[test]
+    fn token_for_ipv6_peer_does_not_validate_for_ipv4_resplit() {
+        let dcid = [0xd5u8; 8];
+        // 14 バイト目 = 12 + DCID の長さ（切り直した元の DCID の長さが 20 になる）
+        let mut a = [0u8; 16];
+        for (i, b) in a.iter_mut().enumerate() {
+            *b = 0x20 + i as u8;
+        }
+        a[14] = 12 + dcid.len() as u8;
+        let v6 = SocketAddr::from((std::net::Ipv6Addr::from(a), 4433));
+        let mut t = [0u8; TOKEN_MAX_LEN];
+        let n = mint_token(&v6, &dcid, 1_000, &mut t);
+        assert_eq!(validate_token_at(&v6, &t[..n], 999), Some(&dcid[..]));
+        let body = n - TOKEN_TAG_LEN;
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&a[6..15]);
+        forged.push(a[15]);
+        forged.extend_from_slice(&4433u16.to_be_bytes());
+        forged.extend_from_slice(&t[..body]);
+        forged.extend_from_slice(&t[body..n]);
+        let v4 = SocketAddr::from(([a[0], a[1], a[2], a[3]], u16::from_be_bytes([a[4], a[5]])));
+        assert_eq!(forged.len(), 8 + 1 + 20 + TOKEN_TAG_LEN);
+        assert_eq!(validate_token_at(&v4, &forged, 999), None);
     }
 
     #[test]

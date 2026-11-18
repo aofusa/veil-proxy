@@ -332,7 +332,7 @@ The `[wasm.defaults.pooling]` section configures the pooling allocator for high-
 
 | Capability | Description | Default |
 |-----------|-------------|---------|
-| `allow_logging` | Log output | false |
+| `allow_logging` | Log output (`proxy_log`; control characters in the message, such as CR and LF, are written as `\n`, `\r`, `\u{1b}` so that logged client data cannot add lines) | false |
 | `allow_metrics` | Metrics operations | false |
 | `allow_shared_data` | Shared data access (`proxy_set_shared_data`/`proxy_get_shared_data`). One table per module name, shared by every request and worker and kept across config reloads (Envoy shares it per `vm_id`). Also required for shared queues: a queue belongs to the module that registered it and only that module dequeues from it; another module enqueues only after resolving the queue by the owner's module name (`vm_id`) | false |
 | `allow_request_headers_read` | Read request headers | false |

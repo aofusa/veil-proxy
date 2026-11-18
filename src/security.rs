@@ -3163,11 +3163,81 @@ pub mod capsicum {
     }
 
     /// 絶対パスを登録ルート配下の相対パスへ解決し、ルート dirfd と NUL 終端された
-    /// 相対パス（`&CStr`）をコールバック `f` に渡す（F-155: ゼロアロケーション版）。
+    /// 相対パス（`&CStr`）をコールバック `f` に渡す（F-155: ゼロアロケーション版。
+    /// 相対パスの置き方は `with_rel_cstr`）。
     ///
-    /// 相対パスのバイト列は **スタック上の固定長バッファ**（FreeBSD の `PATH_MAX` =
-    /// 1024 バイト、NUL 終端込み）へコピーする。`CString::new` によるヒープ確保は
-    /// 一切行わない（静的ファイルアクセスのたびに実行されるホットパスのため）。
+    /// - 有効化されていない / どのルート配下でもない場合は `None`
+    ///   （呼び出し側は通常経路へフォールバックする）。
+    /// - 登録済みのルートとの間に登録されていないルート（リロードで足した File のルート）があれば、
+    ///   そのルートへ封じ込めて開く（`resolve_in`。B-431）。
+    fn with_resolved_root<F, T>(abs: &Path, f: F) -> Option<io::Result<T>>
+    where
+        F: FnOnce(RawFd, &CStr) -> io::Result<T>,
+    {
+        if !static_serving_active() {
+            return None;
+        }
+        // 深い順に並ぶので最初に前方一致したものが最も深い登録済みのルート
+        let (root, fd) = STATIC_DIRS
+            .get()?
+            .iter()
+            .find_map(|(root, _, fd)| abs.starts_with(root).then_some((root.as_path(), *fd)))?;
+        crate::cache::resolve::with_unregistered_root_below(root, abs, |inner| {
+            resolve_in(root, fd, inner, abs, f)
+        })
+    }
+
+    /// `abs` を登録済みのルート `root`（dirfd `fd`）の下で開く。`inner` は `root` と `abs` の間にある登録されていない
+    /// ルート（リロードで足した File のルート）のうち最も深いもの。
+    ///
+    /// B-431: `inner` の下は `root` の dirfd で直に開かない（`inner` の外を指すシンボリックリンクを `root` の封じ込めで
+    /// 許してしまう）。`inner` を `root` の dirfd の下に開いてから、その下に開く（`O_RESOLVE_BENEATH` が `inner` へ
+    /// 封じ込める）。canonicalize の経路へは回さない（capability mode では絶対パスを解決できず、リロードで足した
+    /// ルートの下が 404 になっていた）。要求ごとに `openat`・`close` が 1 本ずつ増えるのは、リロードで足したルートの下
+    /// だけ（再起動すれば登録され、直に開く）。
+    fn resolve_in<F, T>(
+        root: &Path,
+        fd: RawFd,
+        inner: Option<&Path>,
+        abs: &Path,
+        f: F,
+    ) -> Option<io::Result<T>>
+    where
+        F: FnOnce(RawFd, &CStr) -> io::Result<T>,
+    {
+        use std::os::fd::AsRawFd as _;
+        let Some(inner) = inner else {
+            return with_rel_cstr(abs.strip_prefix(root).ok()?, |rel| f(fd, rel));
+        };
+        let dir = match with_rel_cstr(inner.strip_prefix(root).ok()?, |rel| {
+            open_dir_beneath(fd, rel)
+        })? {
+            Ok(dir) => dir,
+            Err(e) => return Some(Err(e)),
+        };
+        with_rel_cstr(abs.strip_prefix(inner).ok()?, |rel| f(dir.as_raw_fd(), rel))
+    }
+
+    /// `dirfd` の下のディレクトリ `rel` を開く（`O_RESOLVE_BENEATH`。B-431）
+    fn open_dir_beneath(dirfd: RawFd, rel: &CStr) -> io::Result<std::os::fd::OwnedFd> {
+        // SAFETY: dirfd は開いているディレクトリの fd、rel は NUL 終端された C 文字列
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                rel.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | O_RESOLVE_BENEATH,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat が返した所有権のある有効な fd
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// 相対パスを NUL 終端して **スタック上の固定長バッファ**（FreeBSD の `PATH_MAX` = 1024 バイト、NUL 終端込み）
+    /// へ置き、`f` に渡す。`CString::new` によるヒープ確保は一切行わない（静的ファイルアクセスのたびに実行される
+    /// ホットパスのため。F-155）。
     ///
     /// - 相対パスが空なら `"."` を使う（旧 `resolve_root` と同じ挙動）。
     /// - 相対パスの途中に NUL バイトを含む場合は `None` を返す（`CString::new` が
@@ -3177,44 +3247,24 @@ pub mod capsicum {
     ///   なるため、ヒープへフォールバックしてまで受理する意味がない
     ///   （ホットパスにアロケーション経路を残さないほうが AGENTS.md の規約に沿うと
     ///   判断し、設計書にある「CString フォールバック」はあえて採用していない）。
-    /// - 有効化されていない / どのルート配下でもない場合は `None`
-    ///   （呼び出し側は通常経路へフォールバックする）。
-    fn with_resolved_root<F, R>(abs: &Path, f: F) -> Option<R>
-    where
-        F: FnOnce(RawFd, &CStr) -> R,
-    {
-        if !static_serving_active() {
+    fn with_rel_cstr<R>(rel: &Path, f: impl FnOnce(&CStr) -> R) -> Option<R> {
+        let rel_bytes = rel.as_os_str().as_bytes();
+        let src: &[u8] = if rel_bytes.is_empty() {
+            b"."
+        } else {
+            rel_bytes
+        };
+        if src.contains(&0) || src.len() >= 1024 {
             return None;
         }
-        let dirs = STATIC_DIRS.get()?;
-        for (root, _, fd) in dirs {
-            if let Ok(rel) = abs.strip_prefix(root) {
-                let rel_bytes = rel.as_os_str().as_bytes();
-                let src: &[u8] = if rel_bytes.is_empty() {
-                    b"."
-                } else {
-                    rel_bytes
-                };
-                // 途中に NUL バイトが含まれる場合は安全な CStr を構築できない。
-                if src.contains(&0) {
-                    return None;
-                }
-                // NUL 終端込みで PATH_MAX(1024) に収まらない場合は openat/fstatat 側で
-                // どのみち ENAMETOOLONG になるため、ヒープへフォールバックせず None。
-                if src.len() >= 1024 {
-                    return None;
-                }
-                let mut buf = [0u8; 1024];
-                buf[..src.len()].copy_from_slice(src);
-                buf[src.len()] = 0;
-                // SAFETY: buf[..=src.len()] は「NUL を含まないことを確認済みの
-                // src」+ 末尾 1 バイトの 0 からなり、CStr::from_bytes_with_nul の
-                // 不変条件（NUL は末尾に 1 個のみ）を満たす。
-                let cstr = unsafe { CStr::from_bytes_with_nul_unchecked(&buf[..=src.len()]) };
-                return Some(f(*fd, cstr));
-            }
-        }
-        None
+        let mut buf = [0u8; 1024];
+        buf[..src.len()].copy_from_slice(src);
+        buf[src.len()] = 0;
+        // SAFETY: buf[..=src.len()] は「NUL を含まないことを確認済みの
+        // src」+ 末尾 1 バイトの 0 からなり、CStr::from_bytes_with_nul の
+        // 不変条件（NUL は末尾に 1 個のみ）を満たす。
+        let cstr = unsafe { CStr::from_bytes_with_nul_unchecked(&buf[..=src.len()]) };
+        Some(f(cstr))
     }
 
     /// `open_static_ro`/`stat_static` が実際に登録済みルートへ相対化できるかどうかを
@@ -3230,12 +3280,17 @@ pub mod capsicum {
         if !static_serving_active() {
             return false;
         }
-        match STATIC_DIRS.get() {
-            Some(dirs) => dirs
-                .iter()
-                .any(|(root, _, _)| abs.strip_prefix(root).is_ok()),
-            None => false,
-        }
+        // 登録されていない内側のルートの下も `with_resolved_root` が開く（そのルートへ封じ込めて。B-431）
+        STATIC_DIRS
+            .get()
+            .is_some_and(|dirs| dirs.iter().any(|(root, _, _)| abs.starts_with(root)))
+    }
+
+    /// `root` が dirfd の表にある静的ルートか（B-431）
+    pub fn is_static_dir_root(root: &Path) -> bool {
+        STATIC_DIRS
+            .get()
+            .is_some_and(|dirs| dirs.iter().any(|(r, _, _)| r == root))
     }
 
     /// 登録済み静的ルート配下のパスを、登録時に解決した canonical 形で返す（F-178）。
@@ -3832,6 +3887,74 @@ pub mod capsicum {
             jail_name, jid
         );
         Ok(())
+    }
+
+    /// B-431: リロードで足した内側のルートの下は、内側のルートへ封じ込めて開く（登録表の OnceLock は触らない）。
+    #[cfg(test)]
+    mod inner_root_tests {
+        use super::*;
+
+        fn open_ro(dirfd: RawFd, rel: &CStr) -> io::Result<std::fs::File> {
+            // SAFETY: dirfd は開いているディレクトリの fd、rel は NUL 終端された C 文字列
+            let fd = unsafe {
+                libc::openat(
+                    dirfd,
+                    rel.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | O_RESOLVE_BENEATH,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: openat が返した所有権のある有効な fd
+            Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+        }
+
+        fn read(r: Option<io::Result<std::fs::File>>) -> io::Result<String> {
+            use std::io::Read;
+            let mut s = String::new();
+            r.expect("the path is below the registered root")?
+                .read_to_string(&mut s)?;
+            Ok(s)
+        }
+
+        // 理由付き allow: 試験のフィクスチャを書く
+        #[allow(clippy::disallowed_methods)]
+        #[test]
+        fn inner_root_confines_paths_below_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let outer = dir.path();
+            let inner = outer.join("sub");
+            std::fs::create_dir(&inner).unwrap();
+            std::fs::write(inner.join("ok.txt"), b"inner-ok").unwrap();
+            std::fs::write(outer.join("secret.txt"), b"outer-secret").unwrap();
+            std::os::unix::fs::symlink("../secret.txt", inner.join("link")).unwrap();
+            let path = CString::new(outer.as_os_str().as_bytes()).unwrap();
+            // SAFETY: NUL 終端された有効なパス
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(fd >= 0, "{}", io::Error::last_os_error());
+            // SAFETY: open が返した所有権のある有効な fd（試験の終わりに閉じる）
+            let _outer = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            let inner_root = Some(inner.as_path());
+            // 内側のルートの下のファイルは開ける
+            let ok = resolve_in(outer, fd, inner_root, &inner.join("ok.txt"), open_ro);
+            assert_eq!(read(ok).unwrap(), "inner-ok");
+            // 内側のルートの外を指すシンボリックリンクは断る（リンク先は外側のルートの中にある）
+            let link = resolve_in(outer, fd, inner_root, &inner.join("link"), open_ro);
+            assert!(read(link).is_err(), "escaped the inner root");
+            // 外側の dirfd で直に開くと、外側の封じ込めだけで通ってしまう（内側のルートを渡す理由）
+            let direct = resolve_in(outer, fd, None, &inner.join("link"), open_ro);
+            assert_eq!(read(direct).unwrap(), "outer-secret");
+            // 内側のルートが無ければ開けない（404 相当）
+            let gone = outer.join("gone");
+            let missing = resolve_in(outer, fd, Some(gone.as_path()), &gone.join("x"), open_ro);
+            assert!(read(missing).is_err());
+        }
     }
 
     /// F-178: 名前付きファイルの dirfd 登録（cap_enter はしない。登録表の OnceLock も触らない）。

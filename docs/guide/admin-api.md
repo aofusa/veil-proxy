@@ -101,7 +101,9 @@ IP filtering is checked before authentication. When `allowed_ips` is empty (defa
 Unix-socket listeners) are allowed; before v0.10.0 every IP was. Write `["0.0.0.0/0", "::/0"]` to allow everyone.
 
 The secret is compared in constant time. After 10 failed authentications from one IP within a minute, that IP gets
-`401 Unauthorized` even with the right secret until the rate drops again.
+`401 Unauthorized` even with the right secret until the rate drops again. IPv6 clients are counted per /64 (changing
+the address inside one /64 does not reset the count), and an IPv4-mapped address counts as its IPv4 address. Use a
+long random secret: the limit slows guessing down, it does not stop a client that controls many networks.
 
 | Format | Example |
 |--------|---------|

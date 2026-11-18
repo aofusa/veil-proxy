@@ -51,6 +51,9 @@ pub mod compressed;
 // 事前圧縮した兄弟ファイル（`app.js.br` 等）を探す（F-294）
 pub mod precompressed;
 
+// 静的ファイルを丸ごと読んでいる量の上限（B-321・B-427。`cache` の有無で同じ）
+mod inflight;
+
 // DashMap依存モジュール（cache feature 有効時のみ）
 #[cfg(feature = "cache")]
 mod content_cache;
@@ -592,8 +595,6 @@ fn open_and_read_uncached(
     path: &std::path::Path,
     containment: Option<(Option<std::path::PathBuf>, std::path::PathBuf)>,
 ) -> Option<StaticFileOutcome> {
-    use std::io::Read;
-
     #[cfg(target_os = "linux")]
     {
         let opened = match containment.as_ref() {
@@ -607,9 +608,7 @@ fn open_and_read_uncached(
                     if !info.is_file {
                         return Some(StaticFileOutcome::Directory(info));
                     }
-                    let mut buf: Vec<u8> = Vec::with_capacity(meta.len() as usize);
-                    file.read_to_end(&mut buf).ok()?;
-                    Some(StaticFileOutcome::File(info, bytes::Bytes::from(buf)))
+                    read_whole_charged(&mut file, info, meta.len())
                 }
                 Err(_) => None,
             };
@@ -632,9 +631,7 @@ fn open_and_read_uncached(
                 if !info.is_file {
                     return Some(StaticFileOutcome::Directory(info));
                 }
-                let mut buf: Vec<u8> = Vec::with_capacity(meta.len() as usize);
-                file.read_to_end(&mut buf).ok()?;
-                Some(StaticFileOutcome::File(info, bytes::Bytes::from(buf)))
+                read_whole_charged(&mut file, info, meta.len())
             }
             Err(_) => None,
         };
@@ -657,9 +654,29 @@ fn open_and_read_uncached(
     if !info.is_file {
         return Some(StaticFileOutcome::Directory(info));
     }
-    let mut buf: Vec<u8> = Vec::with_capacity(meta.len() as usize);
+    read_whole_charged(&mut file, info, meta.len())
+}
+
+/// `cache` の無いビルドの静的配信の本体の読み込み。読む量はプロセス全体の上限（`cache` 版と同じ）に対して予約し、
+/// 達していれば `Busy`（503）を返す。予約は本文を送り終えて落とすまで持つ
+// B-427: 以前は数えておらず、HTTP/2・HTTP/3 で大きなファイルを多数のストリームから同時に要求すると、ストリームごとに
+// 丸ごと読み込んで受信窓の閉じた相手を待つ間メモリに置いた
+#[cfg(not(feature = "cache"))]
+fn read_whole_charged(
+    file: &mut std::fs::File,
+    info: CachedFileInfo,
+    len: u64,
+) -> Option<StaticFileOutcome> {
+    use std::io::Read;
+    let Some(reserved) = inflight::reserve_whole(len) else {
+        return Some(StaticFileOutcome::Busy);
+    };
+    let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
     file.read_to_end(&mut buf).ok()?;
-    Some(StaticFileOutcome::File(info, bytes::Bytes::from(buf)))
+    Some(StaticFileOutcome::File(
+        info,
+        inflight::charge(bytes::Bytes::from(buf), Some(reserved)),
+    ))
 }
 
 /// B-65: `cache` feature 無効時のスタブ版 `get_static_file_with_content`。

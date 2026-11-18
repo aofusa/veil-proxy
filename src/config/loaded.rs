@@ -334,6 +334,23 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
     #[cfg(feature = "access-log")]
     crate::logging::set_access_log_enabled(runtime_config.access_log_config.enabled);
     crate::trust_store::commit_default(loaded.default_ca);
+    // B-431: 登録されていない静的ルート（リロードで足したもの）の下は、外側のルートの dirfd で開かない。その集合が
+    // 変わったら、外側のルートで開いて入れた静的配信のキャッシュを捨てる（内側のルートの要求がヒットしないように）
+    let file_roots: Vec<std::path::PathBuf> = runtime_config
+        .route
+        .iter()
+        .filter_map(|r| match &r.action {
+            BackendConfig::File { path, .. } => Some(std::path::PathBuf::from(path)),
+            _ => None,
+        })
+        .collect();
+    if crate::cache::resolve::set_configured_roots(&file_roots) {
+        #[cfg(feature = "cache")]
+        {
+            crate::cache::get_file_cache().clear();
+            crate::cache::clear_content_cache();
+        }
+    }
     CURRENT_CONFIG.store(Arc::new(runtime_config));
 
     info!("Configuration reloaded successfully (TLS certificates unchanged - restart required for TLS updates)");

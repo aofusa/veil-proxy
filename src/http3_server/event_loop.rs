@@ -462,6 +462,19 @@ pub(super) fn process_datagram_segments(
 
         // パケットを処理（同一スライスをそのまま渡す。追加コピーなし）
         if let Some(handler) = conns.get_mut(&conn_id) {
+            // B-455: 要求の検査（blocked_ips・ルートの allowed_ips/denied_ips・source_ip・レート制限・
+            // X-Forwarded-For・アクセスログ）は接続の client_ip（最初の Initial の送信元）で行う。別の IP から
+            // 届いたパケットを quiche へ渡すと、quiche は disable_active_migration を送っていても接続をその IP へ
+            // 移し（非プロービングで最大の番号なら on_peer_migrated）、以後の要求が古い IP として許されていた。
+            // IP の違うパケットは復号の前に捨てる（RFC 9000 §9 が disable_active_migration の違反に許す扱い。
+            // 偽の送信元のパケットで接続を切らせることもない）。ポートだけの変化（NAT の付け替え）は受ける
+            if from.ip() != handler.peer_addr.ip() {
+                debug!(
+                    "[HTTP/3] dropped a packet for the connection from {} sent from {}",
+                    handler.peer_addr, from
+                );
+                continue;
+            }
             let recv_info = quiche::RecvInfo {
                 from,
                 to: local_addr,
@@ -479,10 +492,16 @@ pub(super) fn process_datagram_segments(
                 }
             }
             handler.conn.set_time_hint(None);
-            // B-256: パスのイベント（相手の送信元の変更など）は使わないが、取り出さないと接続の寿命の間
-            // 溜まり続ける（GHSA-4q5x-gp38-rfp4。アクティブマイグレーションを無効にしていても起きる）
+            // B-256: パスのイベントは取り出さないと接続の寿命の間溜まり続ける（GHSA-4q5x-gp38-rfp4。
+            // アクティブマイグレーションを無効にしていても起きる）
             while let Some(ev) = handler.conn.path_event_next() {
                 debug!("[HTTP/3] path event: {:?}", ev);
+                // B-455: 移った先は同じ IP（上で揃えている）のポート違いだけ。ログ等のアドレスを新しいポートにする
+                if let quiche::PathEvent::PeerMigrated(_, peer) = ev {
+                    if peer.ip() == handler.peer_addr.ip() {
+                        handler.peer_addr = peer;
+                    }
+                }
             }
 
             // B-34: クライアントがハンドシェイク直後に HTTP/3 フレームを送るため、

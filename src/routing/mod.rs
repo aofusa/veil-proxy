@@ -305,6 +305,11 @@ impl PathRouter {
                     || path.as_bytes().get(prefix.len()) == Some(&b'/'));
         }
 
+        // B-426: 末尾が `/` のパターン（`/admin/`）も前方一致（`/admin`・`/admin/`・`/admin/...` に一致する。
+        // `matches_path_pattern` と同じ）。以前は残りが `/` で始まらないので `/admin/users` に一致せず、より広い
+        // ルート（`/`）へ落ちてこのルートの検査が掛からなかった
+        let pattern = pattern.strip_suffix('/').unwrap_or(pattern);
+
         // Prefix match
         if let Some(remaining) = path.strip_prefix(pattern) {
             return remaining.is_empty() || remaining.starts_with('/');
@@ -963,6 +968,18 @@ mod tests {
                 );
             }
         }
+        // B-426: 末尾が `/` のパターンは、その下のパスと `/` の無い形にも一致する
+        for (path, hit) in [
+            ("/api", true),
+            ("/api/", true),
+            ("/api/x", true),
+            ("/api/x/y", true),
+            ("/apix", false),
+            ("/ap", false),
+        ] {
+            assert_eq!(router.matches_pattern("/api/", path), hit, "{path}");
+            assert_eq!(router.get_candidates(path).contains(&1), hit, "{path}");
+        }
         // 選択の順（インデックス順の最初）で `/admin` のルートが catch-all より先に来る
         let mut opt = OptimizedRouter::new();
         opt.add_route(0, None, Some("/admin"), None);
@@ -985,7 +1002,12 @@ mod tests {
         assert_eq!(opt.get_candidates("h", "/admin/x", &ip), vec![1]);
 
         let mut opt = OptimizedRouter::new();
-        opt.add_route(0, None, Some("/admin"), Some(&[" 203.0.113.0/24 ".to_string()]));
+        opt.add_route(
+            0,
+            None,
+            Some("/admin"),
+            Some(&[" 203.0.113.0/24 ".to_string()]),
+        );
         opt.finalize();
         assert_eq!(opt.get_candidates("h", "/admin/x", &ip), vec![0]);
 

@@ -596,6 +596,105 @@ fn f188_plaintext_only_server_without_tls_serves_http1_and_h2c() {
     assert_eq!(body, b"plain");
 }
 
+/// B-430: ディレクトリへの要求で返す index がルートの外を指すシンボリックリンクなら、どのプロトコルでも返さない
+/// （以前は HTTP/1.1 だけ、index の解決が canonicalize に回ると封じ込めの検査無しで返し得た）
+#[cfg(unix)]
+#[test]
+fn b430_index_symlink_outside_root_is_not_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, "top-secret").unwrap();
+    let d = dir.path().join("www").join("d");
+    std::fs::create_dir_all(&d).unwrap();
+    std::os::unix::fs::symlink(&secret, d.join("index.html")).unwrap();
+    let veil = spawn_cleartext(dir.path(), port, "enable_secure_redirect = false");
+
+    let resp = http1_get(port, "/d/").expect("plain HTTP/1.1");
+    assert_ne!(resp.status, 200, "{}", veil.log());
+    assert!(!resp.text().contains("top-secret"));
+    let (status, body) = h2c_get(port, "/d/");
+    assert_ne!(status, 200);
+    assert!(!String::from_utf8_lossy(&body).contains("top-secret"));
+    // ルートの中の index は従来どおり返す
+    let resp = http1_get(port, "/").expect("plain HTTP/1.1");
+    assert_eq!(resp.status, 200, "{}", veil.log());
+}
+
+/// B-431: リロードで足した入れ子の File のルート（dirfd を登録していない）の下は、外側のルートの dirfd で開かない。
+/// 内側のルートの外（外側のルートだけが配る場所）を指す相対シンボリックリンクは返さない
+#[cfg(unix)]
+#[test]
+fn b431_nested_root_added_by_reload_keeps_its_containment() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = dir.path().join("srv");
+    std::fs::create_dir_all(srv.join("public")).unwrap();
+    std::fs::create_dir_all(srv.join("private")).unwrap();
+    std::fs::write(srv.join("private/secret.txt"), "top-secret").unwrap();
+    std::fs::write(srv.join("public/hello.txt"), "hello").unwrap();
+    std::os::unix::fs::symlink("../private", srv.join("public/shared")).unwrap();
+    let port = free_port();
+    let base = format!(
+        r#"
+[server]
+listen_cleartext = "127.0.0.1:{port}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[[route]]
+[route.conditions]
+path = "/internal/*"
+source_ip = ["192.0.2.1"]
+[route.action]
+type = "File"
+path = "{srv}"
+"#,
+        srv = tp(&srv)
+    );
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(&cfg_path, &base).unwrap();
+    let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
+    assert!(
+        wait_for_port(port, Duration::from_secs(20)),
+        "{}",
+        veil.log()
+    );
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"{base}
+[[route]]
+[route.conditions]
+path = "/pub/*"
+[route.action]
+type = "File"
+path = "{public}"
+"#,
+            public = tp(&srv.join("public"))
+        ),
+    )
+    .unwrap();
+    veil.sighup();
+    let ok = wait_until(Duration::from_secs(10), || {
+        http1_get(port, "/pub/hello.txt")
+            .map(|r| r.status == 200)
+            .unwrap_or(false)
+    });
+    assert!(
+        ok,
+        "route added by reload is not served; log:\n{}",
+        veil.log()
+    );
+
+    let resp = http1_get(port, "/pub/shared/secret.txt").expect("plain HTTP/1.1");
+    assert_ne!(resp.status, 200, "{}", veil.log());
+    assert!(!resp.text().contains("top-secret"));
+    let (status, body) = h2c_get(port, "/pub/shared/secret.txt");
+    assert_ne!(status, 200);
+    assert!(!String::from_utf8_lossy(&body).contains("top-secret"));
+}
+
 /// B-122: 平文リスナーは接続してから最初のバイトが届くまで待つ（以前は 200ms で打ち切り、HTTP/1.1 の
 /// クライアントへ HTTP/2 の GOAWAY を返していた）。最初の断片が判別に足りなくても続きを待ち、
 /// 何も送らずに閉じた接続（TCP のヘルスチェック）は WARN を出さずに閉じる。

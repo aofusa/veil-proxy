@@ -1283,6 +1283,10 @@ fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
     if pattern.contains('{') {
         return crate::api::pattern::route_pattern_matches(pattern, path);
     }
+    // B-426: 末尾が `/` のパターン（`/admin/`）も前方一致（`/admin`・`/admin/`・`/admin/...`。ルーターの
+    // `PathRouter::matches_pattern` と同じ）。以前は `/admin/users` に一致しなかった
+    let pattern = pattern.strip_suffix('/').unwrap_or(pattern);
+
 
     // ワイルドカードパターン: "/api/*"
     if let Some(prefix) = pattern.strip_suffix("/*") {
@@ -1374,6 +1378,11 @@ mod tests {
     #[test]
     fn test_b96_root_path_pattern_matches_every_path() {
         assert!(matches_path_pattern("/", b"/"));
+        // B-426: 末尾が `/` のパターンも前方一致
+        assert!(matches_path_pattern("/api/", b"/api/v1"));
+        assert!(matches_path_pattern("/api/", b"/api"));
+        assert!(matches_path_pattern("/api/", b"/api/"));
+        assert!(!matches_path_pattern("/api/", b"/apix"));
         assert!(matches_path_pattern("/", b"/small.html"));
         assert!(matches_path_pattern("/", b"/a/b/c"));
         // 既存の意味論は不変

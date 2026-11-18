@@ -71,6 +71,7 @@ use bytes::Bytes;
 
 use super::content_cache::{self, StaticContentCacheConfig};
 use super::file_cache::{self, CachedFileInfo, OpenFileCacheConfig};
+use super::inflight::{charge, reserve_whole, UncachedRead};
 // `resolve`（openat2/RESOLVE_BENEATH によるカーネル封じ込め）は Linux 専用経路でしか
 // 使わない。FreeBSD は `security::capsicum` 側（`is_registered_static_root` /
 // 生の base_path 配下も許可する `sendfile_base_contains`）を使うため、
@@ -104,76 +105,12 @@ fn cache_limit(cfg: &StaticContentCacheConfig) -> u64 {
     }
 }
 
-/// キャッシュに入らないファイルを丸ごと読んでいる量（`Busy` の判定。B-321）
-static UNCACHED_INFLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// その上限。1 つも読んでいなければ上限を超える大きさのファイルも 1 つは読む
-const UNCACHED_INFLIGHT_MAX: u64 = 256 * 1024 * 1024;
-
-/// 読む量を予約する。返した値を落とすと戻す
-struct UncachedRead {
-    counter: &'static std::sync::atomic::AtomicU64,
-    len: u64,
-}
-
-impl UncachedRead {
-    fn reserve_in(
-        counter: &'static std::sync::atomic::AtomicU64,
-        max: u64,
-        len: u64,
-    ) -> Option<Self> {
-        use std::sync::atomic::Ordering;
-        let mut cur = counter.load(Ordering::Relaxed);
-        loop {
-            if cur != 0 && cur.saturating_add(len) > max {
-                return None;
-            }
-            match counter.compare_exchange_weak(
-                cur,
-                cur + len,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(Self { counter, len }),
-                Err(c) => cur = c,
-            }
-        }
-    }
-}
-
-impl Drop for UncachedRead {
-    fn drop(&mut self) {
-        self.counter
-            .fetch_sub(self.len, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// 予約を本文の寿命（送り終えて落とすまで）に結び付ける
-struct ChargedBytes {
-    data: Bytes,
-    _reserved: UncachedRead,
-}
-
-impl AsRef<[u8]> for ChargedBytes {
-    fn as_ref(&self) -> &[u8] {
-        &self.data
-    }
-}
-
 /// キャッシュに入らない大きさ（`cache_limit` を超える）なら予約する。`Err` は上限に達した
 fn reserve_uncached(len: u64, cache_limit: u64) -> Result<Option<UncachedRead>, ()> {
     if len <= cache_limit {
         return Ok(None);
     }
-    UncachedRead::reserve_in(&UNCACHED_INFLIGHT, UNCACHED_INFLIGHT_MAX, len)
-        .map(Some)
-        .ok_or(())
-}
-
-fn charge(data: Bytes, reserved: Option<UncachedRead>) -> Bytes {
-    match reserved {
-        Some(r) => Bytes::from_owner(ChargedBytes { data, _reserved: r }),
-        None => data,
-    }
+    reserve_whole(len).map(Some).ok_or(())
 }
 
 /// 静的配信用: メタデータと本体を **1 回の offload** で取得する（B-65）。
@@ -607,23 +544,10 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
-    /// B-321: キャッシュに入らない大きさの読み込みは上限まで。予約は本文を落とすと戻る
+    /// B-321: キャッシュに入る大きさの読み込みは数えない（上限は `inflight` の試験）
     #[test]
     fn uncached_read_budget() {
-        static C: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         assert!(matches!(reserve_uncached(10, 100), Ok(None)));
-        let first = UncachedRead::reserve_in(&C, 100, 101).expect("one read is always allowed");
-        let data = charge(Bytes::from_static(b"x"), Some(first));
-        assert!(UncachedRead::reserve_in(&C, 100, 1).is_none());
-        let copy = data.clone();
-        drop(data);
-        assert!(UncachedRead::reserve_in(&C, 100, 1).is_none());
-        drop(copy);
-        let a = UncachedRead::reserve_in(&C, 100, 60).expect("released");
-        assert!(UncachedRead::reserve_in(&C, 100, 50).is_none());
-        let b = UncachedRead::reserve_in(&C, 100, 40).expect("fits");
-        drop((a, b));
-        assert_eq!(C.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     fn test_ofc() -> OpenFileCacheConfig {
