@@ -842,6 +842,7 @@
 | B-477 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-477-bsd-unit-test-socketpair-buffer.md](bugs/B-477-bsd-unit-test-socketpair-buffer.md) | BSD で HTTP/1.1 の本文の上限の単体試験（B-372）が、AF_UNIX の 8KiB の送信バッファへ同じスレッドで先に書いて止まり、リリースの BSD の単体試験を止めるところだった（試験の socketpair のバッファを広げる） |
 | B-478 | P2 | 修正済み（fix/security-scan-fable-max） | [bugs/B-478-health-check-tls-handshake-timeout-loop.md](bugs/B-478-health-check-tls-handshake-timeout-loop.md) | HTTPS・gRPC のヘルスチェックが TLS のハンドシェイクの時間切れで眠って繰り返し、黙る上流で全部のヘルスチェックが止まっていた（FreeBSD の capability mode では sleep が panic してスレッドが終わった。接続ブローカーの同期の接続の待ちも） |
 | B-479 | P1 | 修正済み（fix/security-scan-fable-max） | [bugs/B-479-nightly-wasmtime-advisory-ghsa-hj27.md](bugs/B-479-nightly-wasmtime-advisory-ghsa-hj27.md) | container-security の nightly の cargo_audit が vendoring の wasmtime 36.0.20 の勧告（GHSA-hj27-mpw9-ff4c、Caller::get_module_export の panic）で落ちる。vendoring と crates.io の wasmtime を 36.0.21 へ |
+| B-480 | P1 | 修正済み（fix/security-scan-fable-max） | [bugs/B-480-windows-shared-listener-concurrent-accept-hang.md](bugs/B-480-windows-shared-listener-concurrent-accept-hang.md) | Windows で B-460 の共有の待ち受けのソケットへ複数のワーカーが同時に accept し、片方が mswsock の accept の中で止まって受理済みの接続に応答しなくなる（bindings の CI の Python の要求・WebSocket の時間切れ）。受理の番を取ってから accept する |
 
 ---
 

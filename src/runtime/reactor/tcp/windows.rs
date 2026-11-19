@@ -14,6 +14,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, Weak};
 use std::task::{Context, Poll};
 
@@ -230,6 +231,8 @@ fn duplicate_listen_socket(base: SOCKET) -> io::Result<SOCKET> {
 /// 同じアドレスの全ワーカーのリスナーが複製元にする待ち受けのソケット（最後のリスナーが落ちたら閉じる。B-460）
 struct SharedListenSocket {
     sock: SOCKET,
+    /// どれかのワーカーがこのソケットで `accept` を呼んでいる（B-480。[`raw_accept_one`] が取る番）
+    accepting: AtomicBool,
 }
 
 impl Drop for SharedListenSocket {
@@ -250,8 +253,8 @@ static SHARED_LISTEN_SOCKETS: Mutex<Vec<(SocketAddr, Weak<SharedListenSocket>)>>
 /// 非同期 TCP リスナー。
 pub struct TcpListener {
     fd: RawFd,
-    /// `bind_reuse_port` のリスナーが複製元を生かしておく（B-460）
-    _shared: Option<Arc<SharedListenSocket>>,
+    /// `bind_reuse_port` のリスナーが複製元を生かしておく（B-460）。受理の番もここで取る（B-480）
+    shared: Option<Arc<SharedListenSocket>>,
 }
 
 impl TcpListener {
@@ -259,14 +262,15 @@ impl TcpListener {
         let addr = resolve_listen_addr(addr)?;
         Ok(Self {
             fd: win::from_socket(listen_exclusive(&addr)?),
-            _shared: None,
+            shared: None,
         })
     }
 
     /// Windows には Linux 的な `SO_REUSEPORT`（カーネル分散）が無いため、同じアドレスの全ワーカーで 1 本の
     /// 待ち受けのソケット（`SO_EXCLUSIVEADDRUSE`）を共有し、各ワーカーにはその複製を返す。接続はその時に
     /// 受理したワーカーへ渡る（thread-per-core の accept 分散は保証されない。F-125）。B-460: 以前は各ワーカーが
-    /// `SO_REUSEADDR` で同じポートへ bind しており、他の利用者のソケットも重ねて bind できた
+    /// `SO_REUSEADDR` で同じポートへ bind しており、他の利用者のソケットも重ねて bind できた。複製での受理は
+    /// 同時に 1 つのワーカーだけが行う（B-480。[`raw_accept_one`]）
     pub fn bind_reuse_port(addr: impl std::net::ToSocketAddrs) -> io::Result<Self> {
         let addr = resolve_listen_addr(addr)?;
         // ポート 0 は呼び出しごとに別のポート（共有しない）
@@ -287,6 +291,7 @@ impl TcpListener {
                 None => {
                     let s = Arc::new(SharedListenSocket {
                         sock: listen_exclusive(&addr)?,
+                        accepting: AtomicBool::new(false),
                     });
                     table.push((addr, Arc::downgrade(&s)));
                     s
@@ -295,15 +300,12 @@ impl TcpListener {
         };
         Ok(Self {
             fd: win::from_socket(duplicate_listen_socket(shared.sock)?),
-            _shared: Some(shared),
+            shared: Some(shared),
         })
     }
 
     pub fn accept(&self) -> Accept<'_> {
-        Accept {
-            listener_fd: self.fd,
-            _marker: std::marker::PhantomData,
-        }
+        Accept { listener: self }
     }
 
     /// バックログに溜まっている接続を最大 `max_batch` 件までまとめて受理する
@@ -321,7 +323,7 @@ impl TcpListener {
     {
         let mut count = 0usize;
         while count < max_batch {
-            match raw_accept_one(self.fd) {
+            match raw_accept_one(self) {
                 Ok(Some((fd, storage))) => {
                     // 先に TcpStream を構築する: アドレス変換が失敗しても Drop 経由で
                     // ソケットがクローズされ、リークしない（`Accept::poll` と同じ順序）。
@@ -359,7 +361,7 @@ impl TcpListener {
 impl Drop for TcpListener {
     fn drop(&mut self) {
         unregister(self.fd);
-        // 自分の記述子だけを閉じる（共有の複製元は `_shared` の最後の参照が落ちたときに閉じる）
+        // 自分の記述子だけを閉じる（共有の複製元は `shared` の最後の参照が落ちたときに閉じる）
         unsafe { closesocket(win::to_socket(self.fd)) };
     }
 }
@@ -383,8 +385,16 @@ impl AsRawFd for TcpListener {
 // ====================
 
 pub struct Accept<'a> {
-    listener_fd: RawFd,
-    _marker: std::marker::PhantomData<&'a TcpListener>,
+    listener: &'a TcpListener,
+}
+
+/// 共有の待ち受けのソケットで `accept` を呼ぶ番（B-480）。落とすと返す
+struct AcceptTurn<'a>(&'a AtomicBool);
+
+impl Drop for AcceptTurn<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// `accept` を 1 回だけ非ブロッキングで試みる、`Accept::poll` と
@@ -399,10 +409,28 @@ pub struct Accept<'a> {
 /// （F-155 の「accept の作法を二重管理しない」方針）。
 ///
 /// - 成功: `Ok(Some((fd, storage)))`
-/// - `WSAEWOULDBLOCK`: バックログが尽きたことを示す `Ok(None)`
+/// - `WSAEWOULDBLOCK`（バックログが尽きた）、または同じ待ち受けのソケットで別のワーカーが受理している最中: `Ok(None)`
 /// - それ以外のエラー: `Err(e)`
-fn raw_accept_one(listener_fd: RawFd) -> io::Result<Option<(RawFd, [u8; 128])>> {
-    let listener_sock = win::to_socket(listener_fd);
+///
+/// B-480: 同じ待ち受けのソケットの複製を持つワーカー同士は、同時に `accept` を呼ばない。mswsock の非ブロッキングの
+/// `accept` は、接続が並んでいるかを確かめてから待つ形の要求を出す。その間に別のスレッドが同じ接続を受理すると、
+/// 次の接続が来るまで `accept` の中で止まり、そのワーカーが受理済みの接続ごと止まっていた。番を取れなかった
+/// ワーカーは readiness を待ち直す（接続が残っていれば WSAPoll がすぐに起こす）
+fn raw_accept_one(listener: &TcpListener) -> io::Result<Option<(RawFd, [u8; 128])>> {
+    let _turn = match &listener.shared {
+        Some(shared) => {
+            if shared
+                .accepting
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                return Ok(None);
+            }
+            Some(AcceptTurn(&shared.accepting))
+        }
+        None => None,
+    };
+    let listener_sock = win::to_socket(listener.fd);
     let mut buf = [0u8; 128];
     let mut len = buf.len() as i32;
     let accepted =
@@ -423,7 +451,7 @@ impl<'a> Future for Accept<'a> {
     type Output = io::Result<(TcpStream, SocketAddr)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match raw_accept_one(self.listener_fd) {
+        match raw_accept_one(self.listener) {
             Ok(Some((fd, buf))) => {
                 // 先に TcpStream を構築してからアドレス変換する（変換失敗時も
                 // Drop でソケットが閉じられ、リークしない）。
@@ -432,7 +460,7 @@ impl<'a> Future for Accept<'a> {
                 Poll::Ready(Ok((stream, peer_addr)))
             }
             Ok(None) => {
-                register_read(self.listener_fd, cx.waker().clone());
+                register_read(self.listener.fd, cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e)),
@@ -1151,6 +1179,108 @@ mod tests {
         assert!(
             again.is_some(),
             "the port is free after every listener closed"
+        );
+    }
+
+    /// B-480: 同じ待ち受けのソケットの複製で複数のスレッドが同時に受理しても、`accept` の中で止まらない。ワーカーと
+    /// 同じく readiness を待ってからまとめて受理し、受理した接続に 1 バイト返す（受理の中で止まったスレッドは、
+    /// 先に受理した接続に次の接続が来るまで応えない）
+    // 理由付き allow: 試験のスレッド・同期の接続・待ち（データプレーン外）
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn concurrent_accepts_on_a_shared_socket_do_not_block() {
+        use std::io::Read;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::{Duration, Instant};
+
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 100;
+        const CONNS: usize = 8;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..THREADS {
+            let listener = TcpListener::bind_reuse_port(addr).expect("worker listener");
+            let stop = Arc::clone(&stop);
+            let finished = Arc::clone(&finished);
+            threads.push(std::thread::spawn(move || {
+                // ワーカーと同じく、受理した接続はもう一度受理を試みた後で進める（受理のループは受理した接続の
+                // タスクを走らせる前に次の accept を呼ぶ）。受理の中で止まると、受理済みの接続に応えない
+                let mut accepted: Vec<TcpStream> = Vec::new();
+                let mut fresh = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    let mut pfd = WinSock::WSAPOLLFD {
+                        fd: win::to_socket(listener.fd),
+                        events: WinSock::POLLRDNORM,
+                        revents: 0,
+                    };
+                    // SAFETY: pfd は 1 要素の有効な配列
+                    let ready = unsafe { WinSock::WSAPoll(&mut pfd, 1, 20) } > 0;
+                    if ready || !accepted.is_empty() {
+                        let _ = listener.accept_batch(31, |s, _| fresh.push(s));
+                    }
+                    for s in accepted.drain(..) {
+                        // SAFETY: s.fd は受理した有効なソケット（送信の領域は空いている）
+                        unsafe { send(win::to_socket(s.fd), b"x".as_ptr(), 1, 0) };
+                    }
+                    accepted.append(&mut fresh);
+                }
+                finished.fetch_add(1, Ordering::Release);
+            }));
+        }
+
+        // 各回の接続は同時に張る（要求が同時に来たときと同じく、接続が並んだ状態で全スレッドが起きる）
+        let mut unanswered = 0;
+        for _ in 0..ROUNDS {
+            unanswered += std::thread::scope(|scope| {
+                let clients: Vec<_> = (0..CONNS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut c = std::net::TcpStream::connect(addr).expect("connect");
+                            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                            let mut b = [0u8; 1];
+                            c.read_exact(&mut b).is_err()
+                        })
+                    })
+                    .collect();
+                clients
+                    .into_iter()
+                    .map(|c| usize::from(c.join().unwrap()))
+                    .sum::<usize>()
+            });
+            if unanswered > 0 {
+                break;
+            }
+        }
+
+        // 受理の中で止まっているスレッドは接続を張って起こしてから終わらせる
+        stop.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut wake = Vec::new();
+        while finished.load(Ordering::Acquire) < THREADS && Instant::now() < deadline {
+            if let Ok(c) = std::net::TcpStream::connect(addr) {
+                wake.push(c);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            finished.load(Ordering::Acquire),
+            THREADS,
+            "a thread stayed inside accept"
+        );
+        for t in threads {
+            t.join().unwrap();
+        }
+        drop(wake);
+        assert_eq!(
+            unanswered, 0,
+            "a thread stopped inside accept and left the connections it had accepted unanswered"
         );
     }
 }

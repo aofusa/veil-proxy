@@ -22,7 +22,8 @@ datagrams」から確認。
 
 - Windows の TCP: 待ち受けのソケットは `SO_EXCLUSIVEADDRUSE` で bind する。同じアドレスの `bind_reuse_port` は
   1 本の待ち受けのソケットを共有し、各ワーカーには `WSADuplicateSocketW` で作った複製を渡す（最後のリスナーが落ちたら
-  閉じる）。ポート 0 と `bind` は共有しない。
+  閉じる）。ポート 0 と `bind` は共有しない。共有したソケットで複数のワーカーが同時に `accept` すると片方が mswsock の
+  `accept` の中で止まったので、受理は番を取ってから行う（[B-480](B-480-windows-shared-listener-concurrent-accept-hang.md)）。
 - UDP: Linux では `SO_REUSEADDR` を付けない（UDP に TIME_WAIT は無い。ワーカー間の共有は同じ UID に限られる
   `SO_REUSEPORT` で行う）。Windows は `SO_EXCLUSIVEADDRUSE`。
 - 利用者ガイド（`platforms.md` の英日の Windows の行）に書いた。
