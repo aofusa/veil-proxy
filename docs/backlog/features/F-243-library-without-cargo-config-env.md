@@ -1,7 +1,7 @@
 # F-243: `.cargo/config.toml` の `[env]` 無しで、Cargo.toml に書くだけで veil-proxy を使えるようにする
 
-**状態: 設計（feat/v083-release、2026-10-21。同日に方式を「同梱の BoringSSL」から「aws-lc-sys の Rust のバインディング経由」に
-改めた。v0.8.3 で公開）**
+**状態: 完了（v0.8.3 で公開、2026-10-21。設計の当日に方式を「同梱の BoringSSL」から「aws-lc-sys の Rust のバインディング経由」に
+改めた）**
 
 ## 目的
 
