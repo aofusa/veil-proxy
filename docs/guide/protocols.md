@@ -12,8 +12,10 @@ Supports HTTP/2 (RFC 7540) via TLS ALPN negotiation.
 |---------|--------|
 | Stream Multiplexing | Parallel processing of multiple requests on a single connection |
 | HPACK Header Compression | Significantly reduces header overhead. Decode uses a **4-bit LUT state machine** (F-121; 256 states × 16 peeks, 16 KiB L1-resident packed table) instead of scanning the encode table per symbol — release microbench ~12× vs the prior linear decoder; EOS padding and B-21 invalid-input safety retained |
-| Server Push | Latency reduction through proactive resource sending |
 | Flow Control | Stream and connection level control |
+
+Server push is not implemented: veil never sends `PUSH_PROMISE` and advertises `SETTINGS_ENABLE_PUSH = 0`
+(major browsers have removed push as well).
 
 ### Enabling
 

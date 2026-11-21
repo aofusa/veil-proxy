@@ -855,7 +855,7 @@
 | B-485 | P2 | 未着手 | [bugs/B-485-websocket-ignores-consistent-hash-key.md](bugs/B-485-websocket-ignores-consistent-hash-key.md) | WebSocket（HTTP/1.1 の upgrade・HTTP/2/3 の拡張 CONNECT）の上流の選択が Consistent Hash の `header:`・`cookie:` キーを見ない（同じセッションの HTTP の要求と別の上流へ行く） |
 | B-486 | P2 | 未着手 | [bugs/B-486-grpc-health-check-tls-without-h2.md](bugs/B-486-grpc-health-check-tls-without-h2.md) | gRPC のヘルスチェックが TLS の上流には ALPN 無しの HTTP/1.1 で送り、TLS の gRPC サーバを常に不健全とみなす（平文は h2c 済み。文書も古い） |
 | B-487 | P2 | 未着手 | [bugs/B-487-h2-h3-no-send-stall-timeout.md](bugs/B-487-h2-h3-no-send-stall-timeout.md) | HTTP/2・HTTP/3 の応答の送信に時間切れが無く、読まないクライアントが接続・ストリームのタスク・上流の接続を握り続ける（HTTP/1.1 は `WRITE_TIMEOUT`・`client_write_timeout_secs`） |
-| B-488 | P3 | 未着手 | [bugs/B-488-protocol-docs-stale-claims.md](bugs/B-488-protocol-docs-stale-claims.md) | プロトコルの文書の誤り（HTTP/2 Server Push は未実装、ハンドラのストリーミングの要求本文・`max_body_size`・拡張 CONNECT の upgrade のプロトコルごとの説明が古い） |
+| B-488 | P3 | 修正済み（feat/protocol-parity） | [bugs/B-488-protocol-docs-stale-claims.md](bugs/B-488-protocol-docs-stale-claims.md) | プロトコルの文書の誤り（HTTP/2 Server Push は未実装、ハンドラのストリーミングの要求本文・`max_body_size`・拡張 CONNECT の upgrade のプロトコルごとの説明が古い） |
 
 ---
 

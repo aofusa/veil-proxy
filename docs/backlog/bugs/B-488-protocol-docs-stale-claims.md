@@ -1,6 +1,6 @@
 # B-488: プロトコルの文書の誤り（HTTP/2 Server Push・ハンドラのストリーミング・拡張 CONNECT の upgrade）
 
-**状態: 未着手（2026-11-21 起票。機能 × プロトコルの網羅性の確認、feat/protocol-parity）**
+**状態: 修正済み（feat/protocol-parity、2026-11-21）**
 
 ## 出典
 
@@ -25,3 +25,11 @@
 ## 関連
 
 - [F-288](../features/F-288-websocket-over-h2-h3.md)、[F-266](../features/F-266-multipart-file-upload.md)、[F-209](../features/F-209-grpc-handler-gap-audit.md)
+
+## 対応（2026-11-21）
+
+- `protocols.md`（英日）の HTTP/2 の機能表から「Server Push」を外し、実装していないこと（`PUSH_PROMISE` を送らない・
+  `SETTINGS_ENABLE_PUSH = 0`）を書いた。
+- `library.md`（英日）: ストリーミング受信は HTTP/2・HTTP/3 が全二重、HTTP/1.1 は `Content-Length` の本文を届いた順に渡して応答は
+  本文の後、chunked は 1 断片。`max_body_size` はどのプロトコルのストリーミングのルートにも掛からない。upgrade の 400 の条件から
+  「HTTP/2・HTTP/3 で届いた」を外し、`:protocol` の一致する拡張 CONNECT だけがアップグレードできると書いた。

@@ -351,9 +351,10 @@ HTTP/3 も同様（打ち切りはストリームのリセット）です。す�
 `HEAD` ではストリームを poll せずに捨てます。
 
 届いた順に要求本文を受け取りたいルートは `streaming = true`（`#[veil::route(..., streaming = true)]` または
-`App::route_fn_streaming`）にして、`req.take_body_stream()`（`Stream<Item = Bytes>`）で読みます。HTTP/2 ではヘッダが
-届いた時点でハンドラが動き、要求と応答が同時に流れます（全二重）。HTTP/1.1 と HTTP/3 では本文を読み終えてから 1 断片として
-渡します。HTTP/2 のストリーミング受信のルートには `max_body_size` が掛からないので、読みながら制限してください。
+`App::route_fn_streaming`）にして、`req.take_body_stream()`（`Stream<Item = Bytes>`）で読みます。HTTP/2・HTTP/3 では
+ヘッダが届いた時点でハンドラが動き、要求と応答が同時に流れます（全二重）。HTTP/1.1 でもヘッダが届いた時点でハンドラが動き、
+`Content-Length` の本文は届いた順に渡しますが、応答は要求本文を読み終えてから書きます。chunked の要求本文は読み終えてから
+1 断片として渡します。ストリーミング受信のルートにはどのプロトコルでも `max_body_size` が掛からないので、読みながら制限してください。
 どちらの向きも tower の層をそのまま通ります。
 
 本文が途中で切れたとき（クライアントの切断・ストリームのリセット・時間切れ、HTTP/1.1 では `Content-Length` に届かない）も、
@@ -406,8 +407,9 @@ async fn echo(req: Request) -> Response {
 - 要求ヘッダの直後にクライアントが送ったバイト列（同じパケットでも）は最初の `read` で返ります。
 - 101 には `Connection: Upgrade`・`Upgrade: <protocol>` と `with_header` で足したヘッダが付きます。`Content-Length` は付かず、
   接続は HTTP に戻りません。アクセスログには 101 が 1 行残ります。
-- 要求がアップグレードの要求でない（`Connection: upgrade` / `Upgrade` が無い）・HTTP/1.0・本文付き・HTTP/2 や HTTP/3 で届いた
-  （RFC 8441 / RFC 9220 の拡張 CONNECT は非対応）ときは、veil が 400 に置き換えます。`h2c` は予約済みです（500 と警告）。
+- 要求がアップグレードの要求でない（`Connection: upgrade` / `Upgrade` が無い）・HTTP/1.0・本文付きのときは、veil が 400 に
+  置き換えます。HTTP/2・HTTP/3 でアップグレードできるのは `:protocol` の一致する拡張 CONNECT（RFC 8441 / RFC 9220。下記の
+  WebSocket の注記）だけで、それ以外のアップグレードの応答は 400 です。`h2c` は予約済みです（500 と警告）。
 - アップグレードした接続も `[security] max_concurrent_connections` に数えます。`[api] upgrade_idle_timeout_secs`
   （既定 300。0 = 無し）より長く待った `read` は `TimedOut` で失敗します。
 - `tokio-compat` では `up.into_tokio_io()` が `veil::tokio::io::{AsyncRead, AsyncWrite}` を実装したものを返し、tokio 前提の

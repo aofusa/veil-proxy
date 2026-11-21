@@ -367,9 +367,11 @@ already available are merged up to 16 KiB per frame. For `HEAD` the stream is dr
 
 A route that needs the request body as it arrives sets `streaming = true` (`#[veil::route(..., streaming = true)]`
 or `App::route_fn_streaming`) and reads it with `req.take_body_stream()` (a `Stream<Item = Bytes>`). Over HTTP/2
-the handler runs as soon as the headers arrive and request and response flow in both directions at once; over
-HTTP/1.1 and HTTP/3 the body is read first and handed over as one chunk. `max_body_size` does not apply to a
-streaming route over HTTP/2 (limit it while reading). Both directions pass through tower layers unchanged.
+and HTTP/3 the handler runs as soon as the headers arrive and request and response flow in both directions at once.
+Over HTTP/1.1 the handler also runs as soon as the headers arrive and reads a `Content-Length` body as it arrives,
+but the response is written after the request body has been read; a chunked request body is read first and handed
+over as one chunk. `max_body_size` does not apply to a streaming route on any protocol (limit it while reading).
+Both directions pass through tower layers unchanged.
 
 The body stream also ends (`None`) when the body is cut off before it is complete: the client disconnects, resets
 the stream or times out, or (HTTP/1.1) fewer bytes than `Content-Length` arrive. Check
@@ -424,7 +426,8 @@ async fn echo(req: Request) -> Response {
 - The 101 carries `Connection: Upgrade`, `Upgrade: <protocol>` and the headers you add with `with_header`; it has no
   `Content-Length` and the connection never returns to HTTP. The access log records the 101.
 - veil answers 400 instead when the request is not an upgrade request (no `Connection: upgrade` / `Upgrade`),
-  is HTTP/1.0, has a body, or arrived over HTTP/2 or HTTP/3 (RFC 8441 / RFC 9220 extended CONNECT is not supported).
+  is HTTP/1.0 or has a body. Over HTTP/2 and HTTP/3 only an extended CONNECT request (RFC 8441 / RFC 9220) whose
+  `:protocol` matches can be upgraded (see the WebSocket notes below); other upgrade responses there become 400.
   `h2c` is reserved (500 and a warning).
 - An upgraded connection still counts against `[security] max_concurrent_connections`. `[api] upgrade_idle_timeout_secs`
   (default 300; 0 = none) makes a `read` that waits longer fail with `TimedOut`.
