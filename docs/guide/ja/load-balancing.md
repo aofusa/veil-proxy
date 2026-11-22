@@ -173,9 +173,9 @@ TCP接続の確立可否のみを確認します。HTTP通信は行いません�
 
 ### gRPCヘルスチェック
 
-[gRPC Health Checking Protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md) に基づき、`Content-Type: application/grpc` の HTTP/1.1 POST でチェックを行います。`grpc-status: 0`（OK）を受信した場合に healthy と判定します。
+[gRPC Health Checking Protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md)（`grpc.health.v1.Health/Check`）でチェックします。HTTP/2 で送ります: 平文の上流には h2c（prior knowledge）、TLS の上流（`use_tls = true`）には ALPN で `h2` と `http/1.1` を出し、サーバが `h2` を選べば HTTP/2 で送ります。`SERVING` または `grpc-status: 0` を受け取れば healthy、`NOT_SERVING` なら unhealthy と判定します。
 
-> **注意**: この実装は HTTP/1.1 フレームを使用します。HTTP/1.1 で gRPC ヘルスエンドポイントを公開しているバックエンド（gRPC-Web 互換）に対して動作します。
+> **注意**: HTTP/1.1 でしか応えないバックエンド（gRPC-Web 互換のモック）には、`Content-Type: application/grpc` の HTTP/1.1 POST で確かめます（平文は h2c が失敗したとき、TLS は ALPN で `http/1.1` が選ばれたとき）。
 
 ```toml
   [upstreams."grpc-servers".health_check]

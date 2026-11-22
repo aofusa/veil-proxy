@@ -1,6 +1,6 @@
 # B-486: gRPC のヘルスチェックが TLS では HTTP/1.1 で送り、TLS の gRPC サーバを確かめられない
 
-**状態: 未着手（2026-11-21 起票。機能 × プロトコルの網羅性の確認、feat/protocol-parity）**
+**状態: 修正済み（feat/protocol-parity。2026-11-21 起票・2026-11-22 修正。機能 × プロトコルの網羅性の確認）**
 
 ## 出典
 
@@ -22,6 +22,15 @@
   HEADERS・DATA、トレーラの `grpc-status`）を TLS の上で行う。h2c の関数を `Read + Write` の上で動く形にして共有する。
   `http/1.1` が選ばれたら今の HTTP/1.1 の経路（gRPC-Web 互換のモック）。
 - 文書（load-balancing、英日）を直す。
+
+## 対応（2026-11-22）
+
+- h2c のやり取りを `Read + Write` の上で動く `grpc_health_check_over_h2` に切り出し、平文（h2c）と TLS で共有する
+  （`:scheme` は `http`・`https`）。
+- TLS の上流には ALPN `h2`・`http/1.1` を出す（`http2` feature のとき）。`h2` が選ばれたら HTTP/2 で確かめ、応答を
+  解釈できなければ不健全（同じ TLS の接続で HTTP/1.1 へは落とさない）。`http/1.1` が選ばれたか ALPN が無ければ従来の
+  HTTP/1.1 の POST。
+- 文書（`load-balancing.md`、英日）: HTTP/2 で確かめること・TLS では ALPN で決めること・HTTP/1.1 のモックへの扱いを書いた。
 
 ## 受け入れ条件
 

@@ -420,20 +420,36 @@ fn build_grpc_health_request_body(service_name: &str) -> Vec<u8> {
 /// tonic 等の本物の gRPC サーバは HTTP/2 のみ受け付けるため、HTTP/1.1 フォールバック前に試行する。
 /// 戻り値: Ok(healthy) / Err(()) は接続・ハンドシェイク失敗（H1 へフォールバック可）。
 #[cfg(feature = "http2")]
-#[allow(clippy::disallowed_methods)] // ヘルスチェックスレッド専用の同期 I/O
 fn perform_grpc_health_check_h2c(
     addr: &str,
-    _service_name: &str,
+    grpc_frame: &[u8],
+    timeout: Duration,
+) -> Result<bool, ()> {
+    // F-170: TCP/UDS 共通の接続入口。
+    let mut stream = connect_probe(addr, timeout).map_err(|_| ())?;
+    grpc_health_check_over_h2(
+        &mut stream,
+        probe_host_header(addr),
+        b"http",
+        grpc_frame,
+        timeout,
+    )
+}
+
+/// HTTP/2 で grpc.health.v1.Health/Check を 1 回やり取りする（平文の h2c・ALPN で h2 を選んだ TLS の上。B-486）。
+///
+/// 戻り値: Ok(healthy) / Err(()) は書き込み・読み取りの失敗か、応答を解釈できなかった。
+#[cfg(feature = "http2")]
+fn grpc_health_check_over_h2<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    host: &str,
+    scheme: &[u8],
     grpc_frame: &[u8],
     timeout: Duration,
 ) -> Result<bool, ()> {
     use crate::http2::frame::{Frame, FrameDecoder, FrameEncoder, FrameHeader};
     use crate::http2::hpack::{HpackDecoder, HpackEncoder};
     use crate::http2::settings::defaults;
-    use std::io::{Read, Write};
-
-    // F-170: TCP/UDS 共通の接続入口。
-    let mut stream = connect_probe(addr, timeout).map_err(|_| ())?;
 
     let enc = FrameEncoder::new(defaults::MAX_FRAME_SIZE);
     let mut hpack = HpackEncoder::new(defaults::HEADER_TABLE_SIZE as usize);
@@ -453,12 +469,11 @@ fn perform_grpc_health_check_h2c(
     );
     stream.write_all(&settings).map_err(|_| ())?;
 
-    let host = probe_host_header(addr);
     let path = b"/grpc.health.v1.Health/Check";
     let headers: [(&[u8], &[u8], bool); 6] = [
         (b":method", b"POST", false),
         (b":path", path, false),
-        (b":scheme", b"http", false),
+        (b":scheme", scheme, false),
         (b":authority", host.as_bytes(), false),
         (b"content-type", b"application/grpc", false),
         (b"te", b"trailers", false),
@@ -576,7 +591,7 @@ pub(crate) fn perform_grpc_health_check(
     // F-97: まず H2C（本物の gRPC サーバ向け）。失敗時のみ H1 モック互換へフォールバック。
     #[cfg(feature = "http2")]
     if !use_tls {
-        match perform_grpc_health_check_h2c(addr, service_name, &grpc_frame, timeout) {
+        match perform_grpc_health_check_h2c(addr, &grpc_frame, timeout) {
             Ok(healthy) => return healthy,
             Err(()) => {
                 // H2C 接続/ハンドシェイク失敗 → H1 フォールバック
@@ -665,6 +680,15 @@ pub(crate) fn perform_grpc_health_check(
             )
         };
 
+        // B-486: gRPC は HTTP/2 の上でしか動かない（TLS の gRPC サーバは ALPN の h2 が無いクライアントを拒否し得る）。
+        // h2 を先に出し、選ばれたら HTTP/2 で確かめる。http/1.1 を選ぶサーバ（gRPC-Web 互換のモック）は従来の経路
+        #[cfg(feature = "http2")]
+        let config = {
+            let mut c = (*config).clone();
+            c.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            Arc::new(c)
+        };
+
         let server_name = match ServerName::try_from(host_header.to_string()) {
             Ok(n) => n,
             Err(_) => return false,
@@ -678,6 +702,18 @@ pub(crate) fn perform_grpc_health_check(
             if tls_conn.complete_io(&mut tcp_stream).is_err() {
                 return false;
             }
+        }
+        #[cfg(feature = "http2")]
+        if tls_conn.alpn_protocol() == Some(&b"h2"[..]) {
+            let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp_stream);
+            return grpc_health_check_over_h2(
+                &mut stream,
+                host_header,
+                b"https",
+                &grpc_frame,
+                timeout,
+            )
+            .unwrap_or(false);
         }
         let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp_stream);
         if stream.write_all(request.as_bytes()).is_err() {
@@ -1581,6 +1617,99 @@ mod tests {
             probe_host_header("backend.example.com:8080"),
             "backend.example.com"
         );
+    }
+
+    /// B-486: TLS の gRPC のヘルスサーバ（テストの中で立てる。1 回の接続に応える）。`alpn` が `h2` なら HTTP/2 で
+    /// HealthCheckResponse（SERVING・NOT_SERVING）とトレーラの `grpc-status: 0` を返し、`http/1.1` なら gRPC-Web 互換の
+    /// モックと同じく HTTP/1.1 の応答のヘッダに `grpc-status` を載せる（SERVING なら 0、そうでなければ 5）
+    #[cfg(feature = "http2")]
+    fn spawn_tls_grpc_health_server(alpn: &'static [u8], serving: bool) -> String {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let provider = Arc::new(crate::tls_provider::provider::default_provider());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()),
+        );
+        let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![ck.cert.der().clone()], key)
+            .unwrap();
+        cfg.alpn_protocols = vec![alpn.to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(tcp).await.unwrap();
+                if alpn != b"h2" {
+                    // 要求のヘッダの終わりまで読んでから応える（本文は読まずに閉じる）
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = tls.read(&mut buf).await.unwrap();
+                        assert!(n > 0, "connection closed before the request head");
+                        req.extend_from_slice(&buf[..n]);
+                    }
+                    assert!(req.starts_with(b"POST /grpc.health.v1.Health/Check HTTP/1.1\r\n"));
+                    let code = if serving { 0 } else { 5 };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/grpc\r\ngrpc-status: {code}\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    tls.write_all(resp.as_bytes()).await.unwrap();
+                    tls.flush().await.unwrap();
+                    let _ = tls.shutdown().await;
+                    return;
+                }
+                let mut conn = h2::server::handshake(tls).await.unwrap();
+                while let Some(req) = conn.accept().await {
+                    let Ok((req, mut respond)) = req else { break };
+                    assert_eq!(req.uri().path(), "/grpc.health.v1.Health/Check");
+                    let resp = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(())
+                        .unwrap();
+                    let mut send = respond.send_response(resp, false).unwrap();
+                    let status = if serving { 1 } else { 2 };
+                    send.send_data(bytes::Bytes::from(vec![0, 0, 0, 0, 2, 0x08, status]), false)
+                        .unwrap();
+                    let mut trailers = http::HeaderMap::new();
+                    trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                    send.send_trailers(trailers).unwrap();
+                }
+            });
+        });
+        format!("127.0.0.1:{port}")
+    }
+
+    /// B-486: TLS の gRPC のヘルスチェックは ALPN で h2 と http/1.1 を出し、h2 が選ばれたら HTTP/2 で確かめる（以前は
+    /// ALPN 無しの HTTP/1.1 で送り、h2 だけを受ける本物の gRPC サーバを常に不健全にしていた）。http/1.1 を選ぶサーバには
+    /// 従来どおり HTTP/1.1 で確かめる
+    #[cfg(feature = "http2")]
+    #[test]
+    fn grpc_health_check_over_tls_follows_alpn() {
+        let _ = crate::tls_provider::provider::default_provider().install_default();
+        for alpn in [&b"h2"[..], &b"http/1.1"[..]] {
+            for serving in [true, false] {
+                let addr = spawn_tls_grpc_health_server(alpn, serving);
+                assert_eq!(
+                    perform_grpc_health_check(&addr, "", true, false, Duration::from_secs(5)),
+                    serving,
+                    "ALPN {} serving {serving}",
+                    String::from_utf8_lossy(alpn)
+                );
+            }
+        }
     }
 
     #[test]

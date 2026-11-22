@@ -187,9 +187,9 @@ servers = [
 
 ### gRPC Health Check
 
-Implements [gRPC Health Checking Protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md) via HTTP/1.1 POST with `Content-Type: application/grpc`. A response of `grpc-status: 0` (OK) is treated as healthy.
+Implements the [gRPC Health Checking Protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md) (`grpc.health.v1.Health/Check`). The check speaks HTTP/2: h2c with prior knowledge on a plaintext upstream, and on a TLS upstream (`use_tls = true`) it offers ALPN `h2` and `http/1.1` and uses HTTP/2 when the server picks `h2`. A response with `SERVING` or `grpc-status: 0` is treated as healthy, and `NOT_SERVING` as unhealthy.
 
-> **Note**: This implementation uses HTTP/1.1 framing. It works with backends that expose a gRPC health endpoint over HTTP/1.1 (gRPC-Web compatible). Full HTTP/2 gRPC is not currently supported.
+> **Note**: A backend that only answers HTTP/1.1 (gRPC-Web compatible mocks) is still checked with an HTTP/1.1 POST of `Content-Type: application/grpc`: a plaintext upstream gets it when the h2c attempt fails, and a TLS upstream when it picks `http/1.1` in ALPN.
 
 ```toml
 [upstreams."grpc-servers"]
