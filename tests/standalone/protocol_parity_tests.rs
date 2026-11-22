@@ -637,3 +637,489 @@ url = "http://127.0.0.1:{up}"
         assert_eq!(seen_len(&seen), n0 + 1, "{proto:?}\n{}", veil.log());
     }
 }
+
+/// B-487: 応答を受け始めてから `pause` の間、フロー制御のクレジットを出さずに待ち（HTTP/2 は WINDOW_UPDATE を送らず、HTTP/3 は
+/// 読まずに MAX_STREAM_DATA を出させない）、その後で本文を全部読む。読めた本文のバイト数。Err はストリームが打ち切られた
+fn paused_download(
+    proto: Proto,
+    ports: Ports,
+    path: &str,
+    pause: Duration,
+) -> Result<usize, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let path = path.to_string();
+    rt.block_on(async move {
+        let run = async {
+            match proto {
+                Proto::H2c | Proto::H2Tls => {
+                    let tls = proto == Proto::H2Tls;
+                    let port = if tls { ports.tls } else { ports.clear };
+                    let mut client = h2_connect(tls, port).await?;
+                    let req = h2_request(tls, port, "GET", &path, &[]);
+                    let (resp, _send) =
+                        client.send_request(req, true).map_err(|e| e.to_string())?;
+                    let resp = resp.await.map_err(|e| e.to_string())?;
+                    if resp.status() != 200 {
+                        return Err(format!("status {}", resp.status()));
+                    }
+                    let mut body = resp.into_body();
+                    tokio::time::sleep(pause).await;
+                    let mut n = 0;
+                    while let Some(c) = body.data().await {
+                        let c = c.map_err(|e| e.to_string())?;
+                        n += c.len();
+                        let _ = body.flow_control().release_capacity(c.len());
+                    }
+                    Ok(n)
+                }
+                #[cfg(feature = "http3")]
+                Proto::H3 => {
+                    let (_endpoint, mut send) = h3_connect(ports.tls).await?;
+                    let req = h3_request(ports.tls, "GET", &path, &[]);
+                    let mut stream = send.send_request(req).await.map_err(|e| e.to_string())?;
+                    stream.finish().await.map_err(|e| e.to_string())?;
+                    let resp = stream.recv_response().await.map_err(|e| e.to_string())?;
+                    if resp.status() != 200 {
+                        return Err(format!("status {}", resp.status()));
+                    }
+                    tokio::time::sleep(pause).await;
+                    let mut n = 0;
+                    while let Some(mut c) = stream.recv_data().await.map_err(|e| e.to_string())? {
+                        let len = bytes::Buf::remaining(&c);
+                        n += len;
+                        bytes::Buf::advance(&mut c, len);
+                    }
+                    Ok(n)
+                }
+                _ => unreachable!(),
+            }
+        };
+        tokio::time::timeout(pause + Duration::from_secs(20), run)
+            .await
+            .unwrap_or_else(|_| Err("client timed out".to_string()))
+    })
+}
+
+/// B-487: フロー制御のクレジットを出さないクライアントへの応答は、`buffering = "full"` のルートでは
+/// `client_write_timeout_secs` の後に HTTP/2・HTTP/3 のストリームをリセットする（HTTP/1.1 と同じ）。ほかのルートは既定の
+/// `WRITE_TIMEOUT`（30 秒）まで待つので、数秒止めただけなら最後まで届く（以前の HTTP/2・HTTP/3 はいつまでも待った）
+#[test]
+fn b487_buffered_response_stalled_by_flow_control_is_reset() {
+    const BODY: usize = 4 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let (up, _seen) = spawn_recording_upstream(|_| (200, String::new(), vec![b'x'; BODY]));
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[[route]]
+[route.conditions]
+path = "/full/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}"
+[route.buffering]
+mode = "full"
+client_write_timeout_secs = 2
+
+[[route]]
+[route.conditions]
+path = "/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}"
+"#,
+        listeners = listeners_toml(ports, &cert, &key),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    // 見回りは 1 秒ごとで、2 秒の設定なら止まってから 3〜4 秒で打ち切る
+    let pause = Duration::from_secs(8);
+    let protos: Vec<Proto> = all_protos()
+        .into_iter()
+        .filter(|p| *p != Proto::H1)
+        .collect();
+    let results: Vec<(Proto, &str, Result<usize, String>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = protos
+            .iter()
+            .flat_map(|&proto| {
+                ["/full/x", "/stream/x"].map(|path| {
+                    s.spawn(move || (proto, path, paused_download(proto, ports, path, pause)))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (proto, path, r) in results {
+        let ctx = format!("{proto:?} {path}: {r:?}\n{}", veil.log());
+        if path.starts_with("/full") {
+            assert!(matches!(r, Err(ref e) if !e.contains("timed out")), "{ctx}");
+        } else {
+            assert_eq!(r, Ok(BODY), "{ctx}");
+        }
+    }
+}
+
+/// `Sec-WebSocket-Key` に対する `Sec-WebSocket-Accept`（RFC 6455 §4.2.2）
+fn ws_accept(key: &str) -> String {
+    use base64::Engine;
+    let mut data = key.as_bytes().to_vec();
+    data.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let d = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
+    base64::engine::general_purpose::STANDARD.encode(d.as_ref())
+}
+
+/// B-487: 本文を `1 GiB` と名乗って書けるだけ書く HTTP/1.1 の上流（WebSocket の upgrade には 101 を返してから書き続ける）。
+/// 要求の行と、書き込みが失敗した（veil が上流の接続を閉じた）時刻を記録する
+fn spawn_endless_upstream() -> (u16, Arc<Mutex<Vec<(String, std::time::Instant)>>>) {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let closed = Arc::new(Mutex::new(Vec::new()));
+    let closed2 = closed.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            let closed = closed2.clone();
+            std::thread::spawn(move || {
+                let mut head = Vec::new();
+                let mut b = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut b) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&b[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let line = head.lines().next().unwrap_or_default().to_string();
+                let ws_key = head.lines().find_map(|l| {
+                    let (n, v) = l.split_once(':')?;
+                    n.trim()
+                        .eq_ignore_ascii_case("sec-websocket-key")
+                        .then(|| v.trim().to_string())
+                });
+                let resp_head = match ws_key {
+                    Some(key) => format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                         Sec-WebSocket-Accept: {}\r\n\r\n",
+                        ws_accept(&key)
+                    ),
+                    None => format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", 1u64 << 30),
+                };
+                let chunk = vec![b'x'; 65536];
+                let ok = s.write_all(resp_head.as_bytes()).is_ok()
+                    && (0..(1usize << 30) / chunk.len()).all(|_| s.write_all(&chunk).is_ok());
+                if !ok {
+                    closed
+                        .lock()
+                        .unwrap()
+                        .push((line, std::time::Instant::now()));
+                }
+            });
+        }
+    });
+    (port, closed)
+}
+
+/// B-487: TCP の受信を止めたクライアント（h2c を直に話す）を `stop` まで続ける。WINDOW_UPDATE で窓を最大にしてから要求を送り、
+/// 以後は何も読まない（サーバの送信がソケットで詰まる）
+fn h2c_stop_reading(port: u16, path: &str, stop: &std::sync::atomic::AtomicBool) {
+    use std::io::Write;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
+    // SETTINGS（INITIAL_WINDOW_SIZE = 2^31-1）
+    s.write_all(&[0, 0, 6, 0x4, 0, 0, 0, 0, 0, 0, 0x4, 0x7f, 0xff, 0xff, 0xff])
+        .unwrap();
+    // WINDOW_UPDATE（接続。2^31-1 まで広げる）
+    let inc: u32 = 0x7fff_ffff - 65535;
+    let mut wu = vec![0, 0, 4, 0x8, 0, 0, 0, 0, 0];
+    wu.extend_from_slice(&inc.to_be_bytes());
+    s.write_all(&wu).unwrap();
+    // HEADERS（stream 1、END_STREAM | END_HEADERS）: GET（静的表 2）・http（6）・:path・:authority（リテラル）
+    let authority = format!("127.0.0.1:{port}");
+    let mut block = vec![0x82, 0x86, 0x44, path.len() as u8];
+    block.extend_from_slice(path.as_bytes());
+    block.extend_from_slice(&[0x41, authority.len() as u8]);
+    block.extend_from_slice(authority.as_bytes());
+    let mut frame = vec![0, 0, block.len() as u8, 0x1, 0x5, 0, 0, 0, 1];
+    frame.extend_from_slice(&block);
+    s.write_all(&frame).unwrap();
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// B-487: 応答の見出しを受けた後、フロー制御のクレジットを出さずに `stop` まで待つ（ストリームは開いたまま）。
+/// `tunnel` は HTTP/2 の拡張 CONNECT（WebSocket。上流が送り続ける）。HTTP/3 は PING を送り続けて QUIC のアイドルの
+/// 時間切れを避ける
+fn stall_after_head(
+    proto: Proto,
+    tunnel: bool,
+    ports: Ports,
+    path: &str,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let wait = || async {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    rt.block_on(async {
+        match proto {
+            Proto::H2c => {
+                let client = h2_connect(false, ports.clear).await.unwrap();
+                let mut client = client.ready().await.unwrap();
+                let req = if tunnel {
+                    // h2 は SETTINGS_ENABLE_CONNECT_PROTOCOL を受けるまで `:protocol` を送れない
+                    for _ in 0..100 {
+                        if client.is_extended_connect_protocol_enabled() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        client = client.ready().await.unwrap();
+                    }
+                    http::Request::builder()
+                        .method(http::Method::CONNECT)
+                        .uri(format!("http://localhost:{}{path}", ports.clear))
+                        .extension(h2::ext::Protocol::from_static("websocket"))
+                        .header("sec-websocket-version", "13")
+                        .body(())
+                        .unwrap()
+                } else {
+                    h2_request(false, ports.clear, "GET", path, &[])
+                };
+                // トンネルは要求の側も開いたまま（END_STREAM を送らない）
+                let (resp, _send) = client.send_request(req, !tunnel).unwrap();
+                let resp = resp.await.unwrap();
+                assert_eq!(resp.status(), 200);
+                let _body = resp.into_body();
+                wait().await;
+            }
+            #[cfg(feature = "http3")]
+            Proto::H3 => {
+                let mut transport = quinn::TransportConfig::default();
+                transport.keep_alive_interval(Some(Duration::from_secs(2)));
+                let (_endpoint, mut send) = h3_connect_with(ports.tls, transport).await.unwrap();
+                let req = h3_request(ports.tls, "GET", path, &[]);
+                let mut stream = send.send_request(req).await.unwrap();
+                stream.finish().await.unwrap();
+                let resp = stream.recv_response().await.unwrap();
+                assert_eq!(resp.status(), 200);
+                wait().await;
+            }
+            _ => unreachable!(),
+        }
+    });
+}
+
+/// B-487: TCP の受信を止めた HTTP/2 の接続は `WRITE_TIMEOUT`（30 秒）〜その 2 倍で閉じ、フロー制御のクレジットを出さない
+/// HTTP/2・HTTP/3 のストリーム（ストリーミングの中継・HTTP/2 の WebSocket のトンネル）は `WRITE_TIMEOUT` の後にリセットされる。
+/// どれも中継していた上流の接続を放す（以前はいつまでも握った。HTTP/1.1 は書き込みの時間切れで閉じる。HTTP/3 は PING で
+/// QUIC のアイドルの時間切れを避けるクライアントで確かめる）
+#[test]
+fn b487_stalled_clients_release_upstream_after_write_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let (up, closed) = spawn_endless_upstream();
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[http2]
+enable_connect_protocol = true
+
+[[route]]
+[route.conditions]
+path = "/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}"
+"#,
+        listeners = listeners_toml(ports, &cert, &key),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let started = std::time::Instant::now();
+    #[allow(unused_mut)]
+    let mut expect: Vec<(&str, Duration, Duration)> = vec![
+        // 書き込みの見張りは張り直しを含めて 30〜60 秒
+        (
+            "/b487/tcp",
+            Duration::from_secs(28),
+            Duration::from_secs(75),
+        ),
+        // 見回りは 1 秒ごと（30 秒を超えてから打ち切る）
+        ("/b487/h2", Duration::from_secs(28), Duration::from_secs(45)),
+        ("/b487/ws", Duration::from_secs(28), Duration::from_secs(45)),
+    ];
+    #[cfg(feature = "http3")]
+    expect.push(("/b487/h3", Duration::from_secs(28), Duration::from_secs(45)));
+    let all_closed = std::thread::scope(|s| {
+        s.spawn(|| h2c_stop_reading(ports.clear, "/b487/tcp", &stop));
+        s.spawn(|| stall_after_head(Proto::H2c, false, ports, "/b487/h2", &stop));
+        s.spawn(|| stall_after_head(Proto::H2c, true, ports, "/b487/ws", &stop));
+        #[cfg(feature = "http3")]
+        s.spawn(|| stall_after_head(Proto::H3, false, ports, "/b487/h3", &stop));
+        let ok = wait_until(Duration::from_secs(80), || {
+            closed.lock().unwrap().len() >= expect.len()
+        });
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        ok
+    });
+    let closed = closed.lock().unwrap().clone();
+    let ctx = format!("{closed:?} (started {started:?})\n{}", veil.log());
+    assert!(all_closed, "upstream connections were kept: {ctx}");
+    for (path, min, max) in expect {
+        let at = closed
+            .iter()
+            .find(|(line, _)| line.starts_with(&format!("GET {path} ")))
+            .map(|(_, t)| t.duration_since(started))
+            .unwrap_or_else(|| panic!("{path}: upstream kept\n{ctx}"));
+        assert!(
+            at >= min && at <= max,
+            "{path}: released after {at:?}\n{ctx}"
+        );
+    }
+}
+
+/// B-487: `n` 本の GET を 1 つの接続で同時に送り、全部の本文を `rate`（バイト毎秒）でゆっくり読む。接続のウィンドウは
+/// 64 KB、ストリームのウィンドウは 4 MB（空いた接続のクレジットを veil の順番で先のストリームが使い続け、後のストリームは
+/// 接続のクレジットを待つ）。ストリームごとに読めた本文のバイト数（打ち切られたら Err）
+fn slow_parallel_download(
+    proto: Proto,
+    ports: Ports,
+    path: &str,
+    n: usize,
+    rate: u64,
+) -> Vec<Result<usize, String>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let path = path.to_string();
+    let pace = move |len: usize| Duration::from_micros(len as u64 * 1_000_000 / rate);
+    rt.block_on(async move {
+        let mut tasks = Vec::new();
+        match proto {
+            Proto::H2c => {
+                let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ports.clear))
+                    .await
+                    .unwrap();
+                let (client, conn) = h2::client::Builder::new()
+                    .initial_window_size(4 << 20)
+                    .initial_connection_window_size(65535)
+                    .handshake::<_, bytes::Bytes>(tcp)
+                    .await
+                    .unwrap();
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                for _ in 0..n {
+                    let mut client = client.clone().ready().await.unwrap();
+                    let req = h2_request(false, ports.clear, "GET", &path, &[]);
+                    let (resp, _send) = client.send_request(req, true).unwrap();
+                    tasks.push(tokio::spawn(async move {
+                        let resp = resp.await.map_err(|e| e.to_string())?;
+                        let mut body = resp.into_body();
+                        let mut got = 0;
+                        while let Some(c) = body.data().await {
+                            let c = c.map_err(|e| e.to_string())?;
+                            got += c.len();
+                            tokio::time::sleep(pace(c.len())).await;
+                            let _ = body.flow_control().release_capacity(c.len());
+                        }
+                        Ok(got)
+                    }));
+                }
+            }
+            #[cfg(feature = "http3")]
+            Proto::H3 => {
+                let mut transport = quinn::TransportConfig::default();
+                transport.receive_window(quinn::VarInt::from_u32(65536));
+                transport.stream_receive_window(quinn::VarInt::from_u32(4 << 20));
+                let (endpoint, send) = h3_connect_with(ports.tls, transport).await.unwrap();
+                for _ in 0..n {
+                    let mut send = send.clone();
+                    let req = h3_request(ports.tls, "GET", &path, &[]);
+                    let mut stream = send.send_request(req).await.unwrap();
+                    stream.finish().await.unwrap();
+                    tasks.push(tokio::spawn(async move {
+                        stream.recv_response().await.map_err(|e| e.to_string())?;
+                        let mut got = 0;
+                        while let Some(mut c) =
+                            stream.recv_data().await.map_err(|e| e.to_string())?
+                        {
+                            let len = bytes::Buf::remaining(&c);
+                            got += len;
+                            bytes::Buf::advance(&mut c, len);
+                            tokio::time::sleep(pace(len)).await;
+                        }
+                        Ok(got)
+                    }));
+                }
+                let mut out = Vec::new();
+                for t in tasks {
+                    out.push(t.await.unwrap());
+                }
+                drop(endpoint);
+                return out;
+            }
+            _ => unreachable!(),
+        }
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.unwrap());
+        }
+        out
+    })
+}
+
+/// B-487: 接続のウィンドウだけが小さく、全部のストリームをゆっくり読むクライアント（遅い回線で並行に取る）は、空いた
+/// 接続のクレジットを先のストリームが使い続けても、後のストリームを打ち切らない（自分のウィンドウは残っていて、接続は
+/// 進んでいる。ストリームごとの進みだけを見ると、`client_write_timeout_secs` の 2 秒の間待たされたストリームを打ち切る）
+#[test]
+fn b487_slow_reader_of_parallel_streams_is_not_reset() {
+    // 1 本を読むのに 3 秒（最後のストリームは 6 秒ほど待つ）
+    const BODY: usize = 1200 * 1024;
+    const RATE: u64 = 400 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let (up, _seen) = spawn_recording_upstream(|_| (200, String::new(), vec![b'x'; BODY]));
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[[route]]
+[route.conditions]
+path = "/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}"
+[route.buffering]
+mode = "full"
+client_write_timeout_secs = 2
+"#,
+        listeners = listeners_toml(ports, &cert, &key),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    #[allow(unused_mut)]
+    let mut protos = vec![Proto::H2c];
+    #[cfg(feature = "http3")]
+    protos.push(Proto::H3);
+    let results: Vec<(Proto, Vec<Result<usize, String>>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = protos
+            .iter()
+            .map(|&proto| {
+                s.spawn(move || (proto, slow_parallel_download(proto, ports, "/x", 3, RATE)))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (proto, r) in results {
+        assert_eq!(r, vec![Ok(BODY); 3], "{proto:?}\n{}", veil.log());
+    }
+}

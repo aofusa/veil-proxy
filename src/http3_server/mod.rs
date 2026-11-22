@@ -697,6 +697,8 @@ struct ProxyStream {
     resp_policy: Option<std::sync::Arc<SecurityConfig>>,
     /// 本文の受信の見張り（B-274。本文の続きを待つ間だけ Some）
     recv_watch: Option<RecvWatch>,
+    /// 応答を送れない状態（`head_pending`・`body_pending`・`need_fin`・`trailers_pending`）の見張り（B-487）
+    send_watch: crate::l7::SendStallWatch,
 }
 
 impl ProxyStream {
@@ -725,6 +727,7 @@ impl ProxyStream {
             cors: None,
             resp_policy: None,
             recv_watch: None,
+            send_watch: crate::l7::SendStallWatch::new(),
         }
     }
 
@@ -755,6 +758,15 @@ impl ProxyStream {
         true
     }
 
+    /// 応答の続きをフロー制御・輻輳で送れずに保留している（B-487 の見張りの対象）
+    fn send_blocked(&self) -> bool {
+        #[cfg(any(feature = "grpc", feature = "handler"))]
+        if self.trailers_pending.is_some() {
+            return true;
+        }
+        self.head_pending.is_some() || self.body_pending.is_some() || self.need_fin
+    }
+
     /// B-97: バッファ経路の要求（本文は受信済み）。要求方向は最初から閉じている。
     fn new_buffered(resp_rx: crate::http3_stream::Receiver<crate::http3_stream::RespMsg>) -> Self {
         Self {
@@ -776,8 +788,17 @@ impl ProxyStream {
             cors: None,
             resp_policy: None,
             recv_watch: None,
+            send_watch: crate::l7::SendStallWatch::new(),
         }
     }
+}
+
+/// B-487: 応答を送れないストリームが、自分のクレジットではなく接続のクレジット（MAX_DATA と輻輳窓）を待っているか。
+/// 接続のクレジットが無ければ quiche の `writable` は空（見回り 1 回につき 1 度だけ見て `conn_limited` に置く）。
+/// クレジットがあるのに送れないストリームは、自分の MAX_STREAM_DATA を待っている（`stream_capacity` が 0）
+fn waits_conn_credit(conn: &mut H3Conn, conn_limited: &mut Option<bool>, id: u64) -> bool {
+    *conn_limited.get_or_insert_with(|| conn.writable().next().is_none())
+        || conn.stream_capacity(id).unwrap_or(0) > 0
 }
 
 /// バッファリング（非ストリーミング）経路の保留リクエスト（F-32）。
@@ -791,6 +812,9 @@ struct BufferedReq {
     end: bool,
     /// 本文の受信の見張り（B-274）
     recv_watch: Option<RecvWatch>,
+    /// 応答を送れない状態で打ち切るまでの秒数（`buffering = "full"` のルートの `client_write_timeout_secs`。
+    /// None は既定の `WRITE_TIMEOUT`。B-487）
+    send_timeout: Option<u64>,
 }
 
 /// メインループの `select_biased!` 受信結果（F-32）。
@@ -836,6 +860,8 @@ struct PartialResponse {
     body: Vec<u8>,
     /// 送信済みボディバイト数。
     written: usize,
+    /// 送れない状態の見張り（B-487。保留している間だけある応答なので常に見る）
+    send_watch: crate::l7::SendStallWatch,
 }
 
 /// `Http3Handler::handle_sendfile` の引数まとめ。
@@ -1002,6 +1028,12 @@ struct Http3Handler {
     handshake: Option<admission::HandshakeSlot>,
     /// `classify` が解決したルートの `client_body_timeout_secs`（ルートが無ければ 0。B-274）
     classify_body_timeout: u64,
+    /// `classify` がバッファ経路にした `buffering = "full"` のルートの `client_write_timeout_secs`（B-487）
+    classify_send_timeout: Option<u64>,
+    /// 応答（本文・見出し）を送った量の和と、前回の送信の止まりの見回りで見た値。接続のクレジットを待つだけの
+    /// ストリームを、接続がほかのストリームで進んでいる間は打ち切らないのに使う（B-487）
+    send_progress: u64,
+    send_progress_mark: u64,
     /// 本文の受信が止まった要求を次に見回る時刻（見張る要求がある間だけ Some。接続のタイマーに載せる。B-274）
     body_check_at: Option<Instant>,
 }
@@ -1040,6 +1072,9 @@ impl Http3Handler {
             shutdown_closed: false,
             handshake: None,
             classify_body_timeout: 0,
+            classify_send_timeout: None,
+            send_progress: 0,
+            send_progress_mark: 0,
             body_check_at: None,
         }
     }
@@ -1051,15 +1086,36 @@ impl Http3Handler {
         }
     }
 
-    /// 本文の受信が止まった要求を H3_REQUEST_CANCELLED で打ち切る（B-274。接続のタイマーから 1 秒ごと）。
+    /// 本文の受信が止まった要求と、応答を送れない状態が続いた要求を H3_REQUEST_CANCELLED で打ち切る
+    /// （B-274・B-487。接続のタイマーから 1 秒ごと）。
     ///
-    /// 応答を送り始めた要求（双方向のストリーミング等）と、こちらが上流へ渡し切れずに受信を止めている
+    /// 受信: 応答を送り始めた要求（双方向のストリーミング等）と、こちらが上流へ渡し切れずに受信を止めている
     /// （バックプレッシャ）要求は打ち切らない。ストリーミングの要求は送信端を `finish` せずに捨てるので、
-    /// 上流へは途中で切れた本文として伝わる（B-277）。打ち切ったら `true`。
+    /// 上流へは途中で切れた本文として伝わる（B-277）。
+    ///
+    /// 送信: クライアントが MAX_STREAM_DATA・MAX_DATA を送らず、応答の続きが [`crate::l7::SendStallWatch`] の
+    /// 秒数を超えて進まない要求。ストリームの表から外すと応答の受信端が閉じ、タスクは上流の接続を放す。
+    /// 打ち切ったら `true`。
     fn check_stalled_bodies(&mut self, now: Instant) -> bool {
         let mut expired: Vec<u64> = Vec::new();
+        let mut send_expired: Vec<u64> = Vec::new();
         let mut watching = false;
+        let conn_progress = self.send_progress != self.send_progress_mark;
+        self.send_progress_mark = self.send_progress;
+        let mut conn_limited = None;
+        let conn = &mut self.conn;
         for (&id, ps) in self.proxy_streams.iter_mut() {
+            // B-487: 応答を送れない状態
+            if ps.send_blocked() {
+                watching = true;
+                let moved = conn_progress && waits_conn_credit(conn, &mut conn_limited, id);
+                if ps.send_watch.stalled_tick(moved) {
+                    send_expired.push(id);
+                    continue;
+                }
+            } else {
+                ps.send_watch.clear();
+            }
             let Some(w) = ps.recv_watch.as_mut() else {
                 continue;
             };
@@ -1089,12 +1145,29 @@ impl Http3Handler {
                 watching = true;
             }
         }
+        // B-487: 送り切れずに保留している直接の応答（エラー・リダイレクト等）
+        for (&id, pr) in self.partial_responses.iter_mut() {
+            watching = true;
+            let moved = conn_progress && waits_conn_credit(conn, &mut conn_limited, id);
+            if pr.send_watch.stalled_tick(moved) {
+                send_expired.push(id);
+            }
+        }
         self.body_check_at = watching.then(|| now + H3_RECV_SWEEP_INTERVAL);
         for &id in &expired {
             debug!(
                 "[HTTP/3] Request body stalled on stream {} from {}; cancelling",
                 id, self.peer_addr
             );
+        }
+        for &id in &send_expired {
+            debug!(
+                "[HTTP/3] Response stalled by flow control on stream {} from {}; cancelling",
+                id, self.peer_addr
+            );
+        }
+        expired.extend_from_slice(&send_expired);
+        for &id in &expired {
             let _ = self
                 .conn
                 .stream_shutdown(id, quiche::Shutdown::Read, H3_REQUEST_CANCELLED);
@@ -1104,6 +1177,7 @@ impl Http3Handler {
             self.proxy_streams.remove(&id);
             self.buffered_reqs.remove(&id);
             self.stream_bodies.remove(&id);
+            self.partial_responses.remove(&id);
             self.metric_stream_close(id);
         }
         !expired.is_empty()
@@ -1468,6 +1542,7 @@ impl Http3Handler {
                             headers,
                             end: !more_frames,
                             recv_watch,
+                            send_timeout: self.classify_send_timeout,
                         },
                     );
                 }
@@ -1551,8 +1626,11 @@ impl Http3Handler {
             // `drive_proxy_streams` がメトリクスを閉じる。
             let (resp_tx, resp_rx) =
                 crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
-            self.proxy_streams
-                .insert(stream_id, ProxyStream::new_buffered(resp_rx));
+            let mut ps = ProxyStream::new_buffered(resp_rx);
+            if let Some(secs) = br.send_timeout {
+                ps.send_watch.set_secs(secs);
+            }
+            self.proxy_streams.insert(stream_id, ps);
             self.new_buffered.push((
                 H3BufferedTask {
                     stream_id,
@@ -1596,12 +1674,23 @@ impl Http3Handler {
         let conn = &mut self.conn;
         let mut done: Vec<u64> = Vec::new();
         let mut did_work = false;
+        let mut send_blocked = false;
+        let mut progressed = 0u64;
         for (&stream_id, ps) in self.proxy_streams.iter_mut() {
+            let before = ps.send_watch.sent;
             let (work, is_done) = drive_proxy_stream(h3, conn, stream_id, ps);
+            progressed += ps.send_watch.sent - before;
             did_work |= work;
             if is_done {
                 done.push(stream_id);
+            } else if ps.send_blocked() {
+                send_blocked = true;
             }
+        }
+        self.send_progress += progressed;
+        // B-487: 応答を送れないストリームがあれば見回りを始める（張ってあれば何もしない）
+        if send_blocked {
+            self.arm_body_check();
         }
         if !done.is_empty() {
             // ストリーム完了自体も「仕事をした」に含める。
@@ -1624,6 +1713,7 @@ impl Http3Handler {
     /// TLS・サーバ選択失敗）は `Buffer` を返し、既存の `handle_request` が処理する。
     fn classify(&mut self, stream_id: u64, headers: &[h3::Header], more_frames: bool) -> Decision {
         self.classify_body_timeout = 0;
+        self.classify_send_timeout = None;
         // --- 疑似ヘッダ + 必要ヘッダを抽出 ---
         let mut method: Option<&[u8]> = None;
         let mut path: Option<&[u8]> = None;
@@ -1877,6 +1967,8 @@ impl Http3Handler {
 
         // バッファリング full は gRPC 以外で全バッファ経路（F-97: gRPC は Full をバイパス）。
         if buffering.mode == crate::buffering::BufferingMode::Full && !is_grpc {
+            // B-487: 溜めた応答を送れない状態は `client_write_timeout_secs` まで待つ（HTTP/1.1 と同じ）
+            self.classify_send_timeout = Some(buffering.client_write_timeout_secs);
             return Decision::Buffer;
         }
         // WASM モジュール適用ありはボディ全体が必要 → バッファ経路。
@@ -2144,8 +2236,10 @@ impl Http3Handler {
                         ),
                         body: body.map(|b| b.to_vec()).unwrap_or_default(),
                         written: 0,
+                        send_watch: crate::l7::SendStallWatch::new(),
                     },
                 );
+                self.arm_body_check();
                 return Ok(());
             }
             Err(e) => {
@@ -2174,8 +2268,10 @@ impl Http3Handler {
                                     head: None,
                                     body: body_data.to_vec(),
                                     written,
+                                    send_watch: crate::l7::SendStallWatch::new(),
                                 },
                             );
+                            self.arm_body_check();
                         }
                     }
                     Err(h3::Error::Done) => {
@@ -2190,8 +2286,10 @@ impl Http3Handler {
                                 head: None,
                                 body: body_data.to_vec(),
                                 written: 0,
+                                send_watch: crate::l7::SendStallWatch::new(),
                             },
                         );
+                        self.arm_body_check();
                     }
                     Err(e) => {
                         warn!("[HTTP/3] send_body error on stream {}: {}", stream_id, e);
@@ -2261,6 +2359,7 @@ impl Http3Handler {
                         stream_id
                     );
                     pr.head = None;
+                    pr.send_watch.sent += 1;
                     // ボディ無し応答（リダイレクト等）はヘッダ送出で完了。
                     if pr.body.is_empty() {
                         return true;
@@ -2287,6 +2386,7 @@ impl Http3Handler {
             match h3_conn.send_body(conn, stream_id, &pr.body[pr.written..], true) {
                 Ok(sent) => {
                     pr.written += sent;
+                    pr.send_watch.sent += sent as u64;
                     debug!(
                         "[HTTP/3] Deferred body sent for stream {}: {}/{}",
                         stream_id,
@@ -2326,10 +2426,14 @@ impl Http3Handler {
 
         let mut completed = Vec::new();
         let mut did_work = false;
+        let mut progressed = 0u64;
         for (&stream_id, pr) in &mut self.partial_responses {
             // 進捗判定用に呼び出し前の状態を控える（try_flush_partial 自体は変更しない）。
             let head_present_before = pr.head.is_some();
-            if Self::try_flush_partial(h3_conn, &mut self.conn, stream_id, pr) {
+            let before = pr.send_watch.sent;
+            let flushed = Self::try_flush_partial(h3_conn, &mut self.conn, stream_id, pr);
+            progressed += pr.send_watch.sent - before;
+            if flushed {
                 completed.push(stream_id);
                 did_work = true;
             } else if pr.head.is_some() != head_present_before {
@@ -2338,6 +2442,7 @@ impl Http3Handler {
                 did_work = true;
             }
         }
+        self.send_progress += progressed;
         for stream_id in completed {
             self.partial_responses.remove(&stream_id);
         }
@@ -2368,7 +2473,10 @@ impl Http3Handler {
             // 部分レスポンスがあるかチェック
             if let Some(pr) = self.partial_responses.get_mut(&stream_id) {
                 let head_present_before = pr.head.is_some();
-                if Self::try_flush_partial(h3_conn, &mut self.conn, stream_id, pr) {
+                let before = pr.send_watch.sent;
+                let flushed = Self::try_flush_partial(h3_conn, &mut self.conn, stream_id, pr);
+                self.send_progress += pr.send_watch.sent - before;
+                if flushed {
                     completed.push(stream_id);
                     did_work = true;
                 } else if pr.head.is_some() != head_present_before {
@@ -3506,6 +3614,7 @@ mod tests {
             head: Some(vec![h3::Header::new(b":status", b"302")]),
             body: Vec::new(),
             written: 0,
+            send_watch: crate::l7::SendStallWatch::new(),
         };
         assert!(redirect.head.is_some(), "ヘッダ未送出であること");
         assert!(redirect.body.is_empty(), "ボディ無し = fin=true で完了扱い");
@@ -3515,6 +3624,7 @@ mod tests {
             head: Some(vec![h3::Header::new(b":status", b"200")]),
             body: b"hello world".to_vec(),
             written: 0,
+            send_watch: crate::l7::SendStallWatch::new(),
         };
 
         // ヘッダ送出成功を模擬（try_flush_partial の Ok アーム相当）。

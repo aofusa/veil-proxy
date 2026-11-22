@@ -101,6 +101,7 @@ Legend: **=** same meaning, **≈** close (see notes), **—** not available (th
 | `client_max_body_size` | `[route.security] max_request_body_size` | = |
 | `client_header_timeout` | — | ≈ request headers are bounded by the listener's read timeout (the route key `client_header_timeout_secs` is not used) |
 | `client_body_timeout` | `client_body_timeout_secs` | = per route, on HTTP/1.1, HTTP/2 and HTTP/3 |
+| `send_timeout` | — (30 s, fixed) / `[route.buffering] client_write_timeout_secs` | ≈ fixed except for buffered routes; on HTTP/1.1, HTTP/2 and HTTP/3 ([protocols.md](protocols.md)) |
 | `upstream` round-robin / `weight=` | `algorithm = "round_robin"` / `"weighted"` + `weight` | = |
 | `least_conn;` | `algorithm = "least_conn"` | = |
 | `ip_hash;` / `hash $cookie_x consistent;` | `algorithm = "ip_hash"` / `"consistent_hash"` + `hash_key` | = |

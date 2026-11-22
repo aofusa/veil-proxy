@@ -51,8 +51,13 @@ where
     let result =
         handle_http2_requests(&mut conn, client_ip, &mut connection_metric, None, true).await;
 
-    if let Err(e) = result {
-        warn!("[HTTP/2] Connection error: {}", e);
+    match result {
+        // B-487: 読まないクライアントで書き込みが止まって閉じた（相手の都合で起きるので debug!。B-235）
+        Err(http2::Http2Error::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+            debug!("[HTTP/2] Closing connection from {}: {}", client_ip, e);
+        }
+        Err(e) => warn!("[HTTP/2] Connection error: {}", e),
+        Ok(()) => {}
     }
 
     debug!("[HTTP/2] Connection closed from {}", client_ip);
@@ -449,8 +454,10 @@ where
             }
         } else {
             // 処理中のストリームがある: 可読 or notify を待つ。可読なら fill する。
-            // 見回りは受信中のストリームがあるときだけ（応答を返しているだけならタイマーを張らない）
-            if recv_sweep.is_none() && conn.has_receiving_streams() {
+            // 見回りは受信中のストリームか、応答をフロー制御で送れないストリーム（B-487）があるときだけ
+            // （応答を返しているだけならタイマーを張らない）
+            if recv_sweep.is_none() && (drive_scratch.send_blocked || conn.has_receiving_streams())
+            {
                 recv_sweep.set(Some(crate::runtime::time::sleep(H2_RECV_SWEEP_INTERVAL)));
             }
             match h2_select_readable_notify_or_sweep(
@@ -464,7 +471,8 @@ where
                 H2Wake::Notify => false,
                 H2Wake::Sweep => {
                     recv_sweep.set(None);
-                    h2_reset_stalled_streams(conn, &mut streams, &mut stalled).await?;
+                    h2_reset_stalled_streams(conn, &mut streams, &mut stalled, &mut drive_scratch)
+                        .await?;
                     continue;
                 }
             }
@@ -525,6 +533,9 @@ pub(crate) enum H2RespMsg {
     HandlerTrailers(Vec<(Bytes, Bytes)>),
     /// head 送出後のバックエンドエラー等でストリームをリセットする（RST_STREAM エラーコード）。
     Reset(u32),
+    /// 応答をフロー制御で送れない状態が続いたらリセットするまでの秒数を変える（head の前に送る。既定は
+    /// `WRITE_TIMEOUT`。`buffering = "full"` の応答は `client_write_timeout_secs`。HTTP/1.1 と同じ。B-487）
+    SendTimeout(u32),
 }
 
 /// per-stream リクエストタスクへ conn 非依存で引き渡すリクエスト情報（F-116）。
@@ -589,6 +600,8 @@ pub(super) struct H2ActiveStream {
     peeked: Option<H2RespMsg>,
     /// HEAD の要求（HEADERS に END_STREAM を付け、本文は送らない。どの経路の応答でも。B-266）。
     head_req: bool,
+    /// 応答をフロー制御で送れない状態（`pending_body`）の見張り（B-487）。
+    send_watch: crate::l7::SendStallWatch,
 }
 
 /// per-stream リクエストタスクのスポーナ型（F-46: 型付きタスクプールで Box 確保を回避）。
@@ -778,6 +791,8 @@ pub(super) fn h2_spawn_for_request<S, V>(
             end_with_pending: false,
             peeked: None,
             head_req,
+            // B-487: WebSocket のトンネルも見張る（HTTP/1.1 の中継の書き込みの時間切れと同じ）
+            send_watch: crate::l7::SendStallWatch::new(),
         },
     );
 }
@@ -855,26 +870,85 @@ pub(super) async fn h2_select_readable_notify_or_sweep(
     .await
 }
 
-/// 要求の受信が止まったストリームを RST_STREAM(CANCEL) で打ち切る（B-274・B-276）。
+/// 要求の受信が止まったストリームと、応答をフロー制御で送れない状態が続いたストリームを
+/// RST_STREAM(CANCEL) で打ち切る（B-274・B-276・B-487）。接続の見回り（1 秒ごと）から呼ぶ。
 ///
-/// 応答を送り始めたストリーム（gRPC の双方向等。要求の続きを待つのはアプリケーションの都合）と、
+/// 受信: 応答を送り始めたストリーム（gRPC の双方向等。要求の続きを待つのはアプリケーションの都合）と、
 /// こちらが本文を上流へ渡し切れずに受信を止めている（バックプレッシャ）ストリームは打ち切らない。
 /// 打ち切ったストリーミングの要求は送信端を `finish` せずに捨てるので、上流へは途中で切れた本文として
 /// 伝わる（B-277）。
+///
+/// 送信（`send_blocked` が立っているときだけ見る）: クライアントが WINDOW_UPDATE を送らず、`pending_body` が
+/// [`crate::l7::SendStallWatch`] の秒数を超えて進まないストリーム。自分のウィンドウは残っていて接続のウィンドウを
+/// 待つストリームは、接続がほかのストリームで進んでいれば止まっていない。ストリームの表から外すと応答の受信端が
+/// 閉じ、タスクは上流の接続を放す。`send_blocked` は見回りのたびに数え直す。
 #[cfg(feature = "http2")]
 async fn h2_reset_stalled_streams<S>(
     conn: &mut http2::Http2Connection<S>,
     streams: &mut http2::stream::StreamIdMap<H2ActiveStream>,
     stalled: &mut Vec<u32>,
+    scratch: &mut H2DriveScratch,
 ) -> Result<(), http2::Http2Error>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
     stalled.clear();
     conn.collect_stalled_receiving_streams(stalled);
+    if !stalled.is_empty() {
+        h2_reset_recv_stalled(conn, streams, stalled).await?;
+    }
+    if !scratch.send_blocked {
+        return Ok(());
+    }
+    let conn_progress = scratch.conn_sent != scratch.conn_sent_mark;
+    scratch.conn_sent_mark = scratch.conn_sent;
+    stalled.clear();
+    let mut still_blocked = false;
+    for (&id, st) in streams.iter_mut() {
+        if st.pending_body.is_none() {
+            st.send_watch.clear();
+            continue;
+        }
+        still_blocked = true;
+        let waits_conn = conn.stream_send_window(id) > 0;
+        if st.send_watch.stalled_tick(waits_conn && conn_progress) {
+            stalled.push(id);
+        }
+    }
+    scratch.send_blocked = still_blocked;
     if stalled.is_empty() {
         return Ok(());
     }
+    // send_rst_stream は write_all（write_buf が空の前提）
+    conn.flush_write_buf().await?;
+    for &id in stalled.iter() {
+        debug!(
+            "[HTTP/2] Response stalled by flow control on stream {}; resetting",
+            id
+        );
+        conn.send_rst_stream(id, http2::Http2ErrorCode::Cancel)
+            .await?;
+        if let Some(st) = streams.remove(&id) {
+            if st.req_streaming {
+                // 未転送分のクレジットが conn レベルに残らないよう補充する
+                conn.replenish_recv_window(id);
+                conn.flush_write_buf().await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`h2_reset_stalled_streams`] の受信の分（`stalled` は要求の受信が止まったストリーム）。
+#[cfg(feature = "http2")]
+async fn h2_reset_recv_stalled<S>(
+    conn: &mut http2::Http2Connection<S>,
+    streams: &mut http2::stream::StreamIdMap<H2ActiveStream>,
+    stalled: &[u32],
+) -> Result<(), http2::Http2Error>
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
     // send_rst_stream は write_all（write_buf が空の前提）
     conn.flush_write_buf().await?;
     for &id in stalled.iter() {
@@ -904,6 +978,11 @@ where
 pub(super) struct H2DriveScratch {
     ids: Vec<u32>,
     done: Vec<u32>,
+    /// 応答をフロー制御で送れないストリームがある（送信の止まりの見回りを張る。B-487）
+    send_blocked: bool,
+    /// 接続で送った DATA のバイト数と、前回の送信の止まりの見回りで見た値（B-487）
+    conn_sent: u64,
+    conn_sent_mark: u64,
 }
 
 /// 全ストリームのレスポンスを 1 回駆動する（F-116）。
@@ -932,6 +1011,9 @@ where
     let H2DriveScratch {
         ids: stream_ids,
         done,
+        send_blocked,
+        conn_sent,
+        ..
     } = scratch;
     done.clear();
     stream_ids.clear();
@@ -987,6 +1069,8 @@ where
                 // 本体の持ち主ごと渡す（FreeBSD の平文 h2c は共有メモリの本体を sendfile(2) で送る）
                 let end = st.end_with_pending;
                 let queued = conn.queue_data_frames_bytes(sid, &buf.slice(off..), end)?;
+                st.send_watch.sent += queued as u64;
+                *conn_sent += queued as u64;
                 let new_off = off + queued;
                 if conn.pending_write_len() > WRITE_BUF_FLUSH_THRESHOLD {
                     conn.flush_write_buf().await?;
@@ -994,6 +1078,7 @@ where
                 if new_off < buf.len() {
                     // まだウィンドウ不足 → 再保留してこのストリームは以降スキップ。
                     st.pending_body = Some((buf, new_off));
+                    *send_blocked = true;
                     continue;
                 }
                 if end {
@@ -1049,6 +1134,7 @@ where
                     conn.send_headers_buffered_end(sid, status, &headers, end_stream)
                         .await?;
                     st.head_sent = true;
+                    st.send_watch.sent += 1;
                     if end_stream {
                         st.end_sent = true;
                         if st.head_req {
@@ -1072,12 +1158,15 @@ where
                     };
                     let last = last && st.head_sent && !st.end_sent;
                     let queued = conn.queue_data_frames_bytes(sid, &bytes, last)?;
+                    st.send_watch.sent += queued as u64;
+                    *conn_sent += queued as u64;
                     if conn.pending_write_len() > WRITE_BUF_FLUSH_THRESHOLD {
                         conn.flush_write_buf().await?;
                     }
                     if queued < bytes.len() {
                         st.pending_body = Some((bytes, queued));
                         st.end_with_pending = last;
+                        *send_blocked = true;
                         break;
                     }
                     if last {
@@ -1112,6 +1201,7 @@ where
                     st.head_sent = true;
                     st.end_sent = true;
                 }
+                H2RespMsg::SendTimeout(secs) => st.send_watch.set_secs(u64::from(secs)),
                 H2RespMsg::Reset(code) => {
                     conn.flush_write_buf().await?;
                     let _ = conn
@@ -2020,6 +2110,12 @@ pub(super) async fn h2_dispatch(
                     .headers
                     .iter()
                     .any(|h| header_pair_is_grpc(&h.name, &h.value));
+            // B-487: 溜めた応答を送れない状態は `client_write_timeout_secs` まで待つ（HTTP/1.1 と同じ）。head の前に
+            // 送る（メインループは head と一緒に受け取るので通知しない）
+            if buffering_full {
+                let secs = buffering.client_write_timeout_secs.min(u64::from(u32::MAX)) as u32;
+                let _ = resp_tx.send(H2RespMsg::SendTimeout(secs)).await;
+            }
             h2_proxy(
                 ctx,
                 &upstream_group,

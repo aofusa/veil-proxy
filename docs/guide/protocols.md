@@ -105,6 +105,19 @@ route), including a header block that never gets its final CONTINUATION frame. T
 connection that has a stream still receiving. HTTP/3 applies the route's
 `client_body_timeout_secs` the same way and cancels the stream with `H3_REQUEST_CANCELLED`.
 
+A response the client stops accepting is given up as well, as HTTP/1.1 does with its write timeout. If the client stops
+reading the connection, so that veil's writes to the socket make no progress, the connection is closed after 30 to 60
+seconds (`WRITE_TIMEOUT`). If the client keeps the connection alive but stops granting flow-control credit
+(`WINDOW_UPDATE`), a stream whose response cannot be sent is reset with `RST_STREAM(CANCEL)` once it has made no
+progress for 30 seconds, or for the route's `[route.buffering] client_write_timeout_secs` when the route buffers the
+response (`mode = "full"`). This includes WebSocket tunnels (extended CONNECT). A stream that still has its own
+window and is only waiting for connection-level credit is not reset while other streams on the connection make
+progress, so a slow client fetching several responses in parallel is not cut off. The check runs on the same
+once-a-second sweep, only while a stream is blocked, and the reset stream releases the upstream connection it was
+relaying. HTTP/3 does the same for a stream the client stops granting `MAX_STREAM_DATA` / `MAX_DATA` to and cancels it
+with `H3_REQUEST_CANCELLED`; a client that stops responding altogether is closed by the QUIC idle timeout
+(`[http3] max_idle_timeout`).
+
 ### HTTP/1.1 Fallback
 
 Clients that don't support HTTP/2 automatically fall back to HTTP/1.1.

@@ -93,6 +93,12 @@ pub struct Http2Connection<S> {
     /// `zc_segs` の本体の合計（フラッシュの閾値に数える）
     #[cfg(all(target_os = "freebsd", feature = "cache"))]
     zc_bytes: usize,
+
+    /// ソケットへの書き込みの止まりの見張り（[`watch_write`]。B-487）。最初に書き込みが待たされたときに張る
+    write_watch: Option<crate::runtime::time::Sleep>,
+    /// 書き終えた回数（見張りを張った時点の値 `write_watch_mark` と比べる）
+    writes_done: u32,
+    write_watch_mark: u32,
 }
 
 /// 共有メモリの範囲（`write_buf` の `at` の位置に差し込む DATA の本体）
@@ -125,6 +131,59 @@ fn set_tcp_nopush(fd: std::os::unix::io::RawFd, on: bool) {
 /// この大きさ以上の DATA の本体だけをゼロコピーで送る（小さいとコピーの方が安い）
 #[cfg(all(target_os = "freebsd", feature = "cache"))]
 const ZC_MIN_CHUNK: usize = 4096;
+
+/// 書き込みが止まったら接続を閉じるまでの時間（HTTP/1.1 の応答の書き込みの時間切れと同じ。B-487）
+const WRITE_STALL_TIMEOUT: std::time::Duration = crate::pool::WRITE_TIMEOUT;
+
+/// 書き込みの止まりで閉じるときのエラー（呼び出し側は `TimedOut` を相手の都合として debug! で記録する）
+fn write_stalled() -> Http2Error {
+    Http2Error::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "HTTP/2 write stalled",
+    ))
+}
+
+/// ソケットへの書き込み `fut` を、止まりの見張り `watch` を見ながら待つ（B-487）。見張りが満了した時点で、張ってから
+/// 書き込みが 1 回も終わっていなければ（`*mark == done`）`None`（時間切れ。呼び出し側は接続を閉じる）。終わって
+/// いれば張り直す。止まった書き込みは `WRITE_STALL_TIMEOUT` からその 2 倍までの間に切れる。
+///
+/// 費用は書き込みが待たされたときだけ: その場で終わる書き込み（reactor の大半）は見張りに触れない。待たされた
+/// 書き込み（io_uring では毎回）は見張りを 1 回 poll するだけで、タイマーを張るのは接続で最初の 1 回と、満了の後の
+/// 最初の 1 回（HTTP/1.1 の `timeout(WRITE_TIMEOUT, ..)` のように書き込みごとにタイマーを張らない。
+/// `flush_write_buf` はメインループの周回ごとに呼ばれる）。
+async fn watch_write<F: std::future::Future>(
+    fut: F,
+    watch: &mut Option<crate::runtime::time::Sleep>,
+    mark: &mut u32,
+    done: u32,
+) -> Option<F::Output> {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(move |cx| {
+        if let Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(out));
+        }
+        let w = watch.get_or_insert_with(|| {
+            *mark = done;
+            crate::runtime::time::sleep(WRITE_STALL_TIMEOUT)
+        });
+        // 毎回 poll して待ち手（このタスク）を登録し直す（満了の通知を取りこぼさない）
+        if Pin::new(&mut *w).poll(cx).is_ready() {
+            if *mark == done {
+                *watch = None;
+                return Poll::Ready(None);
+            }
+            *mark = done;
+            *w = crate::runtime::time::sleep(WRITE_STALL_TIMEOUT);
+            let _ = Pin::new(&mut *w).poll(cx);
+        }
+        Poll::Pending
+    })
+    .await
+}
 
 // ====================
 // コネクション読み込みバッファのスレッドローカル再利用プール（F-34）
@@ -299,6 +358,9 @@ where
             zc_segs: Vec::new(),
             #[cfg(all(target_os = "freebsd", feature = "cache"))]
             zc_bytes: 0,
+            write_watch: None,
+            writes_done: 0,
+            write_watch_mark: 0,
         }
     }
 
@@ -589,9 +651,22 @@ where
     /// 意味する。`WouldBlock` のみ同一バッファで再試行する。
     async fn write_all_raw(&mut self, mut buf: Vec<u8>) -> Http2Result<Vec<u8>> {
         loop {
-            let (result, returned) = self.stream.write_all(buf).await;
+            // B-487: 読まないクライアントで書き込みが止まったら接続を閉じる（HTTP/1.1 の `WRITE_TIMEOUT` と同じ）
+            let Some((result, returned)) = watch_write(
+                self.stream.write_all(buf),
+                &mut self.write_watch,
+                &mut self.write_watch_mark,
+                self.writes_done,
+            )
+            .await
+            else {
+                return Err(write_stalled());
+            };
             match result {
-                Ok(_) => return Ok(returned),
+                Ok(_) => {
+                    self.writes_done = self.writes_done.wrapping_add(1);
+                    return Ok(returned);
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     buf = returned;
                     continue;
@@ -642,14 +717,30 @@ where
         let mut result = Ok(());
         for seg in &segs {
             if result.is_ok() {
-                result = crate::runtime::sendfile::sendfile_all_with_header(
-                    sock,
-                    seg.fd,
-                    seg.off as i64,
-                    seg.len,
-                    &self.write_buf[cursor..seg.at],
+                // B-487: 書き込みの止まりの見張り（`write_all_raw` と同じ）
+                result = match watch_write(
+                    crate::runtime::sendfile::sendfile_all_with_header(
+                        sock,
+                        seg.fd,
+                        seg.off as i64,
+                        seg.len,
+                        &self.write_buf[cursor..seg.at],
+                    ),
+                    &mut self.write_watch,
+                    &mut self.write_watch_mark,
+                    self.writes_done,
                 )
-                .await;
+                .await
+                {
+                    Some(r) => r,
+                    None => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "HTTP/2 write stalled",
+                    )),
+                };
+                if result.is_ok() {
+                    self.writes_done = self.writes_done.wrapping_add(1);
+                }
             }
             cursor = seg.at;
         }
@@ -1805,6 +1896,15 @@ where
         return self.write_buf.len() + self.zc_bytes;
         #[cfg(not(all(target_os = "freebsd", feature = "cache")))]
         self.write_buf.len()
+    }
+
+    /// ストリームの送信ウィンドウ（ストリームが無ければ 0）。応答を送れないストリームが、自分のウィンドウを
+    /// 待つのか接続のウィンドウを待つのかを送信の止まりの見回りが見分けるのに使う（B-487）
+    pub fn stream_send_window(&self, stream_id: u32) -> i32 {
+        self.streams
+            .get_ref(stream_id)
+            .map(|s| s.send_window)
+            .unwrap_or(0)
     }
 
     /// ヘッダーを連結バッファへ積むだけで即送出しない（ストリーミング応答の HEADERS +

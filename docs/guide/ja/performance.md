@@ -327,7 +327,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10); // バックエンド
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);   // Keep-Aliveアイドルタイムアウト
 ```
 
-> **注意**: ルートごとのセキュリティ設定で `client_body_timeout_secs` や `backend_connect_timeout_secs` を設定することで、一部のタイムアウトはconfig.tomlから個別に調整可能です。要求のヘッダはリスナーの読み込みタイムアウト（`READ_TIMEOUT`）で抑えます（ルートの `client_header_timeout_secs` は使われません）。
+> **注意**: ルートごとのセキュリティ設定で `client_body_timeout_secs` や `backend_connect_timeout_secs` を設定することで、一部のタイムアウトはconfig.tomlから個別に調整可能です。要求のヘッダはリスナーの読み込みタイムアウト（`READ_TIMEOUT`）で抑えます（ルートの `client_header_timeout_secs` は使われません）。`WRITE_TIMEOUT` は HTTP/2・HTTP/3 にも効きます。ソケットへの書き込みが進まない HTTP/2 の接続は 30〜60 秒で閉じ、フロー制御のクレジットを出さなくなったストリームは 30 秒進まなければリセットします（応答を溜めるルートは `[route.buffering] client_write_timeout_secs`）。
 
 ### バッファプール設定
 

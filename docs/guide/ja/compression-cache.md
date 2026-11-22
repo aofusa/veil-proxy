@@ -386,7 +386,7 @@ url = "http://localhost:8080"
 | `adaptive_threshold` | adaptiveモードのサイズ閾値（バイト） | 1MB |
 | `disk_buffer_path` | ディスクスピルオーバーディレクトリ（オプション） | なし |
 | `max_disk_buffer` | ディスクバッファ最大サイズ（バイト） | 100MB |
-| `client_write_timeout_secs` | クライアント書き込みタイムアウト | 60 |
+| `client_write_timeout_secs` | 溜めた応答をクライアントへ送れない状態がこの秒数続いたら打ち切る（HTTP/1.1 は接続を閉じ、HTTP/2・HTTP/3 はストリームをリセット）。ほかの応答は固定の 30 秒の書き込みの時間切れ | 60 |
 | `buffer_headers` | ヘッダーもボディと一緒にバッファリング | true |
 
 応答は本文が最後まで届いてから送ります。上流が本文の途中で止まったらクライアントへは 502 を返します。本文が

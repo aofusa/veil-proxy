@@ -371,6 +371,7 @@ pub(super) fn drive_response_flush(
         match send_h3_head(h3, conn, stream_id, status, &headers) {
             HeadSend::Sent => {
                 ps.resp_started = true;
+                ps.send_watch.sent += 1;
                 did_work = true;
             }
             HeadSend::Blocked => {
@@ -388,6 +389,8 @@ pub(super) fn drive_response_flush(
     if let Some((buf, off, fin)) = ps.body_pending.take() {
         match send_h3_body(h3, conn, stream_id, &buf, off, fin) {
             BodySend::Done => {
+                // B-487: 送った量（送れない状態の見張りが進みを見る）
+                ps.send_watch.sent += (buf.len() - off) as u64;
                 did_work = true;
                 if fin {
                     ps.resp_fin_sent = true;
@@ -400,6 +403,7 @@ pub(super) fn drive_response_flush(
                 // 再投入しない。以前は進捗ありとして再投入し、送れない周回を sleep 0 で回し続けた
                 // （FreeBSD の h3_file 54KB で空の kevent が 80 回/要求。v0.8.0）。送った分のパケットは
                 // この周回の送出で出る（send_targets は did_work に関わらず全部を回る）。
+                ps.send_watch.sent += (new_off - off) as u64;
                 ps.body_pending = Some((buf, new_off, fin));
                 return did_work;
             }
@@ -459,6 +463,7 @@ pub(super) fn drive_response_flush(
                 match send_h3_head_fin(h3, conn, stream_id, status, &headers, fin, own_server) {
                     HeadSend::Sent => {
                         ps.resp_started = true;
+                        ps.send_watch.sent += 1;
                         did_work = true;
                         if fin {
                             ps.resp_fin_sent = true;
@@ -480,6 +485,7 @@ pub(super) fn drive_response_flush(
                 let fin = ps.resp_rx.is_finished();
                 match send_h3_body(h3, conn, stream_id, &b, 0, fin) {
                     BodySend::Done => {
+                        ps.send_watch.sent += b.len() as u64;
                         did_work = true;
                         if fin {
                             ps.resp_fin_sent = true;
@@ -488,6 +494,7 @@ pub(super) fn drive_response_flush(
                     }
                     BodySend::Partial(off) => {
                         // 送れる量を使い切った（上の body_pending の Partial と同じ理由で再投入しない）
+                        ps.send_watch.sent += off as u64;
                         ps.body_pending = Some((b, off, fin));
                         return did_work;
                     }

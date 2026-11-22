@@ -338,7 +338,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10); // Backend connection
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);   // Keep-Alive idle timeout
 ```
 
-> **Note**: Some timeouts can be individually adjusted from config.toml via per-route security settings using `client_body_timeout_secs` and `backend_connect_timeout_secs`. Request headers are bounded by the listener's read timeout (`READ_TIMEOUT`); the route's `client_header_timeout_secs` is not used.
+> **Note**: Some timeouts can be individually adjusted from config.toml via per-route security settings using `client_body_timeout_secs` and `backend_connect_timeout_secs`. Request headers are bounded by the listener's read timeout (`READ_TIMEOUT`); the route's `client_header_timeout_secs` is not used. `WRITE_TIMEOUT` also bounds HTTP/2 and HTTP/3: an HTTP/2 connection whose socket writes make no progress is closed after 30 to 60 seconds, and a stream the client stops granting flow-control credit to is reset after 30 seconds without progress (`[route.buffering] client_write_timeout_secs` for buffered routes).
 
 ### Buffer Pool Configuration
 

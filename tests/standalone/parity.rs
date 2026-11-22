@@ -435,11 +435,28 @@ pub async fn h3_connect(
     ),
     String,
 > {
+    h3_connect_with(port, quinn::TransportConfig::default()).await
+}
+
+/// [`h3_connect`] の QUIC の設定を変えたもの（PING の間隔・受信のウィンドウ等）
+#[cfg(feature = "http3")]
+pub async fn h3_connect_with(
+    port: u16,
+    transport: quinn::TransportConfig,
+) -> Result<
+    (
+        quinn::Endpoint,
+        h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    ),
+    String,
+> {
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls_client_config(b"h3"))
         .map_err(|e| e.to_string())?;
     let mut endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).map_err(|e| e.to_string())?;
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    let mut client = quinn::ClientConfig::new(Arc::new(quic));
+    client.transport_config(Arc::new(transport));
+    endpoint.set_default_client_config(client);
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let conn = endpoint
         .connect(addr, "localhost")

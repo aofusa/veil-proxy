@@ -100,6 +100,7 @@ veil は、当たった接頭辞を外してから上流の URL のパスに繋�
 | `client_max_body_size` | `[route.security] max_request_body_size` | = |
 | `client_header_timeout` | — | ≈ 要求のヘッダはリスナーの読み込みタイムアウトで抑える（ルートの `client_header_timeout_secs` は使われない） |
 | `client_body_timeout` | `client_body_timeout_secs` | = ルートごと。HTTP/1.1・HTTP/2・HTTP/3 |
+| `send_timeout` | —（30 秒で固定）・`[route.buffering] client_write_timeout_secs` | ≈ 応答を溜めるルート以外は固定。HTTP/1.1・HTTP/2・HTTP/3（[protocols.md](protocols.md)） |
 | `upstream` のラウンドロビン・`weight=` | `algorithm = "round_robin"`・`"weighted"` + `weight` | = |
 | `least_conn;` | `algorithm = "least_conn"` | = |
 | `ip_hash;` / `hash $cookie_x consistent;` | `algorithm = "ip_hash"` / `"consistent_hash"` + `hash_key` | = |

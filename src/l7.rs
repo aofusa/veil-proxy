@@ -285,9 +285,110 @@ pub(crate) fn request_header_limit_message(status: u16) -> &'static [u8] {
     }
 }
 
+/// 応答を送れない状態の見張り（HTTP/2・HTTP/3 のストリーム。B-487）。
+///
+/// 応答の続き（本文・見出し・終端）をフロー制御（HTTP/3 は輻輳制御も）で送れない間だけ、接続の見回り（1 秒ごと。
+/// 要求の受信の止まりの見回りと同じタイマー）のたびに `sent` が増えたかを見て、`secs` 秒を超えて増えなければ
+/// 打ち切らせる（HTTP/2 は `RST_STREAM(CANCEL)`、HTTP/3 は `H3_REQUEST_CANCELLED`）。送れている間は送った量を
+/// 足すだけで、要求ごとのタイマーは張らない。HTTP/1.1 の応答の書き込みの時間切れ（`WRITE_TIMEOUT`・
+/// `client_write_timeout_secs`。WebSocket の中継も同じ）に当たる。
+///
+/// ストリーム自身のウィンドウは残っていて接続のウィンドウ（HTTP/3 は輻輳窓も）を待つストリームは、接続のほかの
+/// ストリームが進んでいれば止まっていないとみなす（呼び出し側が `stalled_tick` の引数で渡す）。空いたクレジットを
+/// どのストリームが先に使うかは veil の順番で決まるので、読む速さが遅いだけのクライアントのストリームを打ち切らない。
+#[cfg(any(feature = "http2", feature = "http3"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SendStallWatch {
+    /// 打ち切るまでの秒数
+    secs: u32,
+    /// 送った量（本文のバイト数と、見出し 1 つにつき 1）
+    pub(crate) sent: u64,
+    /// 前回の見回りで見た `sent`
+    mark: u64,
+    /// 進まなかった見回りの回数
+    ticks: u32,
+}
+
+#[cfg(any(feature = "http2", feature = "http3"))]
+impl SendStallWatch {
+    /// 既定の秒数（`WRITE_TIMEOUT`。HTTP/1.1 の応答の書き込みの時間切れと同じ）で見張る
+    pub(crate) const fn new() -> Self {
+        Self {
+            secs: crate::pool::WRITE_TIMEOUT.as_secs() as u32,
+            sent: 0,
+            mark: 0,
+            ticks: 0,
+        }
+    }
+
+    /// 秒数を変える（`buffering = "full"` の応答は `[route.buffering] client_write_timeout_secs`。HTTP/1.1 と同じ）
+    pub(crate) fn set_secs(&mut self, secs: u64) {
+        self.secs = secs.min(u64::from(u32::MAX)) as u32;
+    }
+
+    /// 送れない状態での見回り 1 回。打ち切るなら `true`。前回から `sent` が増えたか、`conn_progress`（このストリームは
+    /// 接続のクレジットを待っていて、接続のほかのストリームが進んだ）なら数え直す。見回りは 1 秒ごとなので、
+    /// 送れなくなってから `secs` 秒を超え、`secs + 2` 秒までに打ち切る
+    pub(crate) fn stalled_tick(&mut self, conn_progress: bool) -> bool {
+        if self.sent != self.mark || conn_progress {
+            self.mark = self.sent;
+            self.ticks = 0;
+            return false;
+        }
+        self.ticks = self.ticks.saturating_add(1);
+        self.ticks > self.secs
+    }
+
+    /// 送れる状態での見回り（数え直す）
+    pub(crate) fn clear(&mut self) {
+        self.mark = self.sent;
+        self.ticks = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-487: 送った量が増えない見回りが `secs` 回を超えたら打ち切る。増えたか、接続のクレジットを待つ間に接続が
+    /// 進んだら数え直す
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    #[test]
+    fn send_stall_watch_counts_ticks_without_progress() {
+        let mut w = SendStallWatch::new();
+        w.set_secs(2);
+        // 送ってから止まった: 最初の見回りは前回からの進みを見て数え直す
+        w.sent = 10;
+        assert!(!w.stalled_tick(false));
+        assert!(!w.stalled_tick(false));
+        assert!(!w.stalled_tick(false));
+        assert!(w.stalled_tick(false));
+        // 進んだら数え直す
+        let mut w = SendStallWatch::new();
+        w.set_secs(1);
+        assert!(!w.stalled_tick(false));
+        w.sent += 1;
+        assert!(!w.stalled_tick(false));
+        assert!(!w.stalled_tick(false));
+        assert!(w.stalled_tick(false));
+        // 送れる状態に戻ったら数え直す
+        w.clear();
+        assert!(!w.stalled_tick(false));
+        // 接続のクレジットを待つ間は、接続が進んでいれば打ち切らない
+        let mut c = SendStallWatch::new();
+        c.set_secs(1);
+        for _ in 0..10 {
+            assert!(!c.stalled_tick(true));
+        }
+        assert!(!c.stalled_tick(false));
+        assert!(c.stalled_tick(false));
+        // 既定は WRITE_TIMEOUT の秒数
+        let mut d = SendStallWatch::new();
+        for _ in 0..crate::pool::WRITE_TIMEOUT.as_secs() {
+            assert!(!d.stalled_tick(false));
+        }
+        assert!(d.stalled_tick(false));
+    }
 
     /// B-482: ルートの `max_request_header_size` を超えた要求は 431 で、レート制限の枠を使わない
     #[test]

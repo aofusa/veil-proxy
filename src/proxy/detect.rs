@@ -385,8 +385,13 @@ pub async fn handle_h2c_connection(
     )
     .await;
 
-    if let Err(e) = result {
-        warn!("[H2C] Connection error: {}", e);
+    match result {
+        // B-487: 読まないクライアントで書き込みが止まって閉じた（相手の都合で起きるので debug!。B-235）
+        Err(http2::Http2Error::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+            debug!("[H2C] Closing connection from {}: {}", client_ip, e);
+        }
+        Err(e) => warn!("[H2C] Connection error: {}", e),
+        Ok(()) => {}
     }
 
     debug!("[H2C] Connection closed from {}", client_ip);

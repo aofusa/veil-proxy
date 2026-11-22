@@ -397,7 +397,7 @@ url = "http://localhost:8080"
 | `adaptive_threshold` | Size threshold for adaptive mode (bytes) | 1MB |
 | `disk_buffer_path` | Disk spillover directory (optional) | none |
 | `max_disk_buffer` | Maximum disk buffer size (bytes) | 100MB |
-| `client_write_timeout_secs` | Client write timeout | 60 |
+| `client_write_timeout_secs` | How long sending the buffered response to the client may make no progress before veil gives up (HTTP/1.1 closes the connection; HTTP/2 and HTTP/3 reset the stream). Other responses use the fixed 30-second write timeout | 60 |
 | `buffer_headers` | Buffer headers along with body | true |
 
 A response is sent only after its whole body has arrived. If the upstream stops before the end of the body, the
