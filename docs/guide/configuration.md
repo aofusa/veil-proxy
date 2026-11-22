@@ -39,6 +39,8 @@ The following table lists default values for major configuration options:
 | `[performance]` | `concentrate_connections` | `true` | Linux TCP listeners: send new connections to only as many workers as the load needs, adjusted every 100 ms (see [Performance](performance.md#connection-concentration-linux)). `false` = spread over all workers |
 | `[performance]` | `cpu_affinity` | `"off"` | `"cores"` = pin worker *i* to the *i*-th CPU the process may use (the default of earlier versions); `"off"` = let the OS schedule the workers (see [Performance](performance.md#cpu-affinity)) |
 | `[performance]` | `huge_pages_enabled` | `false` | Enable Huge Pages |
+| `[performance]` | `via_header_enabled` | `false` | Add `Via: <version> <via_header_hostname>` to requests sent upstream (RFC 9110 §7.6.3) for every client protocol, WebSocket included. `<version>` is the protocol veil received the request in (`1.1`, `2` or `3`). Responses are not changed |
+| `[performance]` | `via_header_hostname` | `"veil"` | Name used in `Via` (a token or host[:port]; anything else is a startup error) |
 | `[performance]` | `keepalive_direct_read_ms` | `20` | io_uring, plaintext HTTP/1.1 keep-alive: read the next request directly for this long before waiting without a buffer (`0` = always wait first; F-205) |
 | `[performance]` | `open_file_cache_enabled` | `false` | Enable OpenFileCache |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | Cache validity (seconds) |
@@ -68,7 +70,7 @@ The following table lists default values for major configuration options:
 | `[http2]` | `max_concurrent_streams` | `256` | Max concurrent streams |
 | `[http2]` | `initial_window_size` | `1048576` | Stream window size (1MB) |
 | `[http2]` | `max_frame_size` | `65536` | Max frame size (64KB) |
-| `[http2]` | `max_header_list_size` | `65536` | Max header list size (64KB) |
+| `[http2]` | `max_header_list_size` | `65536` | Largest decoded request header list in bytes, advertised as `SETTINGS_MAX_HEADER_LIST_SIZE` and checked while HPACK decodes it (32 bytes added per field, RFC 7541 §4.1). A larger list closes the connection with `COMPRESSION_ERROR`; a request over veil's request header limit (8 KB or 64 fields) but within this one gets 431. Same default as `[http3] max_field_section_size` |
 | `[http2]` | `connection_window_size` | `1048576` | Connection window (1MB) |
 | `[http2]` | `max_rst_stream_per_second` | `100` | RST_STREAM rate limit |
 | `[http2]` | `max_control_frames_per_second` | `500` | Control frame rate limit |
@@ -95,7 +97,7 @@ The following table lists default values for major configuration options:
 | `[http3]` | `retry_threshold` | `1000` | When this many connections per worker are still handshaking, Initials without a token get a stateless Retry, so a connection is only created after the client proves it owns its source address (one extra round trip). `0` = always Retry |
 | `[http3]` | `handshake_timeout` | `10000` | Milliseconds a connection may spend handshaking before it is dropped (instead of lingering until `max_idle_timeout`) |
 | `[http3]` | `enable_connect_protocol` | `false` | Advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accept WebSocket over HTTP/3 (extended CONNECT, RFC 9220) |
-| `[http3]` | `max_field_section_size` | `65536` | Largest request header section in bytes, advertised as `SETTINGS_MAX_FIELD_SECTION_SIZE` and checked when a HEADERS frame announces its length and while QPACK decodes it (32 bytes added per field, RFC 9114 §4.2.2). A larger section closes the connection; a section over veil's request header limit (8 KB) but within this one gets 431. Same default as `[http2] max_header_list_size` |
+| `[http3]` | `max_field_section_size` | `65536` | Largest request header section in bytes, advertised as `SETTINGS_MAX_FIELD_SECTION_SIZE` and checked when a HEADERS frame announces its length and while QPACK decodes it (32 bytes added per field, RFC 9114 §4.2.2). A larger section closes the connection; a section over veil's request header limit (8 KB or 64 fields) but within this one gets 431. Same default as `[http2] max_header_list_size` |
 | `[http3]` | `recv_drain_max` | `1024` | **reactor backends only** (FreeBSD/OpenBSD/NetBSD/macOS, and Linux `--features epoll`): max UDP datagrams drained per event-loop iteration (1..=4096). Larger values amortize the per-iteration fixed cost (select/timer round-trip + connection sweep) over more datagrams — F-151 measured a 3.2x throughput swing from this quantity alone — at the cost of delaying sends/timeouts/backend wakeups (p99 latency). The default was 64 before v0.8.0; 1024 raised FreeBSD HTTP/3 3B throughput by 37% (p99 11 → 14 ms). The Linux io_uring default backend uses the `mmsg_batch_size` RECVMSG pipeline instead and ignores this key |
 | `[http3]` | `compression_enabled` | `false` | Enable compression |
 | `[http3]` | `gso_gro_enabled` | `true` | Enable GSO/GRO (turned off per socket automatically when the kernel rejects a segmented send) |

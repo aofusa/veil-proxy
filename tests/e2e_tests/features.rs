@@ -42,8 +42,9 @@ pub(super) async fn test_error_handling_invalid_method() {
 
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
 
-    // 不正なHTTPメソッドを送信
-    let invalid_request = b"INVALID / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    // 不正なHTTPメソッド（トークンでない。RFC 9110 §9.1）を送信。トークンの拡張メソッド（`INVALID` 等）は
+    // HTTP/2・HTTP/3 と同じく上流へ渡すので 405 にならない（B-490）
+    let invalid_request = b"INV@LID / HTTP/1.1\r\nHost: localhost\r\n\r\n";
     if let Err(e) = tls_stream.write_all(invalid_request) {
         panic!("Failed to send invalid method request: {:?}", e);
     }
@@ -63,11 +64,11 @@ pub(super) async fn test_error_handling_invalid_method() {
     let response = String::from_utf8_lossy(&response);
     let status = get_status_code(&response);
 
-    // 不正なメソッドの場合、405 Method Not Allowedが返される
+    // トークンでないメソッドは 400 Bad Request
     assert_eq!(
         status,
-        Some(405),
-        "Should return 405 Method Not Allowed for invalid method, got: {:?}",
+        Some(400),
+        "Should return 400 Bad Request for invalid method, got: {:?}",
         status
     );
 

@@ -319,19 +319,10 @@ pub(super) async fn handle_requests(
                     .map(|(off, len)| header_bytes.slice(off..off + len))
                     .unwrap_or_else(|| Bytes::from_static(b"GET"));
 
-                // 有効なHTTPメソッドのみ受け付ける（RFC 7231）
-                const VALID_HTTP_METHODS: &[&[u8]] = &[
-                    b"GET", b"HEAD", b"POST", b"PUT", b"DELETE", b"CONNECT", b"OPTIONS", b"TRACE",
-                    b"PATCH",
-                ];
-                if !VALID_HTTP_METHODS
-                    .iter()
-                    .any(|m| method_bytes.as_ref().eq_ignore_ascii_case(m))
-                {
-                    let err_buf = ERR_MSG_METHOD_NOT_ALLOWED.to_vec();
-                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                    return;
-                }
+                // メソッドは httparse がトークン（RFC 9110 §9.1）であることを確かめている。拡張メソッド（WebDAV の
+                // PROPFIND・管理 API の PURGE 等）も HTTP/2・HTTP/3 と同じく受ける（B-490。以前は 9 つ以外を 405 で
+                // 断り、文書にある管理 API の PURGE が HTTP/1.1 だけ届かなかった）。ルートで絞るときは
+                // `[route.security] allowed_methods`
 
                 // ヘッダー情報抽出
                 let host_bytes: Bytes = host_range
@@ -848,6 +839,7 @@ pub(super) async fn handle_requests(
                     security,
                     client_ip,
                     &method_bytes,
+                    header_bytes.len(),
                     checked_length,
                     is_chunked,
                 );
@@ -1217,8 +1209,14 @@ pub(super) async fn handle_requests(
                             std::str::from_utf8(&path_bytes).unwrap_or("-")
                         );
 
-                        // UpstreamGroup からサーバーを選択
-                        let server = match upstream_group.select(client_ip) {
+                        // UpstreamGroup からサーバーを選択。B-485: Consistent Hash の `header:`・`cookie:` キーも
+                        // HTTP の要求と同じに見る（以前は送信元の IP だけで選び、同じセッションの HTTP の要求と別の上流へ行った）
+                        let server = match upstream_group.select_with_header_fn(client_ip, |name| {
+                            headers_for_proxy
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                                .map(|(_, v)| v.as_ref())
+                        }) {
                             Some(s) => s,
                             None => {
                                 crate::metrics::record_upstream_connect_error(
@@ -1424,7 +1422,7 @@ struct RequestHead {
 
 enum RequestHeadParse {
     Complete(RequestHead),
-    /// ヘッダが `MAX_HEADER_SIZE` を超えた
+    /// ヘッダが `MAX_HEADER_SIZE` を超えた、またはフィールドが `MAX_HEADER_COUNT` 個を超えた（B-482。以前は 400）
     TooLarge,
     /// まだ揃っていない
     Partial,
@@ -1438,12 +1436,15 @@ enum RequestHeadParse {
 #[inline]
 fn parse_request_head(accumulated: &mut BytesMut) -> RequestHeadParse {
     // 格納先は要求ごとに初期化しない（埋まった分だけ `req.headers` に見える）
-    let mut headers_storage = [const { std::mem::MaybeUninit::<httparse::Header>::uninit() }; 64];
+    let mut headers_storage =
+        [const { std::mem::MaybeUninit::<httparse::Header>::uninit() }; MAX_HEADER_COUNT];
     let mut req = Request::new(&mut []);
 
     let header_len = match req.parse_with_uninit_headers(accumulated, &mut headers_storage) {
         Ok(Status::Complete(header_len)) => header_len,
         Ok(Status::Partial) => return RequestHeadParse::Partial,
+        // B-482: フィールドの数の上限（HTTP/2・HTTP/3 と同じ 431）
+        Err(httparse::Error::TooManyHeaders) => return RequestHeadParse::TooLarge,
         Err(_) => return RequestHeadParse::Invalid,
     };
     if header_len > MAX_HEADER_SIZE {
@@ -1472,9 +1473,9 @@ fn parse_request_head(accumulated: &mut BytesMut) -> RequestHeadParse {
     // F-261・B-307: HTTP/1.0 の要求はアップグレードできない
     let http10 = req.version == Some(0);
     // ヘッダの位置はスタックの配列に控える（要求ごとに Vec を確保しない。F-202）。
-    // httparse の格納先と同じ 64 個が上限。ヘッダ部は上の検査で MAX_HEADER_SIZE（8KB）以下なので
+    // httparse の格納先と同じ MAX_HEADER_COUNT（64）個が上限。ヘッダ部は上の検査で MAX_HEADER_SIZE（8KB）以下なので
     // 位置は u16 に収まる。
-    let mut header_ranges = [[0u16; 4]; 64];
+    let mut header_ranges = [[0u16; 4]; MAX_HEADER_COUNT];
     let mut header_count = 0;
     for h in req.headers.iter().filter(|h| !h.name.is_empty()) {
         let (no, nl) = slice_range(accumulated, h.name.as_bytes());

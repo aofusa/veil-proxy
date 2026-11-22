@@ -238,6 +238,9 @@ unsafe impl IoBufMut for SafeReadBuffer {
 
 // セキュリティ制限
 pub(crate) const MAX_HEADER_SIZE: usize = 8192; // 8KB - ヘッダーサイズ上限
+/// 要求ヘッダのフィールドの数の上限（擬似ヘッダを除く）。HTTP/1.1 の httparse の格納先と同じ数で、B-482 で HTTP/2・HTTP/3 にも
+/// 掛けた（以前は HTTP/1.1 だけが 400 で断っていた）
+pub(crate) const MAX_HEADER_COUNT: usize = 64;
 pub(crate) const MAX_BODY_SIZE: usize = 10485760; // 10MB - ボディサイズ上限
                                                   // 圧縮・HTTP/2 への中継のために上流の応答本文を溜める上限（B-281）。既知長がこれを超える応答は
                                                   // 圧縮せずに逐次送り、長さ不明で超えたものは 502（または切断）にする
@@ -1500,6 +1503,47 @@ pub(crate) fn init_alt_svc(enabled: bool, value: &str) {
         if effective { "enabled" } else { "disabled" },
         if effective { value } else { "" }
     );
+}
+
+// ====================
+// Via ヘッダー（B-484）
+// ====================
+//
+// `[performance] via_header_enabled` の `Via: <受けたプロトコルの版> <via_header_hostname>`（RFC 9110 §7.6.3）を
+// 上流への要求に付ける。Server ヘッダーと同じく起動時・リロード時に値を作り、要求ごとには設定を読まない
+// （`CURRENT_CONFIG.load()` は 1 回で 100 命令を超える。F-297）。無効なら要求ごとの費用はアトミックの読み 1 回。
+
+/// 要求を受けたプロトコル（`Via` の received-protocol）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViaProto {
+    Http11 = 0,
+    #[cfg(feature = "http2")]
+    Http2 = 1,
+    #[cfg(feature = "http3")]
+    Http3 = 2,
+}
+
+/// `Via` の値（[`ViaProto`] の順に `1.1 <host>`・`2 <host>`・`3 <host>`）
+static VIA_VALUES: Lazy<arc_swap::ArcSwap<[Bytes; 3]>> =
+    Lazy::new(|| arc_swap::ArcSwap::from_pointee(Default::default()));
+
+/// `Via` を付けるか
+static VIA_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `Via` の設定を反映する（起動時・リロード時。`hostname` は検証済み）
+pub(crate) fn init_via_header(enabled: bool, hostname: &str) {
+    let v = |version: &str| Bytes::from(format!("{version} {hostname}"));
+    VIA_VALUES.store(Arc::new([v("1.1"), v("2"), v("3")]));
+    VIA_ENABLED.store(enabled, std::sync::atomic::Ordering::Release);
+}
+
+/// 上流への要求に付ける `Via` の値（無効なら `None`。有効なときは参照カウントの加算だけ）
+#[inline]
+pub(crate) fn via_header_value(proto: ViaProto) -> Option<Bytes> {
+    if !VIA_ENABLED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    Some(VIA_VALUES.load()[proto as usize].clone())
 }
 
 /// HTTP/3 リッスンアドレスから標準的な Alt-Svc 値を構築する（コールドパス）。

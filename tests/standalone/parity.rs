@@ -647,6 +647,8 @@ pub struct H2UpstreamSeen {
     pub path: String,
     pub body_len: usize,
     pub complete: bool,
+    /// 受けた要求のヘッダ（名前は小文字）
+    pub headers: Vec<(String, String)>,
 }
 
 /// 受けた要求を記録する h2c の上流（本文の終わりまで届いたものに 200 を返す）
@@ -676,6 +678,7 @@ pub fn spawn_recording_h2c_upstream() -> (u16, Arc<std::sync::Mutex<Vec<H2Upstre
                         let seen = seen.clone();
                         tokio::spawn(async move {
                             let path = req.uri().path().to_string();
+                            let headers = header_pairs(req.headers());
                             let mut body = req.into_body();
                             let mut len = 0;
                             let complete = loop {
@@ -692,6 +695,7 @@ pub fn spawn_recording_h2c_upstream() -> (u16, Arc<std::sync::Mutex<Vec<H2Upstre
                                 path,
                                 body_len: len,
                                 complete,
+                                headers,
                             });
                             if complete {
                                 let resp = http::Response::builder().status(200).body(()).unwrap();

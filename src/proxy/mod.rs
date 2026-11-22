@@ -133,6 +133,118 @@ static PROXY_START_TIME: once_cell::sync::Lazy<std::time::Instant> =
 // 使う名前を再エクスポートする（`crate::proxy::check_security` 等の既存のパスを保つ）。
 pub use crate::l7::{check_security, SecurityCheckResult};
 
+/// 管理 API（`[admin]`）の要求か（経路の振り分け用。B-483）。`/__admin/*`・キャッシュの purge のパス・`PURGE` メソッド。
+/// 既知のエンドポイントでなければ [`admin_response`] は `None` を返し、要求は普通のルートへ進む
+#[cfg(all(feature = "admin", any(feature = "http2", feature = "http3")))]
+#[inline]
+pub(crate) fn is_admin_request(
+    admin: &crate::config::AdminConfig,
+    method: &[u8],
+    path: &[u8],
+) -> bool {
+    admin.enabled
+        && (method == b"PURGE"
+            || path.starts_with(admin.path_prefix.as_bytes())
+            || path.starts_with(admin.cache_purge_prefix.as_bytes()))
+}
+
+/// 管理 API の応答 `(ステータス, 本文が JSON か, 本文)`。管理 API の要求でなければ `None`（普通のルートへ進める）。
+///
+/// HTTP/2（B-29）・HTTP/3（B-483）で共有する（HTTP/1.1 は h1.rs で同じ規則を書いている）。IP の許可・認証・
+/// エンドポイントの規則は HTTP/1.1 と同じ。
+#[cfg(all(feature = "admin", any(feature = "http2", feature = "http3")))]
+pub(crate) fn admin_response(
+    config: &crate::config::RuntimeConfig,
+    method: &[u8],
+    path: &[u8],
+    client_ip: &str,
+    auth: Option<&str>,
+) -> Option<(u16, bool, Vec<u8>)> {
+    let admin_config = &config.admin_config;
+    if !admin_config.enabled {
+        return None;
+    }
+    let path_str = std::str::from_utf8(path).unwrap_or("/");
+    let is_purge_method = method == b"PURGE";
+    if is_purge_method || path_str.starts_with(&admin_config.cache_purge_prefix) {
+        let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
+            (403, Vec::new())
+        } else if !admin_config.check_auth_from(client_ip, auth) {
+            (401, Vec::new())
+        } else {
+            let resp = handle_cache_purge(path_str, is_purge_method);
+            parse_http1_admin_response(&resp)
+        };
+        return Some((status, false, body));
+    }
+    if !path_str.starts_with(&admin_config.path_prefix) {
+        return None;
+    }
+    let path_suffix = &path_str[admin_config.path_prefix.len()..];
+    let is_known_endpoint = matches!(
+        (method, path_suffix),
+        (b"GET", "/config")
+            | (b"GET", "/stats")
+            | (b"GET", "/vds")
+            | (b"POST", "/reload")
+            | (b"POST", "/tls/reload")
+    );
+    if !is_known_endpoint {
+        return None;
+    }
+    let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
+        (403, b"{\"error\":\"403\"}".to_vec())
+    } else if !admin_config.check_auth_from(client_ip, auth) {
+        (401, b"{\"error\":\"401\"}".to_vec())
+    } else {
+        match (method, path_suffix) {
+            (b"GET", "/config") => (200, build_admin_config_json(config).into_bytes()),
+            (b"GET", "/stats") => {
+                let uptime_secs = PROXY_START_TIME.elapsed().as_secs();
+                (
+                    200,
+                    format!("{{\"uptime_secs\":{}}}", uptime_secs).into_bytes(),
+                )
+            }
+            (b"GET", "/vds") => (200, admin_vds_json().into_bytes()),
+            (b"POST", "/reload") => {
+                RELOAD_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+                (200, b"{\"ok\":true}".to_vec())
+            }
+            (b"POST", "/tls/reload") => {
+                TLS_RELOAD_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+                (200, b"{\"ok\":true}".to_vec())
+            }
+            _ => (404, Vec::new()),
+        }
+    };
+    Some((status, true, body))
+}
+
+/// HTTP/1.1 レスポンスバイト列からステータスコードとボディを抽出（管理 API Purge 用）
+#[cfg(all(feature = "admin", any(feature = "http2", feature = "http3")))]
+fn parse_http1_admin_response(resp: &[u8]) -> (u16, Vec<u8>) {
+    let status = if resp.starts_with(b"HTTP/1.1 200") {
+        200
+    } else if resp.starts_with(b"HTTP/1.1 401") {
+        401
+    } else if resp.starts_with(b"HTTP/1.1 403") {
+        403
+    } else if resp.starts_with(b"HTTP/1.1 503") {
+        503
+    } else if resp.starts_with(b"HTTP/1.1 501") {
+        501
+    } else {
+        400
+    };
+    let body = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| resp[i + 4..].to_vec())
+        .unwrap_or_default();
+    (status, body)
+}
+
 /// 管理 API: 設定情報をJSON形式で返す（F-21: GET /__admin/config）
 ///
 /// secret フィールドは "***" にマスクする。
@@ -497,6 +609,8 @@ pub(crate) fn forward_allowed(security: &SecurityConfig, name: &[u8]) -> bool {
 pub(crate) struct AddedHeaders {
     user: Vec<(Vec<u8>, Vec<u8>)>,
     fwd: Option<ForwardedValues>,
+    /// `[performance] via_header_enabled` の `Via` の値（B-484。無効なら `None`）
+    via: Option<Bytes>,
 }
 
 /// 既定の転送ヘッダの値（B-232）。
@@ -563,6 +677,7 @@ impl AddedHeaders {
     pub(crate) const NONE: AddedHeaders = AddedHeaders {
         user: Vec::new(),
         fwd: None,
+        via: None,
     };
 
     /// 受けた要求のヘッダ `name` を上流へ送ってよいか（転送ヘッダの方針）。
@@ -571,29 +686,33 @@ impl AddedHeaders {
         self.fwd.as_ref().is_none_or(|f| f.keeps(name))
     }
 
-    /// 足すヘッダ（`add_request_headers` の展開、続けて転送ヘッダ）。
+    /// 足すヘッダ（`add_request_headers` の展開、続けて転送ヘッダ・`Via`）。
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> + Clone {
         self.user
             .iter()
             .map(|(n, v)| (n.as_slice(), v.as_slice()))
             .chain(self.fwd.iter().flat_map(|f| f.pairs()))
+            .chain(self.via.iter().map(|v| (&b"via"[..], v.as_ref())))
     }
 }
 
 /// `[route.security] add_request_headers` を展開する（`$client_ip`・`$host`・`$request_uri`）。設定が無ければ
 /// 確保しない（空の `Vec`）。値に CR・LF・NUL が入るもの（展開した値も含む）は送らない。既定の転送ヘッダ
-/// （`forwarded_headers`。B-232）も持つ。
+/// （`forwarded_headers`。B-232）と、`Via`（`proto` は要求を受けたプロトコル。B-484）も持つ。
 pub(crate) fn expanded_added_headers(
     security: &SecurityConfig,
     client_ip: &str,
     host: &[u8],
     request_uri: &str,
+    proto: crate::pool::ViaProto,
 ) -> AddedHeaders {
     let fwd = ForwardedValues::new(security, client_ip);
+    let via = crate::pool::via_header_value(proto);
     if security.add_request_headers.is_empty() {
         return AddedHeaders {
             user: Vec::new(),
             fwd,
+            via,
         };
     }
     let host = std::str::from_utf8(host).unwrap_or("-");
@@ -605,7 +724,11 @@ pub(crate) fn expanded_added_headers(
             out.push((name.as_bytes().to_ascii_lowercase(), v));
         }
     }
-    AddedHeaders { user: out, fwd }
+    AddedHeaders {
+        user: out,
+        fwd,
+        via,
+    }
 }
 
 /// HTTP/2・HTTP/3 で受けた要求のヘッダを、HTTP/1.1 の上流への要求に書く。
@@ -680,7 +803,7 @@ mod path_tests {
             ]
         };
         let write = |sec: &SecurityConfig, ip: &str| {
-            let added = expanded_added_headers(sec, ip, b"h", "/");
+            let added = expanded_added_headers(sec, ip, b"h", "/", crate::pool::ViaProto::Http11);
             let mut out = Vec::new();
             write_h1_forward_headers(&mut out, hdrs().into_iter(), sec, &added);
             String::from_utf8(out).unwrap()
@@ -718,7 +841,13 @@ mod path_tests {
                 .collect(),
             ..Default::default()
         };
-        let added = expanded_added_headers(&sec, "192.0.2.1", b"example.com", "/p");
+        let added = expanded_added_headers(
+            &sec,
+            "192.0.2.1",
+            b"example.com",
+            "/p",
+            crate::pool::ViaProto::Http11,
+        );
         let hdrs: Vec<(&[u8], &[u8])> = vec![
             (b":method", b"GET"),
             (b"x-ok", b"1"),

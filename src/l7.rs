@@ -14,8 +14,8 @@
 use crate::config::Backend;
 use crate::config::{CompressionConfig, SecurityConfig, CURRENT_CONFIG};
 use crate::constants::{
-    ERR_MSG_FORBIDDEN, ERR_MSG_METHOD_NOT_ALLOWED, ERR_MSG_REQUEST_TOO_LARGE,
-    ERR_MSG_TOO_MANY_REQUESTS,
+    ERR_MSG_FORBIDDEN, ERR_MSG_METHOD_NOT_ALLOWED, ERR_MSG_REQUEST_HEADER_TOO_LARGE,
+    ERR_MSG_REQUEST_TOO_LARGE, ERR_MSG_TOO_MANY_REQUESTS,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -137,6 +137,8 @@ pub enum SecurityCheckResult {
     RateLimitExceeded,
     /// リクエストサイズ超過（413 Request Entity Too Large）
     RequestTooLarge,
+    /// 要求ヘッダの大きさがルートの `max_request_header_size` を超えた（431。B-482）
+    HeaderTooLarge,
 }
 
 impl SecurityCheckResult {
@@ -149,6 +151,7 @@ impl SecurityCheckResult {
             SecurityCheckResult::MethodNotAllowed => 405,
             SecurityCheckResult::RateLimitExceeded => 429,
             SecurityCheckResult::RequestTooLarge => 413,
+            SecurityCheckResult::HeaderTooLarge => 431,
         }
     }
 
@@ -161,6 +164,7 @@ impl SecurityCheckResult {
             SecurityCheckResult::MethodNotAllowed => b"Method Not Allowed",
             SecurityCheckResult::RateLimitExceeded => b"Too Many Requests",
             SecurityCheckResult::RequestTooLarge => b"Request Entity Too Large",
+            SecurityCheckResult::HeaderTooLarge => b"Request Header Fields Too Large",
         }
     }
 
@@ -173,6 +177,7 @@ impl SecurityCheckResult {
             SecurityCheckResult::MethodNotAllowed => Some(ERR_MSG_METHOD_NOT_ALLOWED),
             SecurityCheckResult::RateLimitExceeded => Some(ERR_MSG_TOO_MANY_REQUESTS),
             SecurityCheckResult::RequestTooLarge => Some(ERR_MSG_REQUEST_TOO_LARGE),
+            SecurityCheckResult::HeaderTooLarge => Some(ERR_MSG_REQUEST_HEADER_TOO_LARGE),
         }
     }
 }
@@ -182,10 +187,14 @@ impl SecurityCheckResult {
 /// ## チェック項目（この順。B-132 で 3 経路を揃えた）
 /// 1. IP制限（allowed_ips, denied_ips）
 /// 2. HTTPメソッド制限（allowed_methods）
-/// 3. ボディサイズ制限（max_request_body_size。chunked は本文を読みながら別に数える）
-/// 4. レートリミット（rate_limit_requests_per_min）
+/// 3. ヘッダの大きさ制限（max_request_header_size。B-482）
+/// 4. ボディサイズ制限（max_request_body_size。chunked は本文を読みながら別に数える）
+/// 5. レートリミット（rate_limit_requests_per_min）
 ///
-/// 状態を持たない検査（1〜3）を先にし、ほかの理由で拒否する要求にレート制限の枠を使わせない
+/// `header_size` は要求ヘッダの大きさ（HTTP/1.1 は要求行から空行までのバイト数、HTTP/2・HTTP/3 は復号した後の
+/// 名前と値の合計。擬似ヘッダを含む）。veil 全体の上限（[`request_header_limit_status`]）は各プロトコルの入口で先に見る。
+///
+/// 状態を持たない検査（1〜4）を先にし、ほかの理由で拒否する要求にレート制限の枠を使わせない
 /// （nginx も `client_max_body_size` の検査は `limit_req` より前）。
 ///
 /// ## パフォーマンス
@@ -195,6 +204,7 @@ pub fn check_security(
     security: &SecurityConfig,
     client_ip: &str,
     method: &[u8],
+    header_size: usize,
     content_length: usize,
     is_chunked: bool,
 ) -> SecurityCheckResult {
@@ -214,6 +224,11 @@ pub fn check_security(
         if !is_allowed {
             return SecurityCheckResult::MethodNotAllowed;
         }
+    }
+
+    // ヘッダの大きさ（ルートの上限。B-482。以前は設定を読むだけでどのプロトコルも見ていなかった）
+    if header_size > security.max_request_header_size {
+        return SecurityCheckResult::HeaderTooLarge;
     }
 
     // ボディサイズ制限（chunked以外）
@@ -239,9 +254,86 @@ pub fn check_security(
     SecurityCheckResult::Allowed
 }
 
+/// veil 全体の要求ヘッダの上限（HTTP/1.1・HTTP/2・HTTP/3 で共通。B-482）。超えていれば応答のステータスを返す
+/// （`:path` が `MAX_HEADER_SIZE` を超えれば 414、ヘッダの大きさが `MAX_HEADER_SIZE` を超えるかフィールドが
+/// `MAX_HEADER_COUNT` 個を超えれば 431）。`size` は [`check_security`] の `header_size` と同じ数え方、`count` は
+/// 擬似ヘッダを除くフィールドの数
+#[cfg(any(feature = "http2", feature = "http3"))]
+#[inline]
+pub(crate) fn request_header_limit_status(
+    size: usize,
+    count: usize,
+    path_len: usize,
+) -> Option<u16> {
+    if path_len > crate::pool::MAX_HEADER_SIZE {
+        Some(414)
+    } else if size > crate::pool::MAX_HEADER_SIZE || count > crate::pool::MAX_HEADER_COUNT {
+        Some(431)
+    } else {
+        None
+    }
+}
+
+/// [`request_header_limit_status`] の応答の本文（`text/plain`）
+#[cfg(any(feature = "http2", feature = "http3"))]
+#[inline]
+pub(crate) fn request_header_limit_message(status: u16) -> &'static [u8] {
+    if status == 414 {
+        b"URI Too Long"
+    } else {
+        b"Request Header Fields Too Large"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-482: ルートの `max_request_header_size` を超えた要求は 431 で、レート制限の枠を使わない
+    #[test]
+    fn route_header_limit_is_checked_before_rate_limit() {
+        let security = SecurityConfig {
+            max_request_header_size: 1024,
+            rate_limit_requests_per_min: 1,
+            ..Default::default()
+        };
+        let ip = "192.0.2.78";
+        for _ in 0..3 {
+            let r = check_security(&security, ip, b"GET", 2048, 0, false);
+            assert_eq!(r, SecurityCheckResult::HeaderTooLarge);
+            assert_eq!(r.status_code(), 431);
+            assert!(r.http1_response().unwrap().starts_with(b"HTTP/1.1 431 "));
+        }
+        assert_eq!(
+            check_security(&security, ip, b"GET", 1024, 0, false),
+            SecurityCheckResult::Allowed
+        );
+    }
+
+    /// B-482: veil 全体の上限（大きさ・数・`:path`）
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    #[test]
+    fn request_header_limit_status_by_size_count_and_path() {
+        use crate::pool::{MAX_HEADER_COUNT, MAX_HEADER_SIZE};
+        assert_eq!(request_header_limit_status(100, 10, 1), None);
+        assert_eq!(
+            request_header_limit_status(MAX_HEADER_SIZE, MAX_HEADER_COUNT, 1),
+            None
+        );
+        assert_eq!(
+            request_header_limit_status(MAX_HEADER_SIZE + 1, 1, 1),
+            Some(431)
+        );
+        assert_eq!(
+            request_header_limit_status(100, MAX_HEADER_COUNT + 1, 1),
+            Some(431)
+        );
+        assert_eq!(
+            request_header_limit_status(MAX_HEADER_SIZE + 10, 1, MAX_HEADER_SIZE + 1),
+            Some(414)
+        );
+        assert_eq!(request_header_limit_message(414), b"URI Too Long");
+    }
 
     #[test]
     fn split_query_with_and_without_question_mark() {
@@ -279,17 +371,17 @@ mod tests {
         let ip = "192.0.2.77";
         for _ in 0..3 {
             assert_eq!(
-                check_security(&security, ip, b"POST", 100, false),
+                check_security(&security, ip, b"POST", 0, 100, false),
                 SecurityCheckResult::RequestTooLarge
             );
         }
         // 枠はまだ 1 回分残っている
         assert_eq!(
-            check_security(&security, ip, b"POST", 1, false),
+            check_security(&security, ip, b"POST", 0, 1, false),
             SecurityCheckResult::Allowed
         );
         assert_eq!(
-            check_security(&security, ip, b"POST", 1, false),
+            check_security(&security, ip, b"POST", 0, 1, false),
             SecurityCheckResult::RateLimitExceeded
         );
     }

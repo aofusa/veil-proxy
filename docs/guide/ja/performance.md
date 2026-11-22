@@ -316,7 +316,8 @@ FreeBSD では、静的コンテンツキャッシュ（`[static_file_cache]` + 
 // バッファサイズ
 const BUF_SIZE: usize = 65536;           // 64KB - io_uring最適サイズ
 const HEADER_BUF_CAPACITY: usize = 512;  // HTTPヘッダー用
-const MAX_HEADER_SIZE: usize = 8192;     // 8KB - ヘッダーサイズ上限
+const MAX_HEADER_SIZE: usize = 8192;     // 8KB - ヘッダーサイズ上限（431。:path が超えれば 414）
+const MAX_HEADER_COUNT: usize = 64;      // ヘッダのフィールド数の上限（431）
 const MAX_BODY_SIZE: usize = 10485760;   // 10MB - ボディサイズ上限
 
 // タイムアウト

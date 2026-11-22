@@ -507,14 +507,15 @@ reuseport_balancing = "cbpf"
 # Via ヘッダー設定 (RFC 7230 Section 5.7.1)
 # ------------------------------------------
 #
-# プロキシ経由のリクエスト/レスポンスにViaヘッダーを追加します。
+# 上流へ送る要求に Via ヘッダーを追加します（応答には付けません）。
 # Viaヘッダーはリクエストがどのプロキシを経由したかを示し、
 # ループ検出やデバッグに使用されます。
+# HTTP/1.1・HTTP/2・HTTP/3 のどのクライアントの要求（WebSocket を含む）にも付きます（B-484）。
 #
-# 形式: Via: 1.1 <hostname>
+# 形式: Via: <版> <hostname>（<版> は veil が要求を受けたプロトコル: 1.1 / 2 / 3）
 #
 # via_header_enabled = true
-# via_header_hostname = "veil"  # デフォルト: "veil"
+# via_header_hostname = "veil"  # デフォルト: "veil"（token か host[:port]）
 
 # ------------------------------------------
 # チャンクサイズ設定 (sendfile/splice)
@@ -1261,9 +1262,10 @@ watch = false
 # RFC 7540標準: 16384 (16KB)
 # max_frame_size = 65536
 
-# SETTINGS_MAX_HEADER_LIST_SIZE (最大ヘッダーリストサイズ)
-# デフォルト: 65536 (64KB)
-# 大きなCookie/ヘッダー対応に最適
+# SETTINGS_MAX_HEADER_LIST_SIZE: 復号した要求のヘッダリストの大きさの上限（バイト）。HPACK の復号
+# （1 フィールドにつき 32 バイトを足す）で検査し、超えた接続は COMPRESSION_ERROR で閉じる。
+# veil の要求ヘッダの上限（8KB または 64 フィールド）を超えてこれ以下の要求は 431
+# デフォルト: 65536 (64KB。[http3] max_field_section_size と同じ)
 # max_header_list_size = 65536
 
 # コネクションウィンドウサイズ（コネクション全体のフロー制御）
@@ -1481,7 +1483,7 @@ watch = false
 #
 # max_field_section_size: 要求のヘッダの大きさの上限（バイト）。SETTINGS_MAX_FIELD_SECTION_SIZE として広告し、
 # HEADERS の長さの宣言の時点と QPACK の復号（1 フィールドにつき 32 バイトを足す）で検査する。超えた接続は閉じる。
-# veil の要求ヘッダの上限（8KB）を超えてこれ以下の要求は 431。デフォルト: 65536（[http2] max_header_list_size と同じ）
+# veil の要求ヘッダの上限（8KB または 64 フィールド）を超えてこれ以下の要求は 431。デフォルト: 65536（[http2] max_header_list_size と同じ）
 # max_field_section_size = 65536
 #
 # enable_connect_protocol: 拡張 CONNECT（RFC 9220）。SETTINGS_ENABLE_CONNECT_PROTOCOL を広告し、
@@ -2190,7 +2192,9 @@ watch = false
 # HTTP/1.1 は 408、HTTP/2 は RST_STREAM(CANCEL)、HTTP/3 は H3_REQUEST_CANCELLED。gRPC のクライアントストリーミングにも効く
 # client_body_timeout_secs = 30
 #
-# リクエストヘッダー最大サイズ（バイト）。超過時は 431 を返す
+# ルートの要求ヘッダの大きさの上限（バイト）。超えた要求は HTTP/1.1・HTTP/2・HTTP/3 とも 431。
+# HTTP/1.1 は要求行から空行までのバイト数、HTTP/2・HTTP/3 は復号した後の名前と値の合計（擬似ヘッダを含む）。
+# veil 全体の上限（8KB と 64 フィールド。:path が 8KB を超えれば 414）が先に掛かるので、8KB より大きくしても効かない
 # max_request_header_size = 8192
 #
 # バックエンド接続プール: ホストごとの最大アイドル接続数（HTTP/1.1・HTTPS。HTTP/3 ワーカーの

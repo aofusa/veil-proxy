@@ -327,7 +327,8 @@ Constants in code (set at compile time, requires rebuild):
 // Buffer sizes
 const BUF_SIZE: usize = 65536;           // 64KB - optimal size for io_uring
 const HEADER_BUF_CAPACITY: usize = 512;  // For HTTP headers
-const MAX_HEADER_SIZE: usize = 8192;     // 8KB - header size limit
+const MAX_HEADER_SIZE: usize = 8192;     // 8KB - header size limit (431; a longer :path gets 414)
+const MAX_HEADER_COUNT: usize = 64;      // header field limit (431)
 const MAX_BODY_SIZE: usize = 10485760;   // 10MB - body size limit
 
 // Timeouts

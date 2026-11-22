@@ -69,7 +69,7 @@ pub(super) async fn handle_websocket_proxy(
     // ヘッダーを転送する。Host（上で書いた）・Connection と Upgrade 以外のホップバイホップ・
     // `remove_request_headers` に入っている名前・不正な名前と値は送らず、`add_request_headers` を足す
     // （以前は削除・追加の指定が WebSocket の経路にだけ効いていなかった。F-236 の再走査の F2）。
-    let added = expanded_added_headers(security, client_ip, host, path_str);
+    let added = expanded_added_headers(security, client_ip, host, path_str, ViaProto::Http11);
     // B-307: `Connection` は `Upgrade` だけにし、`Connection` に挙がったホップバイホップのヘッダは送らない
     // B-415: `Upgrade` は `websocket` だけにする（以前はクライアントの値をそのまま写し、`h2c` 等も一緒に送れた）。
     // `HTTP2-Settings` も送らない

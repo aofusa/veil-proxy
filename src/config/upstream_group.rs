@@ -835,6 +835,18 @@ impl UpstreamGroup {
     pub fn use_h2c(&self) -> bool {
         self.use_h2c
     }
+
+    /// どのサーバが選ばれても HTTP/2（h2c、または ALPN で h2 を試す HTTPS）で中継するか。
+    ///
+    /// B-481: 上流を選ぶ前に経路を決めるための判定（HTTP/2 の下見・HTTP/3 の分類）。選ぶとラウンドロビン・重み付けの
+    /// カウンタが進み、本番の選択と合わせて 1 要求で 2 つ進んでいた。サーバの数だけ見る（設定のロード後は変わらない）
+    pub fn all_servers_h2(&self) -> bool {
+        self.use_h2c
+            || self
+                .servers
+                .iter()
+                .all(|s| s.target.use_h2c || s.target.h2_over_tls())
+    }
 }
 
 #[cfg(test)]
@@ -852,5 +864,40 @@ mod h2c_tests {
             .with_h2c(true);
         assert!(plain.use_h2c());
         assert!(plain.servers[0].target.use_h2c);
+    }
+
+    fn entry(url: &str) -> UpstreamServerEntry {
+        UpstreamServerEntry {
+            url: url.to_string(),
+            sni_name: None,
+            use_h2c: false,
+            http2: None,
+            weight: 1,
+        }
+    }
+
+    /// B-481: 選ばずに「どのサーバでも HTTP/2 で中継するか」を答える（選ぶとラウンドロビンのカウンタが進む）
+    #[test]
+    fn all_servers_h2_without_advancing_round_robin() {
+        let g = |urls: &[&str]| {
+            UpstreamGroup::new(
+                "g".into(),
+                urls.iter().map(|u| entry(u)).collect(),
+                LoadBalanceAlgorithm::RoundRobin,
+                None,
+                false,
+            )
+            .unwrap()
+        };
+        // HTTPS は ALPN で h2 を試す（既定の `http2 = "auto"`）
+        assert!(g(&["https://a.example:443", "https://b.example:443"]).all_servers_h2());
+        // 平文は h2c を付けたときだけ
+        let plain = g(&["http://a.example:80", "http://b.example:80"]);
+        assert!(!plain.all_servers_h2());
+        assert!(plain.with_h2c(true).all_servers_h2());
+        // 混在（平文の HTTP/1.1 と HTTPS）は HTTP/2 と言えない
+        let mixed = g(&["http://a.example:80", "https://b.example:443"]);
+        assert!(!mixed.all_servers_h2());
+        assert_eq!(mixed.rr_counter.load(Ordering::Relaxed), 0);
     }
 }

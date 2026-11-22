@@ -37,6 +37,8 @@
 | `[performance]` | `cpu_affinity` | `"off"` | `"cores"` = ワーカー *i* をプロセスが使える *i* 番目の CPU に固定する（以前の版の既定）。`"off"` = OS のスケジューラに任せる（[パフォーマンス](performance.md#cpu-アフィニティ)） |
 | `[performance]` | `concentrate_connections` | `true` | Linux の TCP リスナー: 新しい接続を、負荷に見合う本数のワーカーへだけ振り分ける（100ms ごとに調整。[パフォーマンス](performance.md#接続の集約linux)）。`false` = 全ワーカーへ振り分ける |
 | `[performance]` | `huge_pages_enabled` | `false` | Huge Pagesを有効化 |
+| `[performance]` | `via_header_enabled` | `false` | 上流へ送る要求に `Via: <版> <via_header_hostname>`（RFC 9110 §7.6.3）を付ける。どのクライアントのプロトコル（WebSocket を含む）でも付く。`<版>` は veil が要求を受けたプロトコル（`1.1`・`2`・`3`）。応答は変えない |
+| `[performance]` | `via_header_hostname` | `"veil"` | `Via` に入れる名前（token か host[:port]。それ以外は起動エラー） |
 | `[performance]` | `keepalive_direct_read_ms` | `20` | io_uring・平文 HTTP/1.1 のキープアライブで、次の要求をこの時間だけ直接読みにいき、その後はバッファを持たずに待つ（`0` = 常に先に待つ。F-205） |
 | `[performance]` | `open_file_cache_enabled` | `false` | OpenFileCacheを有効化 |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | キャッシュ有効期間（秒） |
@@ -66,7 +68,7 @@
 | `[http2]` | `max_concurrent_streams` | `256` | 最大同時ストリーム数 |
 | `[http2]` | `initial_window_size` | `1048576` | ストリームウィンドウサイズ（1MB） |
 | `[http2]` | `max_frame_size` | `65536` | 最大フレームサイズ（64KB） |
-| `[http2]` | `max_header_list_size` | `65536` | 最大ヘッダーリストサイズ（64KB） |
+| `[http2]` | `max_header_list_size` | `65536` | 復号した要求のヘッダリストの大きさの上限（バイト）。`SETTINGS_MAX_HEADER_LIST_SIZE` として広告し、HPACK の復号（1 フィールドにつき 32 バイトを足す。RFC 7541 §4.1）で検査する。超えた接続は `COMPRESSION_ERROR` で閉じる。veil の要求ヘッダの上限（8KB または 64 フィールド）を超えてこれ以下の要求は 431。既定は `[http3] max_field_section_size` と同じ |
 | `[http2]` | `connection_window_size` | `1048576` | コネクションウィンドウ（1MB） |
 | `[http2]` | `max_rst_stream_per_second` | `100` | RST_STREAMレート制限 |
 | `[http2]` | `max_control_frames_per_second` | `500` | 制御フレームレート制限 |
@@ -93,7 +95,7 @@
 | `[http3]` | `retry_threshold` | `1000` | ワーカーでハンドシェイク中の接続がこの数に達したら、トークンの無い Initial にステートレスな Retry を返し、クライアントが送信元のアドレスを持つことを確かめてから接続を作る（1 往復増える）。`0` は常に Retry |
 | `[http3]` | `handshake_timeout` | `10000` | ハンドシェイクの期限（ミリ秒）。これまでに確立しない接続は捨てる（`max_idle_timeout` まで残さない） |
 | `[http3]` | `enable_connect_protocol` | `false` | `SETTINGS_ENABLE_CONNECT_PROTOCOL` を広告し、HTTP/3 の上の WebSocket（拡張 CONNECT。RFC 9220）を受ける |
-| `[http3]` | `max_field_section_size` | `65536` | 要求のヘッダの大きさの上限（バイト）。`SETTINGS_MAX_FIELD_SECTION_SIZE` として広告し、HEADERS フレームの長さの宣言の時点と QPACK の復号（1 フィールドにつき 32 バイトを足す。RFC 9114 §4.2.2）で検査する。超えた接続は閉じる。veil の要求ヘッダの上限（8KB）を超えてこれ以下の要求は 431。既定は `[http2] max_header_list_size` と同じ |
+| `[http3]` | `max_field_section_size` | `65536` | 要求のヘッダの大きさの上限（バイト）。`SETTINGS_MAX_FIELD_SECTION_SIZE` として広告し、HEADERS フレームの長さの宣言の時点と QPACK の復号（1 フィールドにつき 32 バイトを足す。RFC 9114 §4.2.2）で検査する。超えた接続は閉じる。veil の要求ヘッダの上限（8KB または 64 フィールド）を超えてこれ以下の要求は 431。既定は `[http2] max_header_list_size` と同じ |
 | `[http3]` | `recv_drain_max` | `1024` | **reactor バックエンド専用**（FreeBSD/OpenBSD/NetBSD/macOS、Linux の `--features epoll`）: 1 イテレーションあたりに掻き出す UDP データグラム数の上限（1..=4096）。大きくするほど 1 イテレーションあたりの固定費（select/タイマー往復 + 接続スイープ）を多くのデータグラムへ償却できる（F-151 でこの量だけで 3.2 倍の差を実測）が、drain 中は送信・タイムアウト・バックエンド通知が待たされるため p99 レイテンシとのトレードオフ。v0.8.0 より前の既定は 64。1024 で FreeBSD の HTTP/3 3B が 37% 伸びた（p99 は 11 → 14ms）。Linux 既定の io_uring バックエンドは `mmsg_batch_size` の RECVMSG パイプラインを使うため本キーを参照しない |
 | `[http3]` | `compression_enabled` | `false` | 圧縮を有効化 |
 | `[http3]` | `gso_gro_enabled` | `true` | GSO/GROを有効化（カーネルが GSO の送信を拒んだらそのソケットだけ自動で切る） |

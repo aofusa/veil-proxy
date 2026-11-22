@@ -1774,10 +1774,10 @@ pub struct PerformanceConfigSection {
     // ====================
     /// Viaヘッダーを追加するかどうか
     ///
-    /// RFC 7230 Section 5.7.1 に従い、プロキシ経由のリクエスト/レスポンスに
-    /// Via ヘッダーを追加します。
+    /// RFC 9110 §7.6.3 に従い、上流へ送る要求に Via ヘッダーを追加します（応答には付けない。
+    /// どのクライアントのプロトコルでも付く。B-484）。
     ///
-    /// 形式: Via: 1.1 `<hostname>`
+    /// 形式: Via: `<受けたプロトコルの版（1.1・2・3）>` `<hostname>`
     ///
     /// - true: Viaヘッダーを追加
     /// - false: Viaヘッダーを追加しない（デフォルト）
@@ -1787,7 +1787,7 @@ pub struct PerformanceConfigSection {
     /// Viaヘッダーに使用するホスト名
     ///
     /// via_header_enabled = true 時に使用します。
-    /// 未指定の場合はシステムホスト名または "veil" を使用します。
+    /// 未指定の場合は "veil" を使用します（token か host[:port]）。
     #[serde(default)]
     pub via_header_hostname: Option<String>,
 

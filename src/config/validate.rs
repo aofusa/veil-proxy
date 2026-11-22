@@ -249,6 +249,23 @@ pub(super) fn validate_config(config: &Config) -> io::Result<()> {
         ));
     }
 
+    // B-484: `Via` の received-by は token か host[:port]（RFC 9110 §7.6.3）。ヘッダの値に入るので、区切り・空白・
+    // 制御文字を入れさせない
+    if let Some(h) = &config.performance.via_header_hostname {
+        let ok = !h.is_empty()
+            && h.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~:[]".contains(&b));
+        if !ok {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "[performance] via_header_hostname: {h:?} must be a token or host[:port] \
+                     (letters, digits and !#$%&'*+-.^_`|~:[])"
+                ),
+            ));
+        }
+    }
+
     // F-220: SAN の許可リストはクライアント証明書を要求するときだけ意味がある（黙って無視しない）
     if !config.tls.client_allowed_sans.is_empty() && config.tls.client_auth == ClientAuthMode::None
     {

@@ -15,6 +15,9 @@ mod standalone;
 // B-266〜B-277・F-285〜F-287: プロトコル間の機能の差の回帰試験
 #[path = "standalone/parity_tests.rs"]
 mod parity_tests;
+// B-481〜B-488・F-312〜F-316: 機能 × プロトコルの網羅性の確認で見つけた差分の回帰試験
+#[path = "standalone/protocol_parity_tests.rs"]
+mod protocol_parity_tests;
 // feat/beat-nginx: 機能 × プロトコルのマトリックス（HTTP/1.1 平文・TLS・h2c・HTTP/2・HTTP/3）
 #[cfg(all(
     feature = "compression",

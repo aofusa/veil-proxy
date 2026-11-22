@@ -539,6 +539,9 @@ pub(crate) struct H2RequestCtx {
     pub(crate) protocol: Option<Bytes>,
     /// 疑似ヘッダー `:method`/`:path`/`:authority` を除いたヘッダー（`:scheme` 等の残余含む）。
     pub(crate) headers: Vec<crate::http2::hpack::HeaderField>,
+    /// 要求ヘッダの大きさ（復号した後の名前と値の合計。擬似ヘッダを含む）と、擬似ヘッダを除く数（B-482）
+    pub(crate) header_size: usize,
+    pub(crate) header_count: usize,
     /// 完了済みリクエストボディ（バッファ経路。ストリーミング経路では空）。
     pub(crate) body: Bytes,
     /// リクエストトレイラー（gRPC 等。通常のリクエストでは空、F-133）。wasm feature
@@ -724,6 +727,8 @@ pub(super) fn h2_spawn_for_request<S, V>(
         authority,
         protocol: parts.protocol,
         headers: parts.headers,
+        header_size: parts.header_size,
+        header_count: parts.header_count,
         body: parts.body.freeze(),
         #[cfg(feature = "wasm")]
         trailers: parts.trailers,
@@ -1142,8 +1147,8 @@ where
 
 /// リクエスト方向ストリーミングの適格判定（F-32 の条件を厳密に踏襲）。
 ///
-/// 条件: Proxy バックエンド + WASM モジュール非適用 + 非 gRPC + バッファリング非 Full +
-/// 上流 use_h2c 以外 + セキュリティ許可 + サーバー選択成功。conn は借用のみ（変更しない）。
+/// 条件: Proxy バックエンド + WASM モジュール非適用 + バッファリング非 Full（gRPC は除く）+
+/// セキュリティ許可 + gRPC なら全サーバが HTTP/2 の上流。上流は選ばない（B-481）。conn は借用のみ（変更しない）。
 /// 適格なら `Some(max_request_body)`（0 = 無制限）を返す。
 #[cfg(feature = "http2")]
 /// [`H2Service::streaming_plan`] の結果。
@@ -1177,6 +1182,30 @@ where
     let Some(stream) = conn.get_stream(stream_id) else {
         return H2StreamPlan::BUFFERED;
     };
+    // B-482: 要求ヘッダの大きさ・数（`take_request_parts` と同じ数え方）
+    let (header_size, header_count) =
+        stream
+            .request_headers
+            .iter()
+            .fold((0usize, 0usize), |(size, count), h| {
+                (
+                    size + h.name.len() + h.value.len(),
+                    count + usize::from(!h.name.starts_with(b":")),
+                )
+            });
+    // veil 全体の上限を超えた要求は、本文を待たずに要求のタスクが 431・414 で断る（溜める経路にしない）
+    if crate::l7::request_header_limit_status(
+        header_size,
+        header_count,
+        stream.path().map_or(0, |p| p.len()),
+    )
+    .is_some()
+    {
+        return H2StreamPlan {
+            streaming: Some(0),
+            body_timeout_secs: 0,
+        };
+    }
     let method = stream
         .method()
         .map(|m| m.to_vec())
@@ -1212,7 +1241,16 @@ where
     let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
     let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(&path[..]);
 
-    let backend_result = crate::l7::resolve_route(
+    // 設定は 1 回だけ読む（経路の解決にも渡す）
+    let config = CURRENT_CONFIG.load();
+    // B-483: 管理 API の要求（本文付きの `POST /__admin/reload` 等）は溜める経路へ回し、`h2_dispatch` が応える
+    // （ストリーミングの経路は管理 API を見ずに上流へ送る）
+    #[cfg(feature = "admin")]
+    if crate::proxy::is_admin_request(&config.admin_config, &method, &path) {
+        return H2StreamPlan::BUFFERED;
+    }
+    let backend_result = crate::l7::resolve_route_in(
+        &config,
         &authority,
         path_wo_query,
         &method,
@@ -1221,6 +1259,7 @@ where
         &client_socket_addr,
         false,
     );
+    drop(config);
 
     let Some((_prefix, backend, _rc)) = backend_result else {
         return H2StreamPlan::BUFFERED;
@@ -1239,7 +1278,8 @@ where
         // Wasm のあるルートはバッファ経路へ回し、そこで検査・Wasm を通す（Proxy の分岐と同じ）
         if !entry.streaming_request
             || modules.as_ref().is_some_and(|m| !m.is_empty())
-            || check_security(sec, client_ip, &method, 0, true) != SecurityCheckResult::Allowed
+            || check_security(sec, client_ip, &method, header_size, 0, true)
+                != SecurityCheckResult::Allowed
         {
             return buffered;
         }
@@ -1272,17 +1312,17 @@ where
     if buffering.mode == crate::buffering::BufferingMode::Full && !is_grpc {
         return buffered;
     }
-    if check_security(&security, client_ip, &method, 0, true) != SecurityCheckResult::Allowed {
+    if check_security(&security, client_ip, &method, header_size, 0, true)
+        != SecurityCheckResult::Allowed
+    {
         return buffered;
     }
-    let Some(server) = upstream_group.select(client_ip) else {
-        return buffered;
-    };
     // F-171: h2c 上流は多重化接続（F-174）のストリームで全二重に中継する。gRPC を HTTP/1.1
     // 上流へ送る構成は従来どおりバッファ経路（トレーラーを HTTP/1.1 で受けられない）。
-    let h2_upstream =
-        server.target.use_h2c || upstream_group.use_h2c() || server.target.h2_over_tls();
-    if is_grpc && !h2_upstream {
+    // B-481: 下見では上流を選ばない（選ぶとラウンドロビン・重み付けのカウンタが進み、`h2_serve_streaming` の選択と
+    // 合わせて 1 要求で 2 つ進んでいた。2 台なら全部が同じ上流へ行く）。gRPC は、どのサーバが選ばれても HTTP/2 で
+    // 中継するグループだけストリーミングにする（上流が 1 台も無いときは本番の選択が 502 を返す）
+    if is_grpc && !upstream_group.all_servers_h2() {
         return buffered;
     }
     H2StreamPlan {
@@ -1318,7 +1358,15 @@ pub(super) async fn h2_request_task(
         .map(|h| h.value.clone())
         .unwrap_or_default();
 
-    let (status, resp_size, req_size) = if ctx.protocol.is_some() {
+    let (status, resp_size, req_size) = if let Some(status) =
+        crate::l7::request_header_limit_status(ctx.header_size, ctx.header_count, ctx.path.len())
+    {
+        // B-482: veil 全体の要求ヘッダの上限（HTTP/1.1・HTTP/3 と同じ。トンネル・ストリーミングの要求も含む。
+        // 以前の HTTP/2 は 8 KB を見ず、デコーダの 16 KB を超えると接続ごと切っていた）
+        let msg = crate::l7::request_header_limit_message(status);
+        let (status, resp_size) = h2_emit_error(&resp_tx, &notify, status, msg).await;
+        (status, resp_size, 0)
+    } else if ctx.protocol.is_some() {
         // F-288: 拡張 CONNECT（WebSocket over HTTP/2）。通常の要求はこの分岐 1 つだけ
         h2_serve_tunnel(&ctx, req_rx, resp_tx, notify.clone()).await
     } else if let Some(rx) = req_rx {
@@ -1367,6 +1415,7 @@ async fn h2_serve_tunnel(
         path: ctx.path.clone(),
         authority: ctx.authority.clone(),
         protocol: ctx.protocol.clone().unwrap_or_default(),
+        header_size: ctx.header_size,
         #[cfg(feature = "wasm")]
         scheme: h2_wasm_scheme(&ctx.headers),
         headers: ctx
@@ -1641,7 +1690,7 @@ pub(super) async fn h2_dispatch(
     #[cfg(feature = "admin")]
     if config.admin_config.enabled {
         if let Some((status, headers, body)) =
-            h2_admin_response(method, path, client_ip, &headers_raw)
+            h2_admin_response(&config, method, path, client_ip, &headers_raw)
         {
             drop(config);
             return h2_emit_full(resp_tx, notify, status, headers, Bytes::from(body)).await;
@@ -1684,7 +1733,14 @@ pub(super) async fn h2_dispatch(
 
     // セキュリティチェック。
     let security = backend.security();
-    let check_result = check_security(security, client_ip, method, ctx.body.len(), false);
+    let check_result = check_security(
+        security,
+        client_ip,
+        method,
+        ctx.header_size,
+        ctx.body.len(),
+        false,
+    );
     if check_result != SecurityCheckResult::Allowed {
         let status = check_result.status_code();
         let msg = check_result.message();
@@ -1932,6 +1988,8 @@ pub(super) async fn h2_dispatch(
             authority: ctx.authority.clone(),
             protocol: ctx.protocol.clone(),
             headers,
+            header_size: ctx.header_size,
+            header_count: ctx.header_count,
             body: wasm_request_body_override.unwrap_or_else(|| ctx.body.clone()),
             trailers: ctx.trailers.clone(),
             client_ip: ctx.client_ip.clone(),
@@ -2385,6 +2443,7 @@ pub(super) async fn h2_proxy(
             client_ip,
             &ctx.authority,
             std::str::from_utf8(req_path).unwrap_or("/"),
+            ViaProto::Http2,
         );
         let headers_iter = ctx
             .headers
@@ -2467,6 +2526,7 @@ pub(super) async fn h2_proxy(
         client_ip,
         &ctx.authority,
         std::str::from_utf8(req_path).unwrap_or("/"),
+        ViaProto::Http2,
     );
     write_h1_forward_headers(
         &mut request,
@@ -3003,6 +3063,7 @@ pub(super) async fn h2_proxy_h2c(
         &ctx.client_ip,
         &ctx.authority,
         std::str::from_utf8(&ctx.path).unwrap_or("/"),
+        ViaProto::Http2,
     );
     let headers_iter = ctx
         .headers
@@ -4191,7 +4252,13 @@ pub(super) async fn h2_relay_h2_streaming(
     let path_str = std::str::from_utf8(&ctx.path).unwrap_or("/");
     let final_path = compute_upstream_path(path_str, prefix, &target.path_prefix, is_grpc);
     let addr = target.conn_addr();
-    let added = expanded_added_headers(security, &ctx.client_ip, &ctx.authority, path_str);
+    let added = expanded_added_headers(
+        security,
+        &ctx.client_ip,
+        &ctx.authority,
+        path_str,
+        ViaProto::Http2,
+    );
     let headers_iter = ctx
         .headers
         .iter()
@@ -4605,7 +4672,13 @@ pub(super) async fn h2_serve_streaming(
         request.extend_from_slice(port_buf.format(target.port).as_bytes());
     }
     request.extend_from_slice(b"\r\n");
-    let added = expanded_added_headers(&security, &ctx.client_ip, &ctx.authority, path_str);
+    let added = expanded_added_headers(
+        &security,
+        &ctx.client_ip,
+        &ctx.authority,
+        path_str,
+        ViaProto::Http2,
+    );
     write_h1_forward_headers(
         &mut request,
         ctx.headers
@@ -4764,20 +4837,15 @@ where
     (status, sent, req_size)
 }
 
-/// HTTP/2 管理 API（B-29）。conn 非依存で `(status, headers, body)` を返す。
+/// HTTP/2 管理 API（B-29）。conn 非依存で `(status, headers, body)` を返す（判定と本文は HTTP/3 と共有。B-483）。
 #[cfg(all(feature = "http2", feature = "admin"))]
 pub(super) fn h2_admin_response(
+    config: &crate::config::RuntimeConfig,
     method: &[u8],
     path: &[u8],
     client_ip: &str,
     headers_raw: &[(&[u8], &[u8])],
 ) -> Option<(u16, Vec<(Bytes, Bytes)>, Vec<u8>)> {
-    let config = CURRENT_CONFIG.load();
-    let admin_config = &config.admin_config;
-    if !admin_config.enabled {
-        return None;
-    }
-    let path_str = std::str::from_utf8(path).unwrap_or("/");
     let auth = headers_raw.iter().find_map(|(name, value)| {
         if name.eq_ignore_ascii_case(b"authorization") {
             std::str::from_utf8(value).ok()
@@ -4785,77 +4853,14 @@ pub(super) fn h2_admin_response(
             None
         }
     });
-
-    let is_purge_method = method == b"PURGE";
-    let is_admin_purge_path = path_str.starts_with(&admin_config.cache_purge_prefix);
-
-    if is_purge_method || is_admin_purge_path {
-        let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
-            (403, Vec::new())
-        } else if !admin_config.check_auth_from(client_ip, auth) {
-            (401, Vec::new())
-        } else {
-            let resp = handle_cache_purge(path_str, is_purge_method);
-            parse_http1_admin_response(&resp)
-        };
-        return Some((status, h2_base_headers(false), body));
-    }
-
-    if !path_str.starts_with(&admin_config.path_prefix)
-        || method == b"PURGE"
-        || path_str.starts_with(&admin_config.cache_purge_prefix)
-    {
-        return None;
-    }
-
-    let path_suffix = &path_str[admin_config.path_prefix.len()..];
-    let is_known_endpoint = matches!(
-        (method, path_suffix),
-        (b"GET", "/config")
-            | (b"GET", "/stats")
-            | (b"GET", "/vds")
-            | (b"POST", "/reload")
-            | (b"POST", "/tls/reload")
-    );
-    if !is_known_endpoint {
-        return None;
-    }
-
-    let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
-        (403, b"{\"error\":\"403\"}".to_vec())
-    } else if !admin_config.check_auth_from(client_ip, auth) {
-        (401, b"{\"error\":\"401\"}".to_vec())
-    } else {
-        match (method, path_suffix) {
-            (b"GET", "/config") => {
-                let json = build_admin_config_json(&config);
-                (200, json.into_bytes())
-            }
-            (b"GET", "/stats") => {
-                let uptime_secs = PROXY_START_TIME.elapsed().as_secs();
-                let json = format!("{{\"uptime_secs\":{}}}", uptime_secs);
-                (200, json.into_bytes())
-            }
-            (b"GET", "/vds") => (200, admin_vds_json().into_bytes()),
-            (b"POST", "/reload") => {
-                use std::sync::atomic::Ordering;
-                RELOAD_FLAG.store(true, Ordering::Relaxed);
-                (200, b"{\"ok\":true}".to_vec())
-            }
-            (b"POST", "/tls/reload") => {
-                use std::sync::atomic::Ordering;
-                TLS_RELOAD_FLAG.store(true, Ordering::Relaxed);
-                (200, b"{\"ok\":true}".to_vec())
-            }
-            _ => (404, Vec::new()),
-        }
-    };
-
+    let (status, json, body) = admin_response(config, method, path, client_ip, auth)?;
     let mut headers = h2_base_headers(false);
-    headers.push((
-        Bytes::from_static(b"content-type"),
-        Bytes::from_static(b"application/json"),
-    ));
+    if json {
+        headers.push((
+            Bytes::from_static(b"content-type"),
+            Bytes::from_static(b"application/json"),
+        ));
+    }
     Some((status, headers, body))
 }
 

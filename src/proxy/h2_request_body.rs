@@ -66,30 +66,6 @@ where
     Ok(())
 }
 
-/// HTTP/1.1 レスポンスバイト列からステータスコードとボディを抽出（管理 API Purge 用）
-#[cfg(all(feature = "http2", feature = "admin"))]
-pub(super) fn parse_http1_admin_response(resp: &[u8]) -> (u16, Vec<u8>) {
-    let status = if resp.starts_with(b"HTTP/1.1 200") {
-        200
-    } else if resp.starts_with(b"HTTP/1.1 401") {
-        401
-    } else if resp.starts_with(b"HTTP/1.1 403") {
-        403
-    } else if resp.starts_with(b"HTTP/1.1 503") {
-        503
-    } else if resp.starts_with(b"HTTP/1.1 501") {
-        501
-    } else {
-        400
-    };
-    let body = resp
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| resp[i + 4..].to_vec())
-        .unwrap_or_default();
-    (status, body)
-}
-
 /// HTTP/2 応答ヘッダーへ WASM レスポンスフィルタを適用（B-30）
 #[cfg(all(feature = "http2", feature = "wasm"))]
 pub(super) async fn apply_h2_wasm_response_headers(

@@ -1,6 +1,6 @@
 # B-485: WebSocket の上流の選択が Consistent Hash の `header:`・`cookie:` キーを見ない
 
-**状態: 未着手（2026-11-21 起票。機能 × プロトコルの網羅性の確認、feat/protocol-parity）**
+**状態: 修正済み（feat/protocol-parity。2026-11-21 起票・2026-11-22 修正。機能 × プロトコルの網羅性の確認）**
 
 ## 出典
 
@@ -19,6 +19,14 @@
 
 - WebSocket の 3 つの経路でも `select_with_header_fn` で選ぶ（HTTP/1.1 は upgrade の要求ヘッダ、拡張 CONNECT は
   ストリームのヘッダ。Wasm がヘッダを書き換えたらその後のヘッダ）。他のアルゴリズムはヘッダを走査しない（今と同じ）。
+
+## 対応（2026-11-22）
+
+- HTTP/1.1 の upgrade（`proxy/h1.rs`）と拡張 CONNECT（`proxy::ws_tunnel`。Wasm の後のヘッダ）で `select_with_header_fn`
+  を使うようにした。
+- `cookie:` キーは HTTP/2・HTTP/3 で分けて送られた cookie の 2 つ目以降のかけらを見ていなかった（B-489 で直した）。
+- 自己完結型 E2E: `b485_websocket_follows_consistent_hash_cookie`（12 個の Cookie で、HTTP/1.1 の GET・upgrade・h2c と
+  TLS の拡張 CONNECT が同じ上流へ行き、2 台とも使われる）。
 
 ## 受け入れ条件
 

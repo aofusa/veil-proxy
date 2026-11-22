@@ -239,7 +239,11 @@ where
         settings: Http2Settings,
         initial_data: Vec<u8>,
     ) -> Self {
-        let hpack_decoder = HpackDecoder::new(settings.header_table_size as usize);
+        let mut hpack_decoder = HpackDecoder::new(settings.header_table_size as usize);
+        // B-482: 復号したヘッダリストの上限は広告する SETTINGS_MAX_HEADER_LIST_SIZE（`[http2] max_header_list_size`）。
+        // 以前はデコーダの既定の 16 KB のままで、広告した 64 KB より手前で接続ごと COMPRESSION_ERROR にしていた
+        // （HTTP/3 は `max_field_section_size` まで受けて、veil の上限を超えた要求を 431 で断る）
+        hpack_decoder.set_max_header_list_size(settings.max_header_list_size as usize);
         let hpack_encoder = HpackEncoder::new(settings.header_table_size as usize);
         let frame_encoder = FrameEncoder::new(settings.max_frame_size);
         let frame_decoder = FrameDecoder::new(settings.max_frame_size);
@@ -1167,8 +1171,8 @@ where
 
         let header_block = stream.take_header_block();
         let mut headers = self.hpack_decoder.decode(&header_block).map_err(|e| {
-            // HPACKエラーを適切に処理
-            ftlog::warn!(
+            // HPACKエラーを適切に処理（相手が要求ごとに起こせるので debug!。B-235・B-482）
+            ftlog::debug!(
                 "[HTTP/2] HPACK decode error for stream {}: {}",
                 stream_id,
                 e
@@ -1199,6 +1203,11 @@ where
                     }
                 }
             }
+        }
+
+        // B-489: 分けて送られた cookie（RFC 9113 §8.2.3）を 1 つにつなぐ
+        if !is_trailer {
+            merge_cookie_crumbs(&mut headers);
         }
 
         let stream = self.streams.get(stream_id).unwrap();
@@ -2700,7 +2709,12 @@ where
         let mut authority = None;
         let mut protocol = None;
         let mut headers = Vec::with_capacity(all_headers.len());
+        // B-482: 要求ヘッダの大きさ（名前と値の合計。擬似ヘッダを含む。HTTP/3 と同じ数え方）と、擬似ヘッダを除く数
+        let mut header_size = 0usize;
+        let mut header_count = 0usize;
         for h in all_headers {
+            header_size += h.name.len() + h.value.len();
+            header_count += usize::from(!h.name.starts_with(b":"));
             match h.name.as_ref() {
                 b":method" => method = h.value,
                 b":path" => path = h.value,
@@ -2717,6 +2731,8 @@ where
             authority,
             protocol,
             headers,
+            header_size,
+            header_count,
             body,
             #[cfg(feature = "wasm")]
             trailers,
@@ -2781,6 +2797,48 @@ pub struct ProcessedRequest {
     pub body_pending: bool,
 }
 
+/// 分けて送られた `cookie` のフィールド（RFC 9113 §8.2.3 の crumb）を `"; "` でつないで 1 つにする（B-489）。
+///
+/// HTTP/1.1 の上流へ複数の `Cookie` 行で渡すと、1 行目しか読まない実装がある（RFC 6265 §5.4 は 1 行に限る）。
+/// ルートの条件・一貫性ハッシュの `cookie:` キー・Proxy-Wasm も 1 つ目のかけらしか見ていなかった。2 つ以上あるときだけ
+/// つなぐ（ブラウザはかけらに分けて送ることが多い）。名前は小文字であることを検査で確かめてある
+pub(crate) fn merge_cookie_crumbs(headers: &mut Vec<crate::http2::hpack::HeaderField>) {
+    let mut first = None;
+    let mut crumbs = 0usize;
+    let mut total = 0usize;
+    for (i, h) in headers.iter().enumerate() {
+        if h.name.as_ref() == b"cookie" {
+            first.get_or_insert(i);
+            crumbs += 1;
+            total += h.value.len();
+        }
+    }
+    let Some(first) = first else {
+        return;
+    };
+    if crumbs < 2 {
+        return;
+    }
+    let mut merged = bytes::BytesMut::with_capacity(total + 2 * (crumbs - 1));
+    for (n, h) in headers
+        .iter()
+        .filter(|h| h.name.as_ref() == b"cookie")
+        .enumerate()
+    {
+        if n > 0 {
+            merged.extend_from_slice(b"; ");
+        }
+        merged.extend_from_slice(&h.value);
+    }
+    headers[first].value = merged.freeze();
+    let mut i = 0usize;
+    headers.retain(|h| {
+        let keep = i == first || h.name.as_ref() != b"cookie";
+        i += 1;
+        keep
+    });
+}
+
 /// ストリームから所有権ごと取り出したリクエスト情報（F-116）。
 ///
 /// [`Http2Connection::take_request_parts`] が `Stream` の蓄積状態から `std::mem::take` で
@@ -2801,6 +2859,10 @@ pub struct H2RequestParts {
     /// 抽出済み疑似ヘッダー（`:method`/`:path`/`:authority`）以外のヘッダー一覧
     /// （`:scheme` 等の残余疑似ヘッダーを含む）。
     pub headers: Vec<crate::http2::hpack::HeaderField>,
+    /// 要求ヘッダの大きさ（復号した後の名前と値の合計。擬似ヘッダを含む。B-482）
+    pub header_size: usize,
+    /// 擬似ヘッダを除くフィールドの数（B-482）
+    pub header_count: usize,
     /// 蓄積済みリクエストボディ（`Stream::request_body` からの移動。
     /// `freeze()` でゼロコピーに `Bytes` 化できる）。
     pub body: bytes::BytesMut,
@@ -3882,5 +3944,30 @@ mod tests {
         assert_eq!(error_code, Http2ErrorCode::ProtocolError as u32);
         // GOAWAY 1 フレームだけで、SETTINGS 等は送らない（ハンドシェイクを続けない）。
         assert_eq!(out.len(), 9 + 8 + b"invalid connection preface".len());
+    }
+
+    /// B-489: 分けて送られた cookie は `"; "` でつないで最初の位置の 1 つにする（1 つだけ・無いときは触らない）
+    #[test]
+    fn cookie_crumbs_are_merged_into_one_field() {
+        use crate::http2::hpack::HeaderField;
+        let mut headers = vec![
+            HeaderField::new(&b":method"[..], &b"GET"[..]),
+            HeaderField::new(&b"cookie"[..], &b"a=1"[..]),
+            HeaderField::new(&b"accept"[..], &b"*/*"[..]),
+            HeaderField::new(&b"cookie"[..], &b"b=2"[..]),
+            HeaderField::new(&b"cookie"[..], &b"sid=x"[..]),
+        ];
+        merge_cookie_crumbs(&mut headers);
+        let names: Vec<&[u8]> = headers.iter().map(|h| h.name.as_ref()).collect();
+        assert_eq!(names, vec![&b":method"[..], b"cookie", b"accept"]);
+        assert_eq!(headers[1].value.as_ref(), b"a=1; b=2; sid=x");
+
+        let mut one = vec![HeaderField::new(&b"cookie"[..], &b"a=1"[..])];
+        merge_cookie_crumbs(&mut one);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].value.as_ref(), b"a=1");
+        let mut none = vec![HeaderField::new(&b"accept"[..], &b"*/*"[..])];
+        merge_cookie_crumbs(&mut none);
+        assert_eq!(none.len(), 1);
     }
 }

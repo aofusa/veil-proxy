@@ -589,6 +589,15 @@ pub(super) fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWit
         config.server.server_header_enabled,
         &config.server.server_header_value,
     );
+    // Via（B-484。上流への要求に付ける値を作っておき、要求ごとに設定を読まない）
+    crate::pool::init_via_header(
+        config.performance.via_header_enabled,
+        config
+            .performance
+            .via_header_hostname
+            .as_deref()
+            .unwrap_or("veil"),
+    );
 
     // Alt-Svc（HTTP/3 広告、F-94）— リロードでも同期。広告するポートは起動時に開いた HTTP/3 のリスナーのもの
     // （リスナーはリロードで開き直さない。F-260）
@@ -900,6 +909,15 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     init_server_header(
         config.server.server_header_enabled,
         &config.server.server_header_value,
+    );
+    // Via（B-484）
+    crate::pool::init_via_header(
+        config.performance.via_header_enabled,
+        config
+            .performance
+            .via_header_hostname
+            .as_deref()
+            .unwrap_or("veil"),
     );
 
     // Alt-Svc（HTTP/3 広告、F-94）

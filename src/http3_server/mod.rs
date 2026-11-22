@@ -72,7 +72,6 @@ use crate::metrics::{
     encode_prometheus_metrics, http3_stream_closed, http3_stream_opened, http3_streams_closed_n,
     Http3ActiveConnGuard,
 };
-use crate::pool::MAX_HEADER_SIZE;
 use crate::proxy::{check_security, SecurityCheckResult};
 
 // F-233: 機能ごとのファイル（子モジュールは `use super::*;` で親の名前を見る）
@@ -86,15 +85,52 @@ pub use self::upstream::*;
 mod event_loop;
 pub use self::event_loop::*;
 
-/// HTTP/3 リクエストヘッダブロックの近似サイズ（name + value の合計）。
+/// HTTP/3 リクエストヘッダブロックの近似サイズ（name + value の合計）と、擬似ヘッダを除くフィールドの数（B-482）。
 ///
-/// H1 のワイヤ上ヘッダサイズ制限（`MAX_HEADER_SIZE`）と同等の DoS 防御に使う。
+/// H1 のワイヤ上ヘッダサイズ制限（`MAX_HEADER_SIZE`）・フィールド数の上限（`MAX_HEADER_COUNT`）と同等の DoS 防御に使う。
 /// QPACK 展開後の論理サイズで判定する（圧縮効率に依存しない）。
-fn h3_request_header_block_size(headers: &[h3::Header]) -> usize {
-    headers
-        .iter()
-        .map(|h| h.name().len().saturating_add(h.value().len()))
-        .sum()
+fn h3_request_header_section(headers: &[h3::Header]) -> (usize, usize) {
+    headers.iter().fold((0usize, 0usize), |(size, count), h| {
+        (
+            size.saturating_add(h.name().len().saturating_add(h.value().len())),
+            count + usize::from(!h.name().starts_with(b":")),
+        )
+    })
+}
+
+/// 分けて送られた `cookie` のフィールドを `"; "` でつないで最初の位置の 1 つにする（RFC 9114 §4.2.1。B-489。
+/// HTTP/2 の `merge_cookie_crumbs` と同じ）。2 つ以上あるときだけ作り直す。名前は小文字であることを検査で確かめてある
+fn h3_merge_cookie_crumbs(list: &mut Vec<h3::Header>) {
+    let mut first = None;
+    let mut crumbs = 0usize;
+    let mut total = 0usize;
+    for (i, h) in list.iter().enumerate() {
+        if h.name() == b"cookie" {
+            first.get_or_insert(i);
+            crumbs += 1;
+            total += h.value().len();
+        }
+    }
+    let Some(first) = first else {
+        return;
+    };
+    if crumbs < 2 {
+        return;
+    }
+    let mut merged = Vec::with_capacity(total + 2 * (crumbs - 1));
+    for (n, h) in list.iter().filter(|h| h.name() == b"cookie").enumerate() {
+        if n > 0 {
+            merged.extend_from_slice(b"; ");
+        }
+        merged.extend_from_slice(h.value());
+    }
+    list[first] = h3::Header::new(b"cookie", &merged);
+    let mut i = 0usize;
+    list.retain(|h| {
+        let keep = i == first || h.name() != b"cookie";
+        i += 1;
+        keep
+    });
 }
 
 /// HTTP/3 の H3_MESSAGE_ERROR（RFC 9114 §8.1）。
@@ -1253,6 +1289,8 @@ impl Http3Handler {
                                             }
                                         }
                                     }
+                                    // B-489: 分けて送られた cookie（RFC 9114 §4.2.1）を 1 つにつなぐ
+                                    h3_merge_cookie_crumbs(&mut list);
                                     new_headers.push((stream_id, list, more_frames));
                                 }
                             }
@@ -1620,6 +1658,33 @@ impl Http3Handler {
 
         // F-101: H1 と同等のリクエストヘッダサイズ上限（RFC 6585 / 431）。
         // 巨大 QPACK 展開ヘッダによるメモリ枯渇をストリーム処理前に拒否する。
+        // B-482: フィールドの数（64）も見て、トンネル（拡張 CONNECT）の前に置く（以前はトンネルが検査の前に抜けていた）
+        let (header_block, header_count) = h3_request_header_section(headers);
+        if let Some(status) =
+            crate::l7::request_header_limit_status(header_block, header_count, path.len())
+        {
+            // 相手が要求ごとに起こせるので debug!（B-235）
+            debug!(
+                "[HTTP/3] request headers over the limit: {} bytes, {} fields (status {})",
+                header_block, header_count, status
+            );
+            let msg = crate::l7::request_header_limit_message(status);
+            let _ = self.send_error_response(stream_id, status, msg);
+            log_access(
+                method,
+                authority,
+                path,
+                user_agent,
+                content_length as u64,
+                status,
+                msg.len() as u64,
+                Instant::now(),
+                self.client_ip.as_str(),
+                "",
+            );
+            return Decision::Handled;
+        }
+
         // B-308: `:protocol` の無い CONNECT（トンネル）は扱わない（以前は `:path` が無いので `/` として上流へ転送され得た）
         if method == b"CONNECT" {
             // F-288: 拡張 CONNECT（RFC 9220）はトンネルの中継のタスクへ（メインループでは待たない。B-97）
@@ -1628,6 +1693,7 @@ impl Http3Handler {
                     path: Bytes::copy_from_slice(path),
                     authority: Bytes::copy_from_slice(authority),
                     protocol: Bytes::copy_from_slice(protocol),
+                    header_size: header_block,
                     #[cfg(feature = "wasm")]
                     scheme: "https",
                     headers: headers
@@ -1665,34 +1731,6 @@ impl Http3Handler {
             return Decision::Handled;
         }
 
-        let header_block = h3_request_header_block_size(headers);
-        if header_block > MAX_HEADER_SIZE {
-            warn!(
-                "[HTTP/3] request header block too large: {} bytes (limit {})",
-                header_block, MAX_HEADER_SIZE
-            );
-            let path_too_long = path.len() > MAX_HEADER_SIZE;
-            let (status, msg): (u16, &[u8]) = if path_too_long {
-                (414, b"URI Too Long")
-            } else {
-                (431, b"Request Header Fields Too Large")
-            };
-            let _ = self.send_error_response(stream_id, status, msg);
-            log_access(
-                method,
-                authority,
-                path,
-                user_agent,
-                content_length as u64,
-                status,
-                msg.len() as u64,
-                Instant::now(),
-                self.client_ip.as_str(),
-                "",
-            );
-            return Decision::Handled;
-        }
-
         let config = CURRENT_CONFIG.load();
 
         // メトリクスエンドポイントはバッファ経路（handle_request が配信、GET・ボディなし）。
@@ -1706,6 +1744,13 @@ impl Http3Handler {
                     }
                 }
             }
+        }
+
+        // B-483: 管理 API（`/__admin/*`）・キャッシュの PURGE はバッファ経路（`handle_request` が経路の解決の前に応える。
+        // HTTP/1.1・HTTP/2 と同じ。以前は普通のルートへ流れ、管理のトークンごと上流へ送られ得た）
+        #[cfg(feature = "admin")]
+        if crate::proxy::is_admin_request(&config.admin_config, method, path) {
+            return Decision::Buffer;
         }
 
         // --- ルーティング ---
@@ -1749,7 +1794,14 @@ impl Http3Handler {
             }
             let security = backend.security();
             // F-266: ストリーミング受信のハンドラは本文の大きさを見ない（HTTP/2 と同じ）
-            let check = check_security(security, self.client_ip.as_str(), method, 0, false);
+            let check = check_security(
+                security,
+                self.client_ip.as_str(),
+                method,
+                header_block,
+                0,
+                false,
+            );
             if check != SecurityCheckResult::Allowed {
                 let status = check.status_code();
                 let msg = check.message();
@@ -1843,6 +1895,7 @@ impl Http3Handler {
             security,
             self.client_ip.as_str(),
             method,
+            header_block,
             content_length,
             false,
         );
@@ -1863,6 +1916,17 @@ impl Http3Handler {
                 "",
             );
             return Decision::Handled;
+        }
+
+        // B-481: 上流を選んだ後でバッファ経路へ回すと、バッファ経路がもう一度選んでラウンドロビン・重み付けのカウンタが
+        // 1 要求で 2 つ進む。選ぶ前に分かる分はここで決める（gRPC を HTTP/1.1 の上流へ送る構成・http2 feature の無い
+        // ビルドの h2c の上流）
+        if is_grpc && !upstream_group.all_servers_h2() {
+            return Decision::Buffer;
+        }
+        #[cfg(not(feature = "http2"))]
+        if upstream_group.use_h2c() || upstream_group.servers.iter().any(|s| s.target.use_h2c) {
+            return Decision::Buffer;
         }
 
         // サーバ選択（F-97: Consistent Hash header/cookie キー対応）。
@@ -1897,7 +1961,8 @@ impl Http3Handler {
         };
         #[cfg(not(feature = "http2"))]
         let h2_tls = false;
-        // gRPC を HTTP/1.1 上流へ送る構成はバッファ経路（従来どおり）。
+        // gRPC を HTTP/1.1 上流へ送る構成はバッファ経路（従来どおり）。B-481 の後にここへ来るのは、HTTPS の上流が
+        // HTTP/1.1 しか話さないと分かったときだけ（バッファ経路が選び直す）
         if is_grpc && !h2_upstream && !h2_tls {
             return Decision::Buffer;
         }
@@ -1912,6 +1977,7 @@ impl Http3Handler {
             self.client_ip.as_str(),
             authority,
             std::str::from_utf8(path).unwrap_or("/"),
+            crate::pool::ViaProto::Http3,
         );
         #[cfg(feature = "http2")]
         let h2 = (h2_upstream || h2_tls).then(|| {
@@ -3470,17 +3536,19 @@ mod tests {
         assert!(pr.written >= pr.body.len(), "全量送出で完了判定");
     }
 
-    /// F-101: ヘッダブロックサイズ合計が MAX_HEADER_SIZE 判定に使えること
+    /// F-101: ヘッダブロックサイズ合計が MAX_HEADER_SIZE 判定に使えること（B-482: 擬似ヘッダを除く数も）
     #[test]
     fn test_h3_request_header_block_size() {
+        use crate::pool::MAX_HEADER_SIZE;
         let small = vec![
             h3::Header::new(b":method", b"GET"),
             h3::Header::new(b":path", b"/"),
             h3::Header::new(b":authority", b"localhost"),
             h3::Header::new(b":scheme", b"https"),
         ];
-        let small_sz = h3_request_header_block_size(&small);
+        let (small_sz, small_count) = h3_request_header_section(&small);
         assert!(small_sz < MAX_HEADER_SIZE);
+        assert_eq!(small_count, 0);
         assert_eq!(
             small_sz,
             b":method".len()
@@ -3501,7 +3569,26 @@ mod tests {
             h3::Header::new(b":scheme", b"https"),
             h3::Header::new(b"x-huge", &big_val),
         ];
-        assert!(h3_request_header_block_size(&big) > MAX_HEADER_SIZE);
+        assert_eq!(h3_request_header_section(&big).1, 1);
+        assert!(h3_request_header_section(&big).0 > MAX_HEADER_SIZE);
+    }
+
+    /// B-489: 分けて送られた cookie は `"; "` でつないで最初の位置の 1 つにする
+    #[test]
+    fn h3_cookie_crumbs_are_merged_into_one_field() {
+        let mut list = vec![
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b"cookie", b"a=1"),
+            h3::Header::new(b"accept", b"*/*"),
+            h3::Header::new(b"cookie", b"sid=x"),
+        ];
+        h3_merge_cookie_crumbs(&mut list);
+        let names: Vec<&[u8]> = list.iter().map(|h| h.name()).collect();
+        assert_eq!(names, vec![&b":method"[..], b"cookie", b"accept"]);
+        assert_eq!(list[1].value(), b"a=1; sid=x");
+        let mut one = vec![h3::Header::new(b"cookie", b"a=1")];
+        h3_merge_cookie_crumbs(&mut one);
+        assert_eq!(one[0].value(), b"a=1");
     }
 
     /// B-18: GSO バッチの flush 判定。

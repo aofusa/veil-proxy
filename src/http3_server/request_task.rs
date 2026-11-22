@@ -607,23 +607,6 @@ impl H3BufferedTask {
             crate::wasm_plugin_config::WasmModules,
         >,
     ) -> io::Result<()> {
-        // F-101: バッファ経路でもヘッダサイズ上限を enforce（classify を経由しないケース）
-        let header_block = h3_request_header_block_size(headers);
-        if header_block > MAX_HEADER_SIZE {
-            let path_len = headers
-                .iter()
-                .find(|h| h.name() == b":path")
-                .map(|h| h.value().len())
-                .unwrap_or(0);
-            if path_len > MAX_HEADER_SIZE {
-                self.send_error_response(414, b"URI Too Long").await?;
-            } else {
-                self.send_error_response(431, b"Request Header Fields Too Large")
-                    .await?;
-            }
-            return Ok(());
-        }
-
         // ヘッダーを解析（`headers` を借用するだけで、リクエストごとに `Vec` へコピーしない）
         let mut method: Option<&[u8]> = None;
         let mut path: Option<&[u8]> = None;
@@ -661,6 +644,16 @@ impl H3BufferedTask {
         let path: &[u8] = path.unwrap_or(b"/");
         let authority: &[u8] = authority.unwrap_or_default();
         self.head_req = method == b"HEAD";
+
+        // F-101: バッファ経路でもヘッダサイズ上限を enforce（classify を経由しないケース。B-482: フィールドの数も）
+        let (header_block, header_count) = h3_request_header_section(headers);
+        if let Some(status) =
+            crate::l7::request_header_limit_status(header_block, header_count, path.len())
+        {
+            self.send_error_response(status, crate::l7::request_header_limit_message(status))
+                .await?;
+            return Ok(());
+        }
 
         // 処理開始時刻（アクセスログ・メトリクスが無効なら時刻を読まない）
         let start_time = crate::logging::request_start_instant();
@@ -782,6 +775,42 @@ impl H3BufferedTask {
         // バックエンド選択（統合ルーティング）
         let config = CURRENT_CONFIG.load();
 
+        // B-483: 管理 API（`/__admin/*`）とキャッシュの PURGE。HTTP/1.1・HTTP/2 と同じく経路の解決の前に受ける
+        // （以前は普通のルートへ流れ、`Authorization` ごと上流へ送られ得た）
+        #[cfg(feature = "admin")]
+        if crate::proxy::is_admin_request(&config.admin_config, method, path) {
+            let auth = headers
+                .iter()
+                .find(|h| h.name().eq_ignore_ascii_case(b"authorization"))
+                .and_then(|h| std::str::from_utf8(h.value()).ok());
+            if let Some((status, json, body)) =
+                crate::proxy::admin_response(&config, method, path, self.client_ip.as_str(), auth)
+            {
+                drop(config);
+                let body_len = body.len() as u64;
+                let hdrs: &[(&[u8], &[u8])] = if json {
+                    &[(b"content-type", b"application/json")]
+                } else {
+                    &[]
+                };
+                self.send_response(status, hdrs, Some(Bytes::from(body)))
+                    .await?;
+                log_access(
+                    method,
+                    authority,
+                    path,
+                    user_agent,
+                    request_body.len() as u64,
+                    status,
+                    body_len,
+                    start_time,
+                    self.client_ip.as_str(),
+                    "",
+                );
+                return Ok(());
+            }
+        }
+
         // ヘッダーをゼロコピーのバイト列スライスとして参照（HashMap 不要）
         let headers_raw: Vec<(&[u8], &[u8])> = headers
             .iter()
@@ -893,6 +922,7 @@ impl H3BufferedTask {
             security,
             self.client_ip.as_str(),
             method,
+            header_block,
             content_length.max(request_body.len()),
             false,
         );
@@ -1394,6 +1424,7 @@ impl H3BufferedTask {
             self.client_ip.as_str(),
             authority,
             path_str,
+            crate::pool::ViaProto::Http3,
         );
         header_pairs.retain(|(n, _)| crate::proxy::forward_allowed(security, n) && added.keeps(n));
         header_pairs.extend(added.iter().map(|(n, v)| (n.to_vec(), v.to_vec())));

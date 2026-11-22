@@ -458,6 +458,7 @@ pub(super) async fn handle_proxy(
             client_ip,
             host_str.as_bytes(),
             std::str::from_utf8(req_path).unwrap_or("/"),
+            ViaProto::Http11,
         );
         match proxy_h1_via_https_h2(
             client_stream,
@@ -561,6 +562,7 @@ pub(super) async fn handle_proxy(
                     client_ip,
                     host_str.as_bytes(),
                     std::str::from_utf8(req_path).unwrap_or("/"),
+                    ViaProto::Http11,
                 );
                 proxy_h2c(
                     client_stream,
@@ -1815,21 +1817,11 @@ pub(crate) fn write_upstream_request_headers(
         }
     }
 
-    // Via ヘッダー追加 (RFC 7230 Section 5.7.1)
-    // プロキシ経由のリクエストに Via ヘッダーを追加
-    {
-        let config = CURRENT_CONFIG.load();
-        if config.performance.via_header_enabled {
-            let hostname = config
-                .performance
-                .via_header_hostname
-                .as_deref()
-                .unwrap_or("veil");
-            // Via: 1.1 <hostname>
-            request.extend_from_slice(b"Via: 1.1 ");
-            request.extend_from_slice(hostname.as_bytes());
-            request.extend_from_slice(HEADER_CRLF);
-        }
+    // Via ヘッダー追加（RFC 9110 §7.6.3）。B-484: 値は設定のロード時に作ったもの（以前は要求ごとに設定を読んだ）
+    if let Some(via) = crate::pool::via_header_value(ViaProto::Http11) {
+        request.extend_from_slice(b"Via: ");
+        request.extend_from_slice(&via);
+        request.extend_from_slice(HEADER_CRLF);
     }
 }
 

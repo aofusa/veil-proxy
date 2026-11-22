@@ -236,14 +236,13 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
             return (ProtocolType::TLS, Vec::new());
         }
 
-        let methods: [&[u8]; 9] = [
-            b"GET ", b"POST", b"PUT ", b"DELE", b"HEAD", b"OPTI", b"CONN", b"TRAC", b"PATC",
-        ];
-        for method in &methods {
-            if data.starts_with(method) {
-                debug!("[Protocol Detection] HTTP/1.1 detected");
-                return (ProtocolType::Http11, Vec::new());
-            }
+        // HTTP/1.1 の要求行: メソッド（トークン。RFC 9110 §9.1）の後に SP。覗いた範囲がメソッドの途中で切れている
+        // （長い拡張メソッド）ときも HTTP/1.1 とする。h2c のプリフェースの途中（`PRI * HTTP/2.0` の手前で止まった）は
+        // 含めない。B-490: 以前は 9 つのメソッドの先頭 4 バイトだけを見て、拡張メソッド（WebDAV の `PROPFIND`・
+        // 管理 API の `PURGE` 等）の接続を閉じていた（HTTP/2・HTTP/3 は受ける）
+        if looks_like_http1_request_line(data) && !PREFACE.starts_with(data) {
+            debug!("[Protocol Detection] HTTP/1.1 detected");
+            return (ProtocolType::Http11, Vec::new());
         }
     }
 
@@ -253,6 +252,12 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
     );
 
     (ProtocolType::Unknown, Vec::new())
+}
+
+/// 覗いたバイト列が HTTP/1.1 の要求行の始まり（メソッドのトークン + SP、またはトークンだけで切れている）か（B-490）
+fn looks_like_http1_request_line(data: &[u8]) -> bool {
+    let method_len = data.iter().position(|&b| b == b' ').unwrap_or(data.len());
+    crate::http_utils::is_valid_header_name(&data[..method_len])
 }
 
 /// h2c 専用リスナーで HTTP/2 プリフェース以外を受けた接続を閉じる（エラー経路のみ）。
@@ -464,4 +469,30 @@ pub async fn handle_connection(
 
     // HTTP/1.1 ハンドラー
     handle_requests(tls_stream, client_ip.as_str(), peer_addr).await;
+}
+
+#[cfg(test)]
+mod request_line_tests {
+    use super::looks_like_http1_request_line;
+
+    /// B-490: 拡張メソッドの要求行も HTTP/1.1 と判別する（TLS・空白始まり・トークンでないものは外す）
+    #[test]
+    fn extension_methods_are_detected_as_http1() {
+        for d in [
+            &b"GET / HTTP/1.1"[..],
+            b"PROPFIND /dav HTTP/1.1",
+            b"PURGE /page",
+            b"MKCALENDA",
+        ] {
+            assert!(looks_like_http1_request_line(d), "{d:?}");
+        }
+        for d in [
+            &b"\x16\x03\x01\x02\x00"[..],
+            b" GET / HTTP/1.1",
+            b"G\x00T / HTTP/1.1",
+            b"{\"a\":1}",
+        ] {
+            assert!(!looks_like_http1_request_line(d), "{d:?}");
+        }
+    }
 }

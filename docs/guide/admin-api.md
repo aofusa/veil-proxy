@@ -6,6 +6,8 @@
 
 The admin API exposes runtime management endpoints under a configurable prefix (default: `/__admin`). All endpoints require IP filtering and Bearer token authentication (see [Cache Purge Administration API](#cache-purge-administration-api) for configuration).
 
+The endpoints and the `PURGE` method are answered the same way on HTTP/1.1, HTTP/2 (TLS and h2c) and HTTP/3, before route matching, so an admin request never reaches an upstream. A path under the prefix that is not one of the endpoints below goes to the routes as usual.
+
 ### Endpoints
 
 | Method | Path | Description |

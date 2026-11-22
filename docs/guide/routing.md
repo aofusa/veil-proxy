@@ -840,11 +840,11 @@ Add a `security` subsection to each route for fine-grained security settings.
 |----------|--------|-------------|---------|
 | Size Limits | `max_request_body_size` | Maximum request body size (bytes) | 10MB |
 | | `max_chunked_body_size` | Maximum cumulative size for chunked transfer | 10MB |
-| | `max_request_header_size` | Maximum request header size | 8KB |
+| | `max_request_header_size` | Maximum request header size for the route (bytes). A larger request gets `431` on HTTP/1.1, HTTP/2 and HTTP/3. HTTP/1.1 counts the bytes from the request line to the empty line; HTTP/2 and HTTP/3 count the field names and values after decoding (pseudo-headers included). veil's own limit (8 KB and 64 header fields; a `:path` over 8 KB gets `414`) applies to every request first, so a value above 8 KB has no effect | 8KB |
 | Timeouts | `client_header_timeout_secs` | Not used: the route is not known until the request headers have arrived, so this key cannot apply. It is accepted for compatibility and logs a warning at start-up | none |
 | | `client_body_timeout_secs` | How long the request body may stop arriving before the request is aborted (until the response starts). HTTP/1.1 returns `408`; HTTP/2 resets the stream with `RST_STREAM(CANCEL)`; HTTP/3 resets it with `H3_REQUEST_CANCELLED`. Applies to streamed uploads, buffered bodies and gRPC client streaming | 30s |
 | | `backend_connect_timeout_secs` | Backend connection timeout | 10s |
-| Access Control | `allowed_methods` | Allowed HTTP methods (array) | all allowed |
+| Access Control | `allowed_methods` | Allowed HTTP methods (array). Without it, HTTP/1.1, HTTP/2 and HTTP/3 accept any method that is a token (RFC 9110 §9.1), including extension methods such as WebDAV's `PROPFIND`; a method that is not a token gets `400` | all allowed |
 | | `rate_limit_requests_per_min` | Request limit per minute **per client IP and route, shared by all workers** (B-31: sliding window over a process-wide 65,536-slot atomic table; requests to one route do not consume another route's limit, and all `[route.traffic] split` targets of a route share its limit; keys that hash to the same slot share a count, which can only make the limit stricter) | 0 (unlimited) |
 | | `allowed_ips` | Allowed IP/CIDR (array) | all allowed |
 | | `denied_ips` | Denied IP/CIDR (array, takes priority) | none |

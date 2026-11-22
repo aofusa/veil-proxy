@@ -31,6 +31,8 @@ pub(crate) struct TunnelRequest {
     pub(crate) authority: Bytes,
     /// `:protocol`
     pub(crate) protocol: Bytes,
+    /// 要求ヘッダの大きさ（復号した後の名前と値の合計。擬似ヘッダを含む。ルートの `max_request_header_size`。B-482）
+    pub(crate) header_size: usize,
     /// `:scheme`（`http` か `https`。Proxy-Wasm のゲストに見せる）
     #[cfg(feature = "wasm")]
     pub(crate) scheme: &'static str,
@@ -63,6 +65,16 @@ pub(crate) enum TunnelOut {
 }
 
 impl TunnelOut {
+    /// 要求を受けたプロトコル（上流への要求の `Via`。B-484）
+    fn via_proto(&self) -> ViaProto {
+        match self {
+            #[cfg(feature = "http2")]
+            TunnelOut::H2 { .. } => ViaProto::Http2,
+            #[cfg(feature = "http3")]
+            TunnelOut::H3 { .. } => ViaProto::Http3,
+        }
+    }
+
     /// メトリクスのラベル（`veil_proxy_websocket_tunnels{protocol}`）
     fn protocol_label(&self) -> &'static str {
         match self {
@@ -255,7 +267,7 @@ pub(crate) async fn serve(
     // ハンドラのルート（F-262 の WebSocket ハンドラを HTTP/2・HTTP/3 のストリームの上で動かす）
     #[cfg(feature = "handler")]
     if let Backend::Handler(entry, security, modules, comp) = &backend {
-        let check = check_security(security, &req.client_ip, b"GET", 0, false);
+        let check = check_security(security, &req.client_ip, b"GET", req.header_size, 0, false);
         if check != SecurityCheckResult::Allowed {
             let r = out.error(check.status_code(), check.message()).await;
             return (r.0, r.1, 0);
@@ -302,7 +314,7 @@ pub(crate) async fn serve(
             .await;
         return (r.0, r.1, 0);
     }
-    let check = check_security(security, &req.client_ip, b"GET", 0, false);
+    let check = check_security(security, &req.client_ip, b"GET", req.header_size, 0, false);
     if check != SecurityCheckResult::Allowed {
         let r = out.error(check.status_code(), check.message()).await;
         return (r.0, r.1, 0);
@@ -321,7 +333,13 @@ pub(crate) async fn serve(
     #[cfg(not(feature = "wasm"))]
     let headers: &[(Bytes, Bytes)] = &req.headers;
 
-    let Some(server) = upstream_group.select(&req.client_ip) else {
+    // B-485: Consistent Hash の `header:`・`cookie:` キーも HTTP の要求と同じに見る（Wasm が書き換えた後のヘッダ）
+    let Some(server) = upstream_group.select_with_header_fn(&req.client_ip, |name| {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_ref())
+    }) else {
         crate::metrics::record_upstream_connect_error(
             crate::metrics::UpstreamConnectError::NoHealthy,
         );
@@ -651,7 +669,13 @@ async fn handshake_and_relay<B: RelayIo>(
     };
     let path_str = std::str::from_utf8(&req.path).unwrap_or("/");
     let final_path = ws_upstream_path(target, path_str, prefix);
-    let added = expanded_added_headers(security, &req.client_ip, &req.authority, path_str);
+    let added = expanded_added_headers(
+        security,
+        &req.client_ip,
+        &req.authority,
+        path_str,
+        out.via_proto(),
+    );
     let request = build_upgrade_request(target, &final_path, &key, headers, security, &added);
 
     let (write_res, returned) = match timeout(WRITE_TIMEOUT, backend.write_all(request)).await {
@@ -1057,7 +1081,13 @@ mod tests {
             ),
         ];
         let security = SecurityConfig::default();
-        let added = expanded_added_headers(&security, "127.0.0.1", b"a.example", "/ws/x");
+        let added = expanded_added_headers(
+            &security,
+            "127.0.0.1",
+            b"a.example",
+            "/ws/x",
+            ViaProto::Http11,
+        );
         let r = build_upgrade_request(&target, "/x", b"KEY", &headers, &security, &added);
         let s = String::from_utf8(r).unwrap();
         assert!(
