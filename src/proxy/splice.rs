@@ -580,7 +580,8 @@ pub(super) async fn splice_transfer_response_ktls(
                     }
                 }
                 ResponseBody::UntilClose => {
-                    // 接続クローズまで読み取り（Keep-Alive 不可）
+                    // 接続クローズまで読み取り（Keep-Alive 不可）。上流が閉じた（EOF）ときだけ本文の終わり
+                    let mut ended = false;
                     loop {
                         // B-17: 無応答の上流で永久待機しないよう READ_TIMEOUT で打ち切る
                         let n = match timeout(
@@ -590,6 +591,10 @@ pub(super) async fn splice_transfer_response_ktls(
                         .await
                         {
                             Ok(Ok(n)) if n > 0 => n,
+                            Ok(Ok(_)) => {
+                                ended = true;
+                                break;
+                            }
                             _ => break,
                         };
                         if (timed_raw_write(client_tcp, &header_buf[..n]).await).is_err() {
@@ -597,11 +602,19 @@ pub(super) async fn splice_transfer_response_ktls(
                         }
                         total += n as u64;
                     }
+                    // F-284: 読み取りの誤り・タイムアウトで止まった本文は close_notify を送らずに閉じる
+                    if !ended {
+                        client_stream.skip_close_notify();
+                    }
                     // 接続クローズが終端のためクライアント側もクローズが必要
                     return (status_code, total, false, true);
                 }
             }
 
+            // F-284: 区切りどおりに終わらなかった本文の後は close_notify を送らずに閉じる
+            if !complete {
+                client_stream.skip_close_notify();
+            }
             // B-244: 本文を区切りどおりに読み切った接続だけを戻す
             return (
                 status_code,

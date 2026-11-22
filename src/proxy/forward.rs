@@ -1380,6 +1380,7 @@ pub(super) async fn proxy_h1_via_https_h2(
             Ok(None) => break,
             Ok(Some(UpResp::Data(b))) => {
                 if declared.is_some_and(|n| sent + b.len() as u64 > n) {
+                    client_stream.skip_close_notify();
                     return H1ViaH2::Done(Some((client_stream, status, sent, true)));
                 }
                 sent += b.len() as u64;
@@ -1404,13 +1405,15 @@ pub(super) async fn proxy_h1_via_https_h2(
             }
             Ok(Some(UpResp::Trailers(t))) => trailers = Some(t),
             Ok(Some(UpResp::Head { .. })) => {}
-            // 本文の途中で上流が失敗: 切り詰めた本文を正常終了に見せないよう接続を閉じる。
+            // 本文の途中で上流が失敗: 切り詰めた本文を正常終了に見せないよう接続を閉じる（close_notify も送らない。F-284）。
             Ok(Some(UpResp::Reset { .. })) | Err(_) => {
+                client_stream.skip_close_notify();
                 return H1ViaH2::Done(Some((client_stream, status, sent, true)));
             }
         }
     }
     if declared.is_some_and(|n| sent != n) {
+        client_stream.skip_close_notify();
         return H1ViaH2::Done(Some((client_stream, status, sent, true)));
     }
     if chunked {

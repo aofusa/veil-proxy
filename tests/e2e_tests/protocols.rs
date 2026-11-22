@@ -787,6 +787,48 @@ pub(super) async fn test_b401_close_notify_after_connection_close() {
     }
 }
 
+/// F-284: HTTP/1.1 のストリーミングで、TLS の上流が閉じて終わる応答（Content-Length も chunked も無い）をそのまま流すとき、
+/// 上流が close_notify で終えた応答は close_notify で終え、close_notify 無しで切れた応答は close_notify を送らずに閉じる
+/// （クライアントが切り詰めと分かる。以前は B-401 の `Drop` で必ず送ったので、切れた応答も正しい終わりに見えた）。
+#[tokio::test]
+#[ntest::timeout(30000)]
+pub(super) async fn test_f284_close_notify_follows_upstream_eof_body() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let body = "f284 eof-delimited body";
+    for (mode, upstream_clean) in [("clean", true), ("abrupt", false)] {
+        let request = format!(
+            "POST /echo-upload-tls/f284-{mode} HTTP/1.1\r\nHost: localhost\r\nx-eof-body: {mode}\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (response, end) = tls_request_until_close(create_client_config(), request.as_bytes());
+        assert_eq!(
+            get_status_code(&response),
+            Some(200),
+            "{mode}: unexpected response: {response:?}"
+        );
+        assert!(
+            response.ends_with(body),
+            "{mode}: the body must be relayed: {response:?}"
+        );
+        if upstream_clean {
+            assert!(
+                end.is_ok(),
+                "{mode}: a response the upstream ended with close_notify must end with close_notify: {end:?}"
+            );
+        } else {
+            assert_eq!(
+                end.as_ref().map_err(|e| e.kind()),
+                Err(std::io::ErrorKind::UnexpectedEof),
+                "{mode}: a response cut without close_notify must not end with close_notify"
+            );
+        }
+    }
+}
+
 /// 不正な要求に誤りを返して閉じるときも close_notify を送る（`Drop` で送るので、どの経路で閉じても通る。B-401）。
 #[tokio::test]
 #[ntest::timeout(30000)]

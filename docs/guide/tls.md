@@ -138,7 +138,8 @@ KeyUpdate closes the connection with a warning (kTLS cannot apply new keys; rust
 An upstream response without `Content-Length` or chunked encoding ends when the upstream closes the connection.
 With TLS (with or without kTLS) veil treats it as complete only if the upstream sent close_notify first; otherwise
 the body may have been cut off, so it is not cached, a buffered or compressed response and a response to an
-HTTP/2 client become 502, and otherwise the client connection is closed (an HTTP/3 client sees the stream reset).
+HTTP/2 client become 502, and otherwise the client connection is closed without close_notify (an HTTP/3 client sees
+the stream reset).
 
 veil itself sends close_notify before it closes a TLS connection (RFC 8446 §6.1), to clients and to upstreams, with
 or without kTLS: after a `Connection: close` response, when a keep-alive connection times out or the server shuts
@@ -146,6 +147,12 @@ down, after an error response, and before the TCP half-close of a WebSocket tunn
 built on OpenSSL 3 that reads a connection to its end treats an end without close_notify as possibly truncated and
 drops the session, so its next connection would need a full handshake. When the socket's send buffer is full at that
 moment veil does not wait for it, except after an HTTP/2 GOAWAY, where it waits up to 500 ms.
+
+The exception is an HTTP/1.1 response whose body was cut short: the upstream stopped or failed before the end of the
+body, or a TLS upstream closed a response that ends with the connection without close_notify. veil then closes the
+client connection without close_notify (F-284), so a client that checks for it (rustls, OpenSSL 3, Go) reports the
+response as incomplete instead of taking the truncated body as the whole response. A response that ends with the
+connection is otherwise indistinguishable from a cut one. nginx also closes without close_notify after an error.
 
 ## Cipher Suites and HTTP/3
 

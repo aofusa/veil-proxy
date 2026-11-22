@@ -131,6 +131,8 @@ pub struct SimpleTlsServerStream {
     conn: Option<Box<ServerConnection>>,
     mode: TlsMode,
     drained_buffer: Vec<u8>,
+    /// 応答の本文が途中で切れた: 閉じるときに close_notify を送らない（F-284。[`Self::skip_close_notify`]）
+    truncated: std::cell::Cell<bool>,
 }
 
 impl crate::runtime::io::BufferedReadState for SimpleTlsServerStream {
@@ -143,6 +145,14 @@ impl crate::runtime::io::BufferedReadState for SimpleTlsServerStream {
 }
 
 impl SimpleTlsServerStream {
+    /// 応答の本文が途中で切れた（上流が区切りの前に止まった・close_notify 無しで切れた等）: 閉じるときに close_notify を
+    /// 送らない（F-284）。送ると、接続の終わりで区切る応答の切り詰めがクライアントからは正しい終わりに見える。
+    /// close_notify の無い EOF なら、厳格なクライアント（rustls・OpenSSL 3 等）は不完全と分かる（nginx も誤りで閉じるときは
+    /// 送らない）。
+    pub fn skip_close_notify(&self) {
+        self.truncated.set(true);
+    }
+
     /// rustls が復号済みで抱えている平文をドレインバッファへ移し、未読があれば `true`（メッシュの L4 転送）。
     pub fn take_pending_plaintext(&mut self) -> bool {
         if let Some(conn) = self.conn.as_mut() {
@@ -522,6 +532,7 @@ pub async fn accept(
         conn: Some(Box::new(conn)),
         mode: TlsMode::Rustls,
         drained_buffer: Vec::new(),
+        truncated: std::cell::Cell::new(false),
     })
 }
 
@@ -546,6 +557,7 @@ pub async fn accept_with_peer_cert(
             conn: Some(Box::new(conn)),
             mode: TlsMode::Rustls,
             drained_buffer: Vec::new(),
+            truncated: std::cell::Cell::new(false),
         },
         peer_cert,
     ))
@@ -561,6 +573,7 @@ pub async fn accept_plain(
         conn: None,
         mode: TlsMode::Plain,
         drained_buffer: initial_data.unwrap_or_default(),
+        truncated: std::cell::Cell::new(false),
     })
 }
 
@@ -749,7 +762,7 @@ impl crate::runtime::io::AsyncWriteRent for SimpleTlsServerStream {
 /// 誤りの応答の後など、どの経路で閉じても通るように `Drop` で送る。待てないので 1 回だけ試す。
 impl Drop for SimpleTlsServerStream {
     fn drop(&mut self) {
-        if self.mode == TlsMode::Rustls {
+        if self.mode == TlsMode::Rustls && !self.truncated.get() {
             if let Some(conn) = self.conn.as_mut() {
                 crate::tls_writev::send_close_notify_now(self.inner.as_raw_fd(), conn);
             }

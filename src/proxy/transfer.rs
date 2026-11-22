@@ -403,6 +403,10 @@ pub(super) async fn transfer_response_body_rest<R: AsyncReader, W: AsyncWriter>(
             ctx.save_to_cache();
         }
     }
+    if !out.complete {
+        // F-284: 切れた本文の後は close_notify を送らずに閉じる（接続の終わりで区切る応答の切り詰めをクライアントが分かる）
+        client.response_truncated();
+    }
     out
 }
 
@@ -563,12 +567,17 @@ mod eof_tests {
         }
     }
 
-    struct Sink(Vec<u8>);
+    /// 書かれた本文と、切れた応答の印（`response_truncated`）を記録する
+    struct Sink(Vec<u8>, bool);
 
     impl AsyncWriter for Sink {
         async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
             self.0.extend_from_slice(&buf);
             (Ok(buf.len()), buf)
+        }
+
+        fn response_truncated(&mut self) {
+            self.1 = true;
         }
     }
 
@@ -585,7 +594,7 @@ mod eof_tests {
                     chunks: vec![b"hello ", b"world"],
                     clean,
                 };
-                let mut sink = Sink(Vec::new());
+                let mut sink = Sink(Vec::new(), false);
                 let start = response_body_start(ResponseBody::UntilClose, b"");
                 let out = transfer_response_body_rest(
                     &mut up,
@@ -598,6 +607,8 @@ mod eof_tests {
                 assert_eq!(out.complete, complete, "clean EOF = {clean}");
                 assert_eq!(sink.0, b"hello world");
                 assert!(out.client_must_close(ResponseBody::UntilClose));
+                // F-284: 切れた応答だけ close_notify を送らずに閉じる印を立てる
+                assert_eq!(sink.1, !complete, "clean EOF = {clean}");
             }
         });
     }

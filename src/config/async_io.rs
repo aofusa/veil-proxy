@@ -30,6 +30,10 @@ pub trait AsyncReader {
 #[allow(async_fn_in_trait)]
 pub trait AsyncWriter {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>);
+
+    /// このクライアントへ書いた応答の本文が途中で切れた。TLS のクライアントの接続は close_notify を送らずに閉じる
+    /// （`skip_close_notify`。F-284）。TLS 以外は何もしない
+    fn response_truncated(&mut self) {}
 }
 
 // TcpStream用の実装
@@ -59,6 +63,10 @@ impl AsyncReader for KtlsServerStream {
 impl AsyncWriter for KtlsServerStream {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.write_all(buf).await
+    }
+
+    fn response_truncated(&mut self) {
+        self.skip_close_notify();
     }
 }
 
@@ -95,6 +103,10 @@ impl AsyncReader for crate::simple_tls::SimpleTlsServerStream {
 impl AsyncWriter for crate::simple_tls::SimpleTlsServerStream {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.write_all(buf).await
+    }
+
+    fn response_truncated(&mut self) {
+        self.skip_close_notify();
     }
 }
 

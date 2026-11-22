@@ -76,6 +76,8 @@ pub struct KtlsServerStream {
     drained_buffer: Vec<u8>,
     /// kTLS で送信しているとき、close_notify を送った（B-401。rustls で送るときは rustls が覚えている）
     sent_close_notify: bool,
+    /// 応答の本文が途中で切れた: 閉じるときに close_notify を送らない（F-284。[`Self::skip_close_notify`]）
+    truncated: std::cell::Cell<bool>,
 }
 
 impl crate::runtime::io::BufferedReadState for KtlsServerStream {
@@ -89,6 +91,14 @@ impl crate::runtime::io::BufferedReadState for KtlsServerStream {
 }
 
 impl KtlsServerStream {
+    /// 応答の本文が途中で切れた（上流が区切りの前に止まった・close_notify 無しで切れた等）: 閉じるときに close_notify を
+    /// 送らない（F-284）。送ると、接続の終わりで区切る応答の切り詰めがクライアントからは正しい終わりに見える。
+    /// close_notify の無い EOF なら、厳格なクライアント（rustls・OpenSSL 3 等）は不完全と分かる（nginx も誤りで閉じるときは
+    /// 送らない）。
+    pub fn skip_close_notify(&self) {
+        self.truncated.set(true);
+    }
+
     /// rustls が復号済みで抱えている平文をドレインバッファへ移し、未読があれば `true`（メッシュの L4 転送。
     /// ハンドシェイクと同じ便で届いたアプリデータはソケットの可読では通知されない）。
     pub fn take_pending_plaintext(&mut self) -> bool {
@@ -947,6 +957,7 @@ pub async fn accept_plain(
         alpn_protocol: None,
         drained_buffer: initial_data.unwrap_or_default(),
         sent_close_notify: false,
+        truncated: std::cell::Cell::new(false),
     })
 }
 
@@ -1041,6 +1052,7 @@ pub async fn accept(
         alpn_protocol,
         drained_buffer,
         sent_close_notify: false,
+        truncated: std::cell::Cell::new(false),
     })
 }
 
@@ -1138,6 +1150,7 @@ pub async fn accept_with_peer_cert(
             alpn_protocol,
             drained_buffer,
             sent_close_notify: false,
+            truncated: std::cell::Cell::new(false),
         },
         peer_cert,
     ))
@@ -1429,6 +1442,9 @@ impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
 /// 誤りの応答の後など、どの経路で閉じても通るように `Drop` で送る。待てないので 1 回だけ試す。
 impl Drop for KtlsServerStream {
     fn drop(&mut self) {
+        if self.truncated.get() {
+            return;
+        }
         let fd = self.inner.as_raw_fd();
         match (self.mode, self.conn.as_mut()) {
             (TlsMode::Plain, _) => {}
