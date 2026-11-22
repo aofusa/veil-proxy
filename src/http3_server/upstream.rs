@@ -47,6 +47,34 @@ pub(super) async fn apply_h3_wasm_response_headers(
     }
 }
 
+/// F-313: HTTP/3 経路で WASM on_response_trailers を適用する（HTTP/2 の `apply_h2_wasm_response_trailers` と同じ扱い）。
+///
+/// 応答のトレーラの段のローカル応答は HTTP/2 と同じく使わず、元のトレーラのまま送る（HTTP/2 は応答の head を
+/// 送った後なので送れない。プロトコルで振る舞いを変えない）。
+#[cfg(feature = "wasm")]
+pub(super) async fn apply_h3_wasm_response_trailers(
+    wasm_modules: &crate::wasm_plugin_config::WasmModules,
+    trailers: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let Some(wasm_engine) = CURRENT_CONFIG.load().wasm_filter_engine.clone() else {
+        return trailers;
+    };
+    // ローカル応答のときに元のトレーラを返すため複製を渡す（トレーラとモジュールのある応答だけ）
+    match Box::pin(wasm_engine.on_response_trailers_with_modules(wasm_modules, trailers.clone()))
+        .await
+    {
+        crate::wasm::FilterResult::Continue { headers, .. } => headers,
+        crate::wasm::FilterResult::LocalResponse(_) => {
+            crate::logging::log_throttled!(
+                warn,
+                "WASM module requested a local response on response trailers, which is not \
+                 supported; keeping the original trailers"
+            );
+            trailers
+        }
+    }
+}
+
 /// F-132: HTTP/3 経路の WASM ライフサイクル終端ヘルパ（`on_log` = `on_request_complete_async`）。
 ///
 /// `LocalResponse` による早期 return を含む**すべての離脱点**から呼ぶことで、

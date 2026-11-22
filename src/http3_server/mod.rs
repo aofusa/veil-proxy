@@ -815,6 +815,21 @@ struct BufferedReq {
     /// 応答を送れない状態で打ち切るまでの秒数（`buffering = "full"` のルートの `client_write_timeout_secs`。
     /// None は既定の `WRITE_TIMEOUT`。B-487）
     send_timeout: Option<u64>,
+    /// 要求のトレーラ（Proxy-Wasm の `on_http_request_trailers` に渡す。上流へは送らない。F-313）
+    #[cfg(feature = "wasm")]
+    trailers: Vec<h3::Header>,
+}
+
+/// 分類前に届いたストリームのトレーラを取り出す（無ければ空。F-313）。
+#[cfg(feature = "wasm")]
+fn take_unclassified_trailers(
+    pending: &mut Vec<(u64, Vec<h3::Header>)>,
+    stream_id: u64,
+) -> Vec<h3::Header> {
+    match pending.iter().position(|(id, _)| *id == stream_id) {
+        Some(i) => pending.swap_remove(i).1,
+        None => Vec::new(),
+    }
 }
 
 /// メインループの `select_biased!` 受信結果（F-32）。
@@ -994,6 +1009,10 @@ struct Http3Handler {
     /// 移して即座に 1 回 poll する（`process_h3_events` の後、`drive_proxy_streams` の前）。
     /// 容量を保持したまま使い回す（要求ごとの確保なし）。
     new_buffered: Vec<(H3BufferedTask, Vec<h3::Header>, Bytes)>,
+    /// 見出しと同じ束で届き、まだ分類していないストリームの要求のトレーラ（分類の後にバッファ経路の要求へ移し、
+    /// ほかは捨てる。トレーラが無ければ確保しない。F-313）
+    #[cfg(feature = "wasm")]
+    unclassified_trailers: Vec<(u64, Vec<h3::Header>)>,
     /// F-99: QUIC 接続ゲージ（Drop で自動 dec。ホットパス無アロケーション）
     _conn_metric: Http3ActiveConnGuard,
     /// F-99: メトリクス計上中のリクエストストリーム ID（open/close の二重計上防止）
@@ -1059,6 +1078,8 @@ impl Http3Handler {
             notify,
             backend_spawner,
             new_buffered: Vec::new(),
+            #[cfg(feature = "wasm")]
+            unclassified_trailers: Vec::new(),
             _conn_metric: Http3ActiveConnGuard::new(),
             metric_open_streams: HashSet::default(),
             dirty: false,
@@ -1368,8 +1389,18 @@ impl Http3Handler {
                                     new_headers.push((stream_id, list, more_frames));
                                 }
                             }
-                            // trailers: 転送しない（従来は新規リクエストとして再分類していた）。
-                            Ok(H3FieldSection::NoPseudo) if known_stream => {}
+                            // trailers: 上流へは転送しない（従来は新規リクエストとして再分類していた）。
+                            // F-313: バッファ経路の要求では Proxy-Wasm の `on_http_request_trailers` に渡すため
+                            // 取っておく（ストリーミングの経路は Wasm を通らないので捨てる）
+                            Ok(H3FieldSection::NoPseudo) if known_stream => {
+                                #[cfg(feature = "wasm")]
+                                if let Some(br) = self.buffered_reqs.get_mut(&stream_id) {
+                                    br.trailers = list;
+                                } else if !self.proxy_streams.contains_key(&stream_id) {
+                                    // 見出しと同じ束で届いた（まだ分類していない）
+                                    self.unclassified_trailers.push((stream_id, list));
+                                }
+                            }
                             other => {
                                 let reason = match other {
                                     Err(r) => r,
@@ -1536,6 +1567,9 @@ impl Http3Handler {
                     if recv_watch.is_some() {
                         self.arm_body_check();
                     }
+                    #[cfg(feature = "wasm")]
+                    let trailers =
+                        take_unclassified_trailers(&mut self.unclassified_trailers, stream_id);
                     self.buffered_reqs.insert(
                         stream_id,
                         BufferedReq {
@@ -1543,6 +1577,8 @@ impl Http3Handler {
                             end: !more_frames,
                             recv_watch,
                             send_timeout: self.classify_send_timeout,
+                            #[cfg(feature = "wasm")]
+                            trailers,
                         },
                     );
                 }
@@ -1584,6 +1620,9 @@ impl Http3Handler {
         }
         // new_headers は drain 済みで既に空。容量を保持したままフィールドへ戻す。
         self.ev_new_headers = new_headers;
+        // バッファ経路にならなかったストリームのトレーラは使わない（F-313）
+        #[cfg(feature = "wasm")]
+        self.unclassified_trailers.clear();
 
         // --- Finished / Reset 反映 ---
         for stream_id in finished.drain(..) {
@@ -1641,6 +1680,8 @@ impl Http3Handler {
                     cors: None,
                     head_req: false,
                     removes_server: false,
+                    #[cfg(feature = "wasm")]
+                    req_trailers: br.trailers,
                 },
                 br.headers,
                 body,

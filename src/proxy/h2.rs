@@ -1934,60 +1934,6 @@ pub(super) async fn h2_dispatch(
         }
     };
 
-    // gRPC リクエストトレイラー WASM フィルタ（F-133）。トレイラー無しの一般的なリクエストは
-    // `ctx.trailers` が空のため、この分岐だけで即座に抜ける（コスト増なし）。
-    #[cfg(feature = "wasm")]
-    if !ctx.trailers.is_empty() && !wasm_modules_to_apply.is_empty() {
-        let config = CURRENT_CONFIG.load();
-        if let Some(ref wasm_engine) = config.wasm_filter_engine {
-            let trailers_vec: Vec<(Vec<u8>, Vec<u8>)> = ctx
-                .trailers
-                .iter()
-                .map(|h| (h.name.to_vec(), h.value.to_vec()))
-                .collect();
-            let wasm_result = wasm_engine
-                .on_request_trailers_with_modules(&wasm_modules_to_apply, trailers_vec)
-                .await;
-            match wasm_result {
-                crate::wasm::FilterResult::LocalResponse(resp) => {
-                    // resp.headers を所有権ムーブで変換（`.clone()` 不要、F-166）。
-                    let mut headers: Vec<(Bytes, Bytes)> = resp
-                        .headers
-                        .into_iter()
-                        .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
-                        .collect();
-                    for (n, v) in h2_base_headers(false) {
-                        headers.push((n, v));
-                    }
-                    let (st, sz) = h2_emit_full(
-                        resp_tx,
-                        notify,
-                        resp.status_code,
-                        headers,
-                        Bytes::from(resp.body),
-                    )
-                    .await;
-                    // ローカルレスポンスでも on_log を呼ぶ（B-300）
-                    crate::wasm::on_request_complete_async(
-                        wasm_engine.clone(),
-                        wasm_modules_to_apply.clone(),
-                    )
-                    .await;
-                    return (st, sz);
-                }
-                // F-133 調査結果: リクエストトレイラー自体が上流バックエンドへ転送される
-                // 経路が存在しない（`h2_proxy_h2c` は `h2c_client.send_request` に
-                // method/path/authority/headers/body しか渡せず、リクエストトレイラーの
-                // 送信 API が無い。H1/HTTPS バックエンド経路も同様）。したがって
-                // WASM がここで返した変更後トレイラーには反映先が無く、意図的に破棄する
-                // （元の `ctx.trailers` を使っても上流へは送られないため、変更後を
-                // 使っても使わなくても観測可能な挙動差は無い）。将来リクエストトレイラー
-                // 転送を実装する際は、ここで変更後トレイラーを保持して反映すること。
-                crate::wasm::FilterResult::Continue { .. } => {}
-            }
-        }
-    }
-
     // F-271: 要求本文のフェーズ。Wasm のルートはバッファ経路（`ctx.body` に本文全体がある）なので、本文のある
     // 要求で本文を読むモジュール（`allow_request_body_read`）があれば `on_request_body` を 1 回呼ぶ。
     #[cfg(feature = "wasm")]
@@ -2052,6 +1998,61 @@ pub(super) async fn h2_dispatch(
                         return (st, sz);
                     }
                 }
+            }
+        }
+    }
+
+    // 要求のトレーラの WASM フィルタ（F-133）。Proxy-Wasm の順（ヘッダ → 本文 → トレーラ）で本文の段の後に呼ぶ
+    // （HTTP/3 と同じ。F-313）。トレイラー無しの一般的なリクエストは `ctx.trailers` が空のため、この分岐だけで
+    // 即座に抜ける（コスト増なし）。
+    #[cfg(feature = "wasm")]
+    if !ctx.trailers.is_empty() && !wasm_modules_to_apply.is_empty() {
+        let config = CURRENT_CONFIG.load();
+        if let Some(ref wasm_engine) = config.wasm_filter_engine {
+            let trailers_vec: Vec<(Vec<u8>, Vec<u8>)> = ctx
+                .trailers
+                .iter()
+                .map(|h| (h.name.to_vec(), h.value.to_vec()))
+                .collect();
+            let wasm_result = wasm_engine
+                .on_request_trailers_with_modules(&wasm_modules_to_apply, trailers_vec)
+                .await;
+            match wasm_result {
+                crate::wasm::FilterResult::LocalResponse(resp) => {
+                    // resp.headers を所有権ムーブで変換（`.clone()` 不要、F-166）。
+                    let mut headers: Vec<(Bytes, Bytes)> = resp
+                        .headers
+                        .into_iter()
+                        .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
+                        .collect();
+                    for (n, v) in h2_base_headers(false) {
+                        headers.push((n, v));
+                    }
+                    let (st, sz) = h2_emit_full(
+                        resp_tx,
+                        notify,
+                        resp.status_code,
+                        headers,
+                        Bytes::from(resp.body),
+                    )
+                    .await;
+                    // ローカルレスポンスでも on_log を呼ぶ（B-300）
+                    crate::wasm::on_request_complete_async(
+                        wasm_engine.clone(),
+                        wasm_modules_to_apply.clone(),
+                    )
+                    .await;
+                    return (st, sz);
+                }
+                // F-133 調査結果: リクエストトレイラー自体が上流バックエンドへ転送される
+                // 経路が存在しない（`h2_proxy_h2c` は `h2c_client.send_request` に
+                // method/path/authority/headers/body しか渡せず、リクエストトレイラーの
+                // 送信 API が無い。H1/HTTPS バックエンド経路も同様）。したがって
+                // WASM がここで返した変更後トレイラーには反映先が無く、意図的に破棄する
+                // （元の `ctx.trailers` を使っても上流へは送られないため、変更後を
+                // 使っても使わなくても観測可能な挙動差は無い）。将来リクエストトレイラー
+                // 転送を実装する際は、ここで変更後トレイラーを保持して反映すること。
+                crate::wasm::FilterResult::Continue { .. } => {}
             }
         }
     }

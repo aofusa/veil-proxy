@@ -15,7 +15,7 @@ VeilはProxy-Wasm ABI v0.2.1に完全準拠したWASM拡張システムを提供
 - **Capability制限**: モジュールごとの細かい権限制御（デフォルト全て無効）
 - **Pulley インタープリタ選択**（`[wasm] interpreter = true`、F-135）: Cranelift ネイティブ JIT の代わりに wasmtime の Pulley ポータブルバイトコードインタープリタで実行し、ネイティブコードを一切生成しない。W^X 制約のあるホストや実行可能 `mmap` を許可できない環境向け。ネイティブ JIT より低速。既定は `false`（Cranelift JIT）。AOT サイドカーキャッシュはファイル名を分離（`.pulley.cwasm`）し、JIT 版と Pulley 版が同じキャッシュを奪い合って毎回再コンパイルする事態を避ける。**OpenBSD（全アーキ）・NetBSD（全アーキ）・FreeBSD aarch64 ではこの設定は常に無視され、常に Pulley が使われる**（B-52/B-55。`interpreter = false` を明示指定すると起動時に警告ログが出るが無視される）
 - **HTTP/3 が HTTP/1.1・HTTP/2 と同等のライフサイクルに対応**（F-132）: HTTP/3 経路でも `on_log` がすべての離脱点（`LocalResponse` による早期 return を含む）から確実に呼ばれるようになり、`Backend::File`（静的配信）ルートにも `on_response_headers` フィルタが適用される。`Backend::Proxy` ルートではリクエスト/レスポンスボディフィルタ（`on_request_body`/`on_response_body`）も動作する（HTTP/3 は WASM 適用時に本文全体を既にバッファしているため `end_of_stream=true` の1回呼びで実装）。レスポンス本文を書き換えた場合は `content-length` を新しい長さへ更新し、nghttp3 の `H3_MESSAGE_ERROR`（本文長不一致・重複)を回避する。
-- **gRPC トレイラーフィルタ**（F-133）: gRPC over H2C で `on_request_trailers`/`on_response_trailers` が実行されるようになり、レスポンストレイラーの `grpc-status`/`grpc-message` を書き換えたり、クライアント送信のリクエストトレイラーを見て `LocalResponse` でリクエストを拒否できる。リクエストトレイラーは観測のみ（バックエンドへの転送機構は無い）。レスポンストレイラーの `Pause`/`LocalResponse` は HEADERS/DATA が送出済みのため適用できず、元のトレイラーをそのまま通して警告ログを出す。
+- **gRPC トレイラーフィルタ**（F-133・F-313）: HTTP/2 と HTTP/3 のどちらでも `on_request_trailers`/`on_response_trailers` が実行され、HTTP/2 の上流（h2c・TLS 上の h2）の応答のトレイラーの `grpc-status`/`grpc-message` を書き換えたり、クライアント送信のリクエストトレイラーを見て `LocalResponse` でリクエストを拒否できる。リクエストトレイラーは観測のみ（バックエンドへの転送機構は無い）。レスポンストレイラーの `Pause`/`LocalResponse` はどちらのプロトコルでも適用せず（HTTP/2 は HEADERS/DATA が送出済み）、元のトレイラーをそのまま通して警告ログを出す。
 - **L4 network filter（Proxy-Wasm `StreamContext` ABI）**（F-133）: `[[l4]]` TCP リスナーに `wasm_modules = ["name"]` を指定すると、生バイト列を検査・書き換えできる（`proxy_on_new_connection`、`proxy_on_downstream_data`、`proxy_on_upstream_data`、`proxy_on_downstream_connection_close`、`proxy_on_upstream_connection_close`）。データは `BufferType::DownstreamData`/`UpstreamData`（値 `2`/`3`）として `proxy_get_buffer_bytes`/`proxy_set_buffer_bytes` 経由でアクセスし、`proxy_close_stream` で接続をクローズできる。**未設定時はコスト増なし**: `wasm_modules` が空（既定）なら従来どおり `splice`/ゼロコピー経路のまま `is_empty()` 判定 1 つだけが追加コスト。モジュールを設定すると（接続確立時に1回だけ）`splice` を使わないユーザー空間バッファ経由の転送へ切り替わる（WASM にデータを見せる必要があるため）。
 
 ### ビルド
@@ -137,14 +137,16 @@ path = "./www"
 |---|---|---|---|
 | `on_http_request_headers` | ○ | ○ | ○ |
 | `on_http_request_body` | ○ | ○ | ○ |
-| `on_http_request_trailers` | – | h2c の gRPC | – |
+| `on_http_request_trailers` | – | トレーラのある要求 | トレーラのある要求 |
 | `on_http_response_headers` | ○ | ○ | ○ |
 | `on_http_response_body` | ○ | ○ | ○ |
+| `on_http_response_trailers` | – | HTTP/2 の上流（h2c・h2） | HTTP/2 の上流（h2c・h2） |
 | `on_log` | ○ | ○ | ○ |
 
 要求のフェーズと `on_http_response_headers` のローカル応答（`send_local_response`）は、上流の応答の代わりに返す（上流の応答の残りは
-読まず、その上流の接続は使い回さない）。`on_http_response_trailers` のローカル応答は、応答のヘッダを送った後なので送れない（元の
-トレーラーのまま）。ローカル応答の後も `on_log` は呼ぶ。
+読まず、その上流の接続は使い回さない）。`on_http_response_trailers` のローカル応答は、HTTP/2 では応答のヘッダを送った後なので送れず、
+HTTP/3 も同じ扱いにする（元のトレーラーのまま）。ローカル応答の後も `on_log` は呼ぶ。要求のフェーズはどのプロトコルでも
+Proxy-Wasm の順（ヘッダ → 本文 → トレーラ）で走る。
 
 要求本文のフェーズは、要求に本文があり、ルートのモジュールのどれかが `allow_request_body_read = true` のときに走る。
 veil は本文を全部読んでから（Content-Length・chunked。上限は `max_request_body_size`・`max_chunked_body_size`、超えたら

@@ -6,6 +6,8 @@
 //!   the backend.
 //! - `on_http_response_trailers`: rewrites the gRPC `grpc-status`/`grpc-message` trailers
 //!   unconditionally, so an E2E test can verify the client observes the rewritten values.
+//! - `on_http_request_trailers`: refuses a request whose trailers carry `x-wasm-reject: 1`
+//!   with a 403 local response, so an E2E test can verify the request trailer phase runs.
 
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
@@ -44,6 +46,19 @@ impl HttpContext for GrpcTrailerFilter {
             "[grpc-trailer-filter] added request header, context={}",
             self.context_id
         );
+        Action::Continue
+    }
+
+    // F-313: HTTP/2 と HTTP/3 で要求のトレーラの段が走ることを確かめるため
+    fn on_http_request_trailers(&mut self, _num_trailers: usize) -> Action {
+        if self.get_http_request_trailer("x-wasm-reject").as_deref() == Some("1") {
+            self.send_http_response(
+                403,
+                vec![("x-wasm-trailer-reject", "1")],
+                Some(b"rejected by request trailers"),
+            );
+            return Action::Pause;
+        }
         Action::Continue
     }
 

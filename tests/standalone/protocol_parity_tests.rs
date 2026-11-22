@@ -1123,3 +1123,260 @@ client_write_timeout_secs = 2
         assert_eq!(r, vec![Ok(BODY); 3], "{proto:?}\n{}", veil.log());
     }
 }
+
+/// gRPC の 1 メッセージ（長さ 0）
+#[cfg(all(feature = "wasm", feature = "grpc"))]
+const GRPC_EMPTY_MESSAGE: &[u8] = &[0, 0, 0, 0, 0];
+
+/// gRPC の応答を返す h2c の上流: HEADERS（200・`application/grpc`）→ DATA（1 メッセージ）→ トレーラ
+/// （`grpc-status: 5`・`grpc-message: original`）。要求の本文は読み捨てる
+#[cfg(all(feature = "wasm", feature = "grpc"))]
+fn spawn_grpc_trailers_upstream() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let l = tokio::net::TcpListener::from_std(l).unwrap();
+            loop {
+                let Ok((tcp, _)) = l.accept().await else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(tcp).await else {
+                        return;
+                    };
+                    while let Some(Ok((req, mut respond))) = conn.accept().await {
+                        tokio::spawn(async move {
+                            let mut body = req.into_body();
+                            while let Some(Ok(c)) = body.data().await {
+                                let _ = body.flow_control().release_capacity(c.len());
+                            }
+                            let resp = http::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .body(())
+                                .unwrap();
+                            let Ok(mut send) = respond.send_response(resp, false) else {
+                                return;
+                            };
+                            let _ = send
+                                .send_data(bytes::Bytes::from_static(GRPC_EMPTY_MESSAGE), false);
+                            let mut trailers = http::HeaderMap::new();
+                            trailers.insert("grpc-status", "5".parse().unwrap());
+                            trailers.insert("grpc-message", "original".parse().unwrap());
+                            let _ = send.send_trailers(trailers);
+                        });
+                    }
+                });
+            }
+        });
+    });
+    port
+}
+
+#[cfg(all(feature = "wasm", feature = "grpc"))]
+fn header_map_pairs(h: &http::HeaderMap) -> Vec<(String, String)> {
+    h.iter()
+        .map(|(n, v)| {
+            (
+                n.as_str().to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
+}
+
+/// gRPC の呼び出しの結果（ステータス・応答のヘッダ・応答のトレーラ）
+#[cfg(all(feature = "wasm", feature = "grpc"))]
+type GrpcOutcome = (u16, Vec<(String, String)>, Vec<(String, String)>);
+
+/// `path` へ gRPC の呼び出し（本文 1 メッセージ）を送る。`trailers` があれば本文の後に `delay` だけ待って要求の
+/// トレーラとして送る
+#[cfg(all(feature = "wasm", feature = "grpc"))]
+fn grpc_call(
+    proto: Proto,
+    ports: Ports,
+    path: &str,
+    trailers: &[(&str, &str)],
+    delay: Duration,
+) -> Result<GrpcOutcome, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut map = http::HeaderMap::new();
+    for (n, v) in trailers {
+        map.insert(
+            http::HeaderName::from_bytes(n.as_bytes()).unwrap(),
+            v.parse().unwrap(),
+        );
+    }
+    let path = path.to_string();
+    let call = async move {
+        let headers = [("content-type", "application/grpc"), ("te", "trailers")];
+        match proto {
+            Proto::H2c | Proto::H2Tls => {
+                let tls = proto == Proto::H2Tls;
+                let port = if tls { ports.tls } else { ports.clear };
+                let mut client = h2_connect(tls, port).await?;
+                let owned: Vec<(String, String)> = headers
+                    .iter()
+                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                    .collect();
+                let req = h2_request(tls, port, "POST", &path, &owned);
+                let (resp, mut send) =
+                    client.send_request(req, false).map_err(|e| e.to_string())?;
+                send.send_data(
+                    bytes::Bytes::from_static(GRPC_EMPTY_MESSAGE),
+                    map.is_empty(),
+                )
+                .map_err(|e| e.to_string())?;
+                if !map.is_empty() {
+                    tokio::time::sleep(delay).await;
+                    send.send_trailers(map).map_err(|e| e.to_string())?;
+                }
+                let resp = resp.await.map_err(|e| e.to_string())?;
+                let status = resp.status().as_u16();
+                let resp_headers = header_map_pairs(resp.headers());
+                let mut body = resp.into_body();
+                while let Some(c) = body.data().await {
+                    let c = c.map_err(|e| e.to_string())?;
+                    let _ = body.flow_control().release_capacity(c.len());
+                }
+                let t = body.trailers().await.map_err(|e| e.to_string())?;
+                Ok((
+                    status,
+                    resp_headers,
+                    t.as_ref().map(header_map_pairs).unwrap_or_default(),
+                ))
+            }
+            #[cfg(feature = "http3")]
+            Proto::H3 => {
+                use bytes::Buf;
+                let (_endpoint, mut send) = h3_connect(ports.tls).await?;
+                let req = h3_request(ports.tls, "POST", &path, &headers);
+                let mut stream = send.send_request(req).await.map_err(|e| e.to_string())?;
+                stream
+                    .send_data(bytes::Bytes::from_static(GRPC_EMPTY_MESSAGE))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !map.is_empty() {
+                    tokio::time::sleep(delay).await;
+                    stream.send_trailers(map).await.map_err(|e| e.to_string())?;
+                }
+                stream.finish().await.map_err(|e| e.to_string())?;
+                let resp = stream.recv_response().await.map_err(|e| e.to_string())?;
+                let status = resp.status().as_u16();
+                let resp_headers = header_map_pairs(resp.headers());
+                while let Some(mut chunk) = stream.recv_data().await.map_err(|e| e.to_string())? {
+                    let n = chunk.remaining();
+                    chunk.advance(n);
+                }
+                let t = stream.recv_trailers().await.map_err(|e| e.to_string())?;
+                Ok((
+                    status,
+                    resp_headers,
+                    t.as_ref().map(header_map_pairs).unwrap_or_default(),
+                ))
+            }
+            _ => Err(format!("gRPC is not tested over {proto:?}")),
+        }
+    };
+    rt.block_on(async move {
+        tokio::time::timeout(Duration::from_secs(20), call)
+            .await
+            .map_err(|_| "timed out".to_string())?
+    })
+}
+
+/// F-313: Proxy-Wasm のトレーラの段が HTTP/2（h2c・TLS）と HTTP/3 で同じように走る。上流（h2c の gRPC）の応答の
+/// トレーラを `on_http_response_trailers` が書き換え（`grpc-status`・`grpc-message`）、要求のトレーラ（`x-wasm-reject: 1`）を
+/// 見た `on_http_request_trailers` のローカル応答（403）で要求を断る。HTTP/3 はトレーラが見出しと同じ束で届いても、
+/// 分類の後に届いても渡す（以前の HTTP/3 はどちらの段も走らず、上流の `grpc-status: 5` と 200 が届いた）
+#[cfg(all(feature = "wasm", feature = "grpc"))]
+#[test]
+fn f313_wasm_trailer_phases_on_http2_and_http3() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    // 生成される .cwasm を作業ツリーに残さないよう一時ディレクトリへ写す
+    let wasm = dir.path().join("grpc_trailer_filter.wasm");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/wasm/grpc_trailer_filter.wasm"),
+        &wasm,
+    )
+    .unwrap();
+    let up = spawn_grpc_trailers_upstream();
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[wasm]
+enabled = true
+
+[[wasm.modules]]
+name = "grpc_trailer_filter"
+path = "{wasm}"
+[wasm.modules.capabilities]
+allow_logging = true
+allow_send_local_response = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_response_headers_read = true
+allow_response_headers_write = true
+
+[[route]]
+modules = ["grpc_trailer_filter"]
+[route.conditions]
+path = "/grpc.test.v1.TestService/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}"
+use_h2c = true
+"#,
+        listeners = listeners_toml(ports, &cert, &key),
+        wasm = tp(&wasm),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    let path = "/grpc.test.v1.TestService/UnaryCall";
+    let protos: Vec<Proto> = all_protos()
+        .into_iter()
+        .filter(|p| *p != Proto::H1)
+        .collect();
+    let trailer = |t: &[(String, String)], name: &str| {
+        t.iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    for proto in protos {
+        // 応答のトレーラの段（要求のトレーラ無し・断らないトレーラ付き）
+        for sent in [&[][..], &[("x-other", "1")][..]] {
+            let r = grpc_call(proto, ports, path, sent, Duration::ZERO);
+            let ctx = format!("{proto:?} {sent:?}: {r:?}\n{}", veil.log());
+            let (status, _, t) = r.expect(&ctx);
+            assert_eq!(status, 200, "{ctx}");
+            assert_eq!(trailer(&t, "grpc-status").as_deref(), Some("0"), "{ctx}");
+            assert_eq!(
+                trailer(&t, "grpc-message").as_deref(),
+                Some("rewritten-by-wasm"),
+                "{ctx}"
+            );
+        }
+        // 要求のトレーラの段（すぐ送る＝見出しと同じ束・少し後に送る＝分類の後）
+        for delay in [Duration::ZERO, Duration::from_millis(300)] {
+            let r = grpc_call(proto, ports, path, &[("x-wasm-reject", "1")], delay);
+            let ctx = format!("{proto:?} reject after {delay:?}: {r:?}\n{}", veil.log());
+            let (status, headers, _) = r.expect(&ctx);
+            assert_eq!(status, 403, "{ctx}");
+            assert_eq!(
+                trailer(&headers, "x-wasm-trailer-reject").as_deref(),
+                Some("1"),
+                "{ctx}"
+            );
+        }
+    }
+}

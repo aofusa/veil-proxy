@@ -15,7 +15,7 @@ Veil provides a WASM extension system fully compliant with Proxy-Wasm ABI v0.2.1
 - **Capability Restrictions**: Fine-grained per-module permission control (all disabled by default)
 - **Optional Pulley Interpreter** (`[wasm] interpreter = true`, F-135): runs Wasm through wasmtime's Pulley portable-bytecode interpreter instead of the Cranelift native JIT, emitting no native code at all. Useful on hosts with W^X constraints or where executable `mmap` cannot be granted. Slower than the native JIT. Default is `false` (Cranelift JIT). The AOT sidecar cache uses a distinct filename (`.pulley.cwasm`) so JIT and Pulley builds never fight over — or invalidate — the same cache file. **On OpenBSD (any arch), NetBSD (any arch), and FreeBSD aarch64 this setting is always ignored and Pulley is always used** (B-52/B-55; explicitly setting `interpreter = false` logs a startup warning and is otherwise ignored)
 - **HTTP/3 parity with HTTP/1.1/HTTP/2** (F-132): the HTTP/3 path now runs the full filter lifecycle — `on_log` fires from every exit point (including early `LocalResponse` returns), `Backend::File` static-serving routes also get the `on_response_headers` filter applied, and `Backend::Proxy` routes run request/response body filters (`on_request_body`/`on_response_body`, applied once with `end_of_stream=true` since HTTP/3 already buffers the whole body when a WASM module is configured). A response body rewrite updates `content-length` to match, avoiding the H3 message-framing error nghttp3 raises on a mismatch/duplicate.
-- **gRPC trailer filtering** (F-133): `on_request_trailers`/`on_response_trailers` now run for gRPC-over-H2C requests, so a module can rewrite `grpc-status`/`grpc-message` on the response trailers, or reject a request based on client-sent request trailers (via `LocalResponse`). Request trailers are only observed this way (there is no client-trailer forwarding to the backend); response trailer `Pause`/`LocalResponse` is not applicable since HEADERS/DATA are already sent by that point, so the original trailers are kept and a warning is logged.
+- **gRPC trailer filtering** (F-133, F-313): `on_request_trailers`/`on_response_trailers` run over HTTP/2 and HTTP/3 alike, so a module can rewrite `grpc-status`/`grpc-message` on the trailers of a response from an HTTP/2 upstream (h2c, or h2 over TLS), or reject a request based on client-sent request trailers (via `LocalResponse`). Request trailers are only observed this way (there is no client-trailer forwarding to the backend); response trailer `Pause`/`LocalResponse` is not applied on either protocol (over HTTP/2 the HEADERS/DATA are already sent by that point), so the original trailers are kept and a warning is logged.
 - **L4 network filter (Proxy-Wasm `StreamContext` ABI)** (F-133): `[[l4]]` TCP listeners can attach WASM modules via `wasm_modules = ["name"]` to inspect/rewrite raw bytes (`proxy_on_new_connection`, `proxy_on_downstream_data`, `proxy_on_upstream_data`, `proxy_on_downstream_connection_close`, `proxy_on_upstream_connection_close`), using `BufferType::DownstreamData`/`UpstreamData` (values `2`/`3`) via `proxy_get_buffer_bytes`/`proxy_set_buffer_bytes`, and can close the connection via `proxy_close_stream`. **Zero cost when unset**: an empty `wasm_modules` list (the default) takes the same `splice`/zero-copy path as before with one added `is_empty()` branch per connection. When modules are configured, the listener switches (once, at connection setup) to a userspace-buffer copy loop instead of `splice`, since the data must be visible to WASM.
 
 ### Build
@@ -136,15 +136,17 @@ reload); the request path only clones an `Arc`.
 |---|---|---|---|
 | `on_http_request_headers` | yes | yes | yes |
 | `on_http_request_body` | yes | yes | yes |
-| `on_http_request_trailers` | – | gRPC over h2c | – |
+| `on_http_request_trailers` | – | requests with trailers | requests with trailers |
 | `on_http_response_headers` | yes | yes | yes |
 | `on_http_response_body` | yes | yes | yes |
+| `on_http_response_trailers` | – | HTTP/2 upstream (h2c, h2) | HTTP/2 upstream (h2c, h2) |
 | `on_log` | yes | yes | yes |
 
 A local response (`send_local_response`) from any request phase or from `on_http_response_headers` replaces the
 upstream response; veil does not read the rest of the upstream response and does not reuse that upstream connection.
-A local response from `on_http_response_trailers` cannot be sent because the response head is already out; the
-original trailers are kept. `on_log` runs after a local response too.
+A local response from `on_http_response_trailers` cannot be sent because the response head is already out over
+HTTP/2; HTTP/3 does the same, and the original trailers are kept. `on_log` runs after a local response too.
+The request phases run in Proxy-Wasm order (headers, body, trailers) on every protocol.
 
 The request-body phase runs when the request has a body and at least one of the route's modules has
 `allow_request_body_read = true`. veil reads the whole body first (Content-Length or chunked, up to

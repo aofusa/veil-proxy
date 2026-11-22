@@ -31,6 +31,9 @@ pub(super) struct H3BufferedTask {
     pub(super) head_req: bool,
     /// ルートの `remove_response_headers` に `Server` がある（自分の `server` も付けない。ルートの解決の後に入れる）
     pub(super) removes_server: bool,
+    /// 要求のトレーラ（Proxy-Wasm の `on_http_request_trailers` に渡す。上流へは送らない。F-313）
+    #[cfg(feature = "wasm")]
+    pub(super) req_trailers: Vec<h3::Header>,
 }
 
 /// バッファ経路の要求 Future を即座に 1 回だけ poll する（B-97）。
@@ -1109,6 +1112,53 @@ impl H3BufferedTask {
                                     }
                                 }
                             }
+
+                            // F-313: 要求のトレーラの段（本文の段の後。HTTP/2 と同じく見るだけで上流へは送らない。
+                            // ローカル応答で要求を断れる）。トレーラの無い要求は分岐だけ
+                            if !self.req_trailers.is_empty() {
+                                let trailers_vec: Vec<(Vec<u8>, Vec<u8>)> = self
+                                    .req_trailers
+                                    .iter()
+                                    .map(|h| (h.name().to_vec(), h.value().to_vec()))
+                                    .collect();
+                                if let crate::wasm::FilterResult::LocalResponse(resp) =
+                                    Box::pin(wasm_engine.on_request_trailers_with_modules(
+                                        &modules_to_apply,
+                                        trailers_vec,
+                                    ))
+                                    .await
+                                {
+                                    self.send_response(
+                                        resp.status_code,
+                                        &resp
+                                            .headers
+                                            .iter()
+                                            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                                            .collect::<Vec<_>>(),
+                                        Some(Bytes::copy_from_slice(&resp.body)),
+                                    )
+                                    .await?;
+                                    let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                                        &[]
+                                    } else {
+                                        user_agent
+                                    };
+                                    log_access(
+                                        method,
+                                        authority,
+                                        path,
+                                        user_agent_slice,
+                                        request_body.len() as u64,
+                                        resp.status_code,
+                                        resp.body.len() as u64,
+                                        start_time,
+                                        self.client_ip.as_str(),
+                                        "",
+                                    );
+                                    // on_log は呼び出し元の `handle_request` ラッパが最後に一度だけ呼ぶ（F-132）
+                                    return Ok(());
+                                }
+                            }
                         }
                     }
                 }
@@ -1602,6 +1652,9 @@ impl H3BufferedTask {
                 let mut body = backend_result.body;
                 #[cfg(not(feature = "wasm"))]
                 let body = backend_result.body;
+                #[cfg(feature = "wasm")]
+                let mut trailers = backend_result.trailers;
+                #[cfg(not(feature = "wasm"))]
                 let trailers = backend_result.trailers;
 
                 // `remove_response_headers`・`add_response_headers`（B-267。HTTP/1.1・HTTP/2 と同じく Wasm の前）
@@ -1695,6 +1748,15 @@ impl H3BufferedTask {
                                 }
                             }
                         }
+                    }
+                }
+
+                // F-313: 応答のトレーラの段（HTTP/2 の上流の応答のトレーラと同じ。gRPC の `grpc-status`・`grpc-message` を
+                // 書き換えられる）。トレーラの無い応答は分岐だけ
+                #[cfg(feature = "wasm")]
+                if !trailers.is_empty() {
+                    if let Some(modules) = wasm_modules.filter(|m| !m.is_empty()) {
+                        trailers = apply_h3_wasm_response_trailers(modules, trailers).await;
                     }
                 }
 
