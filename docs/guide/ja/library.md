@@ -413,7 +413,9 @@ async fn echo(req: Request) -> Response {
 - アップグレードした接続も `[security] max_concurrent_connections` に数えます。`[api] upgrade_idle_timeout_secs`
   （既定 300。0 = 無し）より長く待った `read` は `TimedOut` で失敗します。
 - `tokio-compat` では `up.into_tokio_io()` が `veil::tokio::io::{AsyncRead, AsyncWrite}` を実装したものを返し、tokio 前提の
-  プロトコル実装を載せられます（同じワーカーのタスクを経由するので 1 回余分に写します）。
+  プロトコル実装を載せられます（同じワーカーのタスクを経由するので 1 回余分に写します）。HTTP/1.1 のアップグレードでも、
+  HTTP/2・HTTP/3 の拡張 CONNECT のストリームでも同じに動きます。ストリームでは `shutdown` がストリームの終わり（END_STREAM・FIN）
+  です（F-316）。
 - C: `veil_response_upgrade(resp, "x-echo", &callbacks, ud)`。L4 の TCP と同じコールバック（`on_connect` / `on_data` /
   `on_close`、`veil_l4_write`）で受けます。Rust でも `Upgraded::serve_blocking`（`l4-handler`）で同じ形にできます。
 
@@ -468,7 +470,7 @@ async fn ws(upgrade: WebSocketUpgrade) -> Response {
 - HTTP/2・HTTP/3 の上の WebSocket（拡張 CONNECT。RFC 8441 / RFC 9220）は `[http2]`・`[http3]` の `enable_connect_protocol = true`
   で使えます。`WebSocketUpgrade` は `:protocol = websocket` の `CONNECT` を受け（`Sec-WebSocket-Key` は無い）、`on_upgrade` は `200` で
   応えて、`WebSocket` はストリームの上で動きます。HTTP/2・HTTP/3 のそれ以外のハンドシェイクは 400 です。`Response::switching_protocols`
-  も `:protocol` の一致する拡張 CONNECT で同じに動きます（不一致は 500）。`Upgraded::into_tokio_io()` は HTTP/1.1 だけです。
+  も `:protocol` の一致する拡張 CONNECT で同じに動き（不一致は 500）、`Upgraded::into_tokio_io()` もストリームの上で使えます。
 - メトリクス（`metrics` feature）: `veil_proxy_websocket_connections`（開いている接続数）と
   `veil_proxy_websocket_messages_total{direction="received"|"sent"}`。
 - アップグレードした接続と同じく `[security] max_concurrent_connections` に数えます。
@@ -1455,5 +1457,4 @@ cargo・C コンパイラと make（BSD は GNU make、Windows は MSVC）・HTT
 - Python のハンドラは GIL に制限されます。C のコールバックはスレッドセーフである必要があります。`async def` のハンドラの中でブロックすると、
   そのイベントループが止まります（上記）。
 - HTTP/2・HTTP/3 のプロトコルアップグレードと WebSocket には `enable_connect_protocol = true`（拡張 CONNECT。既定は無効）が要ります。
-  `Upgraded::into_tokio_io()` は HTTP/1.1 だけです。
 - ライブラリモードは `/etc/veil` の設定ファイルを使いません。カレントディレクトリの `config.toml`（または渡したパス）だけです。

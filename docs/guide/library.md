@@ -432,7 +432,9 @@ async fn echo(req: Request) -> Response {
 - An upgraded connection still counts against `[security] max_concurrent_connections`. `[api] upgrade_idle_timeout_secs`
   (default 300; 0 = none) makes a `read` that waits longer fail with `TimedOut`.
 - With `tokio-compat`, `up.into_tokio_io()` returns an object implementing `veil::tokio::io::{AsyncRead, AsyncWrite}`
-  for tokio-based protocol libraries (one extra copy through a task on the same worker).
+  for tokio-based protocol libraries (one extra copy through a task on the same worker). It works on an HTTP/1.1
+  upgrade and on an HTTP/2 or HTTP/3 extended CONNECT stream alike; on a stream, `shutdown` ends the stream
+  (END_STREAM / FIN) (F-316).
 - C: `veil_response_upgrade(resp, "x-echo", &callbacks, ud)` with the L4 TCP callbacks (`on_connect` / `on_data` /
   `on_close`, `veil_l4_write`). Rust can do the same with `Upgraded::serve_blocking` (`l4-handler`).
 
@@ -492,7 +494,8 @@ async fn ws(upgrade: WebSocketUpgrade) -> Response {
   enable_connect_protocol = true`: `WebSocketUpgrade` accepts `CONNECT` with `:protocol = websocket` (no
   `Sec-WebSocket-Key`), `on_upgrade` answers `200`, and the `WebSocket` runs over the stream. Other handshakes on
   HTTP/2 and HTTP/3 are answered with 400. `Response::switching_protocols` works the same way on an extended CONNECT
-  whose `:protocol` matches (a mismatch is answered with 500); `Upgraded::into_tokio_io()` is HTTP/1.1 only.
+  whose `:protocol` matches (a mismatch is answered with 500), and `Upgraded::into_tokio_io()` works on the stream
+  too.
 - Metrics (`metrics` feature): `veil_proxy_websocket_connections` (open connections) and
   `veil_proxy_websocket_messages_total{direction="received"|"sent"}`.
 - The connection counts against `[security] max_concurrent_connections` like any upgraded connection.
@@ -1551,6 +1554,6 @@ another name, e.g. `PY3=python` on Windows). Unit tests: `cargo test
 - Python handlers are bound by the GIL; C callbacks must be thread-safe. Blocking code in an `async def` handler
   stalls its event loop (see above).
 - Protocol upgrades and WebSocket over HTTP/2 and HTTP/3 need `enable_connect_protocol = true` (extended CONNECT,
-  off by default); `Upgraded::into_tokio_io()` works on HTTP/1.1 only.
+  off by default).
 - Library mode does not use a configuration file in `/etc/veil`: `config.toml` in the current directory (or the path
   you pass) is the only file.

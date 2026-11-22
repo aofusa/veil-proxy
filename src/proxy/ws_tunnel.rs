@@ -1126,4 +1126,100 @@ Content-Length: 0\r\nX-Powered-By: php\r\n\r\n";
             ]
         );
     }
+
+    /// F-316: ハンドラの upgrade の `Upgraded::into_tokio_io()` は、HTTP/2・HTTP/3 の拡張 CONNECT のストリームでも動く。
+    /// `run_on_stream` に渡したストリームの上で、tokio の I/O のエコーが要求の本文の断片を応答の本文へ返す。`shutdown` で
+    /// ストリームを終える（応答の送り先を閉じる＝END_STREAM・fin）
+    #[cfg(all(feature = "handler", feature = "tokio-compat"))]
+    #[test]
+    fn tokio_io_echo_on_extended_connect_streams() {
+        #[cfg(all(veil_rt_uring, target_os = "linux"))]
+        if crate::runtime::ring::IoUring::new(8, 0).is_err() {
+            return;
+        }
+        /// tokio の `AsyncRead`・`AsyncWrite` の上で、読んだ分を書き返して、読み終えたら送信側を閉じる
+        fn echo_upgrade() -> crate::api::upgrade::UpgradeFn {
+            let mut resp =
+                crate::api::response::Response::switching_protocols("x-echo", |up| async move {
+                    use crate::tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut io = up.into_tokio_io();
+                    let mut buf = [0u8; 5];
+                    loop {
+                        let n = io.read(&mut buf).await.expect("read");
+                        if n == 0 {
+                            break;
+                        }
+                        io.write_all(&buf[..n]).await.expect("write");
+                    }
+                    io.shutdown().await.expect("shutdown");
+                });
+            resp.upgrade.take().expect("upgrade").on_upgrade
+        }
+        const PARTS: [&[u8]; 3] = [b"hello ", b"over extended ", b"CONNECT"];
+        const WANT: &[u8] = b"hello over extended CONNECT";
+        crate::runtime::block_on(async {
+            #[cfg(feature = "http2")]
+            {
+                let (req_tx, req_rx) = crate::stream_channel::channel::<Bytes>(8);
+                let (resp_tx, resp_rx) = crate::stream_channel::channel::<H2RespMsg>(8);
+                let out = TunnelOut::H2 {
+                    tx: resp_tx,
+                    notify: crate::stream_channel::Notify::new(),
+                };
+                crate::runtime::spawn(crate::api::upgrade::run_on_stream(
+                    echo_upgrade(),
+                    Some(req_rx),
+                    out,
+                    "127.0.0.1",
+                ));
+                for p in PARTS {
+                    assert!(req_tx.send(Bytes::from_static(p)).await.is_ok());
+                }
+                req_tx.finish();
+                let mut echoed = Vec::new();
+                while let Some(msg) = resp_rx.recv().await {
+                    match msg {
+                        H2RespMsg::Body(b) => echoed.extend_from_slice(&b),
+                        _ => panic!("HTTP/2: only body fragments are expected"),
+                    }
+                }
+                assert_eq!(echoed, WANT, "HTTP/2");
+            }
+            #[cfg(feature = "http3")]
+            {
+                use std::cell::RefCell;
+                use std::collections::VecDeque;
+                use std::rc::Rc;
+                let (req_tx, req_rx) = crate::stream_channel::channel::<Bytes>(8);
+                let (resp_tx, resp_rx) =
+                    crate::stream_channel::channel::<crate::http3_stream::RespMsg>(8);
+                let out = TunnelOut::H3 {
+                    tx: resp_tx,
+                    notify: crate::http3_stream::ConnWaker::new(
+                        Rc::new(quiche::ConnectionId::from_vec(vec![1, 2, 3, 4])),
+                        Rc::new(RefCell::new(VecDeque::new())),
+                        crate::stream_channel::Notify::new(),
+                    ),
+                };
+                crate::runtime::spawn(crate::api::upgrade::run_on_stream(
+                    echo_upgrade(),
+                    Some(req_rx),
+                    out,
+                    "127.0.0.1",
+                ));
+                for p in PARTS {
+                    assert!(req_tx.send(Bytes::from_static(p)).await.is_ok());
+                }
+                req_tx.finish();
+                let mut echoed = Vec::new();
+                while let Some(msg) = resp_rx.recv().await {
+                    match msg {
+                        crate::http3_stream::RespMsg::Body(b) => echoed.extend_from_slice(&b),
+                        _ => panic!("HTTP/3: only body fragments are expected"),
+                    }
+                }
+                assert_eq!(echoed, WANT, "HTTP/3");
+            }
+        });
+    }
 }
