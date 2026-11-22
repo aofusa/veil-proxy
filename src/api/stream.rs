@@ -5,7 +5,7 @@
 //!   `BodyChunk::Trailers` (trailers on HTTP/2 and HTTP/3; chunked trailers on HTTP/1.1). `BodyChunk::Abort`
 //!   aborts the stream midway (RST_STREAM on HTTP/2, a stream reset on HTTP/3, closing the connection on HTTP/1.1).
 //! - Request: on a route with streaming reception enabled (`streaming_request`), `Request::take_body_stream()`
-//!   yields the body in arrival order (HTTP/2; on HTTP/1.1 and HTTP/3 the whole body is passed as one chunk).
+//!   yields the body in arrival order (HTTP/1.1 with a `Content-Length` or chunked, HTTP/2 and HTTP/3).
 //!
 //! The body flow completes within a worker thread (both sender and receiver are futures on the same thread).
 

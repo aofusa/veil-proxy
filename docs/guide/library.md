@@ -368,9 +368,10 @@ already available are merged up to 16 KiB per frame. For `HEAD` the stream is dr
 A route that needs the request body as it arrives sets `streaming = true` (`#[veil::route(..., streaming = true)]`
 or `App::route_fn_streaming`) and reads it with `req.take_body_stream()` (a `Stream<Item = Bytes>`). Over HTTP/2
 and HTTP/3 the handler runs as soon as the headers arrive and request and response flow in both directions at once.
-Over HTTP/1.1 the handler also runs as soon as the headers arrive and reads a `Content-Length` body as it arrives,
-but the response is written after the request body has been read; a chunked request body is read first and handed
-over as one chunk. `max_body_size` does not apply to a streaming route on any protocol (limit it while reading).
+Over HTTP/1.1 the handler also runs as soon as the headers arrive and reads the body as it arrives (with a
+`Content-Length` or chunked; a chunked body is unframed as it is read, one piece per read, F-315), but the response
+is written after the request body has been read. `max_body_size` does not apply to a streaming route on any protocol
+(limit it while reading). A chunked body with broken framing ends the stream as cut off (`is_aborted`).
 Both directions pass through tower layers unchanged.
 
 The body stream also ends (`None`) when the body is cut off before it is complete: the client disconnects, resets
@@ -560,8 +561,8 @@ async fn upload(mut form: Multipart) -> Result<Json<Value>, ApiError> {
   `loc = ["body", name]`, a malformed body 400 and a body over the `[api] multipart_*` limits 413
   (`{"detail": "..."}`).
 - `Multipart` cannot be combined with the buffered extractors. Streamed routes are not limited by
-  `max_body_size`; a multipart body is limited per part and as a whole (`multipart_max_total_size`); this holds on HTTP/1.1 (bodies with a `Content-Length`; chunked bodies
-  are buffered), HTTP/2 and HTTP/3. The anonymous files (`O_TMPFILE` on Linux, created and removed elsewhere, delete
+  `max_body_size`; a multipart body is limited per part and as a whole (`multipart_max_total_size`); this holds on HTTP/1.1 (with a `Content-Length` or chunked),
+  HTTP/2 and HTTP/3. The anonymous files (`O_TMPFILE` on Linux, created and removed elsewhere, delete
   on close on Windows) are written on the offload pool and disappear when closed.
 - OpenAPI describes the body as `multipart/form-data` with files as `{"type": "string", "format": "binary"}`, so
   the Swagger UI offers a file picker.

@@ -258,6 +258,30 @@ except socket.timeout:
     pass
 t = re.sub(r"\r\n[0-9a-f]+\r\n", "", out.decode("latin-1"))  # chunked の区切りを外す
 print("|".join(w for w in ("HELLOWORLD", "Hello, World!") if w in t))' "$P"
+  # F-315: chunked の要求本文もストリーミング受信のハンドラへ届いた順に渡す（以前は全部を読んでから 1 塊で、
+  # max_body_size を超えると 413）。curl の -T - は Expect: 100-continue を付けて 100 Continue を待つ
+  expect "streaming request (HTTP/1.1 chunked)" "HELLO CHUNKED" bash -c "printf 'hello chunked' | curl -s -X POST -H 'Transfer-Encoding: chunked' --data-binary @- '$B/upper'"
+  expect "streaming request (HTTP/1.1 chunked, 1MiB)" "1048576" bash -c "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\0' a | curl -s -X POST -T - '$B/upper' | wc -c"
+  expect "streaming request chunked pipelined with 100-continue (HTTP/1.1)" "HELLOWORLD|Hello, World!" "$PY3" -I -c '
+import re, socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+s.sendall(b"POST /upper HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n")
+head = s.recv(65536)
+if head != b"HTTP/1.1 100 Continue\r\n\r\n":
+    raise SystemExit("no 100 Continue: %r" % head)
+s.sendall(b"5\r\nhello\r\n")
+time.sleep(0.3)
+s.sendall(b"5\r\nworld\r\n0\r\n\r\n" + b"GET /hello HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+out = b""
+try:
+    while True:
+        b = s.recv(65536)
+        if not b: break
+        out += b
+except socket.timeout:
+    pass
+t = re.sub(r"\r\n[0-9a-f]+\r\n", "", out.decode("latin-1"))  # chunked の区切りを外す
+print("|".join(w for w in ("HELLOWORLD", "Hello, World!") if w in t))' "$P"
   run_rust_multipart "$B" "$W" "$PID"
   # F-270: [api] compression = true（ルートの compress = false・256 バイト未満・ストリーミング）
   comp_suite "rust" "$B" /dataset/200 /dataset-raw/200 - /stream-big

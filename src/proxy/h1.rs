@@ -1883,10 +1883,22 @@ pub(super) async fn handle_api_handler(
     api_cache: &mut crate::api::dispatch::CallCache,
     overflow: &mut BytesMut,
 ) -> Option<(ServerTls, u16, u64, bool)> {
-    // F-266: ストリーミング受信のハンドラ（`Multipart` 等）は本文を待たずに呼び、届いた順に渡す。
-    // chunked は従来どおり全部を読んでから 1 つの断片で渡す（`take_body_stream` の既定）
+    // F-315: chunked の本文は自分で読むので、読む前に 100 Continue を返す（`Content-Length` の要求は経路の検査の後に
+    // 要求の処理のループが返している。chunked を上流へ流す経路は上流の 100 に任せる。B-189 の Wasm の段と同じ）
+    if is_chunked && check_expect_continue(&headers) {
+        match timeout(
+            WRITE_TIMEOUT,
+            tls_stream.write_all(HTTP_100_CONTINUE.to_vec()),
+        )
+        .await
+        {
+            Ok((Ok(_), _)) => {}
+            _ => return None,
+        }
+    }
+    // F-266: ストリーミング受信のハンドラ（`Multipart` 等）は本文を待たずに呼び、届いた順に渡す（chunked も。F-315）
     // Box に逃がす（このフューチャは要求ごとに Box へコピーされるので、まれな経路の分で大きくしない）
-    if entry.streaming_request && !is_chunked && content_length > 0 {
+    if entry.streaming_request && (is_chunked || content_length > 0) {
         return Box::pin(handle_api_streaming(
             tls_stream,
             entry,
@@ -1895,6 +1907,7 @@ pub(super) async fn handle_api_handler(
             method,
             req_path,
             content_length,
+            is_chunked,
             headers,
             initial_body,
             client_wants_close,
@@ -2009,7 +2022,7 @@ async fn write_api_response(
     Some((tls_stream, status, len, client_wants_close))
 }
 
-/// ストリーミング受信のハンドラ（F-266）: 本文（Content-Length）を読みながらハンドラを呼ぶ。読み取りと
+/// ストリーミング受信のハンドラ（F-266。chunked は F-315）: 本文を読みながらハンドラを呼ぶ。読み取りと
 /// ハンドラは同じタスクの `FuturesUnordered` で待つ（片方の起床でもう片方を poll しない。F-173）。
 /// ハンドラが本文を読み終える前に全量の応答を返したら、残りは読まずに応答の後で接続を閉じる。
 /// ストリーミング応答を返したら（要求本文を応答へ流すエコー等）、本文を読み終えるまで応答の断片を
@@ -2024,6 +2037,7 @@ async fn handle_api_streaming(
     method: &Bytes,
     req_path: &Bytes,
     content_length: usize,
+    is_chunked: bool,
     headers: Vec<(Bytes, Bytes)>,
     initial_body: &[u8],
     client_wants_close: bool,
@@ -2052,8 +2066,13 @@ async fn handle_api_streaming(
     );
     req.tls = !tls_stream.is_plain();
     req.body_stream = Some(slot);
-    let first = &initial_body[..initial_body.len().min(content_length)];
-    let first = (!first.is_empty()).then(|| Bytes::copy_from_slice(first));
+    // chunked は枠ごと渡して読みながら解く（`pump_api_chunked_body`）
+    let first = if is_chunked {
+        None
+    } else {
+        let first = &initial_body[..initial_body.len().min(content_length)];
+        (!first.is_empty()).then(|| Bytes::copy_from_slice(first))
+    };
     let mut body_done = false;
     // 本文を読み終える前に返ったストリーミング応答の本文と、その間に溜めた断片
     let held_stream: Rc<RefCell<Option<BodyStream>>> = Rc::new(RefCell::new(None));
@@ -2065,9 +2084,15 @@ async fn handle_api_streaming(
         set.push(Box::pin(
             crate::api::dispatch::call_with(entry, req, api_cache, comp).map(Ev::Resp),
         ));
-        set.push(Box::pin(
-            pump_api_body(&mut tls_stream, content_length, first, tx, overflow).map(Ev::Pumped),
-        ));
+        if is_chunked {
+            set.push(Box::pin(
+                pump_api_chunked_body(&mut tls_stream, initial_body, tx, overflow).map(Ev::Pumped),
+            ));
+        } else {
+            set.push(Box::pin(
+                pump_api_body(&mut tls_stream, content_length, first, tx, overflow).map(Ev::Pumped),
+            ));
+        }
         let mut early: Option<crate::api::response::Response> = None;
         loop {
             match set.next().await {
@@ -2169,6 +2194,55 @@ async fn pump_api_body(
         }
     }
     true
+}
+
+/// chunked の要求本文を読みながら、チャンクの枠を解いた本文をハンドラの本文のチャネルへ送る（F-315）。読み取りごとに
+/// 1 つの断片にまとめる（`Content-Length` の [`pump_api_body`] と同じ単位）。終端のチャンクとトレーラまで読めたら `true`。
+/// 枠が壊れた・途中で切れた・読み取りが止まったら中断（`abort`）して `false`。枠の検査は本文を溜める経路と同じ厳格な
+/// デコーダ（サイズの行・拡張・トレーラの上限。B-372）。本文の大きさは見ない（ストリーミング受信の `Content-Length`・
+/// HTTP/2 と同じ）。終端より後ろまで読んだ分（次の要求）は `overflow` の後ろに足す（B-186）。
+#[cfg(feature = "handler")]
+async fn pump_api_chunked_body(
+    stream: &mut ServerTls,
+    initial: &[u8],
+    mut tx: crate::api::stream::RequestBodySender,
+    overflow: &mut BytesMut,
+) -> bool {
+    let mut decoder = ChunkedDecoder::new_request(0);
+    let mut piece = Vec::with_capacity(initial.len());
+    let mut state = decode_chunked_into(&mut decoder, initial, &mut piece, overflow);
+    loop {
+        if !piece.is_empty() && tx.send(Bytes::from(piece)).await.is_err() {
+            return false;
+        }
+        match state {
+            ChunkedFeedResult::Complete => return true,
+            ChunkedFeedResult::Continue => {}
+            ChunkedFeedResult::Invalid | ChunkedFeedResult::SizeLimitExceeded => {
+                tx.abort();
+                return false;
+            }
+        }
+        let buf = buf_get();
+        match timeout(READ_TIMEOUT, stream.read(buf)).await {
+            Ok((Ok(n), mut b)) if n > 0 => {
+                b.set_valid_len(n);
+                piece = Vec::with_capacity(n);
+                state = decode_chunked_into(&mut decoder, b.as_valid_slice(), &mut piece, overflow);
+                buf_put(b);
+            }
+            Ok((_, b)) => {
+                buf_put(b);
+                // 終端のチャンクの前に切れた本文を正常な終わりに見せない（B-187）
+                tx.abort();
+                return false;
+            }
+            Err(_) => {
+                tx.abort();
+                return false;
+            }
+        }
+    }
 }
 
 /// Wasm のローカル応答（`send_local_response`）を HTTP/1.1 の応答にする（Content-Length が無ければ補う。F-62）。
@@ -2692,6 +2766,84 @@ mod b186_overflow_tests {
                 got.extend_from_slice(&b);
             }
             assert_eq!(&got[..], b"hello");
+            assert!(rx.is_aborted());
+            drop(c);
+        });
+    }
+
+    /// F-315: chunked の要求本文も、読みながら枠を解いてハンドラへ届いた順に渡す。最初の断片は残りを待たずに届き、
+    /// 本文の後ろの次の要求（パイプライン）は `overflow` へ戻る
+    #[cfg(feature = "handler")]
+    #[test]
+    fn pump_api_chunked_body_streams_pieces_in_arrival_order() {
+        use futures::StreamExt;
+        if !runtime_available() {
+            return;
+        }
+        crate::runtime::block_on(async {
+            let (s, c) = pair();
+            let mut tls = server(s).await;
+            let (tx, slot) = crate::api::stream::request_body_channel(8);
+            let mut rx = slot.lock().unwrap().take().unwrap();
+            let mut over = BytesMut::new();
+            // 見出しと一緒に届いた分（1 つ目のチャンクと 2 つ目の途中）
+            let pump = pump_api_chunked_body(&mut tls, b"5\r\nhello\r\n6\r\n wo", tx, &mut over);
+            let consume = async {
+                // 残りを送る前に、届いた分が断片として渡る
+                assert_eq!(rx.next().await.as_deref(), Some(&b"hello wo"[..]));
+                send_rest(&c, b"rld\r\n3;ext=1\r\n!!!\r\n0\r\nx-trailer: 1\r\n\r\n");
+                let mut rest = Vec::new();
+                while let Some(b) = rx.next().await {
+                    rest.extend_from_slice(&b);
+                }
+                rest
+            };
+            let (done, rest) = futures::future::join(pump, consume).await;
+            assert!(done);
+            assert_eq!(&rest[..], b"rld!!!");
+            assert!(!rx.is_aborted());
+            assert_eq!(&over[..], NEXT);
+        });
+    }
+
+    /// F-315: 枠が壊れた・終端のチャンクの前に切れた chunked の本文は、途中で切れた終わり（`is_aborted`）になる
+    #[cfg(feature = "handler")]
+    #[test]
+    fn pump_api_chunked_body_aborts_on_broken_or_cut_body() {
+        use futures::StreamExt;
+        if !runtime_available() {
+            return;
+        }
+        crate::runtime::block_on(async {
+            // 大きさの行が 16 進でない
+            let (s, mut c) = pair();
+            let mut tls = server(s).await;
+            c.write_all(b"zz\r\nhello\r\n0\r\n\r\n").unwrap();
+            let (tx, slot) = crate::api::stream::request_body_channel(8);
+            let mut rx = slot.lock().unwrap().take().unwrap();
+            let mut over = BytesMut::new();
+            assert!(!pump_api_chunked_body(&mut tls, b"5\r\nhello\r\n", tx, &mut over).await);
+            let mut got = Vec::new();
+            while let Some(b) = rx.next().await {
+                got.extend_from_slice(&b);
+            }
+            assert_eq!(&got[..], b"hello");
+            assert!(rx.is_aborted());
+
+            // 終端のチャンクの前に切れた
+            let (s, mut c) = pair();
+            let mut tls = server(s).await;
+            c.write_all(b"3\r\nabc\r\n").unwrap();
+            c.shutdown(std::net::Shutdown::Write).unwrap();
+            let (tx, slot) = crate::api::stream::request_body_channel(8);
+            let mut rx = slot.lock().unwrap().take().unwrap();
+            let mut over = BytesMut::new();
+            assert!(!pump_api_chunked_body(&mut tls, b"", tx, &mut over).await);
+            let mut got = Vec::new();
+            while let Some(b) = rx.next().await {
+                got.extend_from_slice(&b);
+            }
+            assert_eq!(&got[..], b"abc");
             assert!(rx.is_aborted());
             drop(c);
         });

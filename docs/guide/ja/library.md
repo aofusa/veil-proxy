@@ -353,8 +353,9 @@ HTTP/3 も同様（打ち切りはストリームのリセット）です。す�
 届いた順に要求本文を受け取りたいルートは `streaming = true`（`#[veil::route(..., streaming = true)]` または
 `App::route_fn_streaming`）にして、`req.take_body_stream()`（`Stream<Item = Bytes>`）で読みます。HTTP/2・HTTP/3 では
 ヘッダが届いた時点でハンドラが動き、要求と応答が同時に流れます（全二重）。HTTP/1.1 でもヘッダが届いた時点でハンドラが動き、
-`Content-Length` の本文は届いた順に渡しますが、応答は要求本文を読み終えてから書きます。chunked の要求本文は読み終えてから
-1 断片として渡します。ストリーミング受信のルートにはどのプロトコルでも `max_body_size` が掛からないので、読みながら制限してください。
+本文は届いた順に渡します（`Content-Length` でも chunked でも。chunked は読みながら枠を解き、読み取りごとに 1 断片。F-315）が、
+応答は要求本文を読み終えてから書きます。ストリーミング受信のルートにはどのプロトコルでも `max_body_size` が掛からないので、
+読みながら制限してください。chunked の枠が壊れていたら、途中で切れた終わり（`is_aborted`）になります。
 どちらの向きも tower の層をそのまま通ります。
 
 本文が途中で切れたとき（クライアントの切断・ストリームのリセット・時間切れ、HTTP/1.1 では `Content-Length` に届かない）も、
@@ -532,7 +533,7 @@ async fn upload(mut form: Multipart) -> Result<Json<Value>, ApiError> {
   `Form<T>` も multipart の本文を受け、ファイルは無視します。ファイルが無ければ `loc = ["body", 名前]` の 422、本文が壊れていれば 400、
   `[api] multipart_*` の上限を超えたら 413（`{"detail": "..."}`）です。
 - `Multipart` は溜める抽出子と併用できません。ストリーミングのルートは `max_body_size` の制限を受けず（multipart の本文にはパートごとの上限と本文全体の上限 `multipart_max_total_size` が効く）、
-  HTTP/1.1（`Content-Length` のある本文。chunked は溜める）・HTTP/2・HTTP/3 で同じです。名前の無いファイル（Linux は `O_TMPFILE`、
+  HTTP/1.1（`Content-Length` でも chunked でも）・HTTP/2・HTTP/3 で同じです。名前の無いファイル（Linux は `O_TMPFILE`、
   他は作ってすぐ消す、Windows は閉じたら消す）への書き込みは offload のプールで行い、閉じると消えます。
 - OpenAPI は本文を `multipart/form-data`、ファイルを `{"type": "string", "format": "binary"}` で書くので、Swagger UI でファイルを選べます。
 - **Python:** `name: str = veil.Form()`・`avatar: veil.UploadFile = veil.File()`・`files: list[veil.UploadFile]`・

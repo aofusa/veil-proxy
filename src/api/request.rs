@@ -49,7 +49,7 @@ pub struct Request {
     // B-204: TLS で受けた要求か（ASGI の scheme 等。X-Forwarded-Proto はクライアントが自由に付けられる）
     pub(crate) tls: bool,
     // F-197
-    /// The body when received as a stream (for a `streaming_request` route over HTTP/2).
+    /// The body when received as a stream (for a `streaming_request` route).
     pub(crate) body_stream: Option<super::stream::BodyStreamSlot>,
     // F-288: HTTP/2・HTTP/3 の拡張 CONNECT の `:protocol`
     pub(crate) protocol: Option<Bytes>,
@@ -213,8 +213,8 @@ impl Request {
     // F-197
     /// Receives the body as chunks in arrival order (can be taken only once).
     ///
-    /// On a route with streaming reception (HTTP/2), the received DATA is returned in order. Otherwise the whole body
-    /// is returned as one chunk (zero chunks if it is empty).
+    /// On a route with streaming reception, the body is returned in arrival order (HTTP/1.1 with a `Content-Length`
+    /// or chunked, HTTP/2 and HTTP/3). Otherwise the whole body is returned as one chunk (zero chunks if it is empty).
     pub fn take_body_stream(&self) -> super::stream::RequestBodyStream {
         if let Some(slot) = &self.body_stream {
             if let Some(s) = slot.lock().unwrap().take() {
