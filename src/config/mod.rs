@@ -1787,7 +1787,7 @@ pub struct PerformanceConfigSection {
     /// Viaヘッダーに使用するホスト名
     ///
     /// via_header_enabled = true 時に使用します。
-    /// 未指定の場合は "veil" を使用します（token か host[:port]）。
+    /// 未指定の場合は "veil" を使用します（token か `host[:port]`）。
     #[serde(default)]
     pub via_header_hostname: Option<String>,
 

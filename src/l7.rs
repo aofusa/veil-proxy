@@ -192,7 +192,7 @@ impl SecurityCheckResult {
 /// 5. レートリミット（rate_limit_requests_per_min）
 ///
 /// `header_size` は要求ヘッダの大きさ（HTTP/1.1 は要求行から空行までのバイト数、HTTP/2・HTTP/3 は復号した後の
-/// 名前と値の合計。擬似ヘッダを含む）。veil 全体の上限（[`request_header_limit_status`]）は各プロトコルの入口で先に見る。
+/// 名前と値の合計。擬似ヘッダを含む）。veil 全体の上限（`request_header_limit_status`）は各プロトコルの入口で先に見る。
 ///
 /// 状態を持たない検査（1〜4）を先にし、ほかの理由で拒否する要求にレート制限の枠を使わせない
 /// （nginx も `client_max_body_size` の検査は `limit_req` より前）。
