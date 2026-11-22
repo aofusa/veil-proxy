@@ -176,12 +176,12 @@ Supports caching backend responses to reduce backend load and improve response t
 
 | Feature | Description |
 |---------|-------------|
-| **Memory Cache** | Fast in-memory LRU cache with configurable size limit |
-| **Disk Cache** | Large response storage using monoio async I/O |
+| **All protocols** | HTTP/1.1, HTTP/2 (h2c and TLS) and HTTP/3 clients share the same entries, for `http://` and `https://` upstreams (HTTP/1.1 or HTTP/2 to the upstream) |
+| **Memory Cache** | Fast in-memory LRU cache shared by all routes (100 MB; see [Notes](#notes)) |
 | **ETag/If-None-Match** | 304 Not Modified responses for conditional requests |
 | **If-Modified-Since** | Date-based conditional request validation |
-| **stale-while-revalidate** | Serve stale content while updating in background (the background request is built like a proxied one: upstream `Host`, `path_prefix`, header removal and forwarding headers) |
-| **stale-if-error** | Serve stale content when backend returns errors |
+| **stale-while-revalidate** | Serve an expired entry (up to 60 seconds past its expiry) while updating it in the background (the background request is built like a proxied one: upstream `Host`, `path_prefix`, header removal and forwarding headers) |
+| **stale-if-error** | Serve an expired entry (up to 1 hour past its expiry) instead of a 502/504 |
 | **Vary Header Support** | Separate cache entries based on request headers |
 | **Pattern-based Invalidation** | Glob pattern cache invalidation |
 
@@ -207,10 +207,10 @@ url = "http://localhost:8080"
 | Option | Description | Default |
 |--------|-------------|---------|
 | `enabled` | Enable caching | false |
-| `max_memory_size` | Maximum memory cache size (bytes) | 100MB |
-| `disk_path` | Disk cache directory (optional) | none |
-| `max_disk_size` | Maximum disk cache size (bytes) | 1GB |
-| `memory_threshold` | Responses larger than this go to disk (bytes) | 64KB |
+| `max_memory_size` | Not applied per route yet (see [Notes](#notes)); only caps the size of a response the route stores (at most 10 MB) | 100MB |
+| `disk_path` | Disk cache directory (not used yet; see [Notes](#notes)) | none |
+| `max_disk_size` | Maximum disk cache size (bytes; not used yet) | 1GB |
+| `memory_threshold` | Responses larger than this go to disk (bytes; not used yet) | 64KB |
 | `default_ttl_secs` | Default TTL when Cache-Control is absent | 300 |
 | `methods` | HTTP methods to cache | ["GET", "HEAD"] |
 | `cacheable_statuses` | Status codes to cache | [200, 301, 302, 304] |
@@ -261,8 +261,24 @@ Cache keys are generated from:
 
 ### Notes
 
-- The proxy cache serves requests from **HTTP/1.1 clients** to **plaintext (`http://`) upstreams**. Requests over
-  HTTP/2 and HTTP/3, and responses from `https://` upstreams, are not cached yet (F-257).
+- The proxy cache answers HTTP/1.1, HTTP/2 (h2c and TLS) and HTTP/3 clients alike, for `http://` and `https://`
+  upstreams. An entry stored while answering one protocol answers the same URL over the others. The key includes the
+  host (`Host`, or `:authority` over HTTP/2 and HTTP/3), so `example.com` and `example.com:8443` are different entries
+- Responses served from the cache carry `X-Cache: HIT` (`X-Cache: STALE` for an expired entry served by
+  `stale_while_revalidate` or `stale_if_error`)
+- Only responses veil relays unchanged are stored. Not stored: a response veil compresses on the fly
+  (`[route.compression]`; a client that does not accept the encoding, or a response that is not compressed, is
+  stored), a response whose body a Proxy-Wasm module receives (`on_http_response_body`), a response with trailers,
+  and a response whose end is marked only by the upstream closing the connection. Cache hits are served without the
+  Proxy-Wasm response phases
+- Storage settings are not applied per route yet: every route stores into one in-memory cache of 100 MB, and
+  `disk_path`, `max_disk_size` and `memory_threshold` have no effect (B-494). A route's `max_memory_size` only limits
+  the size of a single response it stores (responses over 10 MB are never stored)
+- `stale_while_revalidate`: an entry is kept for 60 seconds after it expires. A request in that window gets the
+  expired entry at once, and veil refreshes it with one background request to the upstream
+- `stale_if_error`: an entry is kept for 1 hour after it expires. When the upstream cannot be reached, times out,
+  sends a broken response, or answers 502 or 504, a request for that URL gets the expired entry instead of the error.
+  The decision is made before anything is sent to the client
 - On a route with the cache, requests the cache may store are relayed through user space (to fill the cache); only the
   other requests keep the zero-copy (`splice`) path of `streaming` mode
 - Responses with `Cache-Control: no-cache`, `no-store` or `private` are not stored (all `Cache-Control` lines are
@@ -278,6 +294,7 @@ Cache keys are generated from:
   `key_headers = ["Accept-Encoding"]`) to cache such responses per value
 - A request that carries a `key_headers` header more than once, or with a value that is not UTF-8, neither reads nor
   fills the cache (the key could not cover what the upstream receives)
+- A request whose `Host` (`:authority` on HTTP/2 and HTTP/3) is not UTF-8 neither reads nor fills the cache
 - Responses carrying `Set-Cookie` are never stored
 - Requests carrying `Authorization` neither read nor fill the cache (RFC 9111 §3.5), unless `key_headers` contains
   `Authorization`, which makes the cache per user. On a route whose `[route.jwt]` reads the token from another
@@ -285,7 +302,7 @@ Cache keys are generated from:
   for a per-user cache)
 
 > [!CAUTION]
-> **stale_if_error**: When enabled, veil-proxy may serve outdated cached content (up to 1 hour old) when the backend returns 502/504 errors. This improves availability but may cause **data consistency issues** for applications where real-time accuracy is critical (e.g., financial data, medical records, inventory systems). Evaluate your use case carefully before enabling this feature.
+> **stale_if_error**: When enabled, veil-proxy may serve outdated cached content (up to 1 hour past its expiry) when the backend fails or returns 502/504 errors. This improves availability but may cause **data consistency issues** for applications where real-time accuracy is critical (e.g., financial data, medical records, inventory systems). Evaluate your use case carefully before enabling this feature.
 
 ## Static File Caches Follow Disk Changes
 

@@ -696,6 +696,76 @@ pub(crate) struct BackendTaskParams {
     /// `add_response_headers`・`remove_response_headers` のあるルートのセキュリティ設定（B-267。メインループが応答の
     /// head にかける。方針の無いルートは `None`）
     pub resp_policy: Option<std::sync::Arc<crate::config::SecurityConfig>>,
+    /// キャッシュの外れの要求の応答を取り込む（`[route.cache]` のルートだけ `Some`。F-257）。圧縮せずに送った応答を、
+    /// 区切りどおりに送り終えたら保存する
+    pub cache: RefCell<Option<Box<crate::metrics::CacheSaveContext>>>,
+    /// 応答の head（上流から中継する非圧縮の応答の見出し）をメインループへ送った。送る前の 502・504 だけを
+    /// stale-if-error の保存した応答に替える（B-492）
+    pub head_sent: Cell<bool>,
+}
+
+/// stale-if-error の保存した応答を head と本文で送る（送ったら `true`。B-492）。ルートの応答ヘッダの方針・CORS・
+/// 自分の `server` はメインループが当てる（中継の応答と同じ）
+async fn send_stale(
+    cache: &RefCell<Option<Box<crate::metrics::CacheSaveContext>>>,
+    resp_tx: &Sender<RespMsg>,
+    notify: &ConnWaker,
+    no_response_body: bool,
+) -> bool {
+    let hit = crate::proxy::cache_lookup::stale_fallback(cache.borrow().as_deref());
+    let Some(hit) = hit else {
+        return false;
+    };
+    // 送る処理は箱に入れる（エラーの経路から呼ぶので、箱に入れないと普通の要求のフューチャの状態にもその大きさが載る）
+    Box::pin(send_stale_hit(hit, resp_tx, notify, no_response_body)).await
+}
+
+/// [`send_stale`] の当たりを head と本文で送る
+async fn send_stale_hit(
+    hit: crate::proxy::cache_lookup::CacheHit,
+    resp_tx: &Sender<RespMsg>,
+    notify: &ConnWaker,
+    no_response_body: bool,
+) -> bool {
+    let Some(body) = crate::proxy::cache_lookup::hit_body(&hit).await else {
+        return false;
+    };
+    let mut headers: RespHeaders = Vec::with_capacity(hit.entry.headers.len() + 1);
+    crate::proxy::cache_lookup::push_hit_headers(&mut headers, &hit, None, false);
+    let status = crate::proxy::cache_lookup::hit_status(&hit);
+    if resp_tx
+        .send(RespMsg::Head {
+            status,
+            headers,
+            own_server: true,
+        })
+        .await
+        .is_ok()
+        && !no_response_body
+        && !body.is_empty()
+    {
+        let _ = resp_tx.send(RespMsg::Body(body)).await;
+    }
+    notify.notify();
+    true
+}
+
+/// キャッシュの保存へ取り込んだ応答を保存する（取り込み中でなければ何もしない。借用は await の前に返す。F-257）
+async fn save_captured(cache: &RefCell<Option<Box<crate::metrics::CacheSaveContext>>>) {
+    let taken = cache.borrow_mut().take();
+    if let Some(mut ctx) = taken {
+        ctx.save_to_cache().await;
+    }
+}
+
+/// 送る本文をキャッシュの保存へ取り込み、そのまま返す（F-257。値で受けて返す理由は
+/// [`crate::proxy::cache_lookup::capture`]）
+#[inline]
+fn capture_body(
+    cache: &RefCell<Option<Box<crate::metrics::CacheSaveContext>>>,
+    chunk: Bytes,
+) -> Bytes {
+    crate::proxy::cache_lookup::capture(cache.borrow_mut().as_deref_mut(), chunk)
 }
 
 /// F-171: HTTP/2 上流へ送る要求（HTTP/1.1 の `request_head` の代わり）。
@@ -867,9 +937,15 @@ async fn backend_task(
     }
 
     if let Err(status) = outcome {
+        // stale-if-error: head を送る前の 502・504（上流から応答を得られなかった）は保存した応答に替える（B-492）
+        let replaced = crate::proxy::cache_lookup::is_gateway_error(status)
+            && !params.head_sent.get()
+            && send_stale(&params.cache, &resp_tx, &notify, params.no_response_body).await;
         // head 送出前のエラーはそのステータスで応答し、送出後のエラーはメインループが
         // ストリームをリセットする（切り詰めた本文を fin で閉じて成功に見せない）。
-        let _ = resp_tx.send(RespMsg::Error { status }).await;
+        if !replaced {
+            let _ = resp_tx.send(RespMsg::Error { status }).await;
+        }
     }
     // resp_tx / req_body_rx はここで drop → メインループへ fin（EOF）伝播。
     notify.notify();
@@ -998,9 +1074,21 @@ async fn relay_h2_stream(
                 }
             };
             match msg {
-                None => return Ok(()),
+                None => {
+                    // 応答を終わりまで送った（キャッシュの外れなら保存する。F-257）
+                    if head_sent {
+                        save_captured(&params.cache).await;
+                    }
+                    return Ok(());
+                }
                 Some(UpResp::Head { status, headers }) => {
                     params.resp_status.set(status);
+                    // stale-if-error: 上流の 502・504 は中継せずに保存した応答を返す（上流のストリームは捨てる。B-492）
+                    if crate::proxy::cache_lookup::is_gateway_error(status)
+                        && send_stale(&params.cache, resp_tx, notify, params.no_response_body).await
+                    {
+                        return Ok(());
+                    }
                     let content_type = headers
                         .iter()
                         .find(|(n, _)| n.as_ref() == b"content-type")
@@ -1028,6 +1116,8 @@ async fn relay_h2_stream(
                         )
                     };
                     if let Some(enc) = should_compress {
+                        // 圧縮して返す応答は保存しない（F-257）
+                        params.cache.borrow_mut().take();
                         return h2_relay_compressed(
                             resp_rx,
                             status,
@@ -1038,6 +1128,12 @@ async fn relay_h2_stream(
                             resp_tx,
                         )
                         .await;
+                    }
+                    if let Some(ctx) = params.cache.borrow_mut().as_deref_mut() {
+                        ctx.set_header_pairs(
+                            headers.iter().map(|(n, v)| (n.as_ref(), v.as_ref())),
+                            status,
+                        );
                     }
                     if resp_tx
                         .send(RespMsg::Head {
@@ -1051,6 +1147,7 @@ async fn relay_h2_stream(
                         return Ok(()); // クライアント切断（stream の drop で上流へ CANCEL）。
                     }
                     head_sent = true;
+                    params.head_sent.set(true);
                     if resp_rx.is_finished() {
                         // HEADERS で終わった応答（gRPC の trailers-only 等）。すぐ送信端を閉じて
                         // メインループに HEADERS へ fin を載せさせる。
@@ -1061,11 +1158,14 @@ async fn relay_h2_stream(
                     if !head_sent {
                         return Err(502);
                     }
+                    let b = capture_body(&params.cache, b);
                     if resp_tx.send(RespMsg::Body(b)).await.is_err() {
                         return Ok(());
                     }
                 }
                 Some(UpResp::Trailers(trailers)) => {
+                    // トレーラのある応答は保存しない（F-257）
+                    params.cache.borrow_mut().take();
                     #[cfg(feature = "grpc")]
                     {
                         if let Some((_, code)) =
@@ -1336,6 +1436,8 @@ async fn exchange(
             notify,
             before_head,
             &params.resp_status,
+            &params.cache,
+            &params.head_sent,
         )
     };
 
@@ -1454,6 +1556,10 @@ async fn stream_response(
     notify: &ConnWaker,
     before_head: &Cell<bool>,
     resp_status: &Cell<u16>,
+    // キャッシュの外れの要求の応答の取り込み（F-257）
+    cache: &RefCell<Option<Box<crate::metrics::CacheSaveContext>>>,
+    // 非圧縮の応答の head をメインループへ送ったら立てる（stale-if-error の判定。B-492）
+    head_sent: &Cell<bool>,
 ) -> Result<RespEnd, u16> {
     // 読み取りバッファ（所有権ベース read のため都度払い出し→受け取り）。ゼロで埋めない（読んだ分だけを見る。
     // 以前は要求ごとに 32 KiB をゼロで埋めていた）
@@ -1502,6 +1608,13 @@ async fn stream_response(
         return Err(502);
     }
     resp_status.set(status);
+    // stale-if-error: 上流の 502・504 は中継せずに保存した応答を返す（上流の本文は読まないので接続は戻さない。B-492）
+    if crate::proxy::cache_lookup::is_gateway_error(status)
+        && send_stale(cache, resp_tx, notify, no_response_body).await
+    {
+        before_head.set(false);
+        return Ok(RespEnd::Close);
+    }
     // ヘッダ終端（\r\n\r\n）以降は先読みしたボディ断片（多ければ写さずにバッファごと渡す）
     let leftover = split_read_tail(&mut head_buf, header_end + 4);
 
@@ -1526,7 +1639,8 @@ async fn stream_response(
     };
 
     let end = if let Some(enc) = should_compress {
-        // 圧縮はボディ全体が必要 → バッファ経路（HTTP/2 第1フェーズと同方針）。
+        // 圧縮はボディ全体が必要 → バッファ経路（HTTP/2 第1フェーズと同方針）。圧縮して返す応答は保存しない（F-257）
+        cache.borrow_mut().take();
         before_head.set(false);
         stream_response_compressed(
             backend,
@@ -1549,7 +1663,18 @@ async fn stream_response(
             // chunked のデータ長は不定 → content-length は付けない（quiche がストリーム長を管理）。
             headers.retain(|(n, _)| !n.eq_ignore_ascii_case(b"content-length"));
         }
+        // キャッシュの外れ: 見出しを取り込む（本文は chunked の枠を解いて送るので `Transfer-Encoding` は無い）。
+        // 接続の終わりで区切る本文は保存しない（HTTP/1.1 と同じ）
+        if matches!(framing, Framing::Eof) {
+            cache.borrow_mut().take();
+        } else if let Some(ctx) = cache.borrow_mut().as_deref_mut() {
+            ctx.set_header_pairs(
+                headers.iter().map(|(n, v)| (n.as_ref(), v.as_ref())),
+                status,
+            );
+        }
         before_head.set(false);
+        head_sent.set(true);
         if resp_tx
             .send(RespMsg::Head {
                 status,
@@ -1567,12 +1692,15 @@ async fn stream_response(
         match framing {
             Framing::Length(total) => {
                 stream_body_length(
-                    backend, leftover, read_buf, total, deadline, resp_tx, notify,
+                    backend, leftover, read_buf, total, deadline, resp_tx, notify, cache,
                 )
                 .await?
             }
             Framing::Chunked => {
-                stream_body_chunked(backend, leftover, read_buf, deadline, resp_tx, notify).await?
+                stream_body_chunked(
+                    backend, leftover, read_buf, deadline, resp_tx, notify, cache,
+                )
+                .await?
             }
             Framing::Eof => {
                 stream_body_eof(backend, leftover, read_buf, deadline, resp_tx, notify).await?
@@ -1583,6 +1711,7 @@ async fn stream_response(
 }
 
 /// 非圧縮・content-length 既知（または不明だが length フレーミング）のボディ転送。
+#[allow(clippy::too_many_arguments)]
 async fn stream_body_length(
     backend: &BackendIo,
     leftover: Bytes,
@@ -1591,16 +1720,15 @@ async fn stream_body_length(
     deadline: std::time::Instant,
     resp_tx: &Sender<RespMsg>,
     notify: &ConnWaker,
+    cache: &RefCell<Option<Box<crate::metrics::CacheSaveContext>>>,
 ) -> Result<RespEnd, u16> {
     let mut sent = 0usize;
     // B-104: 宣言長を超えて届いたバイト（上流の誤り）があれば接続を再利用しない。
     let mut overrun = leftover.len() > total;
     if !leftover.is_empty() && total > 0 {
         let take = leftover.len().min(total);
-        if send_body_bytes(resp_tx, notify, leftover.slice(0..take))
-            .await
-            .is_err()
-        {
+        let part = capture_body(cache, leftover.slice(0..take));
+        if send_body_bytes(resp_tx, notify, part).await.is_err() {
             return Ok(RespEnd::Close);
         }
         sent += take;
@@ -1626,7 +1754,7 @@ async fn stream_body_length(
             Ok(n) => {
                 let take = n.min(total - sent);
                 overrun |= n > take;
-                let chunk = take_read_chunk(&mut read_buf, n, take);
+                let chunk = capture_body(cache, take_read_chunk(&mut read_buf, n, take));
                 if send_body_bytes(resp_tx, notify, chunk).await.is_err() {
                     return Ok(RespEnd::Close);
                 }
@@ -1639,6 +1767,8 @@ async fn stream_body_length(
             }
         }
     }
+    // 宣言した長さを送り終えた（キャッシュの外れなら保存する。F-257）
+    save_captured(cache).await;
     Ok(if overrun {
         RespEnd::Close
     } else {
@@ -1664,15 +1794,20 @@ async fn stream_body_chunked(
     deadline: std::time::Instant,
     resp_tx: &Sender<RespMsg>,
     notify: &ConnWaker,
+    cache: &RefCell<Option<Box<crate::metrics::CacheSaveContext>>>,
 ) -> Result<RespEnd, u16> {
     use crate::http_utils::ChunkedDecoder;
     let mut decoder = ChunkedDecoder::new_unlimited();
 
     // 先読み分を先にデコード。
     if !leftover.is_empty() {
-        match drain_chunked(&mut decoder, &leftover, resp_tx, notify).await {
+        match drain_chunked(&mut decoder, &leftover, resp_tx, notify, cache).await {
             ChunkedProgress::More => {}
-            ChunkedProgress::Done { exact } => return Ok(reuse_if(exact)),
+            ChunkedProgress::Done { exact } => {
+                // 終端のチャンクまで送った（キャッシュの外れなら保存する。F-257）
+                save_captured(cache).await;
+                return Ok(reuse_if(exact));
+            }
             ChunkedProgress::ClientGone => return Ok(RespEnd::Close),
         }
     }
@@ -1693,9 +1828,12 @@ async fn stream_body_chunked(
             Ok(n) => {
                 // read_buf の先頭 n バイトを Bytes 化してデコード（span はこの Bytes のスライス）。
                 let data = take_read_chunk(&mut read_buf, n, n);
-                match drain_chunked(&mut decoder, &data, resp_tx, notify).await {
+                match drain_chunked(&mut decoder, &data, resp_tx, notify, cache).await {
                     ChunkedProgress::More => {}
-                    ChunkedProgress::Done { exact } => return Ok(reuse_if(exact)),
+                    ChunkedProgress::Done { exact } => {
+                        save_captured(cache).await;
+                        return Ok(reuse_if(exact));
+                    }
                     ChunkedProgress::ClientGone => return Ok(RespEnd::Close),
                 }
             }
@@ -1723,6 +1861,7 @@ async fn drain_chunked(
     data: &Bytes,
     resp_tx: &Sender<RespMsg>,
     notify: &ConnWaker,
+    cache: &RefCell<Option<Box<crate::metrics::CacheSaveContext>>>,
 ) -> ChunkedProgress {
     let mut pos = 0;
     while pos < data.len() {
@@ -1730,7 +1869,7 @@ async fn drain_chunked(
         if span.data_len > 0 {
             // 入力 Bytes のサブスライス（ゼロコピー）。
             let start = pos + span.data_start;
-            let chunk = data.slice(start..start + span.data_len);
+            let chunk = capture_body(cache, data.slice(start..start + span.data_len));
             if send_body_bytes(resp_tx, notify, chunk).await.is_err() {
                 return ChunkedProgress::ClientGone;
             }
@@ -2953,6 +3092,8 @@ mod tests {
                     &waker,
                     &before_head,
                     &status,
+                    &RefCell::new(None),
+                    &Cell::new(false),
                 )
                 .await
             });

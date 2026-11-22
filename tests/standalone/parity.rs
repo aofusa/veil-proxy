@@ -95,8 +95,29 @@ pub fn fetch(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> HttpResponse {
+    let authority = match proto {
+        Proto::H1 => "localhost".to_string(),
+        Proto::H2c => format!("localhost:{}", ports.clear),
+        Proto::H2Tls | Proto::H3 => format!("localhost:{}", ports.tls),
+    };
+    fetch_as(proto, ports, &authority, method, path, headers, body)
+}
+
+/// [`fetch`] と同じだが、`Host`（HTTP/1.1）・`:authority`（HTTP/2・HTTP/3）を `authority` にする（プロトコルを
+/// またいで同じ URL にする。キャッシュのキーはホストを含む）
+pub fn fetch_as(
+    proto: Proto,
+    ports: Ports,
+    authority: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> HttpResponse {
     let r = match proto {
-        Proto::H1 => h1_fetch(ports.clear, method, path, headers, body).map_err(|e| e.to_string()),
+        Proto::H1 => {
+            h1_fetch(ports.clear, authority, method, path, headers, body).map_err(|e| e.to_string())
+        }
         Proto::H2c | Proto::H2Tls => block_on_timeout(h2_fetch(
             proto == Proto::H2Tls,
             if proto == Proto::H2Tls {
@@ -104,12 +125,13 @@ pub fn fetch(
             } else {
                 ports.clear
             },
+            authority.to_string(),
             method.to_string(),
             path.to_string(),
             owned(headers),
             Bytes::copy_from_slice(body),
         )),
-        Proto::H3 => h3_fetch(ports.tls, method, path, headers, body),
+        Proto::H3 => h3_fetch(ports.tls, authority, method, path, headers, body),
     };
     r.unwrap_or_else(|e| panic!("{proto:?} {method} {path}: {e}"))
 }
@@ -170,7 +192,7 @@ pub fn fetch_until(
                 match s.read(&mut tmp) {
                     Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
                     Ok(_) => {
-                        return Err(format!("closed; got {:?}", String::from_utf8_lossy(&buf)))
+                        return Err(format!("closed; got {:?}", String::from_utf8_lossy(&buf)));
                     }
                     Err(e) => return Err(e.to_string()),
                 }
@@ -247,19 +269,30 @@ pub fn fetch_until(
 pub fn try_fetch(proto: Proto, ports: Ports, path: &str) -> Result<HttpResponse, String> {
     match proto {
         Proto::H1 => Err("try_fetch does not support HTTP/1.1".to_string()),
-        Proto::H2c | Proto::H2Tls => block_on_timeout(h2_fetch(
-            proto == Proto::H2Tls,
-            if proto == Proto::H2Tls {
+        Proto::H2c | Proto::H2Tls => {
+            let port = if proto == Proto::H2Tls {
                 ports.tls
             } else {
                 ports.clear
-            },
-            "GET".to_string(),
-            path.to_string(),
-            Vec::new(),
-            Bytes::new(),
-        )),
-        Proto::H3 => h3_fetch(ports.tls, "GET", path, &[], b""),
+            };
+            block_on_timeout(h2_fetch(
+                proto == Proto::H2Tls,
+                port,
+                format!("localhost:{port}"),
+                "GET".to_string(),
+                path.to_string(),
+                Vec::new(),
+                Bytes::new(),
+            ))
+        }
+        Proto::H3 => h3_fetch(
+            ports.tls,
+            &format!("localhost:{}", ports.tls),
+            "GET",
+            path,
+            &[],
+            b"",
+        ),
     }
 }
 
@@ -297,6 +330,7 @@ fn block_on_timeout<T>(
 
 fn h1_fetch(
     port: u16,
+    host: &str,
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
@@ -304,7 +338,7 @@ fn h1_fetch(
 ) -> std::io::Result<HttpResponse> {
     let mut s = connect_local(port, Duration::from_secs(2))?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
     if !body.is_empty() {
         req.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
@@ -382,16 +416,25 @@ pub fn h2_request(
     b.body(()).unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn h2_fetch(
     tls: bool,
     port: u16,
+    authority: String,
     method: String,
     path: String,
     headers: Vec<(String, String)>,
     body: Bytes,
 ) -> Result<HttpResponse, String> {
     let mut client = h2_connect(tls, port).await?;
-    let req = h2_request(tls, port, &method, &path, &headers);
+    let scheme = if tls { "https" } else { "http" };
+    let mut b = http::Request::builder()
+        .method(method.as_str())
+        .uri(format!("{scheme}://{authority}{path}"));
+    for (n, v) in &headers {
+        b = b.header(n.as_str(), v.as_str());
+    }
+    let req = b.body(()).unwrap();
     let (resp, mut send) = client
         .send_request(req, body.is_empty())
         .map_err(|e| e.to_string())?;
@@ -492,12 +535,19 @@ pub fn h3_request(
 #[cfg(feature = "http3")]
 fn h3_fetch(
     port: u16,
+    authority: &str,
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<HttpResponse, String> {
-    let req = h3_request(port, method, path, headers);
+    let mut b = http::Request::builder()
+        .method(method)
+        .uri(format!("https://{authority}{path}"));
+    for (n, v) in headers {
+        b = b.header(*n, *v);
+    }
+    let req = b.body(()).unwrap();
     let body = Bytes::copy_from_slice(body);
     block_on_timeout(async move {
         let (_endpoint, mut send) = h3_connect(port).await?;
@@ -534,6 +584,7 @@ fn h3_fetch(
 #[cfg(not(feature = "http3"))]
 fn h3_fetch(
     _port: u16,
+    _authority: &str,
     _method: &str,
     _path: &str,
     _headers: &[(&str, &str)],

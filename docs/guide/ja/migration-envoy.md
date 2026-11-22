@@ -70,7 +70,7 @@ virtual host の階層が無いので、各ルートに `host` 条件を書き�
 | `rbac` | `allowed_ips` / `denied_ips` / `allowed_methods`、`[tls] client_allowed_sans` | ≈ |
 | `ext_authz` | — | — 予定（F-229） |
 | `compressor`（gzip・brotli・zstd） | `[route.compression]` | = |
-| `cache` | `[route.cache]` | ≈ HTTP/1.1 のクライアントと `http://` の上流だけ（ほかは F-257） |
+| `cache` | `[route.cache]` | ≈ すべてのクライアントのプロトコルと上流。全ルートで共有する 1 つのメモリのキャッシュ（ルートごとの保存先は B-494） |
 | `buffer` | `[route.buffering] mode = "full"` | = |
 | `grpc_web` | プロキシのルートには無い | — API ライブラリは gRPC-Web を自分で受ける（[library.md](library.md)）。プロキシのルートでは上流で変換する |
 | `wasm` | Proxy-Wasm の `modules` | = |

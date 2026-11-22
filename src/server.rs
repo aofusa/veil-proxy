@@ -224,26 +224,39 @@ pub fn spawn_tls_reloader(mut reloader: crate::tls_reload::TlsCertReloader, inte
 /// stale-while-revalidate: バックグラウンドでキャッシュを更新
 ///
 /// staleキャッシュを返した後、バックグラウンドでバックエンドに再リクエストし、
-/// レスポンスでキャッシュを更新します。
+/// レスポンスでキャッシュを更新します（HTTP/1.1・HTTP/2・HTTP/3 のクライアントで共有。F-257）。
 ///
 /// ## Request Collapsing
 ///
 /// 同一キャッシュキーに対して既に更新が進行中の場合、
-/// 重複したリクエストをスキップしてバックエンド過負荷を防ぎます。
-pub fn spawn_background_revalidation(
-    cache_key: cache::CacheKey,
-    upstream_group: UpstreamGroup,
-    security: SecurityConfig,
-    method: Vec<u8>,
-    req_path: Vec<u8>,
-    prefix: Vec<u8>,
-    // F-168: proxy.rs 側のリクエストヘッダーが `Bytes`（accumulated からのゼロコピー
-    // 切り出し）になったため、こちらもそれに合わせる（これはリクエストヘッダーの再送用で
-    // レスポンス側とは無関係）。
-    headers: Vec<(bytes::Bytes, bytes::Bytes)>,
+/// 重複したリクエストをスキップしてバックエンド過負荷を防ぎます（設定・要求の写しはその判定の後で作る）。
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_background_revalidation<'h, I>(
+    cache_key: &cache::CacheKey,
+    // ルートの `[route.cache]`（更新した応答を保存するかをこの設定で決める。B-491）
+    route_cache: &std::sync::Arc<cache::CacheConfig>,
+    upstream_group: &UpstreamGroup,
+    security: &SecurityConfig,
+    method: &[u8],
+    req_path: &[u8],
+    prefix: &[u8],
+    // 要求ヘッダの (名前, 値) の組（HTTP/2・HTTP/3 の擬似ヘッダは送らない）
+    headers: I,
     // B-371: 転送ヘッダ（X-Forwarded-For 等）に入れるクライアントの IP
-    client_ip: String,
-) {
+    client_ip: &str,
+) where
+    I: Iterator<Item = (&'h [u8], &'h [u8])> + Clone,
+{
+    // B-322: 利用者の資格情報（Cookie・Authorization）の付いた要求は裏で送り直さない（共有のキャッシュの更新に
+    // 利用者の資格情報を使わない。キーに Authorization があれば外して送ると別の利用者の応答になる）
+    if headers.clone().any(|(n, _)| {
+        n.eq_ignore_ascii_case(b"cookie")
+            || n.eq_ignore_ascii_case(b"authorization")
+            || n.eq_ignore_ascii_case(b"proxy-authorization")
+    }) {
+        debug!("Background revalidation skipped: request carries credentials");
+        return;
+    }
     let hash = cache_key.hash_value();
 
     // Request Collapsing: 同一キーに対して既に更新中であればスキップ
@@ -254,6 +267,23 @@ pub fn spawn_background_revalidation(
         );
         return;
     }
+    let cache_key = cache_key.clone();
+    let route_cache = route_cache.clone();
+    let upstream_group = upstream_group.clone();
+    let security = security.clone();
+    let method = method.to_vec();
+    let req_path = req_path.to_vec();
+    let prefix = prefix.to_vec();
+    let headers: Vec<(bytes::Bytes, bytes::Bytes)> = headers
+        .filter(|(n, _)| !n.starts_with(b":"))
+        .map(|(n, v)| {
+            (
+                bytes::Bytes::copy_from_slice(n),
+                bytes::Bytes::copy_from_slice(v),
+            )
+        })
+        .collect();
+    let client_ip = client_ip.to_string();
 
     // パニック耐性のあるspawn (stale-while-revalidate のバックグラウンドタスク)
     spawn_with_panic_catch(async move {
@@ -279,41 +309,9 @@ pub fn spawn_background_revalidation(
         };
 
         let target = &server.target;
-        // B-322: TLS の上流へは平文で送らない（以前は `use_tls` を見ずに平文の TCP で要求を書いていた。F42）。
-        // 利用者の資格情報（Cookie・Authorization）の付いた要求は裏で送り直さない（共有のキャッシュの更新に
-        // 利用者の資格情報を使わない。キーに Authorization があれば外して送ると別の利用者の応答になる）
-        if target.use_tls {
-            debug!("Background revalidation skipped: TLS upstream");
-            return;
-        }
-        if headers.iter().any(|(n, _)| {
-            n.eq_ignore_ascii_case(b"cookie")
-                || n.eq_ignore_ascii_case(b"authorization")
-                || n.eq_ignore_ascii_case(b"proxy-authorization")
-        }) {
-            debug!("Background revalidation skipped: request carries credentials");
-            return;
-        }
         // F-170: 接続先表記（UDS 対応、TCP は不変）。
         let addr = target.conn_addr();
         let addr = addr.as_str();
-
-        // バックエンドに接続
-        let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
-        let connect_result = timeout(connect_timeout, TcpStream::connect_str(addr)).await;
-
-        let mut backend_stream = match connect_result {
-            Ok(Ok(stream)) => {
-                let _ = stream.set_nodelay(true);
-                stream
-            }
-            _ => {
-                debug!("Background revalidation: failed to connect to {}", addr);
-                return;
-            }
-        };
-
-        let method_str = std::str::from_utf8(&method).unwrap_or("GET");
 
         // B-371: 生の転送と同じ組み立て（上流の Host・path_prefix・remove_request_headers・転送ヘッダの方針・
         // add_request_headers・Via）。以前はクライアントの Host と全ヘッダ（信頼しない送信元の X-Forwarded-For・
@@ -321,109 +319,145 @@ pub fn spawn_background_revalidation(
         let request = crate::proxy::build_revalidation_request(
             &method, &req_path, &prefix, target, &headers, &security, &client_ip,
         );
+        let is_head = method == b"HEAD";
 
-        // リクエスト送信
-        let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
-        if !matches!(write_result, Ok((Ok(_), _))) {
-            debug!("Background revalidation: failed to send request");
+        // バックエンドに接続（B-322: TLS の上流へは TLS で送る。以前は平文で書いていたので TLS の上流を飛ばしていた。
+        // F-257 で HTTPS の上流の応答も保存するようになったので、TLS でも取り直す）
+        let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
+        let fetched = if target.use_tls {
+            match crate::proxy::connect_https_backend_fresh(
+                target,
+                connect_timeout,
+                upstream_group.tls_profile(),
+            )
+            .await
+            {
+                Ok(mut stream) => revalidation_exchange(&mut stream, request, is_head).await,
+                Err(_) => {
+                    debug!("Background revalidation: failed to connect to {}", addr);
+                    return;
+                }
+            }
+        } else {
+            match timeout(connect_timeout, TcpStream::connect_str(addr)).await {
+                Ok(Ok(mut stream)) => {
+                    let _ = stream.set_nodelay(true);
+                    revalidation_exchange(&mut stream, request, is_head).await
+                }
+                _ => {
+                    debug!("Background revalidation: failed to connect to {}", addr);
+                    return;
+                }
+            }
+        };
+        let Some((status_code, response_headers, body)) = fetched else {
+            debug!("Background revalidation: no complete response");
             return;
-        }
+        };
 
-        // レスポンス受信
-        let mut accumulated = Vec::with_capacity(BUF_SIZE);
-        let mut status_code = 0u16;
-
-        loop {
-            let read_buf = buf_get();
-            let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-
-            let (res, mut returned_buf) = match read_result {
-                Ok(result) => result,
-                Err(_) => break,
-            };
-
-            let n = match res {
-                Ok(0) | Err(_) => {
-                    buf_put(returned_buf);
-                    break;
-                }
-                Ok(n) => n,
-            };
-
-            returned_buf.set_valid_len(n);
-            accumulated.extend_from_slice(returned_buf.as_valid_slice());
-            buf_put(returned_buf);
-
-            // ヘッダー解析
-            if let Some(parsed) = parse_http_response(&accumulated) {
-                status_code = parsed.status_code;
-                let header_len = parsed.header_len;
-
-                // 本文を区切りどおりに読み切った応答だけをキャッシュする（B-244。以前は途中で止まった本文・
-                // chunked の最初の読み込みだけ・接続の終わりまでの本文を 10MB で切ったものを保存していた）。
-                // B-245/B-246: HEAD・本文の無い応答・区切りの不正な応答・接続の終わりで区切る応答は保存しない
-                let kind = parsed.body(method_str == "HEAD");
-                if parsed.framing_invalid
-                    || !matches!(
-                        kind,
-                        crate::http_utils::ResponseBody::Length(_)
-                            | crate::http_utils::ResponseBody::Chunked
-                    )
-                {
-                    break;
-                }
-                let Some((body, _extra)) = crate::proxy::collect_response_body_raw(
-                    &mut backend_stream,
-                    kind,
-                    &accumulated[header_len..],
+        // キャッシュを更新
+        if let Some(cache_manager) = cache::get_global_cache() {
+            if cache_manager
+                .store_async(
+                    &route_cache,
+                    cache_key.clone(),
+                    status_code,
+                    response_headers,
+                    body,
+                    None,
                 )
                 .await
-                else {
-                    break;
-                };
-
-                // ヘッダー抽出
-                let headers_data = &accumulated[..header_len];
-                let mut headers_storage = [httparse::EMPTY_HEADER; 64];
-                let mut response = httparse::Response::new(&mut headers_storage);
-
-                if response.parse(headers_data).is_ok() {
-                    let response_headers: Vec<(Box<[u8]>, Box<[u8]>)> = response
-                        .headers
-                        .iter()
-                        .map(|h| (h.name.as_bytes().into(), h.value.into()))
-                        .collect();
-
-                    // キャッシュを更新
-                    if let Some(cache_manager) = cache::get_global_cache() {
-                        if cache_manager.store(
-                            cache_key.clone(),
-                            status_code,
-                            response_headers,
-                            body,
-                        ) {
-                            info!(
-                                "Background revalidation: cache updated for {:?}",
-                                cache_key.path()
-                            );
-                        }
-                    }
-                }
-
-                break;
-            }
-
-            // ヘッダーが大きすぎる
-            if accumulated.len() > MAX_HEADER_SIZE
-                || crate::http_utils::response_head_invalid(&accumulated)
+                .is_some()
             {
-                break;
+                info!(
+                    "Background revalidation: cache updated for {:?}",
+                    cache_key.path()
+                );
             }
         }
 
         debug!("Background revalidation completed (status={})", status_code);
         // _guard がドロップされて finish_revalidation(hash) が呼ばれる
     });
+}
+
+/// 裏の取り直しの 1 往復（平文・TLS の上流で共有）。本文を区切りどおりに読み切った応答だけを返す
+/// （B-244。以前は途中で止まった本文・chunked の最初の読み込みだけ・接続の終わりまでの本文を 10MB で切ったものを
+/// 保存していた）。B-245/B-246: HEAD・本文の無い応答・区切りの不正な応答・接続の終わりで区切る応答は返さない
+async fn revalidation_exchange<S>(
+    backend_stream: &mut S,
+    request: Vec<u8>,
+    is_head: bool,
+) -> Option<(u16, Vec<(Box<[u8]>, Box<[u8]>)>, Vec<u8>)>
+where
+    S: crate::runtime::io::AsyncReadRent + AsyncWriteRentExt + Unpin,
+{
+    // リクエスト送信
+    let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
+    if !matches!(write_result, Ok((Ok(_), _))) {
+        debug!("Background revalidation: failed to send request");
+        return None;
+    }
+
+    // レスポンス受信
+    let mut accumulated = Vec::with_capacity(BUF_SIZE);
+    loop {
+        let read_buf = buf_get();
+        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+
+        let (res, mut returned_buf) = read_result.ok()?;
+
+        let n = match res {
+            Ok(0) | Err(_) => {
+                buf_put(returned_buf);
+                return None;
+            }
+            Ok(n) => n,
+        };
+
+        returned_buf.set_valid_len(n);
+        accumulated.extend_from_slice(returned_buf.as_valid_slice());
+        buf_put(returned_buf);
+
+        // ヘッダー解析
+        if let Some(parsed) = parse_http_response(&accumulated) {
+            let header_len = parsed.header_len;
+            let kind = parsed.body(is_head);
+            if parsed.framing_invalid
+                || !matches!(
+                    kind,
+                    crate::http_utils::ResponseBody::Length(_)
+                        | crate::http_utils::ResponseBody::Chunked
+                )
+            {
+                return None;
+            }
+            let (body, _extra) = crate::proxy::collect_response_body_raw(
+                backend_stream,
+                kind,
+                &accumulated[header_len..],
+            )
+            .await?;
+
+            // ヘッダー抽出
+            let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+            let mut response = httparse::Response::new(&mut headers_storage);
+            response.parse(&accumulated[..header_len]).ok()?;
+            let response_headers: Vec<(Box<[u8]>, Box<[u8]>)> = response
+                .headers
+                .iter()
+                .map(|h| (h.name.as_bytes().into(), h.value.into()))
+                .collect();
+            return Some((parsed.status_code, response_headers, body));
+        }
+
+        // ヘッダーが大きすぎる
+        if accumulated.len() > MAX_HEADER_SIZE
+            || crate::http_utils::response_head_invalid(&accumulated)
+        {
+            return None;
+        }
+    }
 }
 
 /// キャッシュクリーンアップスレッドを起動

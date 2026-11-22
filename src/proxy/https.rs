@@ -13,7 +13,7 @@ use super::*;
 /// 成功時は確立済みの `ClientTls` を返す。失敗時は `(ステータスコード, クライアントへ
 /// 返すエラーメッセージ)` を返す（接続エラー=502 / タイムアウト=504）。クライアントへの
 /// 書き込みは呼び出し側が行う。
-pub(super) async fn connect_https_backend_fresh(
+pub(crate) async fn connect_https_backend_fresh(
     target: &ProxyTarget,
     connect_timeout: Duration,
     tls_profile: crate::upstream_tls::TlsProfile,
@@ -95,6 +95,8 @@ pub(super) async fn proxy_https_pooled(
     client_wants_close: bool,
     tls_profile: crate::upstream_tls::TlsProfile,
     wasm_modules: crate::wasm_plugin_config::WasmModules,
+    // キャッシュの外れの要求の応答を取り込む（平文の上流と同じ。F-257）
+    mut cache_ctx: Option<&mut CacheSaveContext>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
@@ -134,9 +136,14 @@ pub(super) async fn proxy_https_pooled(
             Some(stream) => (stream, true),
             None => match connect_https_backend_fresh(target, connect_timeout, tls_profile).await {
                 Ok(stream) => (stream, false),
-                Err((code, msg)) => {
-                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(msg.to_vec())).await;
-                    return Some((client_stream, code, 0, true));
+                Err((code, _msg)) => {
+                    return super::forward::write_gateway_error(
+                        client_stream,
+                        code,
+                        cache_ctx.as_deref(),
+                        security,
+                    )
+                    .await;
                 }
             },
         };
@@ -179,7 +186,12 @@ pub(super) async fn proxy_https_pooled(
                 initial_body,
                 max_chunked,
                 buffering_config,
-                None,
+                // Wasm で書き換える前の本文をキャッシュへ置かない（当たりは Wasm を通らない。平文の上流と同じ。F-257）
+                if wasm_body {
+                    None
+                } else {
+                    cache_ctx.as_deref_mut()
+                },
                 security,
                 #[cfg(feature = "wasm")]
                 &wasm_mods,
@@ -204,6 +216,7 @@ pub(super) async fn proxy_https_pooled(
                 security,
                 wasm_mods,
                 client_wants_close,
+                cache_ctx.as_deref_mut(),
             )
             .await
         };
@@ -219,13 +232,13 @@ pub(super) async fn proxy_https_pooled(
                 // B-17: クライアントへ 1 バイトも送らないままバックエンド異常で終わった場合、
                 // エラーページ（502/504）を即時送出してクローズする
                 if total == 0 && status_code >= 500 {
-                    let err_buf = if status_code == 504 {
-                        ERR_MSG_GATEWAY_TIMEOUT.to_vec()
-                    } else {
-                        ERR_MSG_BAD_GATEWAY.to_vec()
-                    };
-                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                    return Some((client_stream, status_code, 0, true));
+                    return super::forward::write_gateway_error(
+                        client_stream,
+                        status_code,
+                        cache_ctx.as_deref(),
+                        security,
+                    )
+                    .await;
                 }
                 // バックエンドがKeep-Aliveを許可している場合、プールに返却
                 if backend_wants_keep_alive {
@@ -248,9 +261,13 @@ pub(super) async fn proxy_https_pooled(
                     continue;
                 }
                 // エラー発生時は接続を破棄
-                let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                return Some((client_stream, 502, 0, true));
+                return super::forward::write_gateway_error(
+                    client_stream,
+                    502,
+                    cache_ctx.as_deref(),
+                    security,
+                )
+                .await;
             }
         }
     }
@@ -272,6 +289,7 @@ pub(super) async fn proxy_https_request_with_compression(
     wasm_modules: crate::wasm_plugin_config::WasmModules,
     // 応答の後にクライアントの接続を閉じる（応答ヘッダに `Connection: close` を付ける。B-360）
     close: bool,
+    cache_ctx: Option<&mut CacheSaveContext>,
 ) -> Option<(u16, u64, bool, bool)> {
     // HEAD の応答は本文を持たない（B-245）
     let is_head = request_is_head(&request);
@@ -341,6 +359,7 @@ pub(super) async fn proxy_https_request_with_compression(
             wasm_modules,
             is_head,
             close,
+            cache_ctx,
         )
         .await;
 
@@ -363,6 +382,8 @@ pub(super) async fn transfer_https_response_with_compression(
     wasm_modules: crate::wasm_plugin_config::WasmModules,
     is_head: bool,
     close: bool,
+    // キャッシュの外れの要求の応答を取り込む（圧縮しない応答だけ。平文の上流と同じ。F-257）
+    mut cache_ctx: Option<&mut CacheSaveContext>,
 ) -> (u64, u16, bool, bool) {
     // 応答のヘッダの蓄積。最初の読み込みのバッファをそのまま使う（`compress` の平文の経路と同じ）
     let mut accumulated: Vec<u8> = Vec::new();
@@ -432,6 +453,23 @@ pub(super) async fn transfer_https_response_with_compression(
                 return (0, 502, false, true);
             }
             status_code = parsed.status_code;
+            // stale-if-error: 上流の 502・504 は中継せずに保存した応答を返す（B-492）
+            if let Some(hit) =
+                super::cache_lookup::gateway_error_stale(status_code, cache_ctx.as_deref())
+            {
+                if let Some(r) = super::cache_lookup::write_h1_stale(
+                    client_stream,
+                    hit,
+                    status_code,
+                    security,
+                    close,
+                )
+                .await
+                {
+                    recycle_read_vec(accumulated);
+                    return r;
+                }
+            }
             let body_kind = parsed.body(is_head);
             backend_wants_keep_alive = !parsed.is_connection_close;
 
@@ -510,6 +548,14 @@ pub(super) async fn transfer_https_response_with_compression(
                 // F-59: ヘッダー + 初期ボディを平文接続では 1 回の SENDMSG で送出
                 // B-244: 最初の読み込みのうち本文の終端までだけを送る（後ろは次の応答であり得る）
                 let start = response_body_start(body_kind, body_start);
+                if let Some(ref mut ctx) = cache_ctx {
+                    capture_h1_upstream_head(
+                        ctx,
+                        &accumulated[..header_len],
+                        status_code,
+                        &accumulated[header_len..header_len + start.send],
+                    );
+                }
                 accumulated.truncate(header_len + start.send);
                 let mut body_data = crate::runtime::buf::SlicedIoBuf::new(accumulated);
                 body_data.advance(header_len);
@@ -529,13 +575,13 @@ pub(super) async fn transfer_https_response_with_compression(
                 total += header_len as u64;
                 total += start.send as u64;
 
-                // 残りのボディを転送。区切りどおりに終わったときだけ上流接続を戻す（B-244）
+                // 残りのボディを転送。区切りどおりに終わったときだけ上流接続を戻し、キャッシュに保存する（B-244）
                 let outcome = transfer_response_body_rest(
                     backend_stream,
                     client_stream,
                     body_kind,
                     start,
-                    None,
+                    cache_ctx,
                 )
                 .await;
                 total += outcome.total;

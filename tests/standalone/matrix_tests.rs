@@ -710,10 +710,8 @@ preserve_path = true
                     check!(r.body == vec![b'u'; 2000], "body differs on GET {i}");
                 }
                 let n = seen_count(&seen, &format!("/c-{} ", p.name()));
-                // HTTP/2・HTTP/3 のクライアントの要求はキャッシュを見ない（文書にある制限。F-257）。
-                // 応答が正しく中継されることだけを確かめ、表では n/a にする
-                let want = if p.is_h1() { 1 } else { 2 };
-                check!(n == want, "upstream saw {n} requests (want {want})");
+                // どのクライアントのプロトコルでも 2 回目はキャッシュから返す（F-257）
+                check!(n == 1, "upstream saw {n} requests (want 1)");
                 Ok(())
             }),
         ),
@@ -958,13 +956,10 @@ preserve_path = true
         table.push_str("---|");
     }
     table.push('\n');
-    // 文書にある制限で、機能が働かないことを確かめている組み（表では n/a と脚注）
-    let limited = |name: &str, p: MProto| name.starts_with("proxy cache") && !p.is_h1();
     for (name, case) in &cases {
         table.push_str(&format!("| {name} |"));
         for p in &protos {
             match case(*p) {
-                Ok(()) if limited(name, *p) => table.push_str(" n/a¹ |"),
                 Ok(()) => table.push_str(" ok |"),
                 Err(e) => {
                     table.push_str(" **FAIL** |");
@@ -974,10 +969,6 @@ preserve_path = true
         }
         table.push('\n');
     }
-    table.push_str(
-        "\n¹ The proxy cache serves HTTP/1.1 clients only (documented limitation); \
-         the cell checks that the response is relayed uncached.\n",
-    );
     println!("{table}");
     assert!(
         failures.is_empty(),

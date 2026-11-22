@@ -70,7 +70,12 @@ pub(crate) use self::forward::build_revalidation_request;
 use self::forward::*;
 mod buffered;
 use self::buffered::*;
+// プロキシのキャッシュの引き当て（HTTP/1.1・HTTP/2・HTTP/3 で共有。F-257）
+pub(crate) mod cache_lookup;
 mod compress;
+// HTTP/3 のバッファ経路がキャッシュへ置くかを決める（Wasm で書き換える本文は置かない。F-257）
+#[cfg(feature = "wasm")]
+pub(crate) use self::compress::wasm_wants_response_body;
 use self::compress::*;
 #[cfg(veil_ktls)]
 mod splice;
@@ -78,6 +83,8 @@ mod splice;
 use self::splice::*;
 mod https;
 use self::https::*;
+// 裏の取り直し（`server::spawn_background_revalidation`）の TLS の上流への接続（F-257）
+pub(crate) use self::https::connect_https_backend_fresh;
 mod transfer;
 pub(crate) use self::transfer::collect_response_body_raw;
 use self::transfer::*;

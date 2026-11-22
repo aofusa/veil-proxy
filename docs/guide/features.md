@@ -20,7 +20,7 @@
 - **Health Check**: Automatic failover with HTTP/TCP/gRPC active health checks (HTTP with status code validation, TCP connect-only, gRPC Health Checking Protocol)
 - **L4 Stream Proxy**: TCP and UDP load balancing with Round Robin/LeastConn, TLS passthrough (TCP), zero-copy `splice(2)` kernel forwarding for TCP (no userspace buffer), UDP session-table forwarding with idle-timeout eviction, connection/session limiting (requires `l4-proxy` feature)
 - **Circuit Breaker**: Per-server circuit breaker (Closed→Open→HalfOpen), outlier detection/ejection, EWMA latency tracking (requires `metrics` feature; request retry is not implemented)
-- **Proxy Cache**: Memory and disk-based response caching (ETag/304, stale-while-revalidate, stale-if-error)
+- **Proxy Cache**: In-memory response caching shared by HTTP/1.1, HTTP/2 and HTTP/3 clients (ETag/304, stale-while-revalidate, stale-if-error; the disk cache is not used yet)
 - **Cache Purge Admin API**: Cache invalidation via HTTP (`PURGE` method or `POST /__admin/cache/purge`) with exact/prefix/glob/all modes and Bearer token auth
 - **Buffering Control**: Response buffering to prevent slow clients from blocking backends (Streaming/Full/Adaptive modes)
 - **WebSocket Support**: Bidirectional proxy with Upgrade header detection (Fixed/Adaptive polling modes)

@@ -1460,6 +1460,9 @@ pub struct CacheSaveContext {
     /// キャッシュキー
     #[cfg(feature = "cache")]
     pub key: crate::cache::CacheKey,
+    /// ルートの `[route.cache]`（保存してよい応答かをこの設定で決める。B-491）
+    #[cfg(feature = "cache")]
+    pub route: std::sync::Arc<crate::cache::CacheConfig>,
     /// ホスト名（メトリクス用）
     pub host: String,
     /// キャプチャしたレスポンスヘッダー
@@ -1482,9 +1485,15 @@ pub struct CacheSaveContext {
 impl CacheSaveContext {
     /// 新しいキャッシュ保存コンテキストを作成
     #[cfg(feature = "cache")]
-    pub fn new(key: crate::cache::CacheKey, host: String, max_capture_size: usize) -> Self {
+    pub fn new(
+        key: crate::cache::CacheKey,
+        route: std::sync::Arc<crate::cache::CacheConfig>,
+        host: String,
+        max_capture_size: usize,
+    ) -> Self {
         Self {
             key,
+            route,
             host,
             captured_headers: Vec::new(),
             captured_body: Vec::with_capacity(4096),
@@ -1498,7 +1507,12 @@ impl CacheSaveContext {
 
     /// cache feature 無効時の new（引数は無視、常にノーオップ）
     #[cfg(not(feature = "cache"))]
-    pub fn new(_key: crate::cache::CacheKey, host: String, _max_capture_size: usize) -> Self {
+    pub fn new(
+        _key: crate::cache::CacheKey,
+        _route: std::sync::Arc<crate::cache::CacheConfig>,
+        host: String,
+        _max_capture_size: usize,
+    ) -> Self {
         Self {
             host,
             captured_headers: Vec::new(),
@@ -1523,6 +1537,16 @@ impl CacheSaveContext {
         self.status_code = status_code;
     }
 
+    /// 名前と値の組から応答ヘッダを取り込む（HTTP/2・HTTP/3 の上流の応答・HTTP/2 の上流への中継。F-257）
+    pub fn set_header_pairs<'a>(
+        &mut self,
+        headers: impl Iterator<Item = (&'a [u8], &'a [u8])>,
+        status_code: u16,
+    ) {
+        let headers = headers.map(|(n, v)| (Box::from(n), Box::from(v))).collect();
+        self.set_headers(headers, status_code);
+    }
+
     /// ボディチャンクを追加（サイズ制限付き）
     #[inline]
     pub fn append_body(&mut self, data: &[u8]) {
@@ -1541,8 +1565,11 @@ impl CacheSaveContext {
         self.captured_body.extend_from_slice(data);
     }
 
-    /// キャッシュに保存（キャプチャ成功時のみ）
-    pub fn save_to_cache(&self) -> bool {
+    /// キャッシュに保存（キャプチャ成功時のみ）。取り込んだヘッダと本文は保存へ渡す（2 回目は何もしない）。
+    ///
+    /// 保存してよい応答かはルートの設定で決め、ディスクへ置く本文は offload で書く（B-491・F-257。以前は全体の既定で
+    /// 判定し、本文とヘッダを丸ごと写してから渡していた）。
+    pub async fn save_to_cache(&mut self) -> bool {
         #[cfg(feature = "cache")]
         {
             if self.capture_aborted || self.captured_body.is_empty() {
@@ -1555,30 +1582,31 @@ impl CacheSaveContext {
             }
 
             if let Some(cache_manager) = crate::cache::get_global_cache() {
-                let stored = cache_manager.store_with_vary(
+                self.capture_aborted = true;
+                let size = self.captured_body.len();
+                // 保存（キーと応答の写し・ディスクへの offload）は箱に入れる。応答を中継する関数は保存を await するので、
+                // 箱に入れないとキャッシュの無いルートの要求のフューチャの状態にも保存の分の大きさが載る（F-257。
+                // HTTP/2 の要求のフューチャが 320 バイト大きくなった）
+                let stored = Box::pin(cache_manager.store_async(
+                    &self.route,
                     self.key.clone(),
                     self.status_code,
-                    self.captured_headers.clone(),
-                    self.captured_body.clone(),
-                    self.vary_headers.clone(),
-                );
-
-                if stored {
+                    std::mem::take(&mut self.captured_headers),
+                    std::mem::take(&mut self.captured_body),
+                    self.vary_headers.take(),
+                ))
+                .await;
+                if let Some(storage) = stored {
                     // B-273: ディスクへ置いた応答も "memory" と数えていた
-                    record_cache_store(
-                        &self.host,
-                        cache_manager.storage_label(self.captured_body.len()),
-                    );
+                    record_cache_store(&self.host, storage);
                     ftlog::debug!(
-                        "Cached response for {} (status={}, size={}, vary={:?})",
+                        "Cached response for {} (status={}, size={})",
                         self.host,
                         self.status_code,
-                        self.captured_body.len(),
-                        self.vary_headers
+                        size
                     );
+                    return true;
                 }
-
-                return stored;
             }
         }
         false

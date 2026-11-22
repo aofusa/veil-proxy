@@ -50,7 +50,7 @@ pub(super) async fn test_e2e_cached_small_response_hits() {
         return;
     }
 
-    // 平文の上流のルート（HTTPS の上流はキャッシュに保存しない。F-257）。ほかで使わないクエリを付ける
+    // 平文の上流のルート。ほかで使わないクエリを付ける
     let path = "/cached-plain/index.html?b162";
     let r1 = send_request(PROXY_PORT, path, &[]).await;
     assert!(r1.is_some(), "First /cached/ request should succeed");
@@ -66,6 +66,37 @@ pub(super) async fn test_e2e_cached_small_response_hits() {
         "the second request for a small response should be served from the cache: {}",
         r2.lines().take(12).collect::<Vec<_>>().join(" | ")
     );
+}
+
+/// F-257: HTTPS の上流（HTTP/1.1・ALPN で h2 を選ぶ上流）の応答も、2 回目はキャッシュから返る（X-Cache: HIT）。
+/// 以前は平文の上流の応答だけを保存していた
+#[tokio::test]
+#[ntest::timeout(15000)]
+pub(super) async fn test_e2e_cached_https_upstream_hits() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    for path in [
+        "/cached-tls/index.html?f257",
+        "/cached-h2tls/index.html?f257",
+    ] {
+        let r1 = send_request(PROXY_PORT, path, &[]).await;
+        assert!(r1.is_some(), "first request for {path} should succeed");
+        assert_eq!(get_status_code(&r1.unwrap()), Some(200), "{path}");
+
+        let r2 = send_request(PROXY_PORT, path, &[]).await;
+        assert!(r2.is_some(), "second request for {path} should succeed");
+        let r2 = r2.unwrap();
+        assert_eq!(get_status_code(&r2), Some(200), "{path}");
+        assert_eq!(
+            get_header_value(&r2, "X-Cache").as_deref(),
+            Some("HIT"),
+            "the second request for {path} should be served from the cache: {}",
+            r2.lines().take(12).collect::<Vec<_>>().join(" | ")
+        );
+    }
 }
 
 /// /rate-limited/* ルートでレート制限（429）を検証する

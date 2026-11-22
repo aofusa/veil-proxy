@@ -400,7 +400,7 @@ pub(super) async fn transfer_response_body_rest<R: AsyncReader, W: AsyncWriter>(
     }
     if out.complete && matches!(kind, ResponseBody::Length(_) | ResponseBody::Chunked) {
         if let Some(ctx) = cache {
-            ctx.save_to_cache();
+            ctx.save_to_cache().await;
         }
     }
     if !out.complete {

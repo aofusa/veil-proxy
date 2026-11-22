@@ -79,9 +79,11 @@ impl CacheIndex {
         // 有効期限チェック
         if !entry.entry.is_valid() {
             self.misses.fetch_add(1, Ordering::Relaxed);
-            // 期限切れエントリは削除
-            drop(entry);
-            self.remove(key);
+            // 期限切れエントリは削除する。stale として返せる期間の内は残す（`get_stale` で引く。B-492）
+            if !entry.entry.is_retained() {
+                drop(entry);
+                self.remove(key);
+            }
             return None;
         }
 
@@ -211,8 +213,9 @@ impl CacheIndex {
     pub fn evict_expired(&self) -> usize {
         let mut evicted = 0;
 
+        // stale として返せる期間の内のエントリは残す（B-492）
         self.entries.retain(|_, entry| {
-            if entry.entry.is_valid() {
+            if entry.entry.is_retained() {
                 true
             } else {
                 evicted += 1;
@@ -510,5 +513,30 @@ mod tests {
         index.clear();
         assert_eq!(index.len(), 0);
         assert_eq!(index.memory_usage(), 0);
+    }
+
+    /// 期限切れのエントリは、保存したルートの stale の期間の内は引いても掃除しても消えない（`get_stale` で引ける）。
+    /// 期間の無いエントリは引いたときに消える（B-492。以前は stale の期間があっても消えたので、stale-while-revalidate・
+    /// stale-if-error は一度も効かなかった）
+    #[test]
+    fn expired_entries_are_kept_within_stale_retention() {
+        let index = CacheIndex::new();
+        let kept = create_test_key("/kept");
+        let dropped = create_test_key("/dropped");
+        // 有効期限 0 秒（入れた時点で期限切れ）
+        index.insert(
+            kept.clone(),
+            create_test_entry(0, b"a").with_stale_retention(3600),
+        );
+        index.insert(dropped.clone(), create_test_entry(0, b"b"));
+
+        assert!(index.get(&kept).is_none());
+        assert!(index.get_stale(&kept).is_some());
+        assert_eq!(index.evict_expired(), 1);
+        assert!(index.get_stale(&kept).is_some());
+
+        assert!(index.get(&dropped).is_none());
+        assert!(index.get_stale(&dropped).is_none());
+        assert_eq!(index.len(), 1);
     }
 }

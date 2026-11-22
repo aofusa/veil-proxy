@@ -218,6 +218,23 @@ pub(super) async fn transfer_response_with_compression(
                 return (0, 502, false, true);
             }
             status_code = parsed.status_code;
+            // stale-if-error: 上流の 502・504 は中継せずに保存した応答を返す（B-492）
+            if let Some(hit) =
+                super::cache_lookup::gateway_error_stale(status_code, cache_ctx.as_deref())
+            {
+                if let Some(r) = super::cache_lookup::write_h1_stale(
+                    client_stream,
+                    hit,
+                    status_code,
+                    security,
+                    close,
+                )
+                .await
+                {
+                    recycle_read_vec(accumulated);
+                    return r;
+                }
+            }
             let body_kind = parsed.body(is_head);
             backend_wants_keep_alive = !parsed.is_connection_close;
 
@@ -277,22 +294,14 @@ pub(super) async fn transfer_response_with_compression(
                 // B-244: 最初の読み込みのうち本文の終端までだけを送る（後ろは次の応答であり得る）
                 let start = response_body_start(body_kind, body_start);
 
-                // キャッシュコンテキストがある場合、ヘッダーを設定
+                // キャッシュコンテキストがある場合、ヘッダーと最初の本文を取り込む
                 if let Some(ref mut ctx) = cache_ctx {
-                    // ヘッダーを解析してキャッシュコンテキストに保存
-                    let mut headers_storage = [httparse::EMPTY_HEADER; 64];
-                    let mut response = httparse::Response::new(&mut headers_storage);
-                    if response.parse(&accumulated[..header_len]).is_ok() {
-                        let headers: Vec<(Box<[u8]>, Box<[u8]>)> = response
-                            .headers
-                            .iter()
-                            .map(|h| (h.name.as_bytes().into(), h.value.into()))
-                            .collect();
-                        ctx.set_headers(headers, status_code);
-                    }
-
-                    // 初期ボディをキャプチャ
-                    ctx.append_body(&body_start[..start.send]);
+                    capture_h1_upstream_head(
+                        ctx,
+                        &accumulated[..header_len],
+                        status_code,
+                        &body_start[..start.send],
+                    );
                 }
 
                 // ヘッダーを修正（remove_response_headers・add_response_headers・Alt-Svc・Wasm・CORS）。1 本のバッファへ
@@ -381,6 +390,28 @@ pub(super) async fn transfer_response_with_compression(
             return (0, 502, false, true);
         }
     }
+}
+
+/// 上流の HTTP/1.1 の応答の見出しと、最初の読み込みに入っていた本文をキャッシュの保存へ取り込む（平文・HTTPS の上流で
+/// 共有する。F-257）。キャッシュの外れの要求だけが通る
+pub(super) fn capture_h1_upstream_head(
+    ctx: &mut CacheSaveContext,
+    head: &[u8],
+    status_code: u16,
+    first_body: &[u8],
+) {
+    let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+    let mut response = httparse::Response::new(&mut headers_storage);
+    if response.parse(head).is_ok() {
+        ctx.set_header_pairs(
+            response
+                .headers
+                .iter()
+                .map(|h| (h.name.as_bytes(), h.value)),
+            status_code,
+        );
+    }
+    ctx.append_body(first_body);
 }
 
 /// 応答のヘッダの蓄積に使った読み取りバッファをプールへ返す（まだ何も読んでいない空の `Vec` は捨てる）。

@@ -188,7 +188,25 @@ impl Default for CacheConfig {
     }
 }
 
+/// stale-while-revalidate（`stale_while_revalidate = true`）で期限切れの応答を返す期間（期限から。秒）
+pub const STALE_WHILE_REVALIDATE_SECS: u64 = 60;
+/// stale-if-error（`stale_if_error = true`）で期限切れの応答を返す期間（期限から。秒）
+pub const STALE_IF_ERROR_SECS: u64 = 3600;
+
 impl CacheConfig {
+    /// このルートで保存した応答を、期限が切れてから残しておく期間（秒）。stale-while-revalidate・stale-if-error で
+    /// 返すため（B-492。どちらも無効なら 0 で、期限が切れたら消す）
+    #[inline]
+    pub fn stale_retention_secs(&self) -> u64 {
+        if self.stale_if_error {
+            STALE_IF_ERROR_SECS
+        } else if self.stale_while_revalidate {
+            STALE_WHILE_REVALIDATE_SECS
+        } else {
+            0
+        }
+    }
+
     /// メソッドがキャッシュ対象かチェック
     #[inline]
     pub fn is_cacheable_method(&self, method: &[u8]) -> bool {
@@ -199,20 +217,24 @@ impl CacheConfig {
 
     /// `Authorization`（とルートの JWT のヘッダ。B-390）の付いた要求でキャッシュを使わないか。`key_headers` に
     /// そのヘッダがあれば利用者ごとのキーになるので使う（RFC 9111 §3.5。F-236 の F7）
+    ///
+    /// `headers` は要求ヘッダの (名前, 値) の組（HTTP/1.1・HTTP/2・HTTP/3 で共有する。F-257）。
     #[inline]
-    pub fn bypass_for_authorization(&self, headers: &[(bytes::Bytes, bytes::Bytes)]) -> bool {
+    pub fn bypass_for_authorization<'h, I>(&self, headers: I) -> bool
+    where
+        I: Iterator<Item = (&'h [u8], &'h [u8])> + Clone,
+    {
         let keyed = |name: &str| {
             self.key_headers
                 .iter()
                 .any(|k| k.eq_ignore_ascii_case(name))
         };
-        (super::policy::CachePolicy::request_has_authorization(headers) && !keyed("authorization"))
-            || self.credential_header.as_deref().is_some_and(|h| {
-                headers
-                    .iter()
-                    .any(|(n, _)| n.eq_ignore_ascii_case(h.as_bytes()))
-                    && !keyed(h)
-            })
+        let has = |name: &[u8]| headers.clone().any(|(n, _)| n.eq_ignore_ascii_case(name));
+        (has(b"authorization") && !keyed("authorization"))
+            || self
+                .credential_header
+                .as_deref()
+                .is_some_and(|h| has(h.as_bytes()) && !keyed(h))
     }
 
     /// ステータスコードがキャッシュ対象かチェック
@@ -281,16 +303,19 @@ mod tests {
                 Bytes::from_static(v.as_bytes()),
             )
         };
+        let bypass = |c: &CacheConfig, hs: &[(Bytes, Bytes)]| {
+            c.bypass_for_authorization(crate::http_utils::header_pairs(hs))
+        };
         let mut c = CacheConfig::default();
-        assert!(c.bypass_for_authorization(&[h("Authorization", "Bearer a")]));
-        assert!(!c.bypass_for_authorization(&[h("X-Access-Token", "a")]));
+        assert!(bypass(&c, &[h("Authorization", "Bearer a")]));
+        assert!(!bypass(&c, &[h("X-Access-Token", "a")]));
         c.credential_header = Some("x-access-token".into());
-        assert!(c.bypass_for_authorization(&[h("X-Access-Token", "a")]));
-        assert!(c.bypass_for_authorization(&[h("authorization", "Bearer a")]));
-        assert!(!c.bypass_for_authorization(&[h("accept", "*/*")]));
+        assert!(bypass(&c, &[h("X-Access-Token", "a")]));
+        assert!(bypass(&c, &[h("authorization", "Bearer a")]));
+        assert!(!bypass(&c, &[h("accept", "*/*")]));
         c.key_headers = vec!["X-Access-Token".into()];
-        assert!(!c.bypass_for_authorization(&[h("x-access-token", "a")]));
-        assert!(c.bypass_for_authorization(&[h("authorization", "Bearer a")]));
+        assert!(!bypass(&c, &[h("x-access-token", "a")]));
+        assert!(bypass(&c, &[h("authorization", "Bearer a")]));
     }
 
     #[test]

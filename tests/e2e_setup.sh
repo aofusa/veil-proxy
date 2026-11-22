@@ -1073,7 +1073,7 @@ default_ttl_secs = 1
 methods = ["GET"]
 cacheable_statuses = [200]
 
-# B-162: 平文の上流（HTTPS の上流はキャッシュに保存しない。F-257）で、小さい応答がキャッシュから返ること
+# B-162: 平文の上流で、小さい応答がキャッシュから返ること
 [[route]]
 [route.conditions]
 host = "localhost"
@@ -1081,6 +1081,33 @@ path = "/cached-plain/*"
 [route.action]
 type = "Proxy"
 url = "http://127.0.0.1:${BACKEND_H2C_PORT}"
+[route.cache]
+enabled = true
+default_ttl_secs = 5
+methods = ["GET"]
+cacheable_statuses = [200]
+
+# F-257: HTTPS の上流（HTTP/1.1・ALPN で h2 を選ぶ上流）の応答もキャッシュから返ること
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/cached-tls/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.cache]
+enabled = true
+default_ttl_secs = 5
+methods = ["GET"]
+cacheable_statuses = [200]
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/cached-h2tls/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-on-pool"
 [route.cache]
 enabled = true
 default_ttl_secs = 5

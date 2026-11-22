@@ -81,7 +81,7 @@ pub mod watch;
 mod static_file;
 
 // 常時公開 (DashMap 不要)
-pub use config::CacheConfig;
+pub use config::{CacheConfig, STALE_IF_ERROR_SECS, STALE_WHILE_REVALIDATE_SECS};
 pub use entry::{CacheEntry, CacheStorage};
 pub use key::CacheKey;
 pub use policy::{CacheControl, CachePolicy, VaryResult};
@@ -310,6 +310,17 @@ impl CacheManager {
         _vary: Option<Vec<String>>,
     ) -> bool {
         false
+    }
+    pub async fn store_async(
+        self: std::sync::Arc<Self>,
+        _route: &CacheConfig,
+        _key: CacheKey,
+        _status: u16,
+        _hdrs: Vec<(Box<[u8]>, Box<[u8]>)>,
+        _body: Vec<u8>,
+        _vary: Option<Vec<String>>,
+    ) -> Option<&'static str> {
+        None
     }
     pub fn invalidate(&self, _key: &CacheKey) {}
     pub fn invalidate_pattern(&self, _pattern: &str) -> usize {

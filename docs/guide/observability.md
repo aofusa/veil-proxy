@@ -35,8 +35,8 @@ Use the `path` option to change the endpoint path.
 
 ### Available Metrics
 
-Every series is recorded for HTTP/1.1, HTTP/2 and HTTP/3 clients alike. The response cache series (`veil_proxy_cache_*`)
-only move on HTTP/1.1, because the proxy response cache (`[route.cache]`) serves HTTP/1.1 requests only.
+Every series is recorded for HTTP/1.1, HTTP/2 and HTTP/3 clients alike, the response cache series (`veil_proxy_cache_*`)
+included.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|

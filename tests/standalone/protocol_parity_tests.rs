@@ -560,7 +560,12 @@ url = "http://127.0.0.1:{a}"
         );
     }
     let mut used = std::collections::HashSet::new();
-    for i in 0..8 {
+    // 少なくとも 8 個のキーを比べ、両方の上流へ分かれるまで続ける（キーを読めずに送信元の IP で選ぶと 1 台だけになる）。
+    // 環は上流の `host:port` から作り、試験の上流のポートは毎回変わるので、8 個のキーが同じ 1 台へ集まる回が 1% 弱ある
+    for i in 0..64 {
+        if i >= 8 && used.len() == 2 {
+            break;
+        }
         let sid = format!("sid=user{i}");
         let joined = format!("a=1; {sid}");
         let h1 = which_upstream(&seen_a, &seen_b, || {
@@ -1106,10 +1111,11 @@ client_write_timeout_secs = 2
         listeners = listeners_toml(ports, &cert, &key),
     );
     let veil = spawn_config(dir.path(), ports, &config);
-    #[allow(unused_mut)]
-    let mut protos = vec![Proto::H2c];
-    #[cfg(feature = "http3")]
-    protos.push(Proto::H3);
+    let protos: &[Proto] = &[
+        Proto::H2c,
+        #[cfg(feature = "http3")]
+        Proto::H3,
+    ];
     let results: Vec<(Proto, Vec<Result<usize, String>>)> = std::thread::scope(|s| {
         let handles: Vec<_> = protos
             .iter()
@@ -1810,4 +1816,539 @@ fn f314_http3_tls13_cipher_suites() {
     )
     .unwrap_or_else(|e| panic!("{e}\n{}", veil.log()));
     assert_eq!(aes256.status, 200);
+}
+
+// ====================
+// F-257・B-491〜B-493: プロキシのキャッシュ・応答の Server
+// ====================
+
+/// 応答の `server` の値（全部）
+fn server_values(r: &HttpResponse) -> Vec<&str> {
+    r.headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("server"))
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
+
+/// `[server] server_header_enabled = true` を足した [`listeners_toml`]
+fn listeners_with_own_server(
+    ports: Ports,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> String {
+    listeners_toml(ports, cert, key).replace(
+        "threads = 1\n",
+        "threads = 1\nserver_header_enabled = true\nserver_header_value = \"veil-test\"\n",
+    )
+}
+
+/// [`spawn_cache_upstream`] の状態
+#[derive(Default)]
+struct CacheUpstream {
+    /// 受けた要求のパス（順に）
+    seen: Mutex<Vec<String>>,
+    /// 真なら 502 を返す
+    fail: std::sync::atomic::AtomicBool,
+    /// 真ならリスナーを閉じる（以後の接続は拒否される）
+    down: std::sync::atomic::AtomicBool,
+}
+
+impl CacheUpstream {
+    /// `path` を受けた回数
+    fn count(&self, path: &str) -> usize {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| *p == path)
+            .count()
+    }
+}
+
+/// キャッシュの試験の HTTP/1.1 の上流（`Server: upstream`）。本文は `h1 {パス} v{そのパスを受けた回数}`。
+/// `/stale-` で始まるパスは 1 回目だけ `max-age=1`（すぐ期限が切れる）、ほかは `max-age=60`。`/chunked` は chunked で
+/// 返す。応答ごとに接続を閉じる（`down` にした後の要求は、プールの接続を使わず接続を拒否される）
+fn spawn_cache_upstream(state: Arc<CacheUpstream>) -> u16 {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        loop {
+            if state.down.load(Ordering::SeqCst) {
+                // リスナーを閉じる
+                return;
+            }
+            let mut s = match l.accept() {
+                Ok((s, _)) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => return,
+            };
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let _ = s.set_nonblocking(false);
+                let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut tmp) {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+                        _ => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).into_owned();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let n = {
+                    let mut seen = state.seen.lock().unwrap();
+                    seen.push(path.clone());
+                    seen.iter().filter(|p| **p == path).count()
+                };
+                let resp = if state.fail.load(Ordering::SeqCst) {
+                    "HTTP/1.1 502 Bad Gateway\r\nServer: upstream\r\nContent-Length: 3\r\n\
+                 Connection: close\r\n\r\nbad"
+                        .to_string()
+                } else {
+                    let body = format!("h1 {path} v{n}");
+                    let max_age = if path.starts_with("/stale-") && n == 1 {
+                        1
+                    } else {
+                        60
+                    };
+                    let mut r = format!(
+                        "HTTP/1.1 200 OK\r\nServer: upstream\r\nContent-Type: text/plain\r\n\
+                     Cache-Control: max-age={max_age}\r\nConnection: close\r\n"
+                    );
+                    if path == "/chunked" {
+                        r.push_str("Transfer-Encoding: chunked\r\n\r\n");
+                        for part in body.as_bytes().chunks(4) {
+                            let part = std::str::from_utf8(part).unwrap();
+                            r.push_str(&format!("{:x}\r\n{part}\r\n", part.len()));
+                        }
+                        r.push_str("0\r\n\r\n");
+                    } else {
+                        r.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+                    }
+                    r
+                };
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    port
+}
+
+/// 本文が `h2c {パス} v{そのパスを受けた回数}` の h2c の上流（`server: upstream`・`cache-control: max-age=60`）
+fn spawn_counting_h2c_upstream() -> (u16, Arc<Mutex<Vec<String>>>) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen2 = seen.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let l = tokio::net::TcpListener::from_std(l).unwrap();
+            loop {
+                let Ok((tcp, _)) = l.accept().await else {
+                    continue;
+                };
+                let seen = seen2.clone();
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(tcp).await else {
+                        return;
+                    };
+                    while let Some(Ok((req, mut respond))) = conn.accept().await {
+                        let path = req.uri().path().to_string();
+                        let n = {
+                            let mut s = seen.lock().unwrap();
+                            s.push(path.clone());
+                            s.iter().filter(|p| **p == path).count()
+                        };
+                        let resp = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "text/plain")
+                            .header("server", "upstream")
+                            .header("cache-control", "max-age=60")
+                            .body(())
+                            .unwrap();
+                        if let Ok(mut send) = respond.send_response(resp, false) {
+                            let body = bytes::Bytes::from(format!("h2c {path} v{n}"));
+                            let _ = send.send_data(body, true);
+                        }
+                    }
+                });
+            }
+        });
+    });
+    (port, seen)
+}
+
+/// F-257: HTTP/2・HTTP/3 のクライアントの要求もキャッシュを引いて保存し（上流が HTTP/1.1・h2c のどちらでも）、
+/// 保存した応答をプロトコルをまたいで返す（以前は HTTP/1.1 のクライアントだけ）。chunked で届いた応答は本文を
+/// 復号して保存し、どのプロトコルにも同じ本文を返す。当たりの応答の `server` は veil の 1 つだけ（B-493）
+#[test]
+fn f257_proxy_cache_on_every_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let h1 = Arc::new(CacheUpstream::default());
+    let up1 = spawn_cache_upstream(h1.clone());
+    let (up2, seen2) = spawn_counting_h2c_upstream();
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[[route]]
+[route.conditions]
+path = "/c/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up1}"
+[route.cache]
+enabled = true
+methods = ["GET"]
+cacheable_statuses = [200]
+
+[[route]]
+[route.conditions]
+path = "/h2/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up2}"
+use_h2c = true
+[route.cache]
+enabled = true
+methods = ["GET"]
+cacheable_statuses = [200]
+"#,
+        listeners = listeners_with_own_server(ports, &cert, &key),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    let h2_count = |path: &str| seen2.lock().unwrap().iter().filter(|p| *p == path).count();
+    for proto in all_protos() {
+        let ctx = |r: &HttpResponse| format!("{proto:?} {:?}\n{}", r.headers, veil.log());
+        // 上流が HTTP/1.1・h2c のそれぞれで、1 回目は上流へ、2 回目はキャッシュから
+        for (path, want, upstream_seen) in [
+            (
+                format!("/c/f-{proto:?}"),
+                format!("h1 /f-{proto:?} v1"),
+                Box::new(|| h1.count(&format!("/f-{proto:?}"))) as Box<dyn Fn() -> usize>,
+            ),
+            (
+                format!("/h2/g-{proto:?}"),
+                format!("h2c /g-{proto:?} v1"),
+                Box::new(move || h2_count(&format!("/g-{proto:?}"))),
+            ),
+        ] {
+            let r = fetch(proto, ports, "GET", &path, &[], b"");
+            assert_eq!(r.status, 200, "{path} {}", ctx(&r));
+            assert_eq!(r.text(), want, "{path} {}", ctx(&r));
+            assert_ne!(r.header("x-cache"), Some("HIT"), "{path} {}", ctx(&r));
+            assert_eq!(server_values(&r), ["veil-test"], "{path} {}", ctx(&r));
+            let r = fetch(proto, ports, "GET", &path, &[], b"");
+            assert_eq!(r.status, 200, "{path} {}", ctx(&r));
+            assert_eq!(r.text(), want, "{path} {}", ctx(&r));
+            assert_eq!(r.header("x-cache"), Some("HIT"), "{path} {}", ctx(&r));
+            assert_eq!(server_values(&r), ["veil-test"], "{path} {}", ctx(&r));
+            assert_eq!(upstream_seen(), 1, "{path} {}", ctx(&r));
+        }
+    }
+
+    // 同じ URL（ホストも同じ）なら、どのプロトコルで保存した応答もほかのプロトコルへ返す
+    for (i, first) in all_protos().into_iter().enumerate() {
+        let path = format!("/c/shared-{i}");
+        let want = format!("h1 /shared-{i} v1");
+        let r = fetch_as(first, ports, "localhost", "GET", &path, &[], b"");
+        assert_eq!(r.text(), want, "{first:?}\n{}", veil.log());
+        for proto in all_protos() {
+            let r = fetch_as(proto, ports, "localhost", "GET", &path, &[], b"");
+            assert_eq!(r.status, 200, "{first:?} -> {proto:?}\n{}", veil.log());
+            assert_eq!(r.text(), want, "{first:?} -> {proto:?}\n{}", veil.log());
+            assert_eq!(
+                r.header("x-cache"),
+                Some("HIT"),
+                "{first:?} -> {proto:?}\n{}",
+                veil.log()
+            );
+        }
+        assert_eq!(h1.count(&format!("/shared-{i}")), 1, "{first:?}");
+    }
+
+    // chunked で届いた応答（HTTP/1.1 のクライアントの外れで保存する）は本文を復号して保存する
+    let r = fetch_as(Proto::H1, ports, "localhost", "GET", "/c/chunked", &[], b"");
+    assert_eq!(r.text(), "h1 /chunked v1", "{}", veil.log());
+    for proto in all_protos() {
+        let r = fetch_as(proto, ports, "localhost", "GET", "/c/chunked", &[], b"");
+        assert_eq!(
+            r.header("x-cache"),
+            Some("HIT"),
+            "{proto:?}\n{}",
+            veil.log()
+        );
+        assert_eq!(r.text(), "h1 /chunked v1", "{proto:?}\n{}", veil.log());
+        if proto == Proto::H1 {
+            assert_eq!(r.header("transfer-encoding"), None, "{:?}", r.headers);
+            assert_eq!(r.header("content-length"), Some("14"), "{:?}", r.headers);
+        }
+    }
+    assert_eq!(h1.count("/chunked"), 1);
+}
+
+/// F-257: `Host`（HTTP/2 は `:authority`）が UTF-8 でない要求はキャッシュを使わない（以前の HTTP/1.1 は `unknown`、
+/// HTTP/2・HTTP/3 は空のホストへ置き換えたキーで保存し、同じキーになるほかの要求へ返し得た）
+#[test]
+fn f257_cache_skips_non_utf8_host() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let up = Arc::new(CacheUpstream::default());
+    let up_port = spawn_cache_upstream(up.clone());
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[[route]]
+[route.conditions]
+path = "/c/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up_port}"
+[route.cache]
+enabled = true
+methods = ["GET"]
+cacheable_statuses = [200]
+"#,
+        listeners = listeners_toml(ports, &cert, &key),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    let wait_count = |path: &str, n: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while up.count(path) < n && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        up.count(path)
+    };
+    // 同じルートで UTF-8 のホストの要求はキャッシュから返る（このルートがキャッシュしていることの確かめ）
+    for _ in 0..2 {
+        let r = fetch(Proto::H1, ports, "GET", "/c/valid", &[], b"");
+        assert_eq!(r.status, 200, "{}", veil.log());
+    }
+    assert_eq!(up.count("/valid"), 1, "{}", veil.log());
+    // HTTP/1.1: Host が UTF-8 でない要求は 2 回とも上流へ届き、`X-Cache: HIT` を付けない
+    for n in 1..=2 {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", ports.clear)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(b"GET /c/raw-h1 HTTP/1.1\r\nHost: \xff\xfe\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut resp = Vec::new();
+        let _ = s.read_to_end(&mut resp);
+        let text = String::from_utf8_lossy(&resp).to_ascii_lowercase();
+        assert!(text.starts_with("http/1.1 200"), "{text}\n{}", veil.log());
+        assert!(!text.contains("x-cache: hit"), "{text}");
+        assert_eq!(wait_count("/raw-h1", n), n, "{}", veil.log());
+    }
+    // HTTP/2（h2c を直に話す）: `:authority` が UTF-8 でない要求も 2 回とも上流へ届く
+    for n in 1..=2 {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", ports.clear)).unwrap();
+        s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
+        // SETTINGS（空）
+        s.write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0]).unwrap();
+        // HEADERS（stream 1、END_STREAM | END_HEADERS）: GET（静的表 2）・http（6）と、索引に入れないリテラルの
+        // :path（4）・:authority（1）
+        let path = b"/c/raw-h2";
+        let mut block = vec![0x82, 0x86, 0x04, path.len() as u8];
+        block.extend_from_slice(path);
+        block.extend_from_slice(&[0x01, 2, 0xff, 0xfe]);
+        let mut frame = vec![0, 0, block.len() as u8, 0x1, 0x5, 0, 0, 0, 1];
+        frame.extend_from_slice(&block);
+        s.write_all(&frame).unwrap();
+        assert_eq!(wait_count("/raw-h2", n), n, "{}", veil.log());
+    }
+}
+
+/// B-492: `stale_while_revalidate`・`stale_if_error` が、どのクライアントのプロトコルでも期限の切れた応答を返す。
+/// 以前は期限の切れたエントリを引いたとき・掃除のときに消していたので一度も効かず、HTTP/1.1 は上流の 502 を
+/// 送った後に保存した応答を続けて書き（1 つの要求に応答が 2 つ）、HTTP/2・HTTP/3 は stale を見なかった。
+/// stale-if-error は上流が返した 502・504 と、veil が返す 502（上流に接続できない）の両方で効く
+#[test]
+fn b492_stale_responses_on_every_protocol() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let h1 = Arc::new(CacheUpstream::default());
+    let up = spawn_cache_upstream(h1.clone());
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[[route]]
+[route.conditions]
+path = "/swr/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}"
+[route.cache]
+enabled = true
+methods = ["GET"]
+cacheable_statuses = [200]
+stale_while_revalidate = true
+
+[[route]]
+[route.conditions]
+path = "/sie/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up}"
+[route.cache]
+enabled = true
+methods = ["GET"]
+cacheable_statuses = [200]
+stale_if_error = true
+"#,
+        listeners = listeners_with_own_server(ports, &cert, &key),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    // 期限 1 秒で保存する
+    for proto in all_protos() {
+        let r = fetch(
+            proto,
+            ports,
+            "GET",
+            &format!("/swr/stale-w-{proto:?}"),
+            &[],
+            b"",
+        );
+        assert_eq!(
+            r.text(),
+            format!("h1 /stale-w-{proto:?} v1"),
+            "{}",
+            veil.log()
+        );
+    }
+    let r = fetch_as(
+        Proto::H1,
+        ports,
+        "localhost",
+        "GET",
+        "/sie/stale-e",
+        &[],
+        b"",
+    );
+    assert_eq!(r.text(), "h1 /stale-e v1", "{}", veil.log());
+    std::thread::sleep(Duration::from_millis(1300));
+
+    // stale-while-revalidate: 期限の切れた応答をすぐ返し、裏で取り直した応答を次から返す
+    for proto in all_protos() {
+        let path = format!("/swr/stale-w-{proto:?}");
+        let upstream_path = format!("/stale-w-{proto:?}");
+        let ctx = |r: &HttpResponse| format!("{proto:?} {:?}\n{}", r.headers, veil.log());
+        let r = fetch(proto, ports, "GET", &path, &[], b"");
+        assert_eq!(r.status, 200, "{}", ctx(&r));
+        assert_eq!(r.header("x-cache"), Some("STALE"), "{}", ctx(&r));
+        assert_eq!(r.text(), format!("h1 {upstream_path} v1"), "{}", ctx(&r));
+        assert_eq!(server_values(&r), ["veil-test"], "{}", ctx(&r));
+        assert!(
+            wait_until(Duration::from_secs(5), || h1.count(&upstream_path) >= 2),
+            "{proto:?}: no background revalidation\n{}",
+            veil.log()
+        );
+        let mut fresh = None;
+        for _ in 0..50 {
+            let r = fetch(proto, ports, "GET", &path, &[], b"");
+            if r.header("x-cache") == Some("HIT") {
+                fresh = Some(r);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let r = fresh
+            .unwrap_or_else(|| panic!("{proto:?}: revalidated entry never served\n{}", veil.log()));
+        assert_ne!(r.text(), format!("h1 {upstream_path} v1"), "{}", ctx(&r));
+    }
+
+    // stale-if-error: 上流が返す 502 の代わりに期限の切れた応答を返す（保存していない URL は 502 のまま）
+    h1.fail.store(true, Ordering::SeqCst);
+    for proto in all_protos() {
+        let r = fetch_as(proto, ports, "localhost", "GET", "/sie/stale-e", &[], b"");
+        let ctx = format!("{proto:?} {:?}\n{}", r.headers, veil.log());
+        assert_eq!(r.status, 200, "{ctx}");
+        assert_eq!(r.header("x-cache"), Some("STALE"), "{ctx}");
+        assert_eq!(r.text(), "h1 /stale-e v1", "{ctx}");
+        assert_eq!(server_values(&r), ["veil-test"], "{ctx}");
+        let r = fetch_as(proto, ports, "localhost", "GET", "/sie/other", &[], b"");
+        assert_eq!(r.status, 502, "{proto:?}\n{}", veil.log());
+    }
+
+    // stale-if-error: 上流に接続できないとき（veil が返す 502）も同じ
+    h1.down.store(true, Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(5), || connect_local(
+            up,
+            Duration::from_millis(200)
+        )
+        .is_err()),
+        "the upstream listener did not close"
+    );
+    for proto in all_protos() {
+        let r = fetch_as(proto, ports, "localhost", "GET", "/sie/stale-e", &[], b"");
+        let ctx = format!("{proto:?} {:?}\n{}", r.headers, veil.log());
+        assert_eq!(r.status, 200, "{ctx}");
+        assert_eq!(r.header("x-cache"), Some("STALE"), "{ctx}");
+        assert_eq!(r.text(), "h1 /stale-e v1", "{ctx}");
+        let r = fetch_as(proto, ports, "localhost", "GET", "/sie/other", &[], b"");
+        assert_eq!(r.status, 502, "{proto:?}\n{}", veil.log());
+    }
+}
+
+/// B-493: `server_header_enabled` のとき、HTTP/2 のクライアントへ中継する応答にも veil の `server` だけを付ける
+/// （以前は HTTP/2 だけ上流の `server` も残し、2 つ送っていた）。上流が HTTP/1.1・h2c、溜める・流す経路のどれでも
+#[test]
+fn b493_single_server_header_on_every_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let h1 = Arc::new(CacheUpstream::default());
+    let up1 = spawn_cache_upstream(h1.clone());
+    let (up2, _seen2) = spawn_counting_h2c_upstream();
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[[route]]
+[route.conditions]
+path = "/h1/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up1}"
+
+[[route]]
+[route.conditions]
+path = "/h1buf/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up1}"
+[route.buffering]
+mode = "full"
+
+[[route]]
+[route.conditions]
+path = "/h2/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:{up2}"
+use_h2c = true
+"#,
+        listeners = listeners_with_own_server(ports, &cert, &key),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    for proto in all_protos() {
+        for path in ["/h1/a", "/h1buf/a", "/h2/a"] {
+            let r = fetch(proto, ports, "GET", path, &[], b"");
+            let ctx = format!("{proto:?} {path} {:?}\n{}", r.headers, veil.log());
+            assert_eq!(r.status, 200, "{ctx}");
+            assert_eq!(server_values(&r), ["veil-test"], "{ctx}");
+        }
+    }
 }

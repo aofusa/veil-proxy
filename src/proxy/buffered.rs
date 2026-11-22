@@ -157,6 +157,22 @@ where
             until_close,
             _chunked,
         )) => {
+            // stale-if-error: 上流の 502・504 は返さずに保存した応答を返す（B-492）
+            if let Some(hit) =
+                super::cache_lookup::gateway_error_stale(status_code, cache_ctx.as_deref())
+            {
+                if let Some((len, st, _, must_close)) = super::cache_lookup::write_h1_stale(
+                    client_stream,
+                    hit,
+                    status_code,
+                    security,
+                    close,
+                )
+                .await
+                {
+                    return Some((st, len, false, must_close));
+                }
+            }
             // ステータス行を HTTP/1.1 に直し、応答ヘッダの方針・Alt-Svc・Wasm・CORS をかける（他の HTTP/1.1 の
             // 経路と同じ。以前は上流の head をそのまま返していた。B-267・B-268・B-271）
             let head = super::compress::finish_h1_upstream_head(
@@ -762,10 +778,11 @@ where
 
     let reusable = !extra && !matches!(kind, ResponseBody::UntilClose);
 
-    // キャッシュに保存（読み切った本文だけ）
-    if let Some(ctx) = cache_ctx {
+    // キャッシュに保存（区切りどおりに読み切った本文だけ。上流が閉じて終わる本文は、流す経路・HTTP/2・HTTP/3 と同じく
+    // 保存しない。F-257）
+    if let Some(ctx) = cache_ctx.filter(|_| !matches!(kind, ResponseBody::UntilClose)) {
         ctx.append_body(&body);
-        ctx.save_to_cache();
+        ctx.save_to_cache().await;
     }
 
     if body.len() > buffering_config.max_memory_buffer {

@@ -961,6 +961,19 @@ struct BufferedReq {
     /// 要求のトレーラ（Proxy-Wasm の `on_http_request_trailers` に渡す。上流へは送らない。F-313）
     #[cfg(feature = "wasm")]
     trailers: Vec<h3::Header>,
+    /// `classify` が引いたキャッシュの結果（F-257）
+    cache: Option<crate::proxy::cache_lookup::CacheLookup>,
+}
+
+/// HTTP/3 の要求ヘッダ（疑似ヘッダを除く）を (名前, 値) の組で読む（キャッシュの判定へ渡す。F-257）
+#[inline]
+pub(super) fn h3_header_pairs(
+    headers: &[h3::Header],
+) -> impl Iterator<Item = (&[u8], &[u8])> + Clone {
+    headers
+        .iter()
+        .filter(|h| !h.name().starts_with(b":"))
+        .map(|h| (h.name(), h.value()))
 }
 
 /// 分類前に届いたストリームのトレーラを取り出す（無ければ空。F-313）。
@@ -1192,6 +1205,9 @@ struct Http3Handler {
     classify_body_timeout: u64,
     /// `classify` がバッファ経路にした `buffering = "full"` のルートの `client_write_timeout_secs`（B-487）
     classify_send_timeout: Option<u64>,
+    /// `classify` が引いたキャッシュの結果（当たり・バッファ経路へ回した外れ）。バッファ経路の要求へ渡す
+    /// （引き直して当たり・外れを数え直さない。セキュリティの検査も済んでいる。F-257）
+    classify_cache: Option<crate::proxy::cache_lookup::CacheLookup>,
     /// 応答（本文・見出し）を送った量の和と、前回の送信の止まりの見回りで見た値。接続のクレジットを待つだけの
     /// ストリームを、接続がほかのストリームで進んでいる間は打ち切らないのに使う（B-487）
     send_progress: u64,
@@ -1237,6 +1253,7 @@ impl Http3Handler {
             handshake: None,
             classify_body_timeout: 0,
             classify_send_timeout: None,
+            classify_cache: None,
             send_progress: 0,
             send_progress_mark: 0,
             body_check_at: None,
@@ -1771,6 +1788,7 @@ impl Http3Handler {
                             send_timeout: self.classify_send_timeout,
                             #[cfg(feature = "wasm")]
                             trailers,
+                            cache: self.classify_cache.take(),
                         },
                     );
                 }
@@ -1874,6 +1892,7 @@ impl Http3Handler {
                     removes_server: false,
                     #[cfg(feature = "wasm")]
                     req_trailers: br.trailers,
+                    cache: br.cache,
                 },
                 br.headers,
                 body,
@@ -1947,6 +1966,7 @@ impl Http3Handler {
     fn classify(&mut self, stream_id: u64, headers: &[h3::Header], more_frames: bool) -> Decision {
         self.classify_body_timeout = 0;
         self.classify_send_timeout = None;
+        self.classify_cache = None;
         // --- 疑似ヘッダ + 必要ヘッダを抽出 ---
         let mut method: Option<&[u8]> = None;
         let mut path: Option<&[u8]> = None;
@@ -2185,9 +2205,9 @@ impl Http3Handler {
         }
 
         // Proxy バックエンドのみストリーミング対象。
-        let (upstream_group, path_compression, buffering, _modules) = match &backend {
-            Backend::Proxy(ug, _sec, comp, buf, _cache, mods) => {
-                (ug.clone(), comp.clone(), buf.clone(), mods.clone())
+        let (upstream_group, path_compression, buffering, _modules, route_cache) = match &backend {
+            Backend::Proxy(ug, _sec, comp, buf, cache, mods) => {
+                (ug.clone(), comp.clone(), buf.clone(), mods.clone(), cache)
             }
             _ => return Decision::Buffer,
         };
@@ -2254,6 +2274,23 @@ impl Http3Handler {
             return Decision::Buffer;
         }
 
+        // キャッシュ（HTTP/1.1・HTTP/2 と共有。F-257）。上流を選ぶ前に引く（当たりで負荷分散の順番を進めない。
+        // B-481）。当たりはバッファ経路で返す。外れは応答を取り込む（この後でバッファ経路へ回すときは結果を渡す）
+        let mut cache_ctx = match crate::proxy::cache_lookup::lookup(
+            route_cache,
+            method,
+            authority,
+            path,
+            h3_header_pairs(headers),
+        ) {
+            crate::proxy::cache_lookup::CacheLookup::Bypass => None,
+            crate::proxy::cache_lookup::CacheLookup::Miss(c) => Some(c),
+            hit => {
+                self.classify_cache = Some(hit);
+                return Decision::Buffer;
+            }
+        };
+
         // サーバ選択（F-97: Consistent Hash header/cookie キー対応）。
         let server = match upstream_group.select_with_header_fn(self.client_ip.as_str(), |name| {
             headers
@@ -2262,7 +2299,13 @@ impl Http3Handler {
                 .map(|h| h.value())
         }) {
             Some(s) => s.clone(),
-            None => return Decision::Buffer, // handle_request -> 502
+            None => {
+                // handle_request -> 502
+                self.classify_cache = cache_ctx
+                    .take()
+                    .map(crate::proxy::cache_lookup::CacheLookup::Miss);
+                return Decision::Buffer;
+            }
         };
 
         // F-171: h2c 上流は多重化接続（F-174）のストリームで全二重に中継する（gRPC を含む。
@@ -2270,6 +2313,9 @@ impl Http3Handler {
         let h2_upstream = server.target.use_h2c || upstream_group.use_h2c();
         #[cfg(not(feature = "http2"))]
         if h2_upstream {
+            self.classify_cache = cache_ctx
+                .take()
+                .map(crate::proxy::cache_lookup::CacheLookup::Miss);
             return Decision::Buffer;
         }
         // F-175: HTTPS 上流は ALPN で HTTP/2 を試す（HTTP/1.1 しか話さないと分かっている上流は除く）。
@@ -2289,6 +2335,9 @@ impl Http3Handler {
         // gRPC を HTTP/1.1 上流へ送る構成はバッファ経路（従来どおり）。B-481 の後にここへ来るのは、HTTPS の上流が
         // HTTP/1.1 しか話さないと分かったときだけ（バッファ経路が選び直す）
         if is_grpc && !h2_upstream && !h2_tls {
+            self.classify_cache = cache_ctx
+                .take()
+                .map(crate::proxy::cache_lookup::CacheLookup::Miss);
             return Decision::Buffer;
         }
 
@@ -2381,6 +2430,8 @@ impl Http3Handler {
             resp_policy: security
                 .has_response_header_ops()
                 .then(|| backend.security_arc().clone()),
+            cache: RefCell::new(cache_ctx),
+            head_sent: Cell::new(false),
         })
     }
 

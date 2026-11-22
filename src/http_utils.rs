@@ -1,4 +1,3 @@
-use crate::cache;
 use httparse::Status;
 use memchr::memchr3;
 
@@ -885,6 +884,27 @@ pub(crate) fn decode_chunked_body(chunked_data: &[u8]) -> Vec<u8> {
     result
 }
 
+/// 終端まで揃った chunked の本文の枠を解く。枠が壊れている・終端が無ければ `None`（キャッシュへ保存する
+/// 応答の本文。上流から中継するときと同じデコーダで読む。F-257）
+#[cfg(feature = "cache")]
+pub(crate) fn decode_complete_chunked(data: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = ChunkedDecoder::new_unlimited();
+    let mut out = Vec::with_capacity(data.len());
+    let mut input = data;
+    while !input.is_empty() {
+        let span = decoder.next_data_span(input);
+        out.extend_from_slice(&input[span.data_start..span.data_start + span.data_len]);
+        if span.complete {
+            return Some(out);
+        }
+        if span.limit_exceeded {
+            return None;
+        }
+        input = &input[span.consumed..];
+    }
+    None
+}
+
 // ====================
 // HTTPヘッダー検証（Header Injection防止）
 // ====================
@@ -1591,12 +1611,14 @@ pub(crate) enum ChunkedFeedResult {
 /// 入力バッファ内に最初に現れた「連続したボディデータ範囲」と、フレーミングの進行状況を
 /// スカラのみで表す（ヒープ確保なし・`Copy`）。ストリーミング転送（F-32）で、読み取り
 /// バッファのサブスライスを中間 `Vec` なしに下流へそのまま送出するために使う。
-// ストリーミング転送（F-32）の http2 / http3 経路と、本文を溜めるハンドラ・Wasm の経路（B-372）
+// ストリーミング転送（F-32）の http2 / http3 経路と、本文を溜めるハンドラ・Wasm の経路（B-372）、
+// キャッシュへ保存する応答の本文（F-257）
 #[cfg(any(
     feature = "http2",
     feature = "http3",
     feature = "handler",
-    feature = "wasm"
+    feature = "wasm",
+    feature = "cache"
 ))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChunkedSpan {
@@ -1941,12 +1963,14 @@ impl ChunkedDecoder {
     /// 呼び出し側は `consumed` バイトを処理済みとして `input[consumed..]` で再呼び出しし、
     /// `consumed == input.len()` になるまでループする。`complete`/`limit_exceeded` が立った
     /// 時点でループを終える。
-    // ストリーミング転送（F-32）の http2 / http3 経路と、本文を溜めるハンドラ・Wasm の経路（B-372）
+    // ストリーミング転送（F-32）の http2 / http3 経路と、本文を溜めるハンドラ・Wasm の経路（B-372）、
+    // キャッシュへ保存する応答の本文（F-257）
     #[cfg(any(
         feature = "http2",
         feature = "http3",
         feature = "handler",
-        feature = "wasm"
+        feature = "wasm",
+        feature = "cache"
     ))]
     pub(crate) fn next_data_span(&mut self, input: &[u8]) -> ChunkedSpan {
         // 既に終端・制限超過に達していれば、これ以上入力を消費しない。
@@ -2068,28 +2092,38 @@ pub(crate) fn last_modified_matches(client_ims: &str, cached_lm: &str) -> bool {
     client_ims.trim() == cached_lm.trim()
 }
 
+/// `(Bytes, Bytes)` の要求ヘッダを (名前, 値) の組で読む（キャッシュの判定の関数へ渡す。HTTP/2・HTTP/3 は
+/// それぞれのヘッダの型から同じ組を作って渡す。F-257）
+#[inline]
+pub(crate) fn header_pairs(
+    headers: &[(bytes::Bytes, bytes::Bytes)],
+) -> impl Iterator<Item = (&[u8], &[u8])> + Clone {
+    headers.iter().map(|(n, v)| (n.as_ref(), v.as_ref()))
+}
+
 /// key_headersに基づいてリクエストヘッダーからVaryキー用の値を抽出
 ///
 /// # Arguments
-/// * `request_headers` - リクエストヘッダー
+/// * `request_headers` - リクエストヘッダー（(名前, 値) の組。[`header_pairs`]）
 /// * `key_header_names` - キャッシュキーに含めるヘッダー名のリスト
 ///
 /// # Returns
 /// (ヘッダー名, ヘッダー値) のペアのリスト
-pub(crate) fn extract_vary_headers_for_cache_key<'a>(
-    request_headers: &'a [(bytes::Bytes, bytes::Bytes)],
-    key_header_names: &'a [String],
-) -> Vec<(&'a str, &'a str)> {
+pub(crate) fn extract_vary_headers_for_cache_key<'k, 'h, I>(
+    request_headers: I,
+    key_header_names: &'k [String],
+) -> Vec<(&'k str, &'h str)>
+where
+    I: Iterator<Item = (&'h [u8], &'h [u8])> + Clone,
+{
     let mut result = Vec::new();
 
     for key_header in key_header_names {
-        for (name, value) in request_headers {
-            if let Ok(name_str) = std::str::from_utf8(name) {
-                if name_str.eq_ignore_ascii_case(key_header) {
-                    if let Ok(value_str) = std::str::from_utf8(value) {
-                        result.push((key_header.as_str(), value_str));
-                        break; // 最初にマッチしたものを使用
-                    }
+        for (name, value) in request_headers.clone() {
+            if name.eq_ignore_ascii_case(key_header.as_bytes()) {
+                if let Ok(value_str) = std::str::from_utf8(value) {
+                    result.push((key_header.as_str(), value_str));
+                    break; // 最初にマッチしたものを使用
                 }
             }
         }
@@ -2102,13 +2136,16 @@ pub(crate) fn extract_vary_headers_for_cache_key<'a>(
 /// キーは最初の値だけ（または値の無いもの）で作られる一方で上流は全部を受け取るので、別の要求の応答を共有し得る。
 /// できなければその要求ではキャッシュを使わない
 // B-425
-pub(crate) fn cache_key_headers_usable(
-    request_headers: &[(bytes::Bytes, bytes::Bytes)],
+pub(crate) fn cache_key_headers_usable<'h, I>(
+    request_headers: I,
     key_header_names: &[String],
-) -> bool {
+) -> bool
+where
+    I: Iterator<Item = (&'h [u8], &'h [u8])> + Clone,
+{
     key_header_names.iter().all(|k| {
         let mut seen = false;
-        for (name, value) in request_headers {
+        for (name, value) in request_headers.clone() {
             if name.eq_ignore_ascii_case(k.as_bytes()) {
                 if seen || std::str::from_utf8(value).is_err() {
                     return false;
@@ -2118,110 +2155,6 @@ pub(crate) fn cache_key_headers_usable(
         }
         true
     })
-}
-
-/// 304 Not Modified レスポンスを構築
-pub(crate) fn build_304_response(
-    cached_entry: &cache::CacheEntry,
-    client_wants_close: bool,
-    is_stale: bool,
-) -> Vec<u8> {
-    let mut response = Vec::with_capacity(256);
-
-    response.extend_from_slice(b"HTTP/1.1 304 Not Modified\r\n");
-
-    // 重要なヘッダーのみ含める
-    for (name, value) in cached_entry.headers.iter() {
-        // ETag, Last-Modified, Cache-Control, Vary, Content-Location のみ
-        if name.eq_ignore_ascii_case(b"etag")
-            || name.eq_ignore_ascii_case(b"last-modified")
-            || name.eq_ignore_ascii_case(b"cache-control")
-            || name.eq_ignore_ascii_case(b"vary")
-            || name.eq_ignore_ascii_case(b"content-location")
-        {
-            response.extend_from_slice(name);
-            response.extend_from_slice(b": ");
-            response.extend_from_slice(value);
-            response.extend_from_slice(b"\r\n");
-        }
-    }
-
-    // X-Cache ヘッダー
-    if is_stale {
-        response.extend_from_slice(b"X-Cache: STALE\r\n");
-    } else {
-        response.extend_from_slice(b"X-Cache: HIT\r\n");
-    }
-
-    // Connection ヘッダー
-    if client_wants_close {
-        response.extend_from_slice(b"Connection: close\r\n");
-    } else {
-        response.extend_from_slice(b"Connection: keep-alive\r\n");
-    }
-
-    response.extend_from_slice(b"\r\n");
-    response
-}
-
-/// キャッシュからのレスポンスを構築（メモリキャッシュ用）
-/// キャッシュレスポンスの **ヘッダー部のみ** を構築する（ボディは含めない）。
-///
-/// メモリキャッシュのヒット時は、ボディ（`bytes::Bytes`）を本ヘッダーとは別に
-/// ゼロコピーでソケットへ書き込むため、ボディを連結しないこのビルダーを使う。
-pub(crate) fn build_cached_response_headers(
-    cached_entry: &cache::CacheEntry,
-    client_wants_close: bool,
-    is_stale: bool,
-) -> Vec<u8> {
-    let mut response = Vec::with_capacity(512);
-
-    // ステータスライン
-    response.extend_from_slice(b"HTTP/1.1 ");
-    let mut status_buf = itoa::Buffer::new();
-    response.extend_from_slice(status_buf.format(cached_entry.status_code).as_bytes());
-    response.extend_from_slice(b" OK\r\n");
-
-    // ヘッダー
-    for (name, value) in cached_entry.headers.iter() {
-        response.extend_from_slice(name);
-        response.extend_from_slice(b": ");
-        response.extend_from_slice(value);
-        response.extend_from_slice(b"\r\n");
-    }
-
-    // X-Cache ヘッダー
-    if is_stale {
-        response.extend_from_slice(b"X-Cache: STALE\r\n");
-    } else {
-        response.extend_from_slice(b"X-Cache: HIT\r\n");
-    }
-
-    // Connection ヘッダー
-    if client_wants_close {
-        response.extend_from_slice(b"Connection: close\r\n");
-    } else {
-        response.extend_from_slice(b"Connection: keep-alive\r\n");
-    }
-
-    response.extend_from_slice(b"\r\n");
-    response
-}
-
-/// キャッシュレスポンス全体（ヘッダー + ボディ）を 1 本の `Vec` に構築する。
-///
-/// ディスクキャッシュのようにボディが所有 `Vec`（ディスクから読込済み）の経路で使う。
-/// メモリキャッシュのゼロコピー配信は [`build_cached_response_headers`] + ボディ別書き込みを使う。
-pub(crate) fn build_cached_response(
-    cached_entry: &cache::CacheEntry,
-    body_data: &[u8],
-    client_wants_close: bool,
-    is_stale: bool,
-) -> Vec<u8> {
-    let mut response = build_cached_response_headers(cached_entry, client_wants_close, is_stale);
-    response.reserve(body_data.len());
-    response.extend_from_slice(body_data);
-    response
 }
 
 /// ステータスコードに対応する理由フレーズを返す
@@ -2466,11 +2399,14 @@ mod idempotent_method_tests {
                 })
                 .collect()
         };
+        let usable = |hs: &[(bytes::Bytes, bytes::Bytes)], keys: &[String]| {
+            cache_key_headers_usable(super::header_pairs(hs), keys)
+        };
         let keys = vec!["Cookie".to_string()];
-        assert!(cache_key_headers_usable(&h(&[("cookie", "a=1")]), &keys));
-        assert!(cache_key_headers_usable(&h(&[("accept", "*/*")]), &keys));
-        assert!(cache_key_headers_usable(&h(&[("cookie", "a=1")]), &[]));
-        assert!(!cache_key_headers_usable(
+        assert!(usable(&h(&[("cookie", "a=1")]), &keys));
+        assert!(usable(&h(&[("accept", "*/*")]), &keys));
+        assert!(usable(&h(&[("cookie", "a=1")]), &[]));
+        assert!(!usable(
             &h(&[("Cookie", "lang=en"), ("cookie", "session=x")]),
             &keys
         ));
@@ -2478,7 +2414,7 @@ mod idempotent_method_tests {
             bytes::Bytes::from_static(b"cookie"),
             bytes::Bytes::from_static(b"session=x; z=\xff"),
         )];
-        assert!(!cache_key_headers_usable(&bad, &keys));
+        assert!(!usable(&bad, &keys));
     }
 
     /// B-419: 静的配信は空のセグメント（`//`）のあるパスを配信しない（クエリの中の `//` は見ない）

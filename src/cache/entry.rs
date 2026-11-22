@@ -12,8 +12,8 @@ use std::time::Instant;
 pub struct CacheEntry {
     /// レスポンスステータスコード
     pub status_code: u16,
-    /// レスポンスヘッダー（名前-値ペアのリスト）
-    pub headers: Arc<[(Box<[u8]>, Box<[u8]>)]>,
+    /// レスポンスヘッダー（名前-値ペアのリスト）。当たりの応答へ写さずに渡せるよう `Bytes` で持つ（F-257）
+    pub headers: Arc<[(Bytes, Bytes)]>,
     /// ボディの格納場所
     pub storage: CacheStorage,
     /// キャッシュ作成時刻
@@ -33,6 +33,8 @@ pub struct CacheEntry {
     /// Varyヘッダーで指定されたヘッダー名のリスト
     /// キャッシュ取得時に同じヘッダー値のリクエストにのみ一致
     pub vary_headers: Option<Arc<[Box<str>]>>,
+    /// 期限が切れてから残しておく期間（秒。保存したルートの stale-while-revalidate・stale-if-error で決まる。B-492）
+    pub stale_retention_secs: u64,
 }
 
 impl CacheEntry {
@@ -90,6 +92,11 @@ impl CacheEntry {
                 .into()
         });
 
+        // `Box<[u8]>` から `Bytes` へは写さずに移る
+        let headers: Vec<(Bytes, Bytes)> = headers
+            .into_iter()
+            .map(|(n, v)| (Bytes::from(n), Bytes::from(v)))
+            .collect();
         Self {
             status_code,
             headers: headers.into(),
@@ -102,7 +109,24 @@ impl CacheEntry {
             content_encoding,
             body_size,
             vary_headers: vary_headers_arc,
+            stale_retention_secs: 0,
         }
+    }
+
+    /// 期限が切れてから残しておく期間を設定する（B-492）
+    #[inline]
+    pub fn with_stale_retention(mut self, secs: u64) -> Self {
+        self.stale_retention_secs = secs;
+        self
+    }
+
+    /// 索引に残しておくエントリか（有効期限内か、期限切れでも stale として返せる期間の内）。以前は期限が切れたら
+    /// 引いたときと掃除の周回で消していたので、期限切れの応答を返す stale-while-revalidate・stale-if-error は
+    /// 一度も効かなかった（B-492）
+    #[inline]
+    pub fn is_retained(&self) -> bool {
+        self.created_at.elapsed().as_secs()
+            < self.max_age_secs.saturating_add(self.stale_retention_secs)
     }
 
     /// エントリが有効期限内かチェック

@@ -34,6 +34,9 @@ pub(super) struct H3BufferedTask {
     /// 要求のトレーラ（Proxy-Wasm の `on_http_request_trailers` に渡す。上流へは送らない。F-313）
     #[cfg(feature = "wasm")]
     pub(super) req_trailers: Vec<h3::Header>,
+    /// `classify` が引いたキャッシュの結果（当たり・バッファ経路へ回した外れ）。`Some` の要求は `classify` が
+    /// セキュリティの検査を済ませている（F-257）
+    pub(super) cache: Option<crate::proxy::cache_lookup::CacheLookup>,
 }
 
 /// バッファ経路の要求 Future を即座に 1 回だけ poll する（B-97）。
@@ -77,20 +80,27 @@ pub(super) fn poll_buffered_arm<F: std::future::Future<Output = ()>>(
 }
 
 /// バッファ経路の要求タスク本体。
-pub(super) async fn buffered_request_task(
+///
+/// `async fn` にせず `async move` のブロックを返す（`async fn` は引数をフューチャの状態に 2 度置く（受け取った値と、
+/// 本体の局所変数へ移した値）。`H3BufferedTask` は 250 バイト近くあり、要求ごとに作って `FuturesUnordered` へ移す）
+// clippy の `manual_async_fn` は `async fn` へ戻すよう勧めるが、戻すと上の 2 度置きでフューチャが大きくなる
+#[allow(clippy::manual_async_fn)]
+pub(super) fn buffered_request_task(
     mut task: H3BufferedTask,
     headers: Vec<h3::Header>,
     body: Bytes,
-) {
-    if let Err(e) = task.handle_request(&headers, &body).await {
-        // 送信失敗（クライアントがストリームをリセット）など。応答を送れていなければ
-        // メインループが送信端の close を見て 502 を返す。
-        debug!(
-            "[HTTP/3] buffered request on stream {} ended: {}",
-            task.stream_id, e
-        );
+) -> impl std::future::Future<Output = ()> {
+    async move {
+        if let Err(e) = task.handle_request(&headers, &body).await {
+            // 送信失敗（クライアントがストリームをリセット）など。応答を送れていなければ
+            // メインループが送信端の close を見て 502 を返す。
+            debug!(
+                "[HTTP/3] buffered request on stream {} ended: {}",
+                task.stream_id, e
+            );
+        }
+        task.finish();
     }
-    task.finish();
 }
 
 /// 借用ヘッダ列を 1 回の確保に詰めて `RespHeaders` にする（ヘッダごとの確保をしない）。
@@ -921,14 +931,24 @@ impl H3BufferedTask {
         // セキュリティチェック。本文は受信済みなので実際の長さでも上限を見る（HTTP/3 は content-length を
         // 省略できる。省略した要求が本文の上限を素通りしていた。B-132 の行列の試験で発見）
         let security = backend.security();
-        let check_result = check_security(
-            security,
-            self.client_ip.as_str(),
-            method,
-            header_block,
-            content_length.max(request_body.len()),
-            false,
-        );
+        // `classify` がキャッシュを引いた要求は検査を済ませている（レート制限の枠を 2 回使わない。F-257）。受け取った
+        // 本文の長さだけ見る（HTTP/3 は content-length を省略できる。B-132）
+        let check_result = if self.cache.is_some() {
+            if request_body.len() > security.max_request_body_size {
+                SecurityCheckResult::RequestTooLarge
+            } else {
+                SecurityCheckResult::Allowed
+            }
+        } else {
+            check_security(
+                security,
+                self.client_ip.as_str(),
+                method,
+                header_block,
+                content_length.max(request_body.len()),
+                false,
+            )
+        };
 
         if check_result != SecurityCheckResult::Allowed {
             let status = check_result.status_code();
@@ -1167,7 +1187,7 @@ impl H3BufferedTask {
 
         // バックエンド処理
         let (status, resp_size) = match backend {
-            Backend::Proxy(upstream_group, security, path_compression, buffering, _cache, _) => {
+            Backend::Proxy(upstream_group, security, path_compression, buffering, cache, _) => {
                 debug!("[HTTP/3] Starting proxy request to upstream group");
                 // `buffering = "full"` の経路（gRPC は使わない。F-97）を数える（HTTP/1.1 と同じ。B-273）
                 #[cfg(feature = "grpc")]
@@ -1195,9 +1215,11 @@ impl H3BufferedTask {
                         &upstream_group,
                         buffering_full,
                         &security,
+                        &cache,
                         &effective_compression,
                         client_encoding,
                         method,
+                        authority,
                         path,
                         &prefix,
                         headers,
@@ -1388,9 +1410,12 @@ impl H3BufferedTask {
         buffering_full: bool,
         // 上流接続プール（B-74 の H2C_POOL・B-104 の HTTP/1.1 プール）の max_idle/idle_timeout。
         security: &SecurityConfig,
+        cache: &Arc<crate::cache::CacheConfig>,
         compression: &CompressionConfig,
         client_encoding: crate::config::ClientAccept,
         method: &[u8],
+        // `handle_request` が読んだ `:authority`（無ければ空）
+        authority: &[u8],
         req_path: &[u8],
         prefix: &[u8],
         headers: &[h3::Header],
@@ -1398,6 +1423,48 @@ impl H3BufferedTask {
         #[cfg(feature = "wasm")] wasm_modules: Option<&crate::wasm_plugin_config::WasmModules>,
         #[cfg(feature = "wasm")] wasm_request_headers: Option<&[(Vec<u8>, Vec<u8>)]>,
     ) -> io::Result<(u16, usize)> {
+        use crate::proxy::cache_lookup::{self, CacheLookup};
+        // キャッシュ（HTTP/1.1・HTTP/2 と共有。F-257）。`classify` が引いていればその結果を使う（数え直さない）。
+        // 当たりは上流を選ぶ前に返す。引き当ての結果は名前を付けずに `match` する（名前を付けた局所変数は
+        // `match` で中身を移した後も、関数の終わりで落とすためにフューチャの状態に 80 バイトの置き場が残る）
+        let mut cache_ctx = match self.cache.take().unwrap_or_else(|| {
+            cache_lookup::lookup(
+                cache,
+                method,
+                authority,
+                req_path,
+                super::h3_header_pairs(headers),
+            )
+        }) {
+            CacheLookup::Bypass => None,
+            CacheLookup::Miss(c) => Some(c),
+            CacheLookup::Hit(hit) => {
+                if hit.stale {
+                    crate::server::spawn_background_revalidation(
+                        &hit.key,
+                        cache,
+                        upstream_group,
+                        security,
+                        method,
+                        req_path,
+                        prefix,
+                        super::h3_header_pairs(headers),
+                        self.client_ip.as_str(),
+                    );
+                }
+                match self.serve_hit(hit, security).await? {
+                    Ok(r) => return Ok(r),
+                    // ディスクから読めなかった: エントリを消して上流から取り直す
+                    Err(hit) => Some(cache_lookup::refill(
+                        cache,
+                        hit,
+                        authority,
+                        super::h3_header_pairs(headers),
+                    )),
+                }
+            }
+        };
+
         // サーバー選択（F-97: Consistent Hash header/cookie キー対応）
         let server = match upstream_group.select_with_header_fn(self.client_ip.as_str(), |name| {
             headers
@@ -1407,6 +1474,10 @@ impl H3BufferedTask {
         }) {
             Some(s) => s,
             None => {
+                // stale-if-error: 上流が 1 台も無いときも保存した応答を返す（B-492）
+                if let Some(r) = self.send_stale(cache_ctx.as_deref(), security).await? {
+                    return Ok(r);
+                }
                 self.send_error_response(502, b"Bad Gateway").await?;
                 return Ok((502, 11));
             }
@@ -1463,11 +1534,6 @@ impl H3BufferedTask {
         // F-236（F4）: [route.security] の要求ヘッダの方針（削除・追加）を、上流の種類（HTTP/1.1・h2c・
         // HTTPS の HTTP/2）に関わらず当てる（以前は HTTP/1.1 で受けた要求にだけ当てていた）
         let mut header_pairs = header_pairs;
-        let authority = headers
-            .iter()
-            .find(|h| h.name() == b":authority")
-            .map(|h| h.value())
-            .unwrap_or_default();
         // B-232: 転送ヘッダの方針（信頼しない送信元の値を捨て、クライアントの IP を入れる）も当てる
         let added = crate::proxy::expanded_added_headers(
             security,
@@ -1648,6 +1714,8 @@ impl H3BufferedTask {
         match proxy_result {
             Ok(backend_result) => {
                 let status_code = backend_result.status_code;
+                // `backend_result` は借りずに先に中身を移す（借りると、移した後も後の `await` をまたいでフューチャに
+                // 80 バイトの置き場が残る）
                 #[cfg(feature = "wasm")]
                 let mut body = backend_result.body;
                 #[cfg(not(feature = "wasm"))]
@@ -1656,9 +1724,34 @@ impl H3BufferedTask {
                 let mut trailers = backend_result.trailers;
                 #[cfg(not(feature = "wasm"))]
                 let trailers = backend_result.trailers;
+                let mut resp_header_store = backend_result.headers;
+                // stale-if-error: 上流の 502・504 は返さずに保存した応答を返す（B-492）
+                if crate::proxy::cache_lookup::is_gateway_error(status_code) {
+                    if let Some(r) = self.send_stale(cache_ctx.as_deref(), security).await? {
+                        return Ok(r);
+                    }
+                }
+                // キャッシュの外れ: 圧縮の前の上流の応答を取り込む（トレーラのある応答・Wasm で書き換える本文は保存
+                // しない。当たりは Wasm を通らない。HTTP/1.1 と同じ。F-257）。見出しの `Transfer-Encoding` は外してあり、
+                // 本文は枠を解いてある
+                if !trailers.is_empty() {
+                    cache_ctx = None;
+                }
+                #[cfg(feature = "wasm")]
+                if wasm_modules.is_some_and(crate::proxy::wasm_wants_response_body) {
+                    cache_ctx = None;
+                }
+                if let Some(ctx) = cache_ctx.as_deref_mut() {
+                    ctx.set_header_pairs(
+                        resp_header_store
+                            .iter()
+                            .map(|(n, v)| (n.as_slice(), v.as_slice())),
+                        status_code,
+                    );
+                    ctx.append_body(&body);
+                }
 
                 // `remove_response_headers`・`add_response_headers`（B-267。HTTP/1.1・HTTP/2 と同じく Wasm の前）
-                let mut resp_header_store = backend_result.headers;
                 if !security.remove_response_headers.is_empty() {
                     resp_header_store.retain(|(n, _)| !security.removes_response_header(n));
                 }
@@ -1801,6 +1894,10 @@ impl H3BufferedTask {
                     }
                 }
 
+                // 圧縮して返す応答は保存しない（ストリーミングの経路と同じ。F-257）
+                if should_compress.is_some() {
+                    cache_ctx = None;
+                }
                 let response_body = if let Some(enc) = should_compress {
                     compress_body_h3(&body, enc, compression)
                 } else {
@@ -1847,14 +1944,85 @@ impl H3BufferedTask {
 
                 self.send_response(status_code, &resp_headers, Some(response_body.clone()))
                     .await?;
+                if let Some(ctx) = cache_ctx.as_deref_mut() {
+                    ctx.save_to_cache().await;
+                }
                 Ok((status_code, response_body.len()))
             }
             Err(e) => {
                 warn!("[HTTP/3] Async backend proxy error: {}", e);
-                self.send_error_response(502, b"Bad Gateway").await?;
-                Ok((502, 11))
+                // stale-if-error: 上流から応答を得られなかった要求に保存した応答を返す（B-492）
+                if let Some(r) = self.send_stale(cache_ctx.as_deref(), security).await? {
+                    return Ok(r);
+                }
+                // 上流の待ちが時間切れなら 504（HTTP/1.1・HTTP/2・HTTP/3 のストリーミングの経路と同じ。以前は常に 502）
+                if e.kind() == io::ErrorKind::TimedOut {
+                    self.send_error_response(504, b"Gateway Timeout").await?;
+                    Ok((504, 15))
+                } else {
+                    self.send_error_response(502, b"Bad Gateway").await?;
+                    Ok((502, 11))
+                }
             }
         }
+    }
+
+    /// stale-if-error の保存した応答を返す（返したら `Some`。B-492）
+    async fn send_stale(
+        &mut self,
+        cache_ctx: Option<&crate::metrics::CacheSaveContext>,
+        security: &SecurityConfig,
+    ) -> io::Result<Option<(u16, usize)>> {
+        let Some(hit) = crate::proxy::cache_lookup::stale_fallback(cache_ctx) else {
+            return Ok(None);
+        };
+        // 返す処理は箱に入れる（エラーの経路から呼ぶので、箱に入れないと普通の要求のフューチャの状態にもその大きさが載る）
+        Ok(Box::pin(self.serve_hit(hit, security)).await?.ok())
+    }
+
+    /// キャッシュの当たりを返す。本文をディスクから読めなかったら当たりを返す（呼び出し側がエントリを消して上流から
+    /// 取り直す）。
+    ///
+    /// 当たりは値で受ける別の `async fn` で返す（呼び出し側で `&hit` を借りたまま本文の読み取りと送出の 2 回 `await`
+    /// すると、当たりの 80 バイトがフューチャの共通部に上がり、キャッシュの無い要求のフューチャまで大きくなる）
+    async fn serve_hit(
+        &mut self,
+        hit: crate::proxy::cache_lookup::CacheHit,
+        security: &SecurityConfig,
+    ) -> io::Result<Result<(u16, usize), crate::proxy::cache_lookup::CacheHit>> {
+        let Some(body) = crate::proxy::cache_lookup::hit_body(&hit).await else {
+            return Ok(Err(hit));
+        };
+        self.send_cache_hit(&hit, security, body).await.map(Ok)
+    }
+
+    /// キャッシュの当たりを返す（F-257）。保存したヘッダにルートの応答ヘッダの方針を当てて `x-cache` を付ける
+    /// （自分の `server`・CORS は `send_msg` が当てる。Proxy-Wasm の応答の段は通らない＝HTTP/1.1 と同じ）。本文は写さない
+    async fn send_cache_hit(
+        &mut self,
+        hit: &crate::proxy::cache_lookup::CacheHit,
+        security: &SecurityConfig,
+        body: Bytes,
+    ) -> io::Result<(u16, usize)> {
+        use crate::http3_stream::RespMsg;
+        let status = crate::proxy::cache_lookup::hit_status(hit);
+        let mut headers: crate::http3_stream::RespHeaders = Vec::with_capacity(
+            hit.entry.headers.len() + security.add_response_header_bytes().len() + 1,
+        );
+        // 保存した上流の `server` は、自分の `server` を付けるときにメインループが落とす（中継の応答と同じ）
+        crate::proxy::cache_lookup::push_hit_headers(&mut headers, hit, Some(security), false);
+        let len = body.len();
+        self.send_msg(RespMsg::Head {
+            status,
+            headers,
+            own_server: true,
+        })
+        .await?;
+        if !body.is_empty() {
+            self.send_msg(RespMsg::Body(body)).await?;
+        }
+        self.finish();
+        Ok((status, len))
     }
 
     /// ファイル配信

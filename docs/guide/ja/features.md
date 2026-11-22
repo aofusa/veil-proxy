@@ -20,7 +20,7 @@
 - **ヘルスチェック**: HTTP/TCP/gRPCによるアクティブヘルスチェックと自動フェイルオーバー（HTTP: ステータスコード検証、TCP: 接続確認のみ、gRPC: Health Checking Protocol）
 - **L4ストリームプロキシ**: TCP/UDPのロードバランシング（RoundRobin/LeastConn）、TLSパススルー（TCPのみ）、`splice(2)` によるカーネル内ゼロコピー転送（TCP、ユーザースペースバッファなし）、UDPはセッションテーブル方式＋アイドルタイムアウト退去、接続数/セッション数制限（`l4-proxy` feature が必要）
 - **サーキットブレーカー**: サーバー単位のサーキットブレーカー（Closed→Open→HalfOpen）、Outlier Detection/排除、EWMAレイテンシ追跡（`metrics` feature が必要。リクエストリトライは未実装）
-- **プロキシキャッシュ**: メモリ・ディスクベースのレスポンスキャッシュ（ETag/304、stale-while-revalidate、stale-if-error）
+- **プロキシキャッシュ**: HTTP/1.1・HTTP/2・HTTP/3 のクライアントで共有するメモリのレスポンスキャッシュ（ETag/304、stale-while-revalidate、stale-if-error。ディスクのキャッシュはまだ使わない）
 - **キャッシュPurge管理API**: HTTPでキャッシュ無効化（`PURGE`メソッド または `POST /__admin/cache/purge`）、exact/prefix/glob/all モードとBearerトークン認証
 - **バッファリング制御**: 低速クライアントによるバックエンド占有防止のためのレスポンスバッファリング（Streaming/Full/Adaptiveモード）
 - **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ（Fixed/Adaptiveポーリングモード）
