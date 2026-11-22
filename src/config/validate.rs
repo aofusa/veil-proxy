@@ -274,20 +274,12 @@ pub(super) fn validate_config(config: &Config) -> io::Result<()> {
             "[tls] client_allowed_sans requires client_auth = \"optional\" or \"require\"",
         ));
     }
-    // F-217: クライアント証明書は TCP の TLS（HTTP/1.1・HTTP/2）だけ。HTTP/3 を併用すると mTLS を迂回できるので拒否する
-    if config.tls.client_auth != ClientAuthMode::None {
-        if config.tls.client_ca.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "[tls] client_auth requires client_ca",
-            ));
-        }
-        if config_has_http3(config) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "[tls] client_auth is not supported with HTTP/3 ([http3] enabled or a [[listener]] with http3 = true; HTTP/3 clients would bypass it)",
-            ));
-        }
+    // F-217: クライアント証明書には `client_ca` が要る（HTTP/3 も同じ検証器で確かめる。F-312）
+    if config.tls.client_auth != ClientAuthMode::None && config.tls.client_ca.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "[tls] client_auth requires client_ca",
+        ));
     }
 
     // TLS証明書ファイルの存在チェック

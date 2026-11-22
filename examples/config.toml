@@ -448,7 +448,8 @@ ktls_fallback_enabled = true
 # "optional" = 要求するが、無くても受ける（出されたものは client_ca で検証する）
 # "require"  = 必須（無い・client_ca で検証できないクライアントはハンドシェイクで拒否）
 # client_ca はクライアント証明書の信頼アンカー（PEM、none 以外では必須）。
-# TCP の TLS（HTTP/1.1・HTTP/2）だけに効く。[http3] と併用すると QUIC で迂回できるので起動時にエラー。
+# HTTP/1.1・HTTP/2（TCP）と HTTP/3 の全部に効く（HTTP/3 は QUIC のハンドシェイクの直後、要求を読む前に同じ規則で
+# 確かめ、通らなければ接続を閉じる。F-312）。
 # 変更の反映には再起動が必要（証明書リロードでは起動時の設定を引き継ぐ）。
 # client_auth = "none"
 # client_ca = "/path/to/client-ca.pem"

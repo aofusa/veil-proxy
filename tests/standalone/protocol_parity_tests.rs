@@ -1380,3 +1380,220 @@ use_h2c = true
         }
     }
 }
+
+/// `client_ca` の外の CA と、それが発行したクライアント証明書（SAN は許可される `client.test`）を書き出す
+#[cfg(feature = "http3")]
+fn write_foreign_client_cert(dir: &std::path::Path) {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+    let named = |sans: Vec<String>, cn: &str| {
+        let mut p = CertificateParams::new(sans).unwrap();
+        p.distinguished_name = rcgen::DistinguishedName::new();
+        p.distinguished_name.push(DnType::CommonName, cn);
+        p
+    };
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = named(Vec::new(), "foreign test CA");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let issuer = Issuer::new(ca_params, ca_key);
+    let key = KeyPair::generate().unwrap();
+    let cert = named(vec!["client.test".to_string()], "client.test")
+        .signed_by(&key, &issuer)
+        .unwrap();
+    std::fs::write(dir.join("foreign.pem"), cert.pem()).unwrap();
+    std::fs::write(dir.join("foreign.key"), key.serialize_pem()).unwrap();
+}
+
+/// HTTP/3 で GET する（`client` はクライアント証明書の PEM の組。サーバ証明書は検証しない）。応答のステータスと、
+/// サーバが見せた証明書（DER）を返す
+#[cfg(feature = "http3")]
+fn h3_get_with_client_cert(
+    port: u16,
+    path: &str,
+    client: Option<(&std::path::Path, &std::path::Path)>,
+) -> Result<(u16, Vec<u8>), String> {
+    use bytes::Buf;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let _ = veil::tls_provider::provider::default_provider().install_default();
+    let b = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(super::NoVerifyServer));
+    let mut tls = match client {
+        Some((cert, key)) => {
+            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert)
+                .unwrap()
+                .map(|c| c.unwrap())
+                .collect();
+            let key = PrivateKeyDer::from_pem_file(key).unwrap();
+            b.with_client_auth_cert(certs, key).unwrap()
+        }
+        None => b.with_no_client_auth(),
+    };
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let path = path.to_string();
+    rt.block_on(async move {
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+                .map_err(|e| e.to_string())?;
+            let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+                .map_err(|e| e.to_string())?;
+            endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let conn = endpoint
+                .connect(addr, "localhost")
+                .map_err(|e| e.to_string())?
+                .await
+                .map_err(|e| e.to_string())?;
+            let server_cert = conn
+                .peer_identity()
+                .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok())
+                .and_then(|v| v.first().map(|c| c.to_vec()))
+                .unwrap_or_default();
+            let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+                .await
+                .map_err(|e| e.to_string())?;
+            tokio::spawn(async move {
+                let _ = driver.wait_idle().await;
+            });
+            let mut stream = send
+                .send_request(h3_request(port, "GET", &path, &[]))
+                .await
+                .map_err(|e| e.to_string())?;
+            stream.finish().await.map_err(|e| e.to_string())?;
+            let resp = stream.recv_response().await.map_err(|e| e.to_string())?;
+            while let Some(mut c) = stream.recv_data().await.map_err(|e| e.to_string())? {
+                let n = c.remaining();
+                c.advance(n);
+            }
+            drop(endpoint);
+            Ok((resp.status().as_u16(), server_cert))
+        })
+        .await
+        .map_err(|_| "timed out".to_string())?
+    })
+}
+
+/// F-312: `[tls] client_auth` が HTTP/3 にも効く（以前は HTTP/3 と組み合わせると起動エラー）。`"require"` と
+/// `client_allowed_sans` では、証明書の無い接続・別の CA の証明書・許可外の SAN を HTTP/1.1（TLS）と同じく断り、
+/// `client_ca` が発行した許可された証明書には答える。証明書のリロードの後も同じ。`"optional"` は証明書無しにも答え、
+/// 別の CA の証明書は断る
+#[cfg(feature = "http3")]
+#[test]
+fn f312_http3_client_certificates() {
+    let dir = tempfile::tempdir().unwrap();
+    let pki = dir.path();
+    super::write_mtls_pki(pki);
+    write_foreign_client_cert(pki);
+    let start = |name: &str, mode: &str, extra: &str| {
+        let port = free_port();
+        let clear = free_port();
+        let d = pki.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        let config = format!(
+            r#"
+[server]
+listen = "127.0.0.1:{port}"
+listen_cleartext = "127.0.0.1:{clear}"
+enable_secure_redirect = false
+threads = 1
+[logging]
+level = "warn"
+[tls]
+cert_path = "{p}/server.pem"
+key_path = "{p}/server.key"
+ktls_enabled = false
+client_auth = "{mode}"
+client_ca = "{p}/ca.pem"
+{extra}
+[http3]
+enabled = true
+[[route]]
+[route.conditions]
+path = "/*"
+[route.action]
+type = "Respond"
+body = "ok"
+"#,
+            p = tp(pki),
+        );
+        let veil = spawn_config(&d, Ports { clear, tls: port }, &config);
+        (veil, port)
+    };
+    let client = (pki.join("client.pem"), pki.join("client.key"));
+    let other = (pki.join("other.pem"), pki.join("other.key"));
+    let foreign = (pki.join("foreign.pem"), pki.join("foreign.key"));
+    let pair = |c: &(std::path::PathBuf, std::path::PathBuf)| Some((c.0.clone(), c.1.clone()));
+    // (名前, クライアント証明書, 答えるか)
+    type Case = (
+        &'static str,
+        Option<(std::path::PathBuf, std::path::PathBuf)>,
+        bool,
+    );
+    let check = |veil: &VeilProcess, port: u16, cases: &[Case], when: &str| {
+        for (name, cert, accepted) in cases {
+            let c = cert.as_ref().map(|(a, b)| (a.as_path(), b.as_path()));
+            let h3 = h3_get_with_client_cert(port, "/x", c);
+            let h1 = super::tls_get_status_line(port, "/x", c);
+            let ctx = format!("{when} {name}: h3={h3:?} h1={h1:?}\n{}", veil.log());
+            assert_eq!(matches!(h3, Ok((200, _))), *accepted, "{ctx}");
+            assert_eq!(
+                matches!(&h1, Ok(l) if l.starts_with("HTTP/1.1 200")),
+                *accepted,
+                "{ctx}"
+            );
+        }
+    };
+
+    // require + SAN の許可リスト。証明書の自動リロード（1 秒ごと）
+    let (veil, port) = start(
+        "require",
+        "require",
+        "client_allowed_sans = [\"client.test\"]\nauto_reload = true\nreload_interval_secs = 1",
+    );
+    let require_cases: Vec<Case> = vec![
+        ("no certificate", None, false),
+        ("foreign CA", pair(&foreign), false),
+        ("SAN not allowed", pair(&other), false),
+        ("allowed", pair(&client), true),
+    ];
+    check(&veil, port, &require_cases, "before reload");
+    // サーバ証明書を差し替え、HTTP/3 が新しい証明書を見せるまで待ってから同じ検査をする
+    let (_, before) = h3_get_with_client_cert(port, "/x", Some((&client.0, &client.1))).unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    std::fs::write(pki.join("server.key.new"), ck.signing_key.serialize_pem()).unwrap();
+    std::fs::write(pki.join("server.pem.new"), ck.cert.pem()).unwrap();
+    std::fs::rename(pki.join("server.key.new"), pki.join("server.key")).unwrap();
+    std::fs::rename(pki.join("server.pem.new"), pki.join("server.pem")).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let now = h3_get_with_client_cert(port, "/x", Some((&client.0, &client.1)));
+        if matches!(&now, Ok((200, c)) if *c != before) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "HTTP/3 did not reload the certificate: {now:?}\n{}",
+            veil.log()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    check(&veil, port, &require_cases, "after reload");
+    drop(veil);
+
+    // optional（SAN の許可リスト無し）
+    let (veil, port) = start("optional", "optional", "");
+    check(
+        &veil,
+        port,
+        &[
+            ("no certificate", None, true),
+            ("foreign CA", pair(&foreign), false),
+            ("allowed", pair(&client), true),
+        ],
+        "optional",
+    );
+}

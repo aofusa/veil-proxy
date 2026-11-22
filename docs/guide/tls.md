@@ -195,8 +195,11 @@ client_allowed_sans = ["spiffe://cluster.local/ns/web/sa/frontend"]   # optional
 - `"require"` rejects clients that send no certificate, or one that does not chain to `client_ca`, during the
   handshake. `"optional"` asks for a certificate but also accepts clients without one (a certificate that is
   sent is still verified).
-- Applies to TLS over TCP (HTTP/1.1 and HTTP/2). Combining it with `[http3]` is a startup error, because QUIC
-  clients would bypass the check.
+- Applies to every TLS listener: HTTP/1.1 and HTTP/2 over TCP, and HTTP/3 (F-312). HTTP/3 checks the certificate
+  with the same rules (only `client_ca` is trusted, plus `client_allowed_sans` and `"require"`) as soon as the QUIC
+  handshake completes, before any request on the connection is read (0-RTT requests included). A rejected HTTP/3
+  client gets a `CONNECTION_CLOSE` carrying the TLS alert as a crypto error (`certificate_required`,
+  `access_denied` for a SAN outside `client_allowed_sans`, or `bad_certificate`).
 - `client_allowed_sans` accepts only certificates with one of the listed SANs (DNS name, URI or IP), checked once
   during the handshake; other identities from the same CA are rejected. It needs `client_auth = "optional"` or
   `"require"`.

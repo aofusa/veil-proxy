@@ -192,7 +192,10 @@ client_allowed_sans = ["spiffe://cluster.local/ns/web/sa/frontend"]   # 任意�
 
 - `"require"` は証明書を出さないクライアントと、`client_ca` で検証できない証明書のクライアントをハンドシェイクで
   拒否する。`"optional"` は証明書を求めるが、出さないクライアントも受ける（出された証明書は検証する）。
-- TCP の TLS（HTTP/1.1・HTTP/2）に効く。`[http3]` と併用すると QUIC のクライアントが迂回できるので、起動時にエラーにする。
+- TLS のリスナーの全部に効く: TCP の HTTP/1.1・HTTP/2 と HTTP/3（F-312）。HTTP/3 は QUIC のハンドシェイクが終わった直後、
+  その接続の要求を 1 つも読む前（0-RTT の要求も含む）に同じ規則（`client_ca` だけを信頼し、`client_allowed_sans`・`"require"` も見る）
+  で証明書を確かめる。拒否した HTTP/3 のクライアントには TLS のアラートを暗号のエラーとして載せた `CONNECTION_CLOSE` を送る
+  （`certificate_required`、`client_allowed_sans` の外の SAN は `access_denied`、それ以外は `bad_certificate`）。
 - `client_allowed_sans` は一覧の SAN（DNS 名・URI・IP）のどれかを持つ証明書だけを受ける。ハンドシェイクで 1 回だけ照合し、
   同じ CA が発行した別の ID は拒否する。`client_auth = "optional"` か `"require"` が要る。
 - 証明書のホットリロードは起動時の `client_auth`・`client_ca`・`client_allowed_sans` を引き継ぐ。これらの変更には再起動が要る。

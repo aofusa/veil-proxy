@@ -444,7 +444,6 @@ TLS や平文のポートを 2 つ以上開くときは [`[[listener]]`](#複数
   `redirect_to`）を書くとエラー。知らないキーもエラー。
 - `redirect_to` は TLS のリスナーの名前であること。`secure_redirect = true` には TLS のリスナーが 1 個以上要る。
 - `[http3] enabled`・`[http3].listen` は `[server].listen` にだけ効く。`[[listener]]` では `http3 = true` を使う。
-- `[tls] client_auth` は HTTP/3 のリスナーと併用できない。
 
 リロード（SIGHUP）では `allow_http`・`allow_h2c`・`secure_redirect`・`redirect_to` が反映されます。リスナーの追加・削除・変更
 （名前・アドレス・`tls`・`http2`・`http3`・`threads` など）は警告を出して起動時の待ち受けのままにします。反映には再起動が要ります

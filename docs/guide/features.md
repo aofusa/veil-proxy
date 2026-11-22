@@ -79,7 +79,7 @@
 - **Connection Limit**: Global concurrent connection limit
 - **Rate Limiter**: Sliding window rate limiting
 - **IP Restriction**: IP address filtering with CIDR support
-- **Client certificates (F-217 / F-220)**: `[tls] client_auth` / `client_ca`, and `client_allowed_sans` to accept only listed identities (see [TLS](tls.md))
+- **Client certificates (F-217 / F-220 / F-312)**: `[tls] client_auth` / `client_ca`, and `client_allowed_sans` to accept only listed identities, on HTTP/1.1, HTTP/2 and HTTP/3 (see [TLS](tls.md))
 - **JWT (F-220)**: `[route.jwt]` verifies tokens (RS/PS/ES, `iss`, `aud`, `exp`) and claim conditions; 401 / 403 otherwise (requires `jwt`, included in `full*`; see [Security](security.md))
 - **Privilege Dropping**: Drop to unprivileged user after root startup
 - **seccomp Filter**: BPF-based system call restriction with argument checks (no PROT_EXEC for mmap/mprotect, socket families, ioctl requests, prctl options, no namespaces for clone) (optional)

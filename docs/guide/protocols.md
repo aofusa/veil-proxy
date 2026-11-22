@@ -169,6 +169,7 @@ Supports HTTP/3 (RFC 9114) based on QUIC/UDP. Uses Cloudflare's [quiche](https:/
 | NAT rebinding | A connection follows a change of the client's port. It does not move to another client IP: veil sends `disable_active_migration` and drops packets from an IP other than the one that completed the handshake, so IP-based checks (`blocked_ips`, `allowed_ips`, `source_ip`, rate limits, `X-Forwarded-For`) always see the address actually sending the requests. A client that changes networks opens a new connection |
 | GSO/GRO Optimization | High-performance UDP processing (UDP_SEGMENT / UDP_GRO) |
 | Congestion control / pacing | Configurable via `[http3]` (`cc_algorithm`, `pacing`, `hystart`, …); default cubic + pacing |
+| Client certificates | `[tls] client_auth` applies to HTTP/3 too: the certificate is checked with the same rules as TCP right after the handshake, before any request is read (F-312; see [TLS](tls.md#requiring-client-certificates)) |
 | Optimistic ACK detection | Skips a packet number whenever the congestion window has doubled since the last check and closes the connection if the client acknowledges it (`[http3] skip_packet_numbers`, default `"on_growth"`) |
 | io_uring pipelined UDP I/O | Receive/send hot path uses pipelined `IORING_OP_RECVMSG`/`IORING_OP_SENDMSG` (batch via `mmsg_batch_size`, default 64); no libc `recvmmsg`/`sendmmsg` on the hot path (F-130) |
 

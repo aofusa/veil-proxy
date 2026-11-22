@@ -79,7 +79,7 @@
 - **同時接続数制限**: グローバルな接続数上限設定
 - **レートリミッター**: スライディングウィンドウ方式のレート制限
 - **IP制限**: CIDR対応のIPアドレスフィルタリング
-- **クライアント証明書（F-217・F-220）**: `[tls] client_auth`・`client_ca`、一覧の ID だけを受ける `client_allowed_sans`（[TLS](tls.md) 参照）
+- **クライアント証明書（F-217・F-220・F-312）**: `[tls] client_auth`・`client_ca`、一覧の ID だけを受ける `client_allowed_sans`。HTTP/1.1・HTTP/2・HTTP/3 で効く（[TLS](tls.md) 参照）
 - **JWT（F-220）**: `[route.jwt]` でトークン（RS/PS/ES、`iss`・`aud`・`exp`）と claim の条件を検証し、通らなければ 401 / 403（`jwt` feature が必要で `full*` に含まれる。[セキュリティ](security.md) 参照）
 - **権限降格**: root起動後の非特権ユーザーへの降格
 - **seccompフィルタ**: BPFベースのシステムコール制限 + 引数の検査（mmap/mprotect の PROT_EXEC・socket のファミリ・ioctl・prctl・clone の名前空間）（オプション）

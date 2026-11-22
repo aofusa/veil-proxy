@@ -307,7 +307,11 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
 ///   mode / OpenBSD pledge+unveil のいずれの下でも動作する（設計根拠は
 ///   docs/artifacts/f136_platform_design.md の F-136 節参照）。
 #[cfg(target_os = "linux")]
-fn new_quic_config_with_certs(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Config> {
+fn new_quic_config_with_certs(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    client_ca: Option<&[u8]>,
+) -> io::Result<Config> {
     let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
@@ -335,7 +339,33 @@ fn new_quic_config_with_certs(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Con
         })?;
     drop(key_memfd);
 
+    if let Some(ca) = client_ca {
+        load_client_ca(&mut quic_config, ca)?;
+    }
+
     Ok(quic_config)
+}
+
+/// `[tls] client_ca`（F-312）を信頼する CA に足し、クライアントに証明書を要求する（Linux。証明書と同じく memfd 経由）。
+///
+/// BoringSSL は送られた証明書のチェーンをハンドシェイクの中で確かめる（信頼する CA の外なら失敗させる）。quiche は
+/// 既定でシステムの CA も読むので、最後の判定はハンドシェイクの完了の後に TCP と同じ検証器で行う
+/// （`verify_h3_client_cert`。`client_ca` だけを信頼し、`client_allowed_sans`・`"require"` も見る）。
+#[cfg(target_os = "linux")]
+fn load_client_ca(quic_config: &mut Config, ca_pem: &[u8]) -> io::Result<()> {
+    let (ca_memfd, ca_path) = create_memfd_for_pem("tls_client_ca", ca_pem)
+        .map_err(|e| io::Error::other(format!("Failed to create memfd for client CA: {}", e)))?;
+    quic_config
+        .load_verify_locations_from_file(&ca_path)
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("client CA load error (memfd): {}", e),
+            )
+        })?;
+    drop(ca_memfd);
+    quic_config.verify_peer(true);
+    Ok(())
 }
 
 /// PEM バイト列から証明書・秘密鍵を設定した新規 `quiche::Config` を構築する
@@ -344,7 +374,11 @@ fn new_quic_config_with_certs(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Con
 /// `new_quic_config_with_certs` の doc コメント参照。`boringssl-boring-crate` feature
 /// （外部 `boring` crate）でのみ提供される in-memory SSL_CTX API を使う。
 #[cfg(not(target_os = "linux"))]
-fn new_quic_config_with_certs(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Config> {
+fn new_quic_config_with_certs(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    client_ca: Option<&[u8]>,
+) -> io::Result<Config> {
     use boring::pkey::PKey;
     use boring::ssl::{SslContextBuilder, SslMethod};
     use boring::x509::X509;
@@ -395,6 +429,26 @@ fn new_quic_config_with_certs(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Con
             format!("set_private_key: {}", e),
         )
     })?;
+
+    // F-312: クライアントに証明書を要求し、`client_ca` だけを信頼する CA にする（最後の判定はハンドシェイクの後の
+    // `verify_h3_client_cert`。Linux の `load_client_ca` を参照）
+    if let Some(ca) = client_ca {
+        let cas = X509::stack_from_pem(ca).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("client CA parse error: {}", e),
+            )
+        })?;
+        for c in cas {
+            builder.cert_store_mut().add_cert(c).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("client CA add_cert: {}", e),
+                )
+            })?;
+        }
+        builder.set_verify(boring::ssl::SslVerifyMode::PEER);
+    }
 
     Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
@@ -500,13 +554,24 @@ fn reload_quiche_certs(
             })?;
             drop(key_memfd);
 
+            // F-312: `client_ca` の中身が変わっていれば足す（検証の設定は既存の SSL_CTX に残っている。最後の判定は
+            // 差し替えた検証器が `client_ca` だけを信頼する）
+            if let Some(auth) = crate::config::H3_CLIENT_AUTH.load_full() {
+                load_client_ca(&mut cfg, &auth.ca_pem)?;
+            }
+
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
             // F-136: capability mode / pledge+unveil 下でも動作する in-memory 経路。
             // 初回ロードと全く同じ手順で新規 Config を構築し、まるごと差し替える。
-            let mut new_cfg = new_quic_config_with_certs(cert_pem, key_pem)?;
+            let auth = crate::config::H3_CLIENT_AUTH.load_full();
+            let mut new_cfg = new_quic_config_with_certs(
+                cert_pem,
+                key_pem,
+                auth.as_deref().map(|a| a.ca_pem.as_slice()),
+            )?;
             configure_quic_transport(&mut new_cfg, _transport_config)?;
             *quic_config.borrow_mut() = new_cfg;
             Ok(())
@@ -1259,6 +1324,22 @@ impl Http3Handler {
     /// h3 の層の外でストリームを読んだりしない（`test_f280_zero_rtt_request_waits_for_handshake`）。
     fn init_h3(&mut self) -> io::Result<()> {
         if self.h3_conn.is_none() && self.conn.is_established() && !self.conn.is_closed() {
+            // F-312: クライアント証明書（`[tls] client_auth`）。h3 の層を作る前（要求を 1 つも読む前。0-RTT の要求も
+            // ここまで読まない）に TCP と同じ検証器で確かめ、通らなければ接続を閉じる（閉じている間は確かめ直さない）
+            if self.conn.local_error().is_some() {
+                return Ok(());
+            }
+            if let Some(auth) = crate::config::H3_CLIENT_AUTH.load().as_ref() {
+                if let Err(code) = verify_h3_client_cert(&self.conn, auth) {
+                    // 相手が接続ごとに起こせるので debug!（B-235）
+                    debug!(
+                        "[HTTP/3] client certificate rejected from {} (error 0x{:x})",
+                        self.peer_addr, code
+                    );
+                    let _ = self.conn.close(false, code, b"");
+                    return Ok(());
+                }
+            }
             let mut h3_config = h3::Config::new().map_err(|e| io::Error::other(e.to_string()))?;
             // B-255: 宣言だけの大きな HEADERS で確保させない上限を広告する
             h3_config.set_max_field_section_size(H3_MAX_FIELD_SECTION_SIZE.with(Cell::get));
@@ -1275,6 +1356,39 @@ impl Http3Handler {
             );
         }
         Ok(())
+    }
+}
+
+/// HTTP/3 のクライアント証明書を TCP と同じ検証器で確かめる（F-312）。通らなければ接続を閉じる QUIC の暗号の
+/// エラー（0x100 + TLS のアラート。RFC 9001 §4.8）を返す
+fn verify_h3_client_cert(conn: &H3Conn, auth: &crate::config::H3ClientAuth) -> Result<(), u64> {
+    const BAD_CERTIFICATE: u64 = 0x100 + 42;
+    const ACCESS_DENIED: u64 = 0x100 + 49;
+    const CERTIFICATE_REQUIRED: u64 = 0x100 + 116;
+    let chain = conn.peer_cert_chain().unwrap_or_default();
+    let Some((leaf, rest)) = chain.split_first() else {
+        return if auth.verifier.client_auth_mandatory() {
+            Err(CERTIFICATE_REQUIRED)
+        } else {
+            Ok(())
+        };
+    };
+    let end_entity = rustls::pki_types::CertificateDer::from(*leaf);
+    let intermediates: Vec<rustls::pki_types::CertificateDer<'_>> = rest
+        .iter()
+        .map(|c| rustls::pki_types::CertificateDer::from(*c))
+        .collect();
+    match auth.verifier.verify_client_cert(
+        &end_entity,
+        &intermediates,
+        rustls::pki_types::UnixTime::now(),
+    ) {
+        Ok(_) => Ok(()),
+        // `client_allowed_sans` に合わない
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        )) => Err(ACCESS_DENIED),
+        Err(_) => Err(BAD_CERTIFICATE),
     }
 }
 
@@ -2783,6 +2897,7 @@ mod tests {
         let mut server_cfg = new_quic_config_with_certs(
             ck.cert.pem().as_bytes(),
             ck.signing_key.serialize_pem().as_bytes(),
+            None,
         )
         .expect("server config");
         server_cfg
@@ -2927,8 +3042,8 @@ mod tests {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.pem();
         let key = ck.signing_key.serialize_pem();
-        let mut server_cfg =
-            new_quic_config_with_certs(cert.as_bytes(), key.as_bytes()).expect("server config");
+        let mut server_cfg = new_quic_config_with_certs(cert.as_bytes(), key.as_bytes(), None)
+            .expect("server config");
         server_cfg
             .set_application_protos(h3::APPLICATION_PROTOCOL)
             .unwrap();
@@ -3005,8 +3120,8 @@ mod tests {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.pem();
         let key = ck.signing_key.serialize_pem();
-        let mut server_cfg =
-            new_quic_config_with_certs(cert.as_bytes(), key.as_bytes()).expect("server config");
+        let mut server_cfg = new_quic_config_with_certs(cert.as_bytes(), key.as_bytes(), None)
+            .expect("server config");
         server_cfg
             .set_application_protos(h3::APPLICATION_PROTOCOL)
             .unwrap();
@@ -3138,8 +3253,8 @@ mod tests {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.pem();
         let key = ck.signing_key.serialize_pem();
-        let mut server_cfg =
-            new_quic_config_with_certs(cert.as_bytes(), key.as_bytes()).expect("server config");
+        let mut server_cfg = new_quic_config_with_certs(cert.as_bytes(), key.as_bytes(), None)
+            .expect("server config");
         server_cfg
             .set_application_protos(h3::APPLICATION_PROTOCOL)
             .unwrap();
@@ -3253,8 +3368,8 @@ mod tests {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = ck.cert.pem();
         let key = ck.signing_key.serialize_pem();
-        let mut server_cfg =
-            new_quic_config_with_certs(cert.as_bytes(), key.as_bytes()).expect("server config");
+        let mut server_cfg = new_quic_config_with_certs(cert.as_bytes(), key.as_bytes(), None)
+            .expect("server config");
         server_cfg
             .set_application_protos(h3::APPLICATION_PROTOCOL)
             .unwrap();
@@ -3381,6 +3496,7 @@ mod tests {
         let mut server_cfg = new_quic_config_with_certs(
             ck.cert.pem().as_bytes(),
             ck.signing_key.serialize_pem().as_bytes(),
+            None,
         )
         .expect("server config");
         server_cfg

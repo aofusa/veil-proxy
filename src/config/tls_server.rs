@@ -210,6 +210,18 @@ pub(super) static TLS_CLIENT_AUTH: once_cell::sync::OnceCell<(
     Vec<String>,
 )> = once_cell::sync::OnceCell::new();
 
+/// HTTP/3 のクライアント証明書の検証（F-312）。TCP と同じ検証器（`client_ca` だけを信頼し、`client_allowed_sans`・
+/// `"require"` も見る）と、quiche（BoringSSL）にクライアント証明書を要求させて先に確かめさせる `client_ca` の PEM。
+pub struct H3ClientAuth {
+    pub verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    pub ca_pem: Vec<u8>,
+}
+
+/// [`H3ClientAuth`] の置き場。TCP の TLS の設定を組み立てるたび（起動・証明書のリロード）に差し替える
+/// （HTTP/3 のワーカーは接続のハンドシェイクの完了ごとに 1 回読む）。`client_auth = "none"` なら空
+pub static H3_CLIENT_AUTH: arc_swap::ArcSwapOption<H3ClientAuth> =
+    arc_swap::ArcSwapOption::const_empty();
+
 /// クライアント証明書の検証器（`client_auth = "none"` なら `None`）。
 pub(super) fn client_cert_verifier(
     tls_config: &TlsConfigSection,
@@ -271,10 +283,17 @@ pub(super) fn client_cert_verifier(
         "TLS client certificates: {:?} (CA {}, allowed SANs {:?})",
         mode, ca, allowed
     );
-    if allowed.is_empty() {
-        return Ok(Some(v));
-    }
-    Ok(Some(Arc::new(ClientSanAllowList { inner: v, allowed })))
+    let v: Arc<dyn rustls::server::danger::ClientCertVerifier> = if allowed.is_empty() {
+        v
+    } else {
+        Arc::new(ClientSanAllowList { inner: v, allowed })
+    };
+    // F-312: HTTP/3 も同じ検証器と CA を使う
+    H3_CLIENT_AUTH.store(Some(Arc::new(H3ClientAuth {
+        verifier: v.clone(),
+        ca_pem: pem,
+    })));
+    Ok(Some(v))
 }
 
 /// クライアント証明書の SAN を許可リストで照合する検証器（`[tls] client_allowed_sans`、F-220）。

@@ -252,6 +252,11 @@ pub async fn run_http3_server_async(
     //   `SslContextBuilder` を組む in-memory 経路（capsicum capability mode /
     //   pledge+unveil 下でも動作する）。
     //
+    // F-312: `[tls] client_auth` のときはクライアント証明書を要求し、`client_ca` を信頼する CA に足す
+    // （TCP の TLS の設定を組み立てたときに置かれる。最後の判定はハンドシェイクの後に TCP と同じ検証器で行う）
+    let client_auth = crate::config::H3_CLIENT_AUTH.load_full();
+    let client_ca = client_auth.as_deref().map(|a| a.ca_pem.as_slice());
+
     // セキュリティ: quiche が証明書を読み込んだ後、config 内の Vec<u8> をセキュアに
     // ゼロ化してからドロップする。
     let mut quic_config = if let (Some(mut cert_pem), Some(mut key_pem)) =
@@ -268,7 +273,7 @@ pub async fn run_http3_server_async(
             );
         });
 
-        let cfg = new_quic_config_with_certs(&cert_pem, &key_pem)?;
+        let cfg = new_quic_config_with_certs(&cert_pem, &key_pem, client_ca)?;
 
         // 証明書・秘密鍵データをセキュアにゼロ化
         secure_zero(&mut cert_pem);
@@ -302,6 +307,9 @@ pub async fn run_http3_server_async(
                         format!("key load error: {}", e),
                     )
                 })?;
+            if let Some(ca) = client_ca {
+                load_client_ca(&mut cfg, ca)?;
+            }
             cfg
         }
         #[cfg(not(target_os = "linux"))]
@@ -315,7 +323,7 @@ pub async fn run_http3_server_async(
             #[allow(clippy::disallowed_methods)]
             let key_pem = std::fs::read(&config.key_path)
                 .map_err(|e| io::Error::new(e.kind(), format!("failed to read key file: {}", e)))?;
-            new_quic_config_with_certs(&cert_pem, &key_pem)?
+            new_quic_config_with_certs(&cert_pem, &key_pem, client_ca)?
         }
     };
 

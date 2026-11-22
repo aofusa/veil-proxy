@@ -1686,17 +1686,26 @@ impl Drop for ChildGuard {
 // ===================== F-217（TOML の mTLS） =====================
 
 /// テスト用の CA と、それが発行するサーバ証明書（URI SAN 付き）・クライアント証明書を書き出す。
+///
+/// 証明書ごとに主体者名（CN）を分ける（rcgen の既定は全部同じ名前で、発行者と同じ名前の証明書を BoringSSL は
+/// 自己発行とみなして CA へつながない。HTTP/3 のクライアント証明書の試験。F-312）
 fn write_mtls_pki(dir: &std::path::Path) {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SanType};
+    let named = |sans: Vec<String>, cn: &str| {
+        let mut p = CertificateParams::new(sans).unwrap();
+        p.distinguished_name = rcgen::DistinguishedName::new();
+        p.distinguished_name.push(DnType::CommonName, cn);
+        p
+    };
     let ca_key = KeyPair::generate().unwrap();
-    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    let mut ca_params = named(Vec::new(), "veil test CA");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = ca_params.self_signed(&ca_key).unwrap();
     std::fs::write(dir.join("ca.pem"), ca.pem()).unwrap();
     let issuer = Issuer::new(ca_params, ca_key);
 
     let server_key = KeyPair::generate().unwrap();
-    let mut sp = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let mut sp = named(vec!["localhost".to_string()], "localhost");
     sp.subject_alt_names
         .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
     sp.subject_alt_names
@@ -1706,14 +1715,14 @@ fn write_mtls_pki(dir: &std::path::Path) {
     std::fs::write(dir.join("server.key"), server_key.serialize_pem()).unwrap();
 
     let client_key = KeyPair::generate().unwrap();
-    let cp = CertificateParams::new(vec!["client.test".to_string()]).unwrap();
+    let cp = named(vec!["client.test".to_string()], "client.test");
     let client = cp.signed_by(&client_key, &issuer).unwrap();
     std::fs::write(dir.join("client.pem"), client.pem()).unwrap();
     std::fs::write(dir.join("client.key"), client_key.serialize_pem()).unwrap();
 
     // 同じ CA が発行した別の ID（F-220 の SAN の許可リストの試験用）
     let other_key = KeyPair::generate().unwrap();
-    let op = CertificateParams::new(vec!["other.test".to_string()]).unwrap();
+    let op = named(vec!["other.test".to_string()], "other.test");
     let other = op.signed_by(&other_key, &issuer).unwrap();
     std::fs::write(dir.join("other.pem"), other.pem()).unwrap();
     std::fs::write(dir.join("other.key"), other_key.serialize_pem()).unwrap();

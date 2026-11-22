@@ -456,7 +456,6 @@ Validation rules (`veil -t`), in addition to the ones above:
   `secure_redirect`, `redirect_to`) are errors, as are unknown keys.
 - `redirect_to` must name a TLS listener; `secure_redirect = true` needs at least one TLS listener.
 - `[http3] enabled` / `[http3].listen` apply only to `[server].listen`; use `http3 = true` on a `[[listener]]`.
-- `[tls] client_auth` cannot be combined with any HTTP/3 listener.
 
 A reload (SIGHUP) applies `allow_http`, `allow_h2c`, `secure_redirect` and `redirect_to`. Adding, removing or
 changing a listener (name, address, `tls`, `http2`, `http3`, `threads`, ...) logs a warning and keeps the listeners
