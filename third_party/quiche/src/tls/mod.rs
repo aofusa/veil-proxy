@@ -328,6 +328,28 @@ impl Context {
         })
     }
 
+    // veil: README.veil.md の 9（F-314）
+    pub fn set_session_tickets(&mut self, num_tickets: usize) -> Result<()> {
+        // `SSL_OP_NO_TICKET`（BoringSSL・AWS-LC の ssl.h）
+        const SSL_OP_NO_TICKET: u32 = 0x0000_4000;
+        if num_tickets == 0 {
+            unsafe { SSL_CTX_set_options(self.as_mut_ptr(), SSL_OP_NO_TICKET) };
+            return Ok(());
+        }
+        map_result(unsafe {
+            SSL_CTX_set_num_tickets(self.as_mut_ptr(), num_tickets)
+        })
+    }
+
+    // veil: README.veil.md の 9（F-314）
+    #[cfg(feature = "aws-lc-sys")]
+    pub fn set_tls13_ciphersuites(&mut self, list: &str) -> Result<()> {
+        let list = ffi::CString::new(list).map_err(|_| Error::TlsFail)?;
+        map_result(unsafe {
+            SSL_CTX_set_ciphersuites(self.as_mut_ptr(), list.as_ptr())
+        })
+    }
+
     fn as_mut_ptr(&mut self) -> *mut SSL_CTX {
         self.0
     }

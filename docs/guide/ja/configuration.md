@@ -55,7 +55,7 @@
 | `[tls]` | `ktls_enabled` | `false` | kTLSを有効化 |
 | `[tls]` | `ktls_fallback_enabled` | `true` | kTLS失敗時のrustlsフォールバック |
 | `[tls]` | `tcp_cork_enabled` | `true` | TCP_CORKを有効化 |
-| `[tls]` | `cipher_suites` | `[]`（rustls 既定） | 許可する TLS 暗号スイート（nginx の `ssl_ciphers` 相当。記載順 = サーバ優先度順。不正名は起動エラー。詳細は examples/config.toml 参照） |
+| `[tls]` | `cipher_suites` | `[]`（rustls 既定） | 許可する TLS 暗号スイート（nginx の `ssl_ciphers` 相当。記載順 = サーバ優先度順。不正名は起動エラー。詳細は examples/config.toml 参照）。HTTP/3 は一覧の TLS 1.3 の名前を使う（Linux。他の OS の HTTP/3 は TLS 1.3 の 3 つを全部並べる必要がある。[TLS](tls.md#暗号スイートと-http3) 参照） |
 | `[tls]` | `auto_reload` | `false` | 証明書の自動リロード（mtime 検知 + SIGHUP） |
 | `[tls]` | `reload_interval_secs` | `60` | 証明書変更チェック間隔（秒） |
 | `[buffer_pool]` | `read_buffer_size` | `65536` | 読み込みバッファサイズ（64KB） |

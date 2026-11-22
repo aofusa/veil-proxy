@@ -147,10 +147,23 @@ built on OpenSSL 3 that reads a connection to its end treats an end without clos
 drops the session, so its next connection would need a full handshake. When the socket's send buffer is full at that
 moment veil does not wait for it, except after an HTTP/2 GOAWAY, where it waits up to 500 ms.
 
+## Cipher Suites and HTTP/3
+
+`[tls] cipher_suites` (names in `examples/config.toml`) restricts the cipher suites of HTTP/1.1, HTTP/2 and HTTP/3
+(F-314):
+
+- HTTP/3 runs TLS 1.3 only and uses the `TLS13_*` names of the list, in the listed order. A list without any TLS 1.3
+  name is a startup error while HTTP/3 is enabled.
+- On Linux HTTP/3 accepts exactly those TLS 1.3 cipher suites. On FreeBSD, OpenBSD, NetBSD, macOS and Windows the TLS
+  library of HTTP/3 (BoringSSL) cannot restrict the TLS 1.3 cipher suites, so a list that leaves out one of
+  `TLS13_AES_128_GCM_SHA256`, `TLS13_AES_256_GCM_SHA384` and `TLS13_CHACHA20_POLY1305_SHA256` is a startup error
+  while HTTP/3 is enabled (instead of HTTP/3 silently accepting the others).
+- QUIC always protects its Initial packets with AES-128-GCM (RFC 9001 §5.2); the list applies to the handshake and
+  the application data.
+
 ## TLS Session Resumption (F-183)
 
-`[tls] session_resumption` selects how HTTP/1.1 and HTTP/2 clients resume TLS sessions
-(HTTP/3 resumption is handled by quiche).
+`[tls] session_resumption` selects how clients resume TLS sessions, on HTTP/1.1, HTTP/2 and HTTP/3 (F-314).
 
 | Value | Behavior |
 |---|---|
@@ -164,6 +177,12 @@ session_resumption = "tickets"
 session_cache_size = 4096   # entries ("cache", and TLS 1.2 session-ID clients with "tickets")
 tls13_tickets = 1           # tickets sent per TLS 1.3 handshake (0 with "off")
 ```
+
+HTTP/3 (quiche) always resumes with stateless tickets, also with `"cache"` (its TLS library keeps no server-side
+TLS 1.3 session cache), and sends `tls13_tickets` tickets per handshake; `"off"` sends none and ignores the tickets
+clients present, so there is no resumption and no 0-RTT. The HTTP/3 ticket key is shared by all HTTP/3 workers (a
+returning client resumes whichever worker its new connection reaches), kept across certificate reloads and replaced
+every 6 hours; tickets issued before a replacement need one full handshake.
 
 Before F-183 veil used the rustls defaults: a 256-entry cache shared by all workers and two
 TLS 1.3 tickets per handshake, each inserted into the cache. At a few thousand handshakes per

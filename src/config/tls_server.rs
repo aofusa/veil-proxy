@@ -203,6 +203,63 @@ pub(super) fn load_tls_config(
     Ok(Arc::new(config))
 }
 
+/// `[tls]` の暗号・セッション再開を HTTP/3 へ写す（F-314）。HTTP/3 のリスナーがあるときだけ、設定の検証とロードで呼ぶ。
+///
+/// - `cipher_suites` が空なら TLS 1.3 の暗号は既定のまま。空でなければ TLS 1.3 の名前だけを OpenSSL の名前で並べる
+///   （TLS 1.2 の名前は QUIC では使わない）。TLS 1.3 の名前が 1 つも無い一覧は HTTP/3 が使えないのでエラー。
+/// - Linux 以外の quiche は BoringSSL で、TLS 1.3 の暗号を絞る口が無い。3 つ全部を並べた一覧でなければエラーにする
+///   （黙って全部を受けると、暗号を絞った構成で HTTP/3 だけ絞られない）。
+/// - `session_resumption = "off"` はチケット 0 枚。`"cache"` も HTTP/3 ではチケットで再開する（BoringSSL の TLS 1.3 は
+///   サーバ側のセッションキャッシュを持たない）。
+#[cfg(feature = "http3")]
+pub(super) fn h3_tls_settings(tls: &TlsConfigSection) -> io::Result<H3TlsSettings> {
+    let tls13_ciphersuites = if tls.cipher_suites.is_empty() {
+        None
+    } else {
+        let suites = resolve_cipher_suites(&tls.cipher_suites)?;
+        let names: Vec<&str> = suites
+            .iter()
+            .filter_map(|s| tls13_openssl_name(s.suite()))
+            .collect();
+        if names.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "[tls] cipher_suites has no TLS 1.3 cipher suite, which HTTP/3 requires \
+                 (add one, or disable HTTP/3)",
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        if names.len() < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "[tls] cipher_suites: HTTP/3 cannot restrict the TLS 1.3 cipher suites on this platform \
+                 (BoringSSL); list all of TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384 and \
+                 TLS13_CHACHA20_POLY1305_SHA256, or disable HTTP/3",
+            ));
+        }
+        Some(names.join(":"))
+    };
+    let session_tickets = match tls.session_resumption {
+        SessionResumption::Off => 0,
+        SessionResumption::Tickets | SessionResumption::Cache => tls.tls13_tickets,
+    };
+    Ok(H3TlsSettings {
+        tls13_ciphersuites,
+        session_tickets,
+    })
+}
+
+/// rustls の TLS 1.3 の暗号の OpenSSL（BoringSSL・AWS-LC）での名前（TLS 1.2 の暗号は `None`）
+#[cfg(feature = "http3")]
+fn tls13_openssl_name(suite: rustls::CipherSuite) -> Option<&'static str> {
+    match suite {
+        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => Some("TLS_AES_128_GCM_SHA256"),
+        rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => Some("TLS_AES_256_GCM_SHA384"),
+        rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => Some("TLS_CHACHA20_POLY1305_SHA256"),
+        _ => None,
+    }
+}
+
 /// 起動時の `[tls] client_auth`・`client_ca`（証明書のリロードでも同じものを使う。F-217）。
 pub(super) static TLS_CLIENT_AUTH: once_cell::sync::OnceCell<(
     ClientAuthMode,
@@ -463,4 +520,65 @@ pub(super) fn apply_session_resumption_mode(
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "http3"))]
+mod f314_h3_tls_tests {
+    use super::*;
+
+    fn settings(toml_text: &str) -> io::Result<H3TlsSettings> {
+        let tls: TlsConfigSection = toml::from_str(toml_text).unwrap();
+        h3_tls_settings(&tls)
+    }
+
+    #[test]
+    fn defaults_keep_library_ciphers_and_one_ticket() {
+        assert_eq!(settings("").unwrap(), H3TlsSettings::default());
+        assert_eq!(settings("").unwrap().session_tickets, 1);
+    }
+
+    #[test]
+    fn resumption_modes_map_to_ticket_counts() {
+        let off = settings("session_resumption = \"off\"\ntls13_tickets = 4").unwrap();
+        assert_eq!(off.session_tickets, 0);
+        let cache = settings("session_resumption = \"cache\"\ntls13_tickets = 3").unwrap();
+        assert_eq!(cache.session_tickets, 3);
+        let tickets = settings("session_resumption = \"tickets\"\ntls13_tickets = 2").unwrap();
+        assert_eq!(tickets.session_tickets, 2);
+    }
+
+    #[test]
+    fn all_tls13_suites_are_kept_in_order() {
+        let s = settings(
+            "cipher_suites = [\"TLS13_CHACHA20_POLY1305_SHA256\", \"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\", \
+             \"tls13_aes_256_gcm_sha384\", \"TLS13_AES_128_GCM_SHA256\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            s.tls13_ciphersuites.as_deref(),
+            Some("TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256")
+        );
+    }
+
+    #[test]
+    fn restricted_tls13_suites() {
+        let r = settings(
+            "cipher_suites = [\"TLS13_AES_256_GCM_SHA384\", \"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\"]",
+        );
+        // Linux（AWS-LC）は絞れる。他の OS（BoringSSL）は絞れないので拒否する
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            r.unwrap().tls13_ciphersuites.as_deref(),
+            Some("TLS_AES_256_GCM_SHA384")
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(r.unwrap_err().to_string().contains("cannot restrict"));
+    }
+
+    #[test]
+    fn tls12_only_list_is_rejected_for_http3() {
+        let e =
+            settings("cipher_suites = [\"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\"]").unwrap_err();
+        assert!(e.to_string().contains("no TLS 1.3 cipher suite"), "{e}");
+    }
 }

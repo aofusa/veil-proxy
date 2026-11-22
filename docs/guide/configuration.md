@@ -57,7 +57,7 @@ The following table lists default values for major configuration options:
 | `[tls]` | `ktls_enabled` | `false` | Enable kTLS |
 | `[tls]` | `ktls_fallback_enabled` | `true` | kTLS fallback to rustls |
 | `[tls]` | `tcp_cork_enabled` | `true` | Enable TCP_CORK |
-| `[tls]` | `cipher_suites` | `[]` (rustls default) | Allowed TLS cipher suites (like nginx `ssl_ciphers`; listed order = server preference; unknown names fail at startup; see examples/config.toml) |
+| `[tls]` | `cipher_suites` | `[]` (rustls default) | Allowed TLS cipher suites (like nginx `ssl_ciphers`; listed order = server preference; unknown names fail at startup; see examples/config.toml). HTTP/3 uses the TLS 1.3 names of the list (on Linux; elsewhere HTTP/3 needs all three TLS 1.3 suites listed, see [TLS](tls.md#cipher-suites-and-http3)) |
 | `[tls]` | `auto_reload` | `false` | Certificate hot reload (mtime detection + SIGHUP) |
 | `[tls]` | `reload_interval_secs` | `60` | Certificate change check interval (seconds) |
 | `[buffer_pool]` | `read_buffer_size` | `65536` | Read buffer size (64KB) |

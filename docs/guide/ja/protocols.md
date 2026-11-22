@@ -176,6 +176,7 @@ HTTP/3（RFC 9114）をQUIC/UDPベースでサポートします。Cloudflare製
 | NAT の付け替え | クライアントのポートが変わっても接続を続ける。別の IP へは移らない（`disable_active_migration` を送り、ハンドシェイクした IP 以外から届いたパケットは捨てる。IP で見る検査（`blocked_ips`・`allowed_ips`・`source_ip`・レート制限・`X-Forwarded-For`）は常に要求を送っているアドレスを見る）。ネットワークを替えたクライアントは新しい接続を開く |
 | GSO/GRO最適化 | 高パフォーマンスUDP処理（UDP_SEGMENT / UDP_GRO） |
 | 輻輳制御・ペーシング | `[http3]`（`cc_algorithm`・`pacing`・`hystart` 等）で設定。既定は cubic + ペーシング |
+| TLS の設定 | `[tls] cipher_suites`（その TLS 1.3 の名前）・`session_resumption`・`tls13_tickets` は HTTP/3 にも効く。セッションチケットの鍵は全部の HTTP/3 のワーカーで共有する（F-314。[TLS](tls.md#暗号スイートと-http3) 参照） |
 | クライアント証明書 | `[tls] client_auth` は HTTP/3 にも効く。ハンドシェイクの直後、要求を読む前に TCP と同じ規則で確かめる（F-312。[TLS](tls.md#クライアント証明書を要求する) 参照） |
 | 楽観的 ACK の検出 | 輻輳窓が前回確かめた窓の 2 倍になるたびにパケット番号を 1 つ飛ばし、クライアントがその番号を ACK したら接続を閉じる（`[http3] skip_packet_numbers`、既定 `"on_growth"`） |
 | io_uring のパイプライン化した UDP I/O | 受信・送信のホットパスはパイプライン化した `IORING_OP_RECVMSG`/`IORING_OP_SENDMSG`（バッチ幅は `mmsg_batch_size`、既定 64）。ホットパスで libc の `recvmmsg`/`sendmmsg` を使わない（F-130） |

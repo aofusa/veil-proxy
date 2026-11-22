@@ -1411,7 +1411,6 @@ fn h3_get_with_client_cert(
     path: &str,
     client: Option<(&std::path::Path, &std::path::Path)>,
 ) -> Result<(u16, Vec<u8>), String> {
-    use bytes::Buf;
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     let _ = veil::tls_provider::provider::default_provider().install_default();
@@ -1430,6 +1429,42 @@ fn h3_get_with_client_cert(
         None => b.with_no_client_auth(),
     };
     tls.alpn_protocols = vec![b"h3".to_vec()];
+    h3_get_tls(port, path, Arc::new(tls)).map(|g| (g.status, g.server_cert))
+}
+
+/// HTTP/3 の GET の結果（F-312・F-314）
+#[cfg(feature = "http3")]
+struct H3Get {
+    status: u16,
+    /// サーバが見せた証明書（DER。再開した接続では最初の接続のもの）
+    server_cert: Vec<u8>,
+    /// 手元のセッションのチケットで 0-RTT を試したか（`Some(サーバが受けたか)`）。チケットが無ければ `None`
+    zero_rtt: Option<bool>,
+}
+
+/// `tls`（ALPN は h3）で HTTP/3 の接続を張って GET する。同じ `tls` を渡せばセッションのチケットを使い回し、チケットが
+/// あれば 0-RTT で始める（サーバが受けたら再開できた）。要求は 1-RTT で送る
+#[cfg(feature = "http3")]
+fn h3_get_tls(port: u16, path: &str, tls: Arc<rustls::ClientConfig>) -> Result<H3Get, String> {
+    use bytes::Buf;
+    use rustls::pki_types::CertificateDer;
+    // quinn は Initial の暗号（TLS13_AES_128_GCM_SHA256）を tls の暗号の一覧から探す。暗号を絞ったクライアントには
+    // 既定の provider のものを渡す
+    let quic = match quinn::crypto::rustls::QuicClientConfig::try_from(tls.clone()) {
+        Ok(q) => q,
+        Err(_) => {
+            let initial = veil::tls_provider::provider::default_provider()
+                .cipher_suites
+                .iter()
+                .find_map(|s| match (s.suite(), s.tls13()) {
+                    (rustls::CipherSuite::TLS13_AES_128_GCM_SHA256, Some(t)) => t.quic_suite(),
+                    _ => None,
+                })
+                .ok_or("no QUIC initial cipher suite")?;
+            quinn::crypto::rustls::QuicClientConfig::with_initial(tls, initial)
+                .map_err(|e| e.to_string())?
+        }
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1437,23 +1472,27 @@ fn h3_get_with_client_cert(
     let path = path.to_string();
     rt.block_on(async move {
         tokio::time::timeout(Duration::from_secs(10), async move {
-            let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
-                .map_err(|e| e.to_string())?;
             let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
                 .map_err(|e| e.to_string())?;
             endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
             let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-            let conn = endpoint
+            let connecting = endpoint
                 .connect(addr, "localhost")
-                .map_err(|e| e.to_string())?
-                .await
                 .map_err(|e| e.to_string())?;
+            let (conn, zero_rtt) = match connecting.into_0rtt() {
+                // 受けたかどうかはハンドシェイクの完了で決まる
+                Ok((conn, accepted)) => {
+                    let ok = accepted.await;
+                    (conn, Some(ok))
+                }
+                Err(connecting) => (connecting.await.map_err(|e| e.to_string())?, None),
+            };
             let server_cert = conn
                 .peer_identity()
                 .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok())
                 .and_then(|v| v.first().map(|c| c.to_vec()))
                 .unwrap_or_default();
-            let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+            let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
                 .await
                 .map_err(|e| e.to_string())?;
             tokio::spawn(async move {
@@ -1469,8 +1508,15 @@ fn h3_get_with_client_cert(
                 let n = c.remaining();
                 c.advance(n);
             }
-            drop(endpoint);
-            Ok((resp.status().as_u16(), server_cert))
+            // サーバがハンドシェイクの後に送るセッションのチケットを受け取ってから閉じる
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            conn.close(0u32.into(), b"");
+            endpoint.wait_idle().await;
+            Ok(H3Get {
+                status: resp.status().as_u16(),
+                server_cert,
+                zero_rtt,
+            })
         })
         .await
         .map_err(|_| "timed out".to_string())?
@@ -1596,4 +1642,172 @@ body = "ok"
         ],
         "optional",
     );
+}
+
+/// F-314 の試験の veil（自己署名の証明書、ワーカー 2 本、`[tls]` に `extra` を足す）。TLS のポートを返す
+#[cfg(feature = "http3")]
+fn start_f314(dir: &std::path::Path, name: &str, extra: &str) -> (VeilProcess, u16) {
+    let ports = Ports::alloc();
+    let d = dir.join(name);
+    std::fs::create_dir_all(&d).unwrap();
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{tls}"
+listen_cleartext = "127.0.0.1:{clear}"
+enable_secure_redirect = false
+threads = 2
+[logging]
+level = "warn"
+[tls]
+cert_path = "{p}/server.pem"
+key_path = "{p}/server.key"
+ktls_enabled = false
+{extra}
+[http3]
+enabled = true
+[[route]]
+[route.conditions]
+path = "/*"
+[route.action]
+type = "Respond"
+body = "ok"
+"#,
+        tls = ports.tls,
+        clear = ports.clear,
+        p = tp(dir),
+    );
+    (spawn_config(&d, ports, &config), ports.tls)
+}
+
+/// `dir` の `server.pem`・`server.key` を新しい自己署名の証明書で置き換える（鍵から先に。リロードが途中を読まない）
+#[cfg(feature = "http3")]
+fn replace_server_cert(dir: &std::path::Path) {
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    std::fs::write(dir.join("server.key.new"), ck.signing_key.serialize_pem()).unwrap();
+    std::fs::write(dir.join("server.pem.new"), ck.cert.pem()).unwrap();
+    std::fs::rename(dir.join("server.key.new"), dir.join("server.key")).unwrap();
+    std::fs::rename(dir.join("server.pem.new"), dir.join("server.pem")).unwrap();
+}
+
+/// F-314: HTTP/3 のセッションチケットの鍵を全ワーカーで共有する（以前はワーカーの `SSL_CTX` ごとに別で、再接続が別の
+/// ワーカーへ着くと再開できなかった）。ワーカー 2 本で、続けて張る接続（クライアントのポートが毎回変わり、どちらの
+/// ワーカーへも着く）が全部 0-RTT で再開する。証明書のリロードの後も前のチケットで再開する。
+/// `session_resumption = "off"` はチケットを出さない（TCP と同じ）
+#[cfg(feature = "http3")]
+#[test]
+fn f314_http3_session_resumption_across_workers() {
+    let dir = tempfile::tempdir().unwrap();
+    replace_server_cert(dir.path());
+    let client = || {
+        let mut c = tls_client_config(b"h3");
+        c.enable_early_data = true;
+        Arc::new(c)
+    };
+
+    let (veil, port) = start_f314(
+        dir.path(),
+        "tickets",
+        "auto_reload = true\nreload_interval_secs = 1",
+    );
+    let tls = client();
+    let first =
+        h3_get_tls(port, "/x", tls.clone()).unwrap_or_else(|e| panic!("{e}\n{}", veil.log()));
+    assert_eq!((first.status, first.zero_rtt), (200, None));
+    for i in 0..10 {
+        let g = h3_get_tls(port, "/x", tls.clone())
+            .unwrap_or_else(|e| panic!("connection {i}: {e}\n{}", veil.log()));
+        assert_eq!(
+            (g.status, g.zero_rtt),
+            (200, Some(true)),
+            "connection {i}: every worker must resume the session\n{}",
+            veil.log()
+        );
+    }
+
+    // 証明書を差し替え、チケットの無いクライアントに新しい証明書が見えるまで待つ
+    replace_server_cert(dir.path());
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let now = h3_get_tls(port, "/x", client());
+        if matches!(&now, Ok(g) if g.status == 200 && g.server_cert != first.server_cert) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "HTTP/3 did not reload the certificate: {}\n{}",
+            now.map(|g| g.status.to_string()).unwrap_or_else(|e| e),
+            veil.log()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    for i in 0..4 {
+        let g = h3_get_tls(port, "/x", tls.clone())
+            .unwrap_or_else(|e| panic!("after reload, connection {i}: {e}\n{}", veil.log()));
+        assert_eq!(
+            (g.status, g.zero_rtt),
+            (200, Some(true)),
+            "after reload, connection {i}\n{}",
+            veil.log()
+        );
+    }
+    drop(veil);
+
+    let (veil, port) = start_f314(dir.path(), "off", "session_resumption = \"off\"");
+    let tls = client();
+    for i in 0..3 {
+        let g = h3_get_tls(port, "/x", tls.clone())
+            .unwrap_or_else(|e| panic!("off, connection {i}: {e}\n{}", veil.log()));
+        assert_eq!(
+            (g.status, g.zero_rtt),
+            (200, None),
+            "off, connection {i}\n{}",
+            veil.log()
+        );
+    }
+}
+
+/// F-314: `[tls] cipher_suites` の TLS 1.3 の暗号が HTTP/3 にも効く（Linux。他の OS は TLS 1.3 の暗号を絞る設定を
+/// 起動時に拒否する）。AES-256 だけに絞ったサーバは、AES-128 しか出さないクライアントを HTTP/3 でも断り、AES-256 を
+/// 出すクライアントには答える
+#[cfg(all(feature = "http3", target_os = "linux"))]
+#[test]
+fn f314_http3_tls13_cipher_suites() {
+    let dir = tempfile::tempdir().unwrap();
+    replace_server_cert(dir.path());
+    let (veil, port) = start_f314(
+        dir.path(),
+        "ciphers",
+        "cipher_suites = [\"TLS13_AES_256_GCM_SHA384\", \"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\"]",
+    );
+    let only = |suite: rustls::CipherSuite| {
+        let mut provider = veil::tls_provider::provider::default_provider();
+        provider.cipher_suites.retain(|s| s.suite() == suite);
+        let mut c = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        c.alpn_protocols = vec![b"h3".to_vec()];
+        Arc::new(c)
+    };
+    let aes128 = h3_get_tls(
+        port,
+        "/x",
+        only(rustls::CipherSuite::TLS13_AES_128_GCM_SHA256),
+    );
+    assert!(
+        aes128.is_err(),
+        "a client offering only AES-128 must be rejected: status {:?}\n{}",
+        aes128.as_ref().map(|g| g.status),
+        veil.log()
+    );
+    let aes256 = h3_get_tls(
+        port,
+        "/x",
+        only(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384),
+    )
+    .unwrap_or_else(|e| panic!("{e}\n{}", veil.log()));
+    assert_eq!(aes256.status, 200);
 }

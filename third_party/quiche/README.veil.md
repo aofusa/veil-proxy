@@ -148,9 +148,21 @@ upstream は楽観的 ACK（受け取っていないパケットの ACK。RFC 90
 - 既定（`EveryRound`）の挙動は upstream と同じ（`set_skip_pn(None)` と同じく次を仕掛ける）。veil は `[http3] skip_packet_numbers`
   （既定 `"on_growth"`）で選ぶ。`grep -n 'veil:' src/packet.rs`。
 
+### 9. `src/tls/boringssl.rs`・`src/tls/mod.rs`・`src/lib.rs`: セッションチケットの数と TLS 1.3 の暗号（F-314、0.24.9-veil.5）
+
+veil の `[tls] session_resumption`・`tls13_tickets`・`cipher_suites` を HTTP/3 にも効かせるための設定の口（upstream に無い）。
+
+- `Config::set_session_tickets(n)`: `n` 枚のチケットを送る（`SSL_CTX_set_num_tickets`）。`0` は `SSL_OP_NO_TICKET`
+  （チケットを出さず、受け取ったチケットも使わない。再開も 0-RTT もしない）。BoringSSL・AWS-LC の両方にある。
+- `Config::set_tls13_ciphersuites(list)`（`aws-lc-sys` feature だけ）: TLS 1.3 の暗号を絞る（`SSL_CTX_set_ciphersuites`。
+  AWS-LC の TLS 1.3 のサーバは暗号を選ぶときにこの一覧だけを見る）。BoringSSL には TLS 1.3 の暗号を絞る口が無い
+  （veil は Linux 以外で絞る設定を起動時に拒否する）。
+- 宣言は `veil_ffi!` の中（`grep -n 'veil:' src/tls/boringssl.rs src/tls/mod.rs`）。チケットの鍵は upstream の
+  `Config::set_ticket_key` を使う（veil が全ワーカーで共有し、6 時間ごとに作り直す）。
+
 ## 追従手順
 
-quiche を更新するときは、新バージョンを同じ手順でコピーし直して上記 1〜8 を再適用する
+quiche を更新するときは、新バージョンを同じ手順でコピーし直して上記 1〜9 を再適用する
 （`grep -n 'Coalesce STREAM frames when fuzzing' src/lib.rs` と `grep -n 'veil:' src/lib.rs`
 で該当箇所が見つかる）。
 upstream がこの挙動を既定にした場合は vendoring を撤去し `[patch.crates-io]` を消す。
@@ -168,7 +180,7 @@ path 依存になると cargo が lint を抑制しなくなるため veil の�
 
 veil を crates.io に出すため、`[patch.crates-io]` で差し替えるのをやめ、別のパッケージとして公開する。
 
-- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.5`（`[lib] name = "quiche"` はそのまま。veil.2 は上の 5、veil.3 は上の 6、veil.4 は上の 7、veil.5 は上の 8）。
+- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.5`（`[lib] name = "quiche"` はそのまま。veil.2 は上の 5、veil.3 は上の 6、veil.4 は上の 7、veil.5 は上の 8・9）。
   既定の feature を空にした（`boringssl-vendored` は取り込んでいない `deps/boringssl` を要るため）。
   `[lints]` で veil の clippy（`-D warnings`）の対象から外す。
 - `rustfmt.toml`: `disable_all_formatting = true`（path 依存になり、veil の `cargo fmt` の対象に入ったため）。

@@ -902,8 +902,15 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     let http2_enabled = config.server.http2_enabled;
     #[cfg(feature = "http2")]
     let http2_config = config.http2.clone();
+    // F-314: `[tls]` の暗号・セッション再開を HTTP/3 のワーカーへ渡す
     #[cfg(feature = "http3")]
-    let http3_config = config.http3.clone();
+    let http3_config = {
+        let mut h = config.http3.clone();
+        if config_has_http3(&config) {
+            h.tls = h3_tls_settings(&config.tls)?;
+        }
+        h
+    };
 
     // Serverヘッダー設定を初期化
     init_server_header(

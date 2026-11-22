@@ -815,6 +815,25 @@ impl Config {
         self.tls_ctx.set_ticket_key(key)
     }
 
+    /// veil: sets how many TLS 1.3 session tickets the server sends after
+    /// a handshake. `0` sends no tickets and ignores the tickets clients
+    /// present, which disables resumption and 0-RTT.
+    ///
+    /// The default is the TLS library's (two tickets).
+    pub fn set_session_tickets(&mut self, num_tickets: usize) -> Result<()> {
+        self.tls_ctx.set_session_tickets(num_tickets)
+    }
+
+    /// veil: restricts the TLS 1.3 cipher suites to `list` (names such as
+    /// `TLS_AES_256_GCM_SHA384`, separated by `:`).
+    ///
+    /// Only with the `aws-lc-sys` feature: BoringSSL has no way to configure
+    /// the TLS 1.3 cipher suites.
+    #[cfg(feature = "aws-lc-sys")]
+    pub fn set_tls13_ciphersuites(&mut self, list: &str) -> Result<()> {
+        self.tls_ctx.set_tls13_ciphersuites(list)
+    }
+
     /// Enables sending or receiving early data.
     pub fn enable_early_data(&mut self) {
         self.tls_ctx.set_early_data_enabled(true);

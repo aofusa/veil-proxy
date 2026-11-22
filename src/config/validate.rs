@@ -274,6 +274,12 @@ pub(super) fn validate_config(config: &Config) -> io::Result<()> {
             "[tls] client_allowed_sans requires client_auth = \"optional\" or \"require\"",
         ));
     }
+    // F-314: `[tls] cipher_suites`・`session_resumption` を HTTP/3 にも効かせる（効かせられない一覧は拒否する）
+    #[cfg(feature = "http3")]
+    if config_has_http3(config) {
+        h3_tls_settings(&config.tls)?;
+    }
+
     // F-217: クライアント証明書には `client_ca` が要る（HTTP/3 も同じ検証器で確かめる。F-312）
     if config.tls.client_auth != ClientAuthMode::None && config.tls.client_ca.is_empty() {
         return Err(io::Error::new(

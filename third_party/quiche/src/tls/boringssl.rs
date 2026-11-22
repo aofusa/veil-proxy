@@ -320,6 +320,17 @@ veil_ffi! {
     ) -> c_int;
     fn SSL_CTX_set_early_data_enabled(ctx: *mut SSL_CTX, enabled: i32);
 
+    // veil: セッションチケットの数・止める（`Context::set_session_tickets`。README.veil.md の 9、F-314）
+    pub(super) fn SSL_CTX_set_options(ctx: *mut SSL_CTX, options: u32) -> u32;
+    pub(super) fn SSL_CTX_set_num_tickets(
+        ctx: *mut SSL_CTX, num_tickets: usize,
+    ) -> c_int;
+    // veil: TLS 1.3 の暗号の一覧（`Context::set_tls13_ciphersuites`）。AWS-LC だけにある（BoringSSL には無い）
+    #[cfg(feature = "aws-lc-sys")]
+    pub(super) fn SSL_CTX_set_ciphersuites(
+        ctx: *mut SSL_CTX, list: *const c_char,
+    ) -> c_int;
+
     pub(super) fn SSL_CTX_set_session_cache_mode(
         ctx: *mut SSL_CTX, mode: c_int,
     ) -> c_int;

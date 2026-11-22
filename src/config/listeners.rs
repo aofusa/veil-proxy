@@ -490,9 +490,8 @@ fn check_address_conflicts(config: &Config, specs: &[ListenerSpec]) -> io::Resul
     Ok(())
 }
 
-/// 設定に HTTP/3 のリスナーがあるか（`[http3] enabled` か `[[listener]] http3 = true`）。使うのは FreeBSD の
-/// capability mode のリロードの検査だけ（F-312 で mTLS との組み合わせの拒否を外した）
-#[cfg(all(target_os = "freebsd", feature = "http3"))]
+/// 設定に HTTP/3 のリスナーがあるか（`[http3] enabled` か `[[listener]] http3 = true`）
+#[cfg(feature = "http3")]
 pub(super) fn config_has_http3(config: &Config) -> bool {
     config.http3.enabled || config.listener.iter().flatten().any(|l| l.http3)
 }

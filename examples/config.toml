@@ -405,8 +405,9 @@ ktls_fallback_enabled = true
 # - kTLS オフロードは AES-GCM 系のみ対応。kTLS 有効時に CHACHA20 系を含めると、
 #   そのスイートでネゴシエートした接続は kTLS へオフロードされず rustls で処理される
 #   （ktls_fallback_enabled = false の場合は接続拒否）。
-# - 本設定は TLS(TCP) リスナー（HTTP/1.1 / HTTP/2）に適用される。
-#   HTTP/3 (QUIC) は quiche が TLS を管理するため対象外。
+# - HTTP/1.1・HTTP/2 に加え HTTP/3 にも効く（F-314）。HTTP/3 は TLS 1.3 だけなので一覧の TLS13_* の名前を使い、
+#   TLS 1.3 の名前が 1 つも無い一覧は HTTP/3 が有効なら起動エラー。Linux 以外の HTTP/3（BoringSSL）は TLS 1.3 の
+#   暗号を絞れないので、TLS13_ の 3 つを全部並べないと HTTP/3 が有効なら起動エラー。
 # cipher_suites = [
 #     "TLS13_AES_256_GCM_SHA384",
 #     "TLS13_AES_128_GCM_SHA256",
@@ -429,7 +430,8 @@ ktls_fallback_enabled = true
 # auto_reload = false
 # reload_interval_secs = 60
 
-# TLS セッション再開（F-183、HTTP/1.1・HTTP/2 の rustls 終端。HTTP/3 は quiche 側）
+# TLS セッション再開（F-183。HTTP/3 にも効く。F-314）
+# HTTP/3 は "cache" でもチケットで再開する（鍵は全部の HTTP/3 のワーカーで共有し、6 時間ごとに作り直す）。
 # "tickets" = ステートレスなセッションチケット【既定】。鍵はプロセス共有で自動ローテーション
 #             （証明書リロードでも維持）。TLS 1.3 の再開はサーバ側の状態を持たず、ワーカー間の
 #             共有ロックも無い。チケットを使わず session ID で再開する TLS 1.2 クライアント向けに

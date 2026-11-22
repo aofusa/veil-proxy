@@ -454,6 +454,79 @@ fn new_quic_config_with_certs(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
 }
 
+/// `[tls]` の暗号・セッション再開を `Config` へ入れる（F-314）。起動時と、`Config` を作り直すリロード（Linux 以外）で呼ぶ
+/// （Linux のリロードは同じ `SSL_CTX` の証明書だけを差し替えるので、ここで入れたものが残る）。
+fn configure_quic_tls(
+    quic_config: &mut Config,
+    tls: &crate::config::H3TlsSettings,
+) -> io::Result<()> {
+    if let Some(list) = tls.tls13_ciphersuites.as_deref() {
+        #[cfg(target_os = "linux")]
+        quic_config.set_tls13_ciphersuites(list).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("[tls] cipher_suites for HTTP/3 ({list}): {e}"),
+            )
+        })?;
+        // 他の OS の quiche（BoringSSL）は TLS 1.3 の暗号を絞れない。設定の検証で、3 つ全部を並べた一覧
+        // （既定と同じ）だけを通している（`config::h3_tls_settings`）
+        #[cfg(not(target_os = "linux"))]
+        let _ = list;
+    }
+    quic_config
+        .set_session_tickets(tls.session_tickets)
+        .map_err(|e| io::Error::other(format!("HTTP/3 session tickets: {e}")))?;
+    if tls.session_tickets > 0 {
+        apply_h3_ticket_key(quic_config, Instant::now())?;
+    }
+    Ok(())
+}
+
+/// HTTP/3 のセッションチケットの鍵を作り直す間隔（TCP の rustls のチケット発行器と同じ 6 時間。F-314）。
+/// 自分で入れた鍵は TLS ライブラリが作り直さない（前方秘匿のために作り直す）
+const H3_TICKET_KEY_ROTATION_SECS: u64 = 6 * 60 * 60;
+
+/// 全ワーカーが共有するセッションチケットの鍵（世代, 鍵）。再接続が別のワーカーへ着いても再開できる。世代が進んだら
+/// 最初に気づいたワーカーが乱数で作り直す（6 時間に 1 回だけ取るロック。F-314）
+static H3_TICKET_KEY: std::sync::Mutex<Option<(u64, [u8; 48])>> = std::sync::Mutex::new(None);
+/// 世代の起点（最初のワーカーの起動）
+static H3_TICKET_ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// `now` の世代
+fn h3_ticket_epoch(now: Instant) -> u64 {
+    let origin = *H3_TICKET_ORIGIN.get_or_init(|| now);
+    now.saturating_duration_since(origin).as_secs() / H3_TICKET_KEY_ROTATION_SECS
+}
+
+/// 次の世代が始まる時刻（ワーカーはこの時刻を過ぎたら `apply_h3_ticket_key` で入れ直す）
+pub(super) fn h3_ticket_next_rotation(now: Instant) -> Instant {
+    let origin = *H3_TICKET_ORIGIN.get_or_init(|| now);
+    origin + Duration::from_secs(H3_TICKET_KEY_ROTATION_SECS * (h3_ticket_epoch(now) + 1))
+}
+
+/// `now` の世代の鍵を `quic_config` に入れる（その世代の鍵がまだ無ければ作る）
+pub(super) fn apply_h3_ticket_key(quic_config: &mut Config, now: Instant) -> io::Result<()> {
+    let epoch = h3_ticket_epoch(now);
+    let key = {
+        let mut slot = H3_TICKET_KEY.lock().unwrap_or_else(|e| e.into_inner());
+        match *slot {
+            // 遅れて気づいたワーカー（古い世代）も最新の鍵を使う
+            Some((e, key)) if e >= epoch => key,
+            _ => {
+                let mut key = [0u8; 48];
+                SystemRandom::new()
+                    .fill(&mut key)
+                    .map_err(|_| io::Error::other("failed to generate a session ticket key"))?;
+                *slot = Some((epoch, key));
+                key
+            }
+        }
+    };
+    quic_config
+        .set_ticket_key(&key)
+        .map_err(|e| io::Error::other(format!("HTTP/3 session ticket key: {e}")))
+}
+
 /// QUIC トランスポートパラメータを `Config` へ適用する（TLS 証明書設定とは独立、初回ロード・
 /// リロード共通。F-136 でリロード時にも呼べるよう独立関数へ切り出した）。
 fn configure_quic_transport(
@@ -573,6 +646,8 @@ fn reload_quiche_certs(
                 auth.as_deref().map(|a| a.ca_pem.as_slice()),
             )?;
             configure_quic_transport(&mut new_cfg, _transport_config)?;
+            // F-314: 作り直した SSL_CTX にも暗号・チケットの数・共有のチケット鍵を入れる
+            configure_quic_tls(&mut new_cfg, &_transport_config.tls)?;
             *quic_config.borrow_mut() = new_cfg;
             Ok(())
         }
@@ -661,6 +736,8 @@ pub struct Http3ServerConfig {
     pub max_field_section_size: u64,
     /// F-288: `SETTINGS_ENABLE_CONNECT_PROTOCOL` を広告して拡張 CONNECT（RFC 9220）を受けるか。デフォルト: false
     pub enable_connect_protocol: bool,
+    /// F-314: `[tls]` の暗号・セッション再開（`configure_quic_tls`）
+    pub tls: crate::config::H3TlsSettings,
 }
 
 /// B-255: `[http3] max_field_section_size` の既定（`[http2] max_header_list_size` と同じ）
@@ -712,6 +789,7 @@ impl Default for Http3ServerConfig {
             handshake_timeout: admission::DEFAULT_HANDSHAKE_TIMEOUT_MS,
             max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
             enable_connect_protocol: false,
+            tls: crate::config::H3TlsSettings::default(),
         }
     }
 }

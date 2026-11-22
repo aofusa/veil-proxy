@@ -329,6 +329,8 @@ pub async fn run_http3_server_async(
 
     // QUIC トランスポートパラメータを設定（初回ロード・リロード共通の独立関数、F-136）
     configure_quic_transport(&mut quic_config, &config)?;
+    // F-314: `[tls]` の暗号・セッション再開（チケットの鍵は全ワーカーで共有する）
+    configure_quic_tls(&mut quic_config, &config.tls)?;
     HTTP3_LOG_ONCE_TRANSPORT.call_once(|| {
         info!(
             "[HTTP/3] quiche transport: cc={} pacing={} hystart={} skip_packet_numbers={} mmsg_batch={} recv_drain_max={}",
@@ -350,6 +352,9 @@ pub async fn run_http3_server_async(
     // 平文のゼロ化が次のリロードまで遅れる。B-351。bind は呼び出し側で済んでいる。B-402）。
     crate::tls_reload::register_http3_worker();
     let mut local_cert_gen = crate::tls_reload::http3_cert_generation();
+    // F-314: セッションチケットの鍵を入れ直す時刻（全ワーカーで同じ。チケットを出さないなら None）
+    let mut ticket_rotate_at =
+        (config.tls.session_tickets > 0).then(|| h3_ticket_next_rotation(Instant::now()));
     HTTP3_LOG_ONCE_GSO_GRO.call_once(|| {
         info!(
             "[HTTP/3] GSO enabled: {}, GRO enabled: {} (config gso_gro_enabled: {})",
@@ -566,6 +571,13 @@ pub async fn run_http3_server_async(
         // ダーティ処理へ進む（レビュー修正: これをしないとストリーミング中のレスポンスが
         // チャンクごとに最大 100ms 停止し得る）。
         let now = Instant::now();
+        // F-314: セッションチケットの鍵の世代が変わったら入れ直す（周回ごとには Instant の比較だけ。6 時間に 1 回）
+        if ticket_rotate_at.is_some_and(|at| now >= at) {
+            if let Err(e) = apply_h3_ticket_key(&mut quic_config.borrow_mut(), now) {
+                error!("[HTTP/3] Session ticket key rotation failed: {}", e);
+            }
+            ticket_rotate_at = Some(h3_ticket_next_rotation(now));
+        }
         let timeout_duration = next_sleep_duration(
             timers.peek().map(|Reverse(TimerKey(dl, _))| *dl),
             now,

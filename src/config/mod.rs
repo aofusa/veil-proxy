@@ -1285,6 +1285,29 @@ pub struct Http3ConfigSection {
     /// Alt-Svc の max-age（秒）。`alt_svc` 未指定時の自動生成に使用。デフォルト: 86400
     #[serde(default = "default_h3_alt_svc_ma")]
     pub alt_svc_ma_secs: u64,
+
+    /// `[tls]` の暗号・セッション再開を HTTP/3 へ写したもの（設定のロードで決める。F-314）
+    #[serde(skip)]
+    pub tls: H3TlsSettings,
+}
+
+/// `[tls] cipher_suites`・`session_resumption`・`tls13_tickets` の HTTP/3（quiche）への写し（F-314）
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct H3TlsSettings {
+    /// TLS 1.3 の暗号（OpenSSL の名前を `:` でつないだもの。並びは設定の順）。`None` は TLS ライブラリの既定（全部）。
+    /// 絞れるのは Linux（AWS-LC）だけで、他の OS で絞る設定は検証で拒否する
+    pub tls13_ciphersuites: Option<String>,
+    /// ハンドシェイクごとに送るセッションチケットの数。0 はチケットを出さない（再開も 0-RTT もしない）
+    pub session_tickets: usize,
+}
+
+impl Default for H3TlsSettings {
+    fn default() -> Self {
+        Self {
+            tls13_ciphersuites: None,
+            session_tickets: default_tls13_tickets(),
+        }
+    }
 }
 
 fn default_h3_max_idle_timeout() -> u64 {
@@ -1361,6 +1384,7 @@ impl Default for Http3ConfigSection {
             alt_svc_enabled: true,
             alt_svc: None,
             alt_svc_ma_secs: default_h3_alt_svc_ma(),
+            tls: H3TlsSettings::default(),
         }
     }
 }
@@ -1404,6 +1428,7 @@ impl Http3ConfigSection {
             handshake_timeout: self.handshake_timeout,
             max_field_section_size: self.max_field_section_size,
             enable_connect_protocol: self.enable_connect_protocol,
+            tls: self.tls.clone(),
         }
     }
 }
