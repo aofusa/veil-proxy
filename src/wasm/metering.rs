@@ -1,7 +1,7 @@
 //! ゲストの CPU の上限と協調的な yield の計り方（`[wasm] metering`。F-319）
 //!
-//! - `clock`（既定）: wasmtime のエポックで測る。専用スレッド（[`Ticker`]）がエポックを `yield_interval_us` ごとに
-//!   進め、走っているゲストは締切（次のエポック）に届くと [`on_epoch`] を呼ぶ。そこで走った時間を足し、
+//! - `clock`（既定）: wasmtime のエポックで測る。専用スレッド（[`Ticker`]）がエポックを進め（長く走るゲストがいる
+//!   間は `yield_interval_us` ごと。下の 3 段）、走っているゲストは締切（次のエポック）に届くと [`on_epoch`] を呼ぶ。そこで走った時間を足し、
 //!   `max_execution_time_ms` を超えたら打ち切り（`OutOfFuel`。メトリクスの `reason` は `fuel`）、実時間の上限を超えたら
 //!   時間切れ（`Interrupt`。`timeout`）、それ以外はワーカーへ譲る。ゲストのコードに入る検査はエポックの比較（関数の
 //!   入口とループの戻り）だけになる。
@@ -13,15 +13,23 @@
 //! CPU を取られていた時間・ページフォールトでディスクを待った時間（B-336）は入らない（壁時計で数えると、CPU を
 //! 取り合う負荷の下で走った時間を最大で数倍に数え、重い `on_configure` が上限を超えた）。区間（呼び出しを始めてから、
 //! または譲ったあと再開してから）の最初の検査と、スレッドの CPU 時間を読めない OS（Windows）は、実時間をエポック
-//! 1 つ分（[`Limits::tick`]）までに切り詰めて足す。読むのは締切に届いたとき（走り続けるゲストでエポックごと）と
+//! 1 回の間隔（[`Limits::slow_tick`]）までに切り詰めて足す。読むのは締切に届いたとき（走り続けるゲストでエポックごと）と
 //! 再開したときだけで、エポックの間に終わる普通のコールバックは読まない。
 //!
 //! 既定は `clock`。ただし Pulley インタープリタ（`interpreter = true`、OpenBSD・NetBSD・FreeBSD aarch64 は常に）では
 //! `fuel` にする（[`resolve`]）。インタープリタはゲストのコードが 10〜30 倍遅く、時間で測ると fuel で収まっていた
 //! モジュールが上限を超える。
 //!
-//! 専用スレッドは、Wasm の呼び出しが無い間は 100 ms ごとにしか起きない（呼び出しを始めたワーカーが起こす。
-//! サイドカーのように多くのプロセスを並べる配置でアイドルの起床を増やさない）。
+//! 専用スレッドがエポックを進める間隔は 3 段（[`Ticker`]）:
+//!
+//! - 締切に届いた呼び出しが、呼び出しを始めてから [`Limits::slow_tick`] の半分を超えて続いている（長く走るゲストが
+//!   いる）間は `yield_interval_us` ごと（[`Limits::tick`]）。譲る間隔と CPU の上限の検査はこの間隔になる。
+//! - 呼び出しが来ているだけの間は 10 ms ごと（[`SLOW_TICK`]）。エポックの間に終わる普通の呼び出しは締切に届かない。
+//!   長く走るゲストは最初の検査（長くても 10 ms 後）で見つかる。専用スレッドが起きるたびにワーカーが 1 つ CPU を
+//!   奪われるので、呼び出しが来ている間ずっと 1 ms ごとに起こすと、aofish の epoll の h1-wasm で 1 要求の CPU が
+//!   約 15% 増えた（2 ms で約 10%、5 ms 以上は差が無い）。
+//! - Wasm の呼び出しが無い間は 100 ms ごと（呼び出しを始めたワーカーが起こす。サイドカーのように多くのプロセスを
+//!   並べる配置でアイドルの起床を増やさない）。
 
 use std::cell::Cell;
 use std::future::Future;
@@ -52,6 +60,10 @@ const FUEL_EPOCH_TICK: Duration = Duration::from_millis(100);
 
 /// `clock` の方式で、呼び出しが無い間にエポックを進める間隔（実時間の上限の検査がこれより遅れない）
 const IDLE_TICK: Duration = Duration::from_millis(100);
+
+/// `clock` の方式で、呼び出しが来ているが長く走るゲストがいない間にエポックを進める間隔（[`Limits::slow_tick`]。
+/// CPU の上限の 4 分の 1 まで）
+const SLOW_TICK: Duration = Duration::from_millis(10);
 
 /// `clock` の方式のエポックの間隔の下限（`yield_interval_us` がこれより短くてもこの間隔で進める。専用スレッドの
 /// 起床が増えすぎないように）
@@ -105,10 +117,13 @@ pub(crate) struct Limits {
     cpu: Duration,
     /// 譲る間隔（`yield_interval_us`）
     yield_interval: Duration,
-    /// エポックを進める間隔（`clock`。`yield_interval` と CPU の上限の 4 分の 1 の短い方を
-    /// [`MIN_TICK`]〜[`IDLE_TICK`] に収める。区間の最初の検査は実時間をこの間隔まで数えるので、上限が小さくても
-    /// その誤差は上限の 4 分の 1 まで）
+    /// 長く走るゲストがいる間にエポックを進める間隔（`clock`。`yield_interval` と CPU の上限の 4 分の 1 の短い方を
+    /// [`MIN_TICK`]〜[`IDLE_TICK`] に収める）
     tick: Duration,
+    /// 呼び出しが来ているが長く走るゲストがいない間にエポックを進める間隔（`clock`。[`SLOW_TICK`] と CPU の上限の
+    /// 4 分の 1 の短い方、`tick` より短くはしない）。検査の間隔はこれより長くならないので、区間の最初の検査・
+    /// スレッドの CPU 時間を読めない OS で実時間を数えるのはこの間隔まで（上限が小さくてもその誤差は上限の 4 分の 1 まで）
+    slow_tick: Duration,
     /// `fuel` の燃料（約 1M で 1 ms）
     fuel: u64,
     /// `fuel` で譲る間隔（燃料。約 1,000 で 1 µs。B-175）
@@ -120,13 +135,14 @@ impl Limits {
         let max_ms = config.defaults.max_execution_time_ms;
         let yield_us = config.defaults.yield_interval_us.max(1);
         let yield_interval = Duration::from_micros(yield_us);
+        let quarter = Duration::from_millis(max_ms) / 4;
+        let tick = yield_interval.min(quarter).clamp(MIN_TICK, IDLE_TICK);
         Self {
             metering: resolve(config),
             cpu: Duration::from_millis(max_ms),
             yield_interval,
-            tick: yield_interval
-                .min(Duration::from_millis(max_ms) / 4)
-                .clamp(MIN_TICK, IDLE_TICK),
+            tick,
+            slow_tick: SLOW_TICK.min(quarter).clamp(tick, IDLE_TICK),
             fuel: max_ms.saturating_mul(1_000_000),
             fuel_yield: yield_us.saturating_mul(1_000),
         }
@@ -140,6 +156,7 @@ impl Limits {
             cpu: Duration::from_millis(fuel / 1_000_000),
             yield_interval: Duration::from_micros(fuel_yield / 1_000),
             tick: FUEL_EPOCH_TICK,
+            slow_tick: FUEL_EPOCH_TICK,
             fuel,
             fuel_yield,
         }
@@ -148,6 +165,25 @@ impl Limits {
     /// wasmtime の fuel を使うか（エンジンの `consume_fuel`）
     pub(crate) fn uses_fuel(&self) -> bool {
         self.metering == Metering::Fuel
+    }
+
+    /// 締切に届いた呼び出しが、始めてから `running` 続いているとき、長く走るゲストか（専用スレッドを速くする）。
+    /// エポックの間に終わる普通の呼び出しがたまたま締切をまたいだだけでは速くしない（呼び出しの始まりは実行器の
+    /// 粗い時計なので、負荷の下では 1〜2 ms 古いことがある）
+    fn is_long(&self, running: Duration) -> bool {
+        running >= self.slow_tick / 2
+    }
+
+    /// 専用スレッドがエポックを進める間隔: 長く走るゲストがいれば `tick`、呼び出しが来ていれば `slow_tick`、
+    /// どちらも無ければ [`IDLE_TICK`]
+    fn pace(&self, busy: bool, active: bool) -> Duration {
+        if busy {
+            self.tick
+        } else if active {
+            self.slow_tick
+        } else {
+            IDLE_TICK
+        }
     }
 }
 
@@ -298,9 +334,13 @@ pub(crate) fn install(store: &mut Store<HostState>, limits: &Limits, ticker: &Ar
     let limits = *limits;
     let ticker = Arc::clone(ticker);
     store.epoch_deadline_callback(move |mut ctx| {
-        // 走り続けるゲストがいる間は専用スレッドを速く回し続ける
-        ticker.wake();
-        on_epoch(&mut ctx.data_mut().meter, &limits, Instant::now())
+        let meter = &mut ctx.data_mut().meter;
+        let now = Instant::now();
+        // 長く走るゲストがいる間は、譲る間隔で検査できるように専用スレッドを速く回す
+        if limits.is_long(now.saturating_duration_since(meter.armed_at)) {
+            ticker.hurry();
+        }
+        on_epoch(meter, &limits, now)
     });
 }
 
@@ -363,8 +403,8 @@ fn decide(
     m.run += match (cpu_now, from_cpu) {
         // 他のスレッドに CPU を取られていた時間・ディスクを待った時間（B-336）は入らない
         (Some(cpu_now), Some(from_cpu)) => cpu_now.saturating_sub(from_cpu),
-        // 区間の最初の検査と、スレッドの CPU 時間を読めない OS: エポック 1 つ分を超える遅れは数えない
-        _ => now.saturating_duration_since(from).min(limits.tick),
+        // 区間の最初の検査と、スレッドの CPU 時間を読めない OS: 検査の間隔（長くても `slow_tick`）を超える遅れは数えない
+        _ => now.saturating_duration_since(from).min(limits.slow_tick),
     };
     m.counted_to = now;
     m.cpu_mark = cpu_now;
@@ -409,11 +449,13 @@ impl Future for Resume {
     }
 }
 
-/// エポックを進める専用スレッドを起こすための状態（エンジンごと）
+/// エポックを進める専用スレッドを起こすための状態（エンジンごと）。2 つの印は専用スレッドが [`ACTIVE_WINDOW`] ごとに
+/// 下ろし、窓の間に立った印で次の窓の間隔を決める（[`Limits::pace`]）
 pub(crate) struct Ticker {
-    /// 呼び出しが来ている（速く進める）。専用スレッドが [`ACTIVE_WINDOW`] ごとに下ろし、呼び出しを始めたワーカーと
-    /// 走り続けるゲストが立てる
+    /// 呼び出しが来ている（`slow_tick` ごとに進める）。呼び出しを始めたワーカーが立てる
     active: AtomicBool,
+    /// 長く走るゲストがいる（`tick` ごとに進める）。締切に届いたゲストが立てる（[`Limits::is_long`]）
+    busy: AtomicBool,
     /// 専用スレッド（眠っているときに起こす）
     thread: OnceLock<std::thread::Thread>,
 }
@@ -422,7 +464,18 @@ impl Ticker {
     /// コールバックを呼ぶ前に呼ぶ（`clock`）。動いている間は読み取り 1 回で、立てるのは窓ごとに 1 回
     #[inline]
     pub(crate) fn wake(&self) {
-        if !self.active.load(Ordering::Relaxed) && !self.active.swap(true, Ordering::AcqRel) {
+        self.raise(&self.active);
+    }
+
+    /// 長く走るゲストがいる（`clock`。エポックのコールバックから）
+    fn hurry(&self) {
+        self.raise(&self.busy);
+    }
+
+    /// 印を立て、下りていたら専用スレッドを起こす（すぐに間隔を縮める）
+    #[inline]
+    fn raise(&self, flag: &AtomicBool) {
+        if !flag.load(Ordering::Relaxed) && !flag.swap(true, Ordering::AcqRel) {
             if let Some(t) = self.thread.get() {
                 t.unpark();
             }
@@ -435,12 +488,13 @@ impl Ticker {
 pub(crate) fn spawn_ticker(engine: &Engine, limits: &Limits) -> anyhow::Result<Arc<Ticker>> {
     let ticker = Arc::new(Ticker {
         active: AtomicBool::new(false),
+        busy: AtomicBool::new(false),
         thread: OnceLock::new(),
     });
     let weak = engine.weak();
     let state = Arc::clone(&ticker);
     let metering = limits.metering;
-    let tick = limits.tick;
+    let limits = *limits;
     let spawned = std::thread::Builder::new()
         .name("veil-wasm-epoch".into())
         .spawn(move || {
@@ -459,23 +513,33 @@ pub(crate) fn spawn_ticker(engine: &Engine, limits: &Limits) -> anyhow::Result<A
                     }
                 },
                 Metering::Clock => {
-                    let fast = (ACTIVE_WINDOW.as_micros() / tick.as_micros().max(1)).max(1);
+                    let mut last = Instant::now();
+                    let mut window_end = last;
+                    let mut period = IDLE_TICK;
                     loop {
-                        if state.active.swap(false, Ordering::AcqRel) {
-                            // 呼び出しが来ている: 窓の間 `tick` ごとに進める
-                            for _ in 0..fast {
-                                crate::server::cap_safe_sleep(tick);
-                                if !advance() {
-                                    return;
-                                }
-                            }
+                        let now = Instant::now();
+                        if now >= window_end {
+                            // 窓の始め: 前の窓に立った印で間隔を決め直す（間隔を延ばすのはここだけ）
+                            window_end = now + ACTIVE_WINDOW;
+                            period = limits.pace(
+                                state.busy.swap(false, Ordering::AcqRel),
+                                state.active.swap(false, Ordering::AcqRel),
+                            );
                         } else {
-                            // 静か: 呼び出しを始めたワーカーに起こされるまで（長くても IDLE_TICK）眠る
-                            std::thread::park_timeout(IDLE_TICK);
+                            // 窓の途中で印が立った（起こされた）: すぐに間隔を縮める
+                            period = period.min(limits.pace(
+                                state.busy.load(Ordering::Relaxed),
+                                state.active.load(Ordering::Relaxed),
+                            ));
+                        }
+                        if now.saturating_duration_since(last) >= period {
                             if !advance() {
                                 return;
                             }
+                            last = now;
                         }
+                        // 起こされたら早く戻る（park は `_umtx_op`・futex で、capsicum の capability mode でも使える）
+                        std::thread::park_timeout((last + period).saturating_duration_since(now));
                     }
                 }
             }
@@ -541,6 +605,38 @@ mod tests {
         assert_eq!(limits(100, 0).yield_interval, Duration::from_micros(1));
     }
 
+    // 長く走るゲストがいない間の間隔は 10 ms。CPU の上限の 4 分の 1 を超えず、`tick` より短くしない
+    #[test]
+    fn the_slow_tick_is_ten_milliseconds_within_bounds() {
+        assert_eq!(limits(100, 1_000).slow_tick, SLOW_TICK);
+        assert_eq!(limits(100, 10).slow_tick, SLOW_TICK);
+        assert_eq!(limits(20, 1_000).slow_tick, 5 * MS);
+        assert_eq!(limits(1, 1_000).slow_tick, MS / 4);
+        assert_eq!(limits(100, 10_000_000).slow_tick, 25 * MS);
+        assert_eq!(limits(1_000, 10_000_000).slow_tick, IDLE_TICK);
+    }
+
+    // 専用スレッドの間隔: 長く走るゲストがいれば `tick`、呼び出しが来ていれば `slow_tick`、静かなら 100 ms
+    #[test]
+    fn the_pace_follows_the_flags() {
+        let l = limits(100, 1_000);
+        assert_eq!(l.pace(true, true), MS);
+        assert_eq!(l.pace(true, false), MS);
+        assert_eq!(l.pace(false, true), SLOW_TICK);
+        assert_eq!(l.pace(false, false), IDLE_TICK);
+    }
+
+    // 締切をまたいだだけの短い呼び出し（粗い時計で数 ms 古く見えるものを含む）では速くしない
+    #[test]
+    fn only_a_call_running_for_half_a_slow_tick_is_long() {
+        let l = limits(100, 1_000);
+        assert!(!l.is_long(Duration::ZERO));
+        assert!(!l.is_long(2 * MS));
+        assert!(!l.is_long(SLOW_TICK / 2 - Duration::from_micros(1)));
+        assert!(l.is_long(SLOW_TICK / 2));
+        assert!(l.is_long(Duration::from_secs(1)));
+    }
+
     // 区間が `yield_interval` の半分に届かないうちは続け、届いたら譲る
     #[test]
     fn a_short_segment_continues_and_a_long_one_yields() {
@@ -585,15 +681,15 @@ mod tests {
         assert_eq!(m.run, 10 * MS);
     }
 
-    // エポック 1 つ分を超える遅れ（ページフォールトでディスクを待つ等。B-336）は CPU に数えない
+    // 検査の間隔（`slow_tick`）を超える遅れ（ページフォールトでディスクを待つ等。B-336）は CPU に数えない
     #[test]
-    fn a_stall_counts_at_most_one_tick() {
+    fn a_stall_counts_at_most_one_slow_tick() {
         let l = limits(100, 1_000);
         let t0 = Instant::now();
         let mut m = meter(t0, &l);
         let d = decide(&mut m, &l, t0 + Duration::from_millis(500), None, None);
         assert_eq!(d, Decision::Yield);
-        assert_eq!(m.run, MS);
+        assert_eq!(m.run, SLOW_TICK);
     }
 
     // 譲っていた時間も含めて実時間の上限を超えたら時間切れ
@@ -715,8 +811,8 @@ mod tests {
         assert!(b > a, "{a:?} -> {b:?} ({x})");
     }
 
-    /// `clock`: 終わらないゲストは約 1 ms ごとに譲りながら走り、`max_execution_time_ms` で打ち切られる（`OutOfFuel`。
-    /// エポックを進める専用スレッドを本当に動かす）
+    /// `clock`: 終わらないゲストは最初の検査（`slow_tick` 後）で見つかり、そのあと約 1 ms ごとに譲りながら走り、
+    /// `max_execution_time_ms` で打ち切られる（`OutOfFuel`。エポックを進める専用スレッドを本当に動かす）
     #[test]
     fn an_endless_guest_yields_and_is_cut_by_the_cpu_budget() {
         use crate::wasm::capabilities::ModuleCapabilities;

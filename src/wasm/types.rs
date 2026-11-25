@@ -92,7 +92,7 @@ impl Default for WasmConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Metering {
-    /// エポック（専用スレッドが `yield_interval_us` ごとに進める）の割り込みで、スレッドの CPU 時間を測る
+    /// エポック（専用スレッドが進める。長く走るゲストがいる間は `yield_interval_us` ごと）の割り込みで、スレッドの CPU 時間を測る
     Clock,
     /// wasmtime の fuel で、ゲストの命令数を数える
     Fuel,
@@ -105,8 +105,8 @@ pub struct WasmDefaults {
     #[serde(default = "default_max_execution_time")]
     pub max_execution_time_ms: u64,
 
-    /// コールバックがワーカーへ制御を返す間隔（マイクロ秒の目安。`metering = "clock"` はエポックを進める間隔で、
-    /// 100µs〜100ms に収める。`"fuel"` は燃料の換算で約 1,000 で 1µs）。
+    /// コールバックがワーカーへ制御を返す間隔（マイクロ秒の目安。`metering = "clock"` は 5ms を超えて走り続ける
+    /// コールバックがいる間にエポックを進める間隔で、100µs〜100ms に収める。`"fuel"` は燃料の換算で約 1,000 で 1µs）。
     /// B-175: 既定 1,000（約 1ms）。小さくすると CPU を長く使うフィルタと同じワーカーの他の要求の待ちが短くなるが、
     /// 普通のコールバックも止まって `instance_reuse` のインスタンスが同時に多く開く。
     #[serde(default = "default_yield_interval_us")]
