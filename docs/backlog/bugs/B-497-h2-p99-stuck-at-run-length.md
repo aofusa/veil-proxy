@@ -1,13 +1,13 @@
-# B-497: HttpArena の HTTP/2 の計測で p99 が計測の長さ（約 5 秒）に張り付く（veil・veil-api とも）
+# B-497: HttpArena の HTTP/2 の計測で、要求の遅延の最大（結果の `p99_latency` の欄）が計測の長さ（約 5 秒）に張り付く（veil・veil-api とも）
 
-**状態: 未着手・要再現（2026-11-22 起票。F-317 の HttpArena の結果の調査で見つけた）**
+**状態: 未着手・要再現（2026-11-22 起票。2026-11-25 に、結果の欄が p99 ではなく最大だったことを確かめて書き直した。F-317 の HttpArena の結果の調査で見つけた）**
 
 ## 事象
 
-HttpArena の公開結果（`site/data/results/*.json`、v0.10.1 のイメージ。計測は 5 秒、h2load）で、HTTP/2 のプロファイルの p99 が
-veil・veil-api とも 4.9〜5.0 秒。nginx・agensio・h2o は同じプロファイルで 0.01〜0.3 秒。
+HttpArena の公開結果（`site/data/results/*.json`。veil・veil-api は v0.10.1。計測は 5 秒）で、HTTP/2 の全部のテストの
+`p99_latency` が veil・veil-api とも 1〜5 秒。nginx・agensio・h2o は 10〜300 ms。
 
-| テスト | veil p99 | veil-api p99 | nginx p99 | agensio p99 |
+| テスト | veil | veil-api | nginx | agensio |
 |---|---|---|---|---|
 | baseline-h2-256（`-m 100`） | 4.98 s | 4.98 s | 46.5 ms | 12.0 ms |
 | baseline-h2-1024 | 4.96 s | 4.94 s | 151.8 ms | 95.1 ms |
@@ -16,36 +16,48 @@ veil・veil-api とも 4.9〜5.0 秒。nginx・agensio・h2o は同じプロフ�
 | baseline-h2c-256 | 4.97 s | 5.00 s | 70.1 ms | 9.3 ms |
 | json-h2c-1024 | 5.00 s | 5.00 s | 173.2 ms | 208.8 ms |
 
-- 1% 以上の要求が計測の終わりまで返っていない（またはほぼ全期間待たされている）。HTTP/1.1・HTTP/3 の p99 は秒に届かない
-  （baseline-4096 は 635 ms・2.2 ms、baseline-h3 は 15 ms・2.9 ms）。
-- Wasm の有無（veil はフィルタ、veil-api はハンドラ）に関係なく出るので、HTTP/2 のサーバの共通部分（接続・ストリームの処理、
-  reactor）の問題と見ている。HttpArena のイメージは epoll（`full-container`）。
-- ノート PC（4 CPU、main の io_uring ビルド、veil-load の h2c 16 接続 × 100 ストリーム）では再現していない（p99 8〜45 ms）。
+### この欄は p99 ではなく最大
 
-## 影響
+- 上の 4 つのエントリの結果は 2026-11-16（HttpArena の a2a61c0）の計測。そのときの HTTP/2 の負荷ツールは Ubuntu の `nghttp2-client`
+  の h2load で、百分位を出さない。HttpArena の集計（`scripts/lib/tools/h2load.sh`）は「`time for request:` の行の **max** を
+  `p99_lat` に入れる」と書いている（h2load に p99 が無いので最大で代える）。表は最大どうしの比較。
+- 2026-11-21（44ba5af）から HttpArena は h2load を nghttp2 1.69.0 から作り、`h2load_parse.py` が本当の p99 と最大（`max_latency`）を
+  分けて記録する。2026-11-22 の okena の結果はこの形（baseline-h2-256 は p99 1.42 ms・最大 8.67 ms）。HTTP/3（h2load-h3）は前から
+  1.69.0 で、本当の p99（veil の baseline-h3 は 15 ms、veil-api は 2.9 ms）。
+- veil-api の baseline-h2-256 の平均は 6.37 ms（30.7M 要求）。遅いのは少数の要求で、1% ではない。
 
-- スループットにも効く可能性がある: h2load はストリームの枠（`-m`）が埋まると次を送らないので、止まったストリームが接続の並列度を減らす。
-- HttpArena では p99 は点に入らないが、結果の表に載る。
+### 分かること
 
-## 調査の手順（案）
+- veil・veil-api では、HTTP/2 の**どのテストでも、計測のほぼ全期間（5 秒近く）返らなかった要求がある**（計測の終わりの直前に
+  返っている。終わりまでに返らなかった要求は h2load が数えない）。Wasm の有無に関係なく出るので、HTTP/2 のサーバの共通部分
+  （接続・ストリームの処理、reactor）の問題と見ている。h2c（平文）でも出るので TLS ではない。HttpArena のイメージは epoll（`full-container`）。
+- 1 本のストリーム（か 1 つの接続）が止まるだけなら、スループットへの影響は小さい（256 接続のうち 1 つなら 0.4%）。点（rps）より、
+  実際の利用者の要求が 5 秒止まる（クライアントの時間切れになる）ことが問題。HTTP/1.1・HTTP/3 では出ていない（baseline-4096 の
+  gcannon の p99 は veil 635 ms・veil-api 2.2 ms）。
+- 次の HttpArena の計測（h2load 1.69.0）では p99 と最大が別に出る。p99 は良くても、直さなければ最大は約 5 秒のまま残る見込み。
+- ノート PC（4 CPU、main の io_uring ビルド、veil-load の h2c 16 接続 × 100 ストリーム）では、veil-load の p99 は 8〜45 ms（最大は未確認）。
 
-1. 同じ条件で再現する: epoll のビルド（`--features full,epoll` か公開イメージ）、h2load `-c 256/1024 -m 100 -t <多く> -D 5`、
-   HttpArena と同じ要求（`/baseline2?a=1&b=1`、静的は 20 ファイル・`Accept-Encoding: br;q=1, gzip;q=0.8`）。aofish（16 スレッド）で、
-   ワーカー数を変えて出方を見る。io_uring のビルドでも出るか。
-2. 止まっているストリームの特定: 応答の送出待ち（送信バッファ・フロー制御の窓）、要求の受信待ち（WINDOW_UPDATE の出し忘れ）、
-   タスクの起床待ち（reactor の `COOP_BUDGET` で区切った後の再投入・`EVENT_INTERVAL`、B-332）のどれか。デバッグのビルドで
-   1 秒以上開いているストリームの状態を出す。
+## 調査の手順
+
+1. 同じ条件で再現する: aofish の Docker で HttpArena の h2load（今の `docker/h2load.Dockerfile`、nghttp2 1.69.0）を作り、epoll のビルド
+   （`--features full,epoll` か公開イメージ）と io_uring のビルドへ `-c 256 -m 100 -t 16 -D 5` を当てる。HttpArena と同じ要求
+   （`/baseline2?a=1&b=1`、h2c は `-p h2c`、静的は 20 ファイル・`Accept-Encoding: br;q=1, gzip;q=0.8`）。最大と p99 を見て、
+   h2load の `--log-file`（要求ごとの記録）で遅い要求がどの接続・いつ送ったものかを見る。ワーカー数も変える。
+2. 止まっている要求の特定: 接続ごと止まっているのか（その接続の全ストリームが遅い）、1 本のストリームだけか。デバッグのビルドで、
+   1 秒以上進んでいないストリーム・接続の状態（待っているもの・ストリーム数・`write_buf` の量・フロー制御の窓）を出す。
 3. 候補:
-   - 接続の集約（F-303。`[performance] concentrate_connections` の既定は Linux の TCP で有効）: h2load は計測の最初に全接続を張り、
-     接続は計測の間ずっと同じワーカーに残る。最初の振り分けが一部のワーカーに偏ると、その接続のストリームが遅れ続ける。
+   - 接続の集約（F-303。`[performance] concentrate_connections` の既定は Linux の TCP で有効）: 振り分けの CBPF の差し替え・
+     動かす接続（`take_shed`）の途中で、受理されないまま・どのワーカーにも poll されないままの接続ができる。
      `concentrate_connections = false` で比べる。
-   - reactor の予算で区切った接続の再投入の漏れ（読み取りが残っているのに起床が来ない）。
-   - 接続のフロー制御の窓（静的配信は 1 応答が数十 KB で、`-m 32` × 接続数）。
+   - reactor の予算（`COOP_BUDGET`）で区切った接続の再投入の漏れ（読み取りが残っているのに起床が来ない。B-332）。
+   - HTTP/2 の送出の順: 多数のストリームの応答があるときに、特定のストリームの HEADERS・DATA が後回しにされ続ける（`-m 100`）。
+   - 計測の終わりに返る理由（h2load が送るのをやめて他のストリームが空いた・接続を閉じ始めた）から、何を待っていたかを逆算する。
 
 ## 受け入れ条件
 
-- 上の条件で p99 が nginx と同程度（数百 ms 以下）になる。原因と直し方を本チケットに書く。
+- 上の条件で最大の遅延が nginx と同程度（数百 ms 以下）になる。原因と直し方を本チケットに書く。
+- 直した経路の試験（止まり方を再現する単体・E2E）を足す。epoll と io_uring の両方。
 
 ## 関連
 
-- [F-317](../features/F-317-httparena-infra-score-plan.md)（親）・F-303・B-332・F-298・F-300
+- [F-317](../features/F-317-httparena-infra-score-plan.md)（親）・[F-323](../features/F-323-h2-per-stream-fixed-cost.md)・F-303・B-332・F-298・F-300

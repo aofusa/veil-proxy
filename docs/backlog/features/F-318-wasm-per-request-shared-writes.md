@@ -53,8 +53,8 @@ HttpArena（64 スレッド、v0.10.1 のイメージ）の 1 要求あたりの
    渡せないところは、ワーカーごとの複製（設定の世代が変わったときだけ作り直す）を使う。`CURRENT_CONFIG.load()` は要求で 1 回
    （AGENTS.md「`CURRENT_CONFIG.load()` は 1 回」）。
 4. 上の 4 の候補は呼ばれていれば、ワーカーごとの範囲で採番する（一意性は「ワーカー番号 + ワーカー内の連番」）。
-5. 同じ観点の Wasm 以外の箇所（静的配信のキャッシュの `hits.fetch_add`、`evict_oldest` の前の `entries.len()` 等）は本チケットの
-   範囲外とし、計測で目立てば別チケットにする。
+5. 同じ観点の Wasm 以外の箇所（ルートのキャッシュの統計、ルートの `Arc` の複製、静的配信のキャッシュの `hits.fetch_add` 等）は
+   [F-321](F-321-core-path-per-request-shared-writes.md) で扱う。伸び方の試験は両方に共通（Wasm の無いルートの値が F-321 の分）。
 
 ## 確かめ方（実装の前と後）
 
@@ -74,8 +74,10 @@ HttpArena（64 スレッド、v0.10.1 のイメージ）の 1 要求あたりの
 ## 期待する効果
 
 - HttpArena の 6 プロファイル（baseline・limited-conn・json-tls・baseline-h2・baseline-h3・pipelined）。Wasm の上乗せがノート PC 並み
-  （約 25 µs）まで下がれば、baseline は 1 要求 約 50 µs → 約 1.2M rps（今 318k）。F-317 の試算で総合点 +約 800。
+  （約 25 µs）まで下がれば、baseline は 1 要求 約 50 µs → 約 1.2M rps（今 318k）。F-317 の試算で総合点 +約 740（S1 → S2。
+  2026-11-24 の結果〈okena を含む〉で計算）。
 
 ## 関連
 
-- [F-317](F-317-httparena-infra-score-plan.md)（親）・[F-319](F-319-wasm-per-request-fixed-cost.md)・B-175・B-173・F-297
+- [F-317](F-317-httparena-infra-score-plan.md)（親）・[F-319](F-319-wasm-per-request-fixed-cost.md)・[F-321](F-321-core-path-per-request-shared-writes.md)・
+  B-175・B-173・F-297

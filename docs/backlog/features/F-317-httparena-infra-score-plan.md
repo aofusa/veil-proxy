@@ -1,86 +1,130 @@
 # F-317: HttpArena の infrastructure で veil の点を上げる（親チケット）
 
-**状態: 未着手（2026-11-22 起票。調査とチケットまで。改修は人の依頼の後）**
+**状態: 未着手（2026-11-22 起票。2026-11-25 に最新の結果〈okena の追加〉で見直し、F-321〜F-325 を追加。調査とチケットまで。改修は人の依頼の後）**
 
 利用者の依頼（2026-11-22）: HttpArena の infrastructure の veil の結果を確認し、性能改善案を作る。ボトルネックは Proxy-Wasm と見ているので
 Proxy-Wasm の改善、または veil に大きな変更を加えずに結果を良く見せる方法を考える。
+
+追加の依頼（2026-11-25）: veil-api でも残る h2o との差（Wasm の無い経路の 1 要求あたりの費用）もチケットにする。h2o・nginx を超えるために、
+今の veil の機能で HttpArena 用にできることを案に出す。
 
 ## 点の付け方
 
 - infrastructure は 9 プロファイル（baseline・pipelined・limited-conn・json-tls・static-tls・baseline-h2・static-h2・baseline-h3・static-h3）。
   プロファイルごとに接続数の rps の平均を infrastructure の中の 1 位で割って 1000 倍し、足す（満点 9000）。h2c・gRPC 等は参考で点に入らない。
 - 設定の制限は無い。ハンドラはサーバが読み込むモジュールであればよい（veil は Proxy-Wasm のフィルタ、nginx は C のモジュール）。
+- 負荷の掛け方: baseline・limited-conn は gcannon の 4096 接続（GET・POST の Content-Length・chunked の 3 種を回す。limited-conn は
+  10 要求で張り直す）、pipelined は 16 本ずつ、json-tls・static-tls は wrk（4096・1024 接続）、HTTP/2 は h2load の `-c 256/1024`
+  （baseline は `-m 100`、static は `-m 32`）、HTTP/3 は h2load の `-c 64 -m 64`。サーバと負荷ツールに 64 スレッドずつ。
 
-## 今の結果（HttpArena の `site/data/results`、v0.10.1 のイメージ）
+## 今の結果（HttpArena の `site/data/results`、2026-11-24 の 3388e45。veil は v0.10.1 のイメージ）
 
 | エントリ | baseline | pipelined | limited | json-tls | static-tls | base-h2 | static-h2 | base-h3 | static-h3 | 計 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| agensio | 977 | 558 | 972 | 1000 | 1000 | 912 | 1000 | 1000 | 930 | 8350 |
-| fit | 650 | 1000 | 593 | 466 | 730 | 412 | 321 | 449 | 1000 | 5620 |
-| nginx | 902 | 454 | 990 | 766 | 605 | 212 | 534 | 562 | 451 | 5476 |
-| h2o | 1000 | 556 | 1000 | 716 | 0 | 1000 | 236 | 0 | 0 | 4508 |
-| varnish | 212 | 255 | 172 | 0 | 262 | 15 | 97 | 0 | 0 | 1014 |
-| caddy | 119 | 86 | 90 | 188 | 134 | 25 | 77 | 42 | 28 | 786 |
-| **veil** | 87 | 67 | 119 | 295 | 81 | 35 | 10 | 61 | 17 | **771** |
-| vinyl-cache | 212 | 256 | 158 | 0 | 0 | 0 | 0 | 0 | 0 | 626 |
+| okena | 1000 | 1000 | 1000 | 1000 | 1000 | 1000 | 1000 | 1000 | 1000 | 9000 |
+| agensio | 895 | 183 | 932 | 904 | 961 | 878 | 879 | 984 | 732 | 7348 |
+| nginx | 826 | 149 | 950 | 692 | 581 | 204 | 470 | 553 | 355 | 4779 |
+| fit | 595 | 328 | 569 | 421 | 702 | 396 | 282 | 442 | 787 | 4521 |
+| h2o | 916 | 182 | 959 | 648 | 0 | 962 | 207 | 0 | 0 | 3874 |
+| varnish | 194 | 84 | 165 | 0 | 252 | 15 | 85 | 0 | 0 | 795 |
+| **veil** | 80 | 22 | 114 | 266 | 78 | 33 | 8 | 60 | 14 | **675** |
+| caddy | 109 | 28 | 86 | 170 | 128 | 24 | 68 | 41 | 22 | 675 |
+| vinyl-cache | 194 | 84 | 152 | 0 | 0 | 0 | 0 | 0 | 0 | 430 |
+| （参考）veil-api を infrastructure として数えた場合 | 631 | 126 | 720 | 631 | 755 | 320 | 589 | 301 | 284 | 4358 |
 
-veil の rps: baseline 318k・pipelined 597k・limited 315k・json-tls 505k・static-tls 97k・baseline-h2 550k・static-h2 14k・baseline-h3 526k・
-static-h3 14k（1 位は 3.6M・8.9M・2.7M・1.7M・1.2M・15.9M・1.5M・8.6M・0.8M）。同じ機械の veil-api（ライブラリのハンドラ）は
-2.5M・3.4M・2.0M・1.2M・0.94M・5.3M・1.0M・2.6M・0.29M。
+- okena（x86-64 のアセンブリ、io_uring・epoll、TLS・HTTP/2・HTTP/3 も自前）が 2026-11-22 に加わり、全プロファイルで 1 位。前回
+  （2026-11-22 の起票時）の veil の 771 点は okena の前の値で、1 位の値が上がったので点は 675 に下がった（veil の rps は同じ）。
+- 1 位の rps: baseline 3.98M・pipelined 27.12M・limited 2.77M・json-tls 1.90M・static-tls 1.24M・base-h2 16.49M・static-h2 1.70M・
+  base-h3 8.78M・static-h3 1.02M（全部 okena）。veil の rps: 318k・597k・315k・505k・97k・550k・14k・526k・14k。
+
+## 1 要求あたりの CPU（µs、`cpu% × 10000 / rps`。各プロファイルの最初の接続数）
+
+| プロファイル | okena | agensio | h2o | nginx | veil-api | veil |
+|---|---|---|---|---|---|---|
+| baseline-4096 | 16.4 | 17.2 | 18.1 | 19.6 | 25.8 | 194.7 |
+| pipelined-4096 | 2.4 | 12.4 | 13.0 | 15.8 | 19.0 | 104.7 |
+| limited-conn-4096 | 20.7 | 23.2 | 23.4 | 23.7 | 32.8 | 193.5 |
+| json-tls-4096 | 24.4 | 37.5 | 52.1 | 48.9 | 53.8 | 129.3 |
+| static-tls-1024 | 42.6 | 52.6 | — | 91.6 | 68.5 | 114.8（11 コアしか使わない） |
+| baseline-h2-256 | 1.3（23 コア） | 1.3（20） | 1.9（30） | 19.0 | 10.2 | 118.7 |
+| static-h2-256 | 32.5 | 37.7 | 174.8 | 82.3 | 61.1 | 1,234.8 |
+| baseline-h3-64 | 1.6（14） | 1.8（15） | — | 6.3（31） | 13.6（36） | 75.6 |
+| static-h3-64 | 26.5 | 45.4 | — | 137.3 | 142.2 | 1,296.3 |
+
+- HTTP/2 の上位 3 つは 20〜30 コアしか使わず、負荷ツール（h2load）の上限（約 16M rps）で止まっている。HTTP/3 の上位 2 つも同じ（約 8.7M）。
 
 ## 原因（調査の結果）
 
 1. **静的配信の 3 プロファイル（static-tls・static-h2・static-h3）は Proxy-Wasm と関係ない設定の既定値の不具合**:
    エントリに `[performance]` が無いと open_file_cache の有効期間・最大件数が 0 になり（[B-495](../bugs/B-495-performance-section-default-zero-ofc.md)）、
    キャッシュに一度も当たらない。HTTP/2・HTTP/3 は本体を入れ直すたびに圧縮結果も捨てる（[B-496](../bugs/B-496-content-cache-reinsert-drops-compressed.md)）ので、
-   要求ごとに br で圧縮し直す（1 要求 1.2〜1.4 ms の CPU）。CPU は 11〜19 コアしか使っていない。設定で回避でき、ノート PC で
-   h2c の静的配信は 710 → 43,216 rps（[F-320](F-320-httparena-veil-entry-config.md)）。
+   要求ごとに br で圧縮し直す（1 要求 1.2〜1.4 ms の CPU）。設定で回避でき、ノート PC で h2c の静的配信は 710 → 43,216 rps
+   （[F-320](F-320-httparena-veil-entry-config.md)）。
 2. **Wasm を通る 6 プロファイル（baseline・limited-conn・json-tls・baseline-h2・baseline-h3・pipelined）は Proxy-Wasm が律速**:
-   どのプロトコルでも 0.3〜0.6M rps で止まり、1 要求の CPU が veil-api の 4〜8 倍（baseline 195 µs 対 26 µs）。ノート PC の Wasm の
-   上乗せ（約 25 µs）の 4〜7 倍に膨らんでいて、コア数で費用が増える形。要求ごとに wasmtime の型レジストリのロックと全ワーカー
-   共有の `Arc` の参照カウントへ数十回書いているのが本命（[F-318](F-318-wasm-per-request-shared-writes.md)）。単発の費用は
-   [F-319](F-319-wasm-per-request-fixed-cost.md)。
-3. **pipelined** は `/pipeline`（本文 `ok`）までフィルタで答えている。設定の固定応答で返せる（F-320）。
-4. **HTTP/2 の p99 が約 5 秒**（veil・veil-api とも。[B-497](../bugs/B-497-h2-p99-stuck-at-run-length.md)）。点には入らないが結果の表に載り、
-   止まったストリームがスループットも下げている可能性がある。
-5. 範囲外の差（チケットは作っていない）: Wasm の無い veil-api でも、HTTP/2・HTTP/3 の 1 要求の CPU（10〜14 µs）が h2o・agensio
-   （1.3〜2 µs）の 5〜10 倍。baseline-h2・baseline-h3 の 1 位（15.9M・8.6M）に近づくにはこの差を詰める必要がある。F-318 の伸び方の試験を
-   Wasm の無い経路にも当てて、共有の書き込みがあるかを見るのが最初の手。
+   どのプロトコルでも 0.3〜0.6M rps で止まり、1 要求の CPU が veil-api の 4〜8 倍。ノート PC の Wasm の上乗せ（約 25 µs）の 4〜7 倍に
+   膨らんでいて、コア数で費用が増える形。要求ごとに wasmtime の型レジストリのロックと全ワーカー共有の `Arc` の参照カウントへ数十回
+   書いているのが本命（[F-318](F-318-wasm-per-request-shared-writes.md)）。単発の費用は [F-319](F-319-wasm-per-request-fixed-cost.md)。
+3. **pipelined** は `/pipeline`（本文 `ok`）までフィルタで答えている。設定の固定応答で返せる（F-320。okena も同じ）。
+4. **HTTP/2 で計測のほぼ全期間（約 5 秒）返らない要求がある**（veil・veil-api とも。h2c でも。結果の `p99_latency` の欄は、
+   2026-11-16 の計測では h2load の最大）。少数の要求なので点への影響は小さい見込みだが、利用者の要求が止まる不具合
+   （[B-497](../bugs/B-497-h2-p99-stuck-at-run-length.md)）。
+5. **Wasm の無い経路（veil-api）にも上位との差がある**（2026-11-25 にチケットにした）:
+   - 64 コアでの膨らみ: 本体の経路にも要求ごとに全ワーカー共有の行へ書く箇所がある（ルートのキャッシュの統計と同じ行の世代、ルートの
+     `Arc` の複製、静的配信のキャッシュの当たりの数、接続の数）（[F-321](F-321-core-path-per-request-shared-writes.md)）。
+   - HTTP/1.1 のパイプライン: 16 本まとめて届いても応答を 1 本ずつ送る（[F-322](F-322-h1-pipelined-response-coalescing.md)。okena は
+     まとめて送って 2.4 µs/要求・27.1M rps）。
+   - HTTP/2: ストリームごとにタスク・チャネル・通知・ヘッダの表を作る固定費（[F-323](F-323-h2-per-stream-fixed-cost.md)）。
+   - HTTP/3: 1 要求 13.6 µs（nginx 6.3、agensio 1.8）。64 接続をハッシュでワーカーへ配るので、約 23 ワーカーに接続が来ない
+     （[F-324](F-324-h3-per-request-cost.md)）。
+6. **Proxy-Wasm のままでは、上の全部を直しても h2o に届かない見込み**（下の試算の S7）。上位のインフラのエントリは全部ハンドラを
+   サーバに組み込んでいる（okena は `make MODULES=httparena.inc`、agensio は CMake の `-DAGENSIO_HTTPARENA=ON`、nginx は C のモジュール、
+   h2o は libh2o に C のハンドラを登録）。veil も今の機能（ハンドラを組み込み、`veil.toml` の `type = "Handler"` で指す）で同じ形に
+   できる（[F-325](F-325-httparena-veil-compiled-handler-module.md)）。
 
-## 試算（infrastructure の総合点。他のエントリは今の値のまま）
+## 試算（infrastructure の総合点。他のエントリは今の値のまま。`docs/artifacts/benchmark/httparena-perf/scripts/scen.py`）
 
-| 段階 | 前提 | 点 | 順位 |
+| 段階 | 前提 | 点 | 順位（9 エントリ） |
 |---|---|---|---|
-| 今 | — | 771 | 7 / 8 |
-| A | F-320 の 1〜2（静的配信が veil-api 並み: 937k・1.0M・289k） | 約 2,480 | 5 |
-| B | A + `/pipeline` を固定応答（3.4M） | 約 2,800 | 5 |
-| C | B + F-318（Wasm の上乗せがノート PC 並みの 25 µs: baseline 1.2M・limited 1.07M・json-tls 0.74M・base-h2 1.7M・base-h3 1.0M） | 約 3,590 | 5 |
+| S0 | 今 | 675 | 7 |
+| S1 | F-320 の 1〜3（静的が veil-api 並み・`/pipeline` を固定応答。Wasm のまま） | 約 2,310 | 6 |
+| S2 | S1 + F-318（Wasm の上乗せがノート PC 並みの 25 µs: baseline 1.2M・limited 1.07M・json-tls 0.74M・base-h2 1.7M・base-h3 1.0M） | 約 3,050 | 6 |
+| S7 | S2 + F-322（pipelined 12M）+ F-321・F-323・F-324 の一部（base-h2 3M・base-h3 1.6M） | 約 3,510 | 6 |
+| S3 | F-325（ハンドラを組み込む）+ F-320 = veil-api の値 | 約 4,360 | 5（h2o 3,874 を超える） |
+| S4 | S3 + F-322（pipelined 12M） | 約 4,670 | 4（fit 4,521 を超える） |
+| S5 | S4 + F-323（base-h2 10M） | 約 4,960 | 3（nginx 4,779 を超える） |
+| S6 | S5 + F-324（base-h3 5M） | 約 5,230 | 3 |
 
-- 試算の道具: `docs/artifacts/benchmark/httparena-perf/scripts/infra_score.py`（引数で各プロファイルの rps を差し替える）。
-- h2o（4,508）・nginx（5,476）を超えるには、C に加えて HTTP/2・HTTP/3 の要求あたりの費用（5）が要る。
+- 12M・10M・5M 等は目標の置き方で、実測ではない。上位 2 つ（okena 9,000・agensio 7,348）は 1 要求 1〜2 µs で別格。
+- veil-api の静的配信は File バックエンドではなくライブラリの `serve_dir` なので、静的の値は目安。
 
 ## 進め方（提案）
 
-1. **F-320 の 1〜3（設定だけ）**: veil 本体を変えずに A〜B。v0.11.0 のイメージで事前圧縮も使える。提出は人の確認の後。
-2. **B-495・B-496**（小さい修正）: 設定を書かない利用者にも効く。次の版に入れる。
-3. **F-318**: Wasm の 5〜6 プロファイルの本命。最初に伸び方の試験で原因を確かめてから直す。
-4. **F-319**: 単発の費用。F-318 の後に測ってから。
-5. **B-497**: 再現から。
-6. 次の版の公開（タグは人の判断）と HttpArena の再提出（人の確認）。
+1. 計測の土台: aofish の伸び方の試験（ワーカー 1〜16 本）、HttpArena と同じ負荷ツール（gcannon・wrk・h2load・h2load-h3 の Docker
+   イメージ）、perf。改修前の値（main）を記録する。
+2. **B-495・B-496・B-498**（小さい修正）: 設定を書かない利用者にも効く（B-498 は文書どおりの暗号スイートの選び方）。
+3. 本体の経路: **F-321 → F-322 → B-497 → F-323 → F-324**（veil-api と、F-325 の版の veil に効く）。
+4. Proxy-Wasm: **F-318 → F-319**（Proxy-Wasm の利用者に効く。エントリを Proxy-Wasm のまま出す場合の点にも効く）。
+5. エントリ（手元だけ。提出しない）: F-320（Proxy-Wasm の版の設定と今の機能の調整）と F-325（ハンドラを組み込む版）を作り、HttpArena の
+   検証と計測で比べる。veil-api のエントリも新しいコードで測る。
+6. main へマージ・push（タグは人の判断）。HttpArena への再提出（どちらの版を出すかを含む）は人の確認の後（F-269）。
 
 ## 計測の環境と記録
 
-- HttpArena の結果: 公開リポジトリの `site/data/results/*.json`（取得時のコミットは `docs/artifacts/benchmark/httparena-perf/httparena-results/REPO_COMMIT.txt`）。
+- HttpArena の結果: 公開リポジトリの `site/data/results/*.json`。2026-11-22 の写しは `docs/artifacts/benchmark/httparena-perf/httparena-results/`、
+  2026-11-24 の写し（okena を含む）は `httparena-results-20261124/`（取得時のコミットは各 `REPO_COMMIT.txt`）。
   計測は 64 スレッド（cpuset 0-31,64-95）・5 秒・`--network host --security-opt seccomp=unconfined`。負荷は gcannon（h1）・h2load（h2・h3）・wrk（TLS）。
 - 手元: ノート PC（4 CPU、共有の機械で ±5% 程度揺れる）、veil-load（h1・h2c）、サーバの CPU は `/proc/<pid>/task/*/schedstat`。
-  スクリプト・設定・結果は `docs/artifacts/benchmark/httparena-perf/`（git 管理外）。
+  スクリプト（`infra_score.py`・`scen.py`・`cpu_table.py`・`measure.py`）・設定・結果は `docs/artifacts/benchmark/httparena-perf/`（git 管理外）。
 
 ## 子チケット
 
 - [B-495](../bugs/B-495-performance-section-default-zero-ofc.md)・[B-496](../bugs/B-496-content-cache-reinsert-drops-compressed.md)・
-  [B-497](../bugs/B-497-h2-p99-stuck-at-run-length.md)・[F-318](F-318-wasm-per-request-shared-writes.md)・
-  [F-319](F-319-wasm-per-request-fixed-cost.md)・[F-320](F-320-httparena-veil-entry-config.md)
+  [B-497](../bugs/B-497-h2-p99-stuck-at-run-length.md)・[B-498](../bugs/B-498-tls-cipher-suites-order-not-server-preference.md)・[F-318](F-318-wasm-per-request-shared-writes.md)・
+  [F-319](F-319-wasm-per-request-fixed-cost.md)・[F-320](F-320-httparena-veil-entry-config.md)・
+  [F-321](F-321-core-path-per-request-shared-writes.md)・[F-322](F-322-h1-pipelined-response-coalescing.md)・
+  [F-323](F-323-h2-per-stream-fixed-cost.md)・[F-324](F-324-h3-per-request-cost.md)・
+  [F-325](F-325-httparena-veil-compiled-handler-module.md)
 
 ## 関連
 
-- F-269（HttpArena への提出）・F-294（事前圧縮）・B-175（Wasm のインスタンスの再利用）
+- F-269（HttpArena への提出）・F-294（事前圧縮）・B-175（Wasm のインスタンスの再利用）・F-188（API ライブラリ）
