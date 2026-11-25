@@ -275,7 +275,7 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 ### プロトコル準拠・サンドボックス
 
 - HTTP/3 のリクエストは `h3_check_field_section` で RFC 9114 §4.3.1 を検査する（quiche の h3 層は検査しない。B-100）。
-  vendoring 版 quiche の差分（STREAM 詰め合わせ・予約ビット検査・rlib のみ・パケット番号を飛ばす頻度）は `third_party/quiche/README.veil.md`。
+  vendoring 版 quiche の差分（STREAM 詰め合わせ・予約ビット検査・rlib のみ・パケット番号を飛ばす頻度・片付けたストリームの ID を範囲で持つ）は `third_party/quiche/README.veil.md`。
 - 不正なプリフェースや拒否する接続は、未読データを残して close しない（RST になり相手は GOAWAY を読めない）。
   送信側を閉じて上限付きで読み捨ててから閉じる（B-102）。
 - seccomp の `ALLOWED_SYSCALLS` に syscall を足すときは番号を `libc::SYS_*` で確かめ、

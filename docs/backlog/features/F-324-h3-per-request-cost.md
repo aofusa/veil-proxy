@@ -1,6 +1,6 @@
 # F-324: HTTP/3 の 1 要求あたりの費用を減らす（veil-api 13.6 µs・nginx 6.3・agensio 1.8）
 
-**状態: 着手（2026-11-26、feat/httparena-perf。下の「進捗」）**
+**状態: 着手（2026-11-26、feat/httparena-perf。下の「進捗」の 1〜3 を入れ、h3-plain の 1 要求の CPU は約 −10%・接続ごとのメモリは要求の数に比例しなくなった。受け入れ条件〈−30%〉には届いていない。残りは quiche の中の作り直しが要る〈「次の候補」〉）**
 
 ## 今の状態（測った値）
 
@@ -73,7 +73,23 @@ HttpArena の baseline-h3（`h2load --alpn-list=h3 -c 64 -m 64 -t 64`）と stat
   8.94 → 8.96、static-h3 31.77 → 32.51（+2.3%）・32.63 → 32.87（+0.7%）。io_uring の h3-plain・static-h3 の増えは同じ組の中の揺れ
   （同じビルドの f324p-uring が前の比較では 5.52）の範囲。プロファイル（io_uring の h3-plain）で `memmove` 6.79 → 5.01%、
   `process_h3_events` 5.14 → 4.36%、`select_route`・ルートのキャッシュ（LRU）・`FuturesUnordered` が上位から消えた。
-- 1・2 を合わせて h3-plain は epoll で約 −8%、io_uring で約 −6〜9%。
+- 1・2 を合わせて h3-plain は epoll で約 −8%、io_uring で約 −6〜9%（3 を足して約 −10%）。
+
+### 3. quiche: 片付けたストリームの ID を範囲で持つ（`third_party/quiche/README.veil.md` の 10）
+
+- quiche の `StreamMap` は、完了して片付けたストリームの ID を `HashSet<u64>`（`collected`）に入れ、接続の終わりまで縮めない。
+  HTTP/3 は要求 1 つでストリーム 1 本なので、集合は要求ごとに 1 項目ずつ増え、ストリームを作るたびの検索と集合の作り直し
+  （倍々の再確保と写し）が続く。ストリームの種類ごとの通し番号の範囲（`RangeSet`）にした。範囲の切れ目は開いているストリームと
+  相手が飛ばした番号だけで、どちらもストリームの数の上限に数えられるので、範囲の数は上限で抑えられる。
+- メモリ（30 秒の h3-plain、`-c 16 -m 64`、交互 2 巡。負荷の後の RSS は同じ）: サーバのピークの RSS（VmHWM）が io_uring 131 → 56 MB、
+  epoll 108 → 34 MB。約 580 万要求・16 接続で集合が約 75 MB になっていた。HttpArena の baseline-h3（64 接続・数百万 rps）では
+  接続の数と要求の数に比例してもっと大きくなる。
+- CPU（f324r → f324c、交互 4 巡）: h3-plain 5.06 → 4.96（epoll、−2.1%）・4.88 → 4.80（io_uring、−1.6%）、h3-wasm +0.8%・−1.7%、
+  static-h3 +1.2%・+0.9%。プロファイル（io_uring の h3-plain）で `StreamMap::get_or_create` 3.9 → 2.4%、`__rust_alloc` 5.7 → 4.2%。
+- **採らなかったもの**: quiche のストリーム ID のハッシュ（`StreamIdHasher`）は ID そのものを返す。hashbrown は上位 7 ビットで
+  グループの中の候補を絞るので、小さな ID は全部同じ値になり、同じ種類の ID（4 の倍数）は表の 1/4 のバケットからしか始まらない。
+  乗算で混ぜた版（f324h）は、範囲化（f324c）に比べて h3-plain が epoll +2.4%・io_uring +1.0%、h3-wasm +2.6%・+1.7% で効かなかった
+  （プロファイルの `get_or_create` も 2.4 → 3.0%）。開いているストリームは 1 接続 64 本程度で、表が小さく衝突の費用が出ない。
 
 ### 残っている費用（f324r、io_uring の h3-plain のプロファイル）
 
@@ -82,6 +98,16 @@ HttpArena の baseline-h3（`h2load --alpn-list=h3 -c 64 -m 64 -t 64`）と stat
   確保（`__rust_alloc` 5.7%・`VeilAlloc` 1.5%）と `memmove` 5.0% の多くも quiche のストリームの作成・破棄。
 - veil 側: `process_h3_events` 4.4%・`handle_request_impl` 1.3%・`h3_check_field_section` 1.2%・arc_swap 1.6%（`classify` の
   設定の読み取り）。
+
+### 次の候補（測った内訳から。どれも数 % ずつで、quiche か要求の処理の作り直しが要る）
+
+- quiche の HTTP/3 のヘッダ: `h3::Header` は名前と値をそれぞれ `Vec<u8>` で持ち、要求・応答のヘッダ 1 項目ごとに確保が 2 回ある
+  （QPACK の復号・`send_response` の両方）。ヘッダのブロック 1 つのバッファと範囲で持つ形にする。
+- quiche のストリームごとの費用: `Stream` の作成と `HashMap` への移動（`memmove` 5〜6%）、優先度のキーの `Arc` と赤黒木
+  （`intrusive_collections`、約 5%）、受信の `BTreeMap`（`RecvBuf::ready` 2〜3%）。
+- その場で終わる要求（`Respond`・キャッシュの当たり）は、タスクと応答のチャネルを通さずにメインループが応答を quiche へ渡す
+  （`handle_request_impl` のセキュリティの検査・圧縮・メトリクスを同期の関数へ切り出す作り直しが要る。HTTP/2 も同じ。F-323）。
+- 接続の振り分けの偏り（「今の状態」の 36 コア）。
 
 ## 受け入れ条件
 

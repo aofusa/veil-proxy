@@ -114,6 +114,39 @@ type BuildStreamIdHasher = std::hash::BuildHasherDefault<StreamIdHasher>;
 pub type StreamIdHashMap<V> = HashMap<u64, V, BuildStreamIdHasher>;
 pub type StreamIdHashSet = HashSet<u64, BuildStreamIdHasher>;
 
+/// veil: The IDs of collected streams, as ranges of stream sequence numbers
+/// (`id >> 2`) for each of the four stream types (`id & 3`).
+///
+/// Streams of a type are opened in order and mostly complete in order, so
+/// the completed ones form a few ranges. A range is missing only for a stream
+/// that is still open or one the peer opened implicitly by skipping it, and
+/// both count against the stream limits.
+struct CollectedStreams {
+    types: [crate::ranges::RangeSet; 4],
+}
+
+impl Default for CollectedStreams {
+    fn default() -> Self {
+        CollectedStreams {
+            types: std::array::from_fn(|_| {
+                crate::ranges::RangeSet::new(usize::MAX)
+            }),
+        }
+    }
+}
+
+impl CollectedStreams {
+    #[inline]
+    fn insert(&mut self, id: u64) {
+        self.types[(id & 3) as usize].push_item(id >> 2);
+    }
+
+    #[inline]
+    fn contains(&self, id: u64) -> bool {
+        self.types[(id & 3) as usize].contains(id >> 2)
+    }
+}
+
 /// Keeps track of QUIC streams and enforces stream limits.
 #[derive(Default)]
 pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
@@ -125,7 +158,11 @@ pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
     /// Instead of keeping the full stream state forever, we collect completed
     /// streams to save memory, but we still need to keep track of previously
     /// created streams, to prevent peers from re-creating them.
-    collected: StreamIdHashSet,
+    ///
+    /// veil: ranges of stream sequence numbers per stream type instead of a
+    /// hash set of IDs (the set grew by one entry per stream for the life of
+    /// the connection).
+    collected: CollectedStreams,
 
     /// Peer's maximum bidirectional stream count limit.
     peer_max_streams_bidi: u64,
@@ -240,7 +277,7 @@ impl<F: BufFactory> StreamMap<F> {
         let (stream, is_new_and_writable) = match self.streams.entry(id) {
             hash_map::Entry::Vacant(v) => {
                 // Stream has already been closed and garbage collected.
-                if self.collected.contains(&id) {
+                if self.collected.contains(id) {
                     return Err(Error::Done);
                 }
 
@@ -626,7 +663,7 @@ impl<F: BufFactory> StreamMap<F> {
 
     /// Returns true if the stream has been collected.
     pub fn is_collected(&self, stream_id: u64) -> bool {
-        self.collected.contains(&stream_id)
+        self.collected.contains(stream_id)
     }
 
     /// Returns true if there are any streams that have data to write.
@@ -1787,6 +1824,63 @@ mod tests {
             Some(Error::StreamLimit),
             "stream limit should be exceeded"
         );
+    }
+
+    /// veil: collected streams of every type are remembered as ranges of
+    /// sequence numbers and can't be created again; the ranges stay few when
+    /// streams complete in order.
+    #[test]
+    fn collected_streams_are_ranges() {
+        let local_tp = crate::TransportParams {
+            initial_max_stream_data_bidi_local: 10,
+            initial_max_stream_data_bidi_remote: 10,
+            initial_max_stream_data_uni: 10,
+            ..Default::default()
+        };
+        let peer_tp = local_tp.clone();
+
+        let mut streams = <StreamMap>::new(10_000, 10_000, 10_000);
+
+        // Client-initiated bidi (0 mod 4) and uni (2 mod 4) streams, completed
+        // in order
+        for seq in 0..3_000u64 {
+            for id in [seq * 4, seq * 4 + 2] {
+                streams
+                    .get_or_create(id, &local_tp, &peer_tp, false, true)
+                    .unwrap();
+                streams.collect(id, false);
+                assert!(streams.is_collected(id));
+            }
+        }
+        for t in 0..4 {
+            assert!(streams.collected.types[t].len() <= 1, "type {t}");
+        }
+
+        // A stream completed out of order leaves a gap only while it is open
+        streams
+            .get_or_create(3_001 * 4, &local_tp, &peer_tp, false, true)
+            .unwrap();
+        streams
+            .get_or_create(3_000 * 4, &local_tp, &peer_tp, false, true)
+            .unwrap();
+        streams.collect(3_001 * 4, false);
+        assert!(!streams.is_collected(3_000 * 4));
+        assert_eq!(streams.collected.types[0].len(), 2);
+        streams.collect(3_000 * 4, false);
+        assert_eq!(streams.collected.types[0].len(), 1);
+
+        // Collected streams can't be re-created, other types aren't affected
+        assert_eq!(
+            streams.get_or_create(0, &local_tp, &peer_tp, false, true).err(),
+            Some(Error::Done)
+        );
+        assert_eq!(
+            streams.get_or_create(2, &local_tp, &peer_tp, false, true).err(),
+            Some(Error::Done)
+        );
+        assert!(!streams.is_collected(1));
+        assert!(!streams.is_collected(3));
+        assert!(!streams.is_collected(3_002 * 4));
     }
 
     /// Stream limit should be satisfied regardless of what order we open

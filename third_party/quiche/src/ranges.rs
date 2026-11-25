@@ -178,6 +178,21 @@ impl RangeSet {
     pub fn push_item(&mut self, item: u64) {
         self.insert(item..item + 1)
     }
+
+    /// veil: Returns true if `item` is in one of the stored ranges.
+    #[inline]
+    pub fn contains(&self, item: u64) -> bool {
+        match self {
+            RangeSet::Inline(set) =>
+                set.inner.iter().any(|&(s, e)| s <= item && item < e),
+
+            RangeSet::BTree(set) => set
+                .inner
+                .range((Bound::Unbounded, Bound::Included(item)))
+                .next_back()
+                .is_some_and(|(_, &e)| item < e),
+        }
+    }
 }
 
 impl InlineRangeSet {
@@ -749,5 +764,34 @@ mod tests {
         r.insert(4..17);
         assert_eq!(r.first(), Some(4));
         assert_eq!(r.last(), Some(19));
+    }
+
+    // veil: `contains` for both representations
+    #[test]
+    fn contains() {
+        let mut r = RangeSet::new(usize::MAX);
+        assert!(!r.contains(0));
+
+        r.insert(3..6);
+        r.insert(10..11);
+        assert!(matches!(r, RangeSet::Inline(_)));
+        for (item, expected) in [(2, false), (3, true), (5, true), (6, false), (10, true), (11, false)] {
+            assert_eq!(r.contains(item), expected, "inline {item}");
+        }
+
+        r.insert(20..22);
+        r.insert(30..31);
+        assert!(matches!(r, RangeSet::BTree(_)));
+        for (item, expected) in [(2, false), (3, true), (6, false), (10, true), (21, true), (22, false), (30, true), (31, false)] {
+            assert_eq!(r.contains(item), expected, "btree {item}");
+        }
+
+        // Adjacent items merge into one range
+        let mut r = RangeSet::new(usize::MAX);
+        for i in 0..1000 {
+            r.push_item(i);
+        }
+        assert_eq!(r.len(), 1);
+        assert!(r.contains(999) && !r.contains(1000));
     }
 }

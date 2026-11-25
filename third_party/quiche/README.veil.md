@@ -160,9 +160,24 @@ veil の `[tls] session_resumption`・`tls13_tickets`・`cipher_suites` を HTTP
 - 宣言は `veil_ffi!` の中（`grep -n 'veil:' src/tls/boringssl.rs src/tls/mod.rs`）。チケットの鍵は upstream の
   `Config::set_ticket_key` を使う（veil が全ワーカーで共有し、6 時間ごとに作り直す）。
 
+### 10. `src/stream/mod.rs`・`src/ranges.rs`: 片付けたストリームの ID を範囲で持つ（F-324、0.24.9-veil.5）
+
+upstream の `StreamMap` は、完了して片付けたストリームの ID を `HashSet<u64>`（`collected`）に入れ、相手が同じ ID のストリームを
+作り直せないようにする。集合は接続の終わりまで縮まず、ストリーム 1 本ごとに 1 項目増える（HTTP/3 は要求 1 つで 1 本）。aofish の
+h2load-h3（`Respond`、`-c 16 -m 64`、30 秒・約 580 万要求）でサーバのピークの RSS が 131 MB（変更後 56 MB）になり、ストリームを
+作るたびの検索（`get_or_create`）と集合の作り直し（倍々の再確保と写し）が CPU の数 % を使っていた。
+
+- `ranges.rs`: `RangeSet::contains(item)`。
+- `stream/mod.rs`: `collected` を、ストリームの種類（`id & 3`）ごとの通し番号（`id >> 2`）の `RangeSet` 4 つにした
+  （`CollectedStreams`）。同じ種類のストリームは番号の順に開かれ、ほぼ順に終わるので、片付けた番号は少しの範囲にまとまる
+  （隣り合う範囲は `RangeSet` がつなぐ）。範囲の切れ目になるのは、まだ開いているストリームと、相手が番号を飛ばして暗黙に開いた
+  まま使わないストリームだけで、どちらもストリームの数の上限に数えられる（quiche は相手のストリームを片付けたときにだけ上限を
+  戻す）ので、範囲の数は上限で抑えられる。`RangeSet` の容量は無制限にする（古い範囲を捨てると、片付けたストリームを作り直せてしまう）。
+- 作り直しの拒否と `is_collected` の結果は upstream と同じ。`grep -n 'veil:' src/stream/mod.rs src/ranges.rs`。
+
 ## 追従手順
 
-quiche を更新するときは、新バージョンを同じ手順でコピーし直して上記 1〜9 を再適用する
+quiche を更新するときは、新バージョンを同じ手順でコピーし直して上記 1〜10 を再適用する
 （`grep -n 'Coalesce STREAM frames when fuzzing' src/lib.rs` と `grep -n 'veil:' src/lib.rs`
 で該当箇所が見つかる）。
 upstream がこの挙動を既定にした場合は vendoring を撤去し `[patch.crates-io]` を消す。
@@ -180,7 +195,7 @@ path 依存になると cargo が lint を抑制しなくなるため veil の�
 
 veil を crates.io に出すため、`[patch.crates-io]` で差し替えるのをやめ、別のパッケージとして公開する。
 
-- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.5`（`[lib] name = "quiche"` はそのまま。veil.2 は上の 5、veil.3 は上の 6、veil.4 は上の 7、veil.5 は上の 8・9）。
+- `Cargo.toml`: パッケージ名 `veil-proxy-quiche`・版 `0.24.9-veil.5`（`[lib] name = "quiche"` はそのまま。veil.2 は上の 5、veil.3 は上の 6、veil.4 は上の 7、veil.5 は上の 8・9・10）。
   既定の feature を空にした（`boringssl-vendored` は取り込んでいない `deps/boringssl` を要るため）。
   `[lints]` で veil の clippy（`-D warnings`）の対象から外す。
 - `rustfmt.toml`: `disable_all_formatting = true`（path 依存になり、veil の `cargo fmt` の対象に入ったため）。
