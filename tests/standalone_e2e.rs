@@ -31,6 +31,10 @@ mod matrix_tests;
 #[path = "standalone/pipeline_tests.rs"]
 mod pipeline_tests;
 
+// B-497: 忙しいワーカーへ多数の接続が一度に来たときの受理
+#[path = "standalone/accept_burst_tests.rs"]
+mod accept_burst_tests;
+
 use standalone::*;
 use std::time::Duration;
 

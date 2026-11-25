@@ -287,6 +287,60 @@ impl TcpListener {
         }
         storage_to_sockaddr(&storage)
     }
+
+    /// 受理待ちの列に溜まっている接続を、待たずに最大 `max_batch` 件まで受理する（B-497。reactor の
+    /// `accept_batch`〈F-155〉と同じ）。受理した接続はその場で `on_conn` へ渡す（中間の `Vec` を作らない）。
+    ///
+    /// `Accept`（`IORING_OP_ACCEPT`）は実行器の 1 周回に 1 件しか終わらない。多数の接続が一度に来ると
+    /// （接続の集約〈F-303〉が少数のワーカーへ寄せたとき等）、忙しいワーカーでは最後の接続の受理が数秒遅れて
+    /// いた。`Accept` が終わった直後に呼び、溜まった分を同じ周回で受理する。リスナーは `O_NONBLOCK`
+    /// （`create_nonblocking_socket`・`bind_unix_listener` の `SOCK_NONBLOCK`）なので `accept4(2)` は待たない。
+    ///
+    /// `EINTR` は内側でやり直す。列が尽きたら（`EAGAIN`）それまでの件数を返す。アドレスを変換できない
+    /// 1 件は捨てて次へ進む（fd は `TcpStream` の `Drop` で閉じる）。それ以外のエラーは、それまでに受理した分を
+    /// `on_conn` へ渡した上で返す。
+    pub fn accept_batch<F>(&self, max_batch: usize, mut on_conn: F) -> io::Result<usize>
+    where
+        F: FnMut(TcpStream, SocketAddr),
+    {
+        let mut count = 0usize;
+        while count < max_batch {
+            // SAFETY: sockaddr_storage は POD で、全ビット 0 が有効な初期値。
+            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            // SAFETY: self.fd は有効なリスナー。storage と len は生存する可変領域で len は storage の大きさ。
+            let fd = unsafe {
+                libc::accept4(
+                    self.fd,
+                    &mut storage as *mut _ as *mut libc::sockaddr,
+                    &mut len,
+                    libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let e = io::Error::last_os_error();
+                match e.kind() {
+                    io::ErrorKind::Interrupted => continue,
+                    io::ErrorKind::WouldBlock => break,
+                    _ => return Err(e),
+                }
+            }
+            // 先に TcpStream を作る（アドレスの変換に失敗しても Drop で fd を閉じる。`Accept::poll` と同じ順）
+            let stream = TcpStream { fd };
+            // F-164: AF_UNIX は sockaddr_un を SocketAddr へ変換できないので `Accept` と同じプレースホルダ
+            let peer_addr = if self.is_unix {
+                SocketAddr::from(([127, 0, 0, 1], 0))
+            } else {
+                match storage_to_sockaddr(&storage) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                }
+            };
+            on_conn(stream, peer_addr);
+            count += 1;
+        }
+        Ok(count)
+    }
 }
 
 impl Drop for TcpListener {
@@ -2197,5 +2251,47 @@ mod tests {
             0,
             "the accepted fd was not closed"
         );
+    }
+
+    /// B-497: 溜まった接続を待たずにまとめて受理し、列が空なら待たずに 0 を返す（io_uring を使わない。リスナーは
+    /// 非ブロッキング）。
+    #[test]
+    #[allow(clippy::disallowed_methods)] // テストのクライアント（同期 connect）
+    fn test_b497_accept_batch_takes_the_backlog_without_waiting() {
+        let listener = TcpListener::bind_reuse_port("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        // 列が空なら待たずに返る
+        assert_eq!(
+            listener
+                .accept_batch(31, |_, _| panic!("nothing queued"))
+                .unwrap(),
+            0
+        );
+
+        let clients: Vec<_> = (0..40)
+            .map(|_| std::net::TcpStream::connect(addr).expect("connect"))
+            .collect();
+        let mut peers = Vec::new();
+        let n = listener
+            .accept_batch(31, |stream, peer| {
+                assert!(stream.fd >= 0);
+                peers.push(peer);
+            })
+            .unwrap();
+        // 上限で区切る（残りは次の周回）
+        assert_eq!(n, 31);
+        let rest = listener
+            .accept_batch(31, |_, peer| peers.push(peer))
+            .unwrap();
+        assert_eq!(rest, 9);
+        assert_eq!(
+            listener.accept_batch(31, |_, _| panic!("drained")).unwrap(),
+            0
+        );
+        // 相手のアドレスは接続した側のアドレス
+        let mut want: Vec<_> = clients.iter().map(|c| c.local_addr().unwrap()).collect();
+        want.sort();
+        peers.sort();
+        assert_eq!(peers, want);
     }
 }

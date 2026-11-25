@@ -176,7 +176,7 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   `poll(2)` を省略しない（HTTP/2 の select で偽の Ready は読み取りの待ちに化ける）。fd は閉じる前に `unregister` し、番号の再利用は
   `forget_stale_fd` で古い記録を消す。タスクは 1 回の poll で I/O を `COOP_BUDGET` までしか進めず（インラインの初回 poll は別の予算。分け合うと束の途中のストリームが落ちる）、実行器は `EVENT_INTERVAL` ごとに
   poller を見る（速い相手の接続が他を飢えさせない。B-332）。kqueue の readiness ヒントは維持し、ヒントが無いときの `poll(2)` フォールバックを消さない（F-141）。
-- fd ごとの待機者は `WakerSlot`（F-166）。accept は `accept_batch` で 1 周回に複数（reactor のみ。F-155）。
+- fd ごとの待機者は `WakerSlot`（F-166）。
 - `block_on` は poller を作り直し、タスクは `block_on` をまたいで残らない。fd 表も一緒に空にする（`reset_fd_table`。「武装済み」の
   記録が残ると `epoll_ctl` を呼ばずに永久に待つ。F-297）。
 - 実行器の poller の待ち時間はタイマーまでの時間を切り捨てない（kqueue はナノ秒、epoll・WSAPoll はミリ秒へ切り上げ。
@@ -188,6 +188,9 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - リスナーは必ず `server::create_listener`（UDS は `server::bind_unix_listener`）経由で作る（F-156/F-164）。
 - accept のループは停止の確認の区切り（`timeout`）で `Accept` を落とさない（ループの前に作って区切りをまたいで持ち越し、受理が
   終わったときだけ次を作る）。io_uring の `Accept` は落とすと取り消され、行き違ってカーネルが受理した接続を後始末が閉じる（B-475）。
+- 1 件受理したら、溜まった分を `accept_batch`（非ブロッキングの `accept4` を `EAGAIN` まで、合わせて 32 件）で同じ周回に受理する
+  （両バックエンド。io_uring の `Accept` は実行器の 1 周回に 1 件しか終わらず、接続の集約が一度に寄せた 1024 接続の受理が忙しい
+  ワーカーで約 5 秒遅れていた。F-155/B-497）。
 - 接続の集約（`[performance] concentrate_connections`。Linux の TCP）は、制御スレッドが SO_REUSEPORT のグループの CBPF を
   差し替えて新しい接続を先頭の N 本へ振り分ける。ワーカーは順に bind する（グループの添字とワーカーの順を一致させる）。
   ホットパスに足すのは Relaxed の加算（park の前後・応答・接続の数）と、動かす接続の `take_shed` だけ。N は測って決める

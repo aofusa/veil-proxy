@@ -407,10 +407,9 @@ fn spawn_workers<S, Fut>(
 
                     // F-155/F-156: nginx の `multi_accept` 相当。1 件目に続けて、
                     // バックログに滞留している接続を合計最大 32 件（1 件目 + 31 件）まで
-                    // 一気に受理・spawn する。io_uring バックエンド（`veil_rt_uring`）の
-                    // `TcpListener` には `accept_batch` が存在しない（io_uring パスの
-                    // ロジックは変更しない方針のため）ので、reactor バックエンド
-                    // （`veil_rt_reactor`: epoll/kqueue）限定で有効にする。
+                    // 一気に受理・spawn する。B-497: io_uring でも行う（`Accept` は実行器の 1 周回に
+                    // 1 件しか終わらず、接続の集約〈F-303〉が一度に来た 1024 接続を少数のワーカーへ寄せると、
+                    // 忙しいワーカーで最後の接続の受理が約 5 秒遅れていた。HTTP/2 の最初の応答も同じだけ遅れる）。
                     //
                     // **効果は FreeBSD の既存ハーネスでは測定できない**（平文の h2c で測定を試みた記録）:
                     // `h2c_file_plain` は h2load が keep-alive で 64 接続を張りっぱなしにするため、
@@ -418,13 +417,10 @@ fn spawn_workers<S, Fut>(
                     // 有無を変えた交互 A/B を 2 回（計 8 ラウンド）取ったところ、結果は逆転し、
                     // 8 サンプルの平均はほぼ同一だった（＝差は測定ノイズ）。本最適化が効くのは
                     // 短命接続が支配的なワークロードで、評価するにはそれ用の負荷（接続確立レート）が要る。
-                    #[cfg(veil_rt_reactor)]
-                    {
-                        if let Err(e) = listener.accept_batch(31, &mut handle_accepted) {
-                            // B-181: 資源不足は次の accept が待ち方ごと扱う（ここで毎回ログを出さない）
-                            if !is_resource_exhausted(&e) {
-                                error!("[{} {}] Accept error: {}", label, thread_id, e);
-                            }
+                    if let Err(e) = listener.accept_batch(31, &mut handle_accepted) {
+                        // B-181: 資源不足は次の accept が待ち方ごと扱う（ここで毎回ログを出さない）
+                        if !is_resource_exhausted(&e) {
+                            error!("[{} {}] Accept error: {}", label, thread_id, e);
                         }
                     }
                 }

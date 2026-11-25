@@ -298,29 +298,18 @@ pub fn spawn_l4_listeners(
 
                                         handle_accepted(stream, peer_addr);
 
-                                        // F-155 と同じ Burst Accept パターン。io_uring バックエンド
-                                        // （`veil_rt_uring`）の `TcpListener` には `accept_batch` が
-                                        // 存在しない（io_uring パスのロジックは変更しない方針）ため、
-                                        // reactor バックエンド（`veil_rt_reactor`）限定で有効にする。
-                                        // クロージャは捕捉状態を書き換えないため `Fn` として
-                                        // 推論される（TLS/H2C ワーカーの `batch_accepted`
-                                        // に相当する可変状態を持たない）。`&mut` を取ると
-                                        // io_uring ビルドで不要な `mut` 束縛になるため、
-                                        // ここでは値渡しする（この周回での最後の使用）。
-                                        #[cfg(veil_rt_reactor)]
-                                        {
-                                            if let Err(e) =
-                                                listener.accept_batch(31, handle_accepted)
-                                            {
-                                                // B-181: 資源不足は次の accept が扱う
-                                                if !crate::listener_workers::is_resource_exhausted(
-                                                    &e,
-                                                ) {
-                                                    error!(
-                                                        "[L4:{} Worker {}] accept error: {}",
-                                                        config.name, thread_id, e
-                                                    );
-                                                }
+                                        // F-155 と同じ Burst Accept パターン（B-497: io_uring でも行う。
+                                        // `Accept` は実行器の 1 周回に 1 件しか終わらない）。クロージャは
+                                        // 捕捉状態を書き換えないため `Fn` として推論される（TLS/H2C
+                                        // ワーカーの `batch_accepted` に相当する可変状態を持たない）ので、
+                                        // 値渡しする（この周回での最後の使用）。
+                                        if let Err(e) = listener.accept_batch(31, handle_accepted) {
+                                            // B-181: 資源不足は次の accept が扱う
+                                            if !crate::listener_workers::is_resource_exhausted(&e) {
+                                                error!(
+                                                    "[L4:{} Worker {}] accept error: {}",
+                                                    config.name, thread_id, e
+                                                );
                                             }
                                         }
                                     }
