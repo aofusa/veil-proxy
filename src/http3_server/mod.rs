@@ -963,6 +963,8 @@ struct BufferedReq {
     trailers: Vec<h3::Header>,
     /// `classify` が引いたキャッシュの結果（F-257）
     cache: Option<crate::proxy::cache_lookup::CacheLookup>,
+    /// `classify` が引いたルート（F-324）
+    routed: Option<ClassifiedRoute>,
 }
 
 /// HTTP/3 の要求ヘッダ（疑似ヘッダを除く）を (名前, 値) の組で読む（キャッシュの判定へ渡す。F-257）
@@ -1161,8 +1163,8 @@ struct Http3Handler {
     notify: crate::http3_stream::ConnWaker,
     /// バックエンドタスクのスポーナ（F-46: 型付きタスクプール。ワーカースレッドで共有）。
     backend_spawner: crate::http3_stream::BackendSpawner,
-    /// B-97: 起動待ちのバッファ経路の要求。メインループがワーカーの `FuturesUnordered` へ
-    /// 移して即座に 1 回 poll する（`process_h3_events` の後、`drive_proxy_streams` の前）。
+    /// B-97: 起動待ちのバッファ経路の要求。メインループがワーカーのタスクのプールのスロットの中で作って
+    /// 即座に 1 回 poll する（`process_h3_events` の後、`drive_proxy_streams` の前。F-324）。
     /// 容量を保持したまま使い回す（要求ごとの確保なし）。
     new_buffered: Vec<(H3BufferedTask, Vec<h3::Header>, Bytes)>,
     /// 見出しと同じ束で届き、まだ分類していないストリームの要求のトレーラ（分類の後にバッファ経路の要求へ移し、
@@ -1193,6 +1195,9 @@ struct Http3Handler {
     /// F-168 P3: `process_h3_events` の Reset ストリーム ID 一時収集バッファ（再利用）。
     /// 用法は `ev_new_headers` と同じ。
     ev_reset: Vec<u64>,
+    /// `process_h3_events` の本文まで揃ったバッファ経路の要求と、`drive_proxy_streams` の送り終えたストリームの
+    /// ID の一時収集バッファ（再利用。用法は `ev_new_headers` と同じ。F-324: 以前は束ごとに `Vec` を確保していた）
+    ev_done: Vec<u64>,
     /// F-187: 受け付けた要求ストリーム ID の最大値 + 4（GOAWAY で「ここまでは処理する」と伝える値）。
     next_req_stream: u64,
     /// F-187: 送った GOAWAY の ID。これ以上の ID の新しい要求は H3_REQUEST_REJECTED で断る。
@@ -1208,6 +1213,8 @@ struct Http3Handler {
     /// `classify` が引いたキャッシュの結果（当たり・バッファ経路へ回した外れ）。バッファ経路の要求へ渡す
     /// （引き直して当たり・外れを数え直さない。セキュリティの検査も済んでいる。F-257）
     classify_cache: Option<crate::proxy::cache_lookup::CacheLookup>,
+    /// `classify` が引いたルート。バッファ経路の要求へ渡す（タスクは設定を読み直さず、ルートも引き直さない。F-324）
+    classify_routed: Option<ClassifiedRoute>,
     /// 応答（本文・見出し）を送った量の和と、前回の送信の止まりの見回りで見た値。接続のクレジットを待つだけの
     /// ストリームを、接続がほかのストリームで進んでいる間は打ち切らないのに使う（B-487）
     send_progress: u64,
@@ -1247,6 +1254,7 @@ impl Http3Handler {
             ev_new_headers: Vec::new(),
             ev_finished: Vec::new(),
             ev_reset: Vec::new(),
+            ev_done: Vec::new(),
             next_req_stream: 0,
             goaway_id: None,
             shutdown_closed: false,
@@ -1254,6 +1262,7 @@ impl Http3Handler {
             classify_body_timeout: 0,
             classify_send_timeout: None,
             classify_cache: None,
+            classify_routed: None,
             send_progress: 0,
             send_progress_mark: 0,
             body_check_at: None,
@@ -1723,7 +1732,10 @@ impl Http3Handler {
         for (stream_id, headers, more_frames) in new_headers.drain(..) {
             // F-99: リクエストストリーム open をメトリクス計上
             self.metric_stream_open(stream_id);
-            match self.classify(stream_id, &headers, more_frames) {
+            let decision = self.classify(stream_id, &headers, more_frames);
+            // バッファ経路の要求だけが使う（ほかの経路ではここで捨てる。F-324）
+            let routed = self.classify_routed.take();
+            match decision {
                 Decision::Stream(params) => {
                     let (req_tx, req_rx) = crate::http3_stream::channel::<Bytes>(REQ_CHAN_CAP);
                     let (resp_tx, resp_rx) =
@@ -1789,6 +1801,7 @@ impl Http3Handler {
                             #[cfg(feature = "wasm")]
                             trailers,
                             cache: self.classify_cache.take(),
+                            routed,
                         },
                     );
                 }
@@ -1807,7 +1820,7 @@ impl Http3Handler {
                 }
                 Decision::Tunnel(req) => {
                     // F-288: 本文（トンネルのバイト列）は上限・受信の見張り無しでチャネルへ流す。中継は別タスク
-                    // （長く続くのでワーカーの `FuturesUnordered` には置かない。HTTP/3 のストリーミングのハンドラと同じ）
+                    // （長く続くのでバッファ経路の要求のプールには置かない。HTTP/3 のストリーミングのハンドラと同じ）
                     let (req_tx, req_rx) = crate::http3_stream::channel::<Bytes>(REQ_CHAN_CAP);
                     let (resp_tx, resp_rx) =
                         crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
@@ -1856,13 +1869,14 @@ impl Http3Handler {
         self.ev_reset = reset;
 
         // --- 完了したバッファ経路リクエストを処理 ---
-        let ready: Vec<u64> = self
-            .buffered_reqs
-            .iter()
-            .filter(|(_, b)| b.end)
-            .map(|(k, _)| *k)
-            .collect();
-        for stream_id in ready {
+        let mut ready = std::mem::take(&mut self.ev_done);
+        ready.extend(
+            self.buffered_reqs
+                .iter()
+                .filter(|(_, b)| b.end)
+                .map(|(k, _)| *k),
+        );
+        for stream_id in ready.drain(..) {
             did_work = true;
             let br = self.buffered_reqs.remove(&stream_id).unwrap();
             let body = self
@@ -1893,11 +1907,13 @@ impl Http3Handler {
                     #[cfg(feature = "wasm")]
                     req_trailers: br.trailers,
                     cache: br.cache,
+                    routed: br.routed,
                 },
                 br.headers,
                 body,
             ));
         }
+        self.ev_done = ready;
 
         // 部分的なレスポンスを送信（非ストリーミング経路）。
         if self.flush_partial_responses()? {
@@ -1924,7 +1940,7 @@ impl Http3Handler {
             None => return false,
         };
         let conn = &mut self.conn;
-        let mut done: Vec<u64> = Vec::new();
+        let mut done = std::mem::take(&mut self.ev_done);
         let mut did_work = false;
         let mut send_blocked = false;
         let mut progressed = 0u64;
@@ -1948,11 +1964,12 @@ impl Http3Handler {
             // ストリーム完了自体も「仕事をした」に含める。
             did_work = true;
         }
-        for stream_id in done {
+        for stream_id in done.drain(..) {
             debug!("[HTTP/3] streaming proxy stream {} done", stream_id);
             self.proxy_streams.remove(&stream_id);
             self.metric_stream_close(stream_id);
         }
+        self.ev_done = done;
         did_work
     }
 
@@ -1967,6 +1984,7 @@ impl Http3Handler {
         self.classify_body_timeout = 0;
         self.classify_send_timeout = None;
         self.classify_cache = None;
+        self.classify_routed = None;
         // --- 疑似ヘッダ + 必要ヘッダを抽出 ---
         let mut method: Option<&[u8]> = None;
         let mut path: Option<&[u8]> = None;
@@ -2106,7 +2124,8 @@ impl Http3Handler {
         let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
         let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
 
-        let backend_result = crate::l7::resolve_route(
+        let backend_result = crate::l7::resolve_route_in(
+            &config,
             authority,
             path_wo_query,
             method,
@@ -2116,9 +2135,20 @@ impl Http3Handler {
             false,
         );
 
+        // F-324: バッファ経路へ回す要求には、ここで引いたルートを渡す（タスクは設定を読み直さず、ルートも引き直さない）。
+        // 渡すのはワーカーの表の値（トラフィック制御の無いルート）と「ルートが無い」だけ。トラフィック制御の選んだ値は
+        // 下見では乱数を引いていないので、タスクが引き直す
         let route = match backend_result {
-            Some(b) => b,
-            None => return Decision::Buffer, // handle_request -> 404（gRPC 含む）
+            Some(b) => {
+                if let crate::l7::RouteMatch::Worker(t) = &b {
+                    self.classify_routed = Some(ClassifiedRoute::new(&config, Some(t)));
+                }
+                b
+            }
+            None => {
+                self.classify_routed = Some(ClassifiedRoute::new(&config, None));
+                return Decision::Buffer; // handle_request -> 404（gRPC 含む）
+            }
         };
         let (prefix, backend) = (&route.prefix, &route.backend);
         // B-274: 本文の受信が止まったら打ち切る秒数（ストリーミング・バッファの両経路）

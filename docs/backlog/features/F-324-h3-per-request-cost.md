@@ -1,6 +1,6 @@
 # F-324: HTTP/3 の 1 要求あたりの費用を減らす（veil-api 13.6 µs・nginx 6.3・agensio 1.8）
 
-**状態: 未着手（2026-11-25 起票。F-317 の子。測ってから効くものだけ行う）**
+**状態: 着手（2026-11-26、feat/httparena-perf。下の「進捗」）**
 
 ## 今の状態（測った値）
 
@@ -43,6 +43,45 @@ HttpArena の baseline-h3（`h2load --alpn-list=h3 -c 64 -m 64 -t 64`）と stat
    - 暗号: TLS 1.3 の AES-128-GCM になっているか（`[tls] cipher_suites` の順。F-314）。
 3. 接続の振り分けの偏り（上の 36 コア）は、費用を下げた後に残る分を測ってから考える（新しい接続を空いたワーカーへ寄せるには、
    サーバの接続 ID に振り分け先を入れて CBPF で引く等の大きな設計が要る。ここでは案として記録するだけ）。
+
+## 進捗
+
+計測は aofish（F-317 の「計測の記録」と同じ条件。サーバは CPU 0-7・ワーカー 8 本、負荷は CPU 8-15 の h2load-h3）。`h3-plain` は
+`Respond`（`/plain3`）、`h3-wasm` は Proxy-Wasm の `/baseline2`、`static-h3` は 20 ファイル（`Accept-Encoding` 付き）、いずれも
+`-c 16 -m 64`。値は 1 要求あたりのサーバの CPU（µs）で、1 回 5 秒の交互 3 巡の中央値。
+
+### 1. バッファ経路の要求をタスクのプールのスロットの中で作る
+
+- 要求ごとに `H3BufferedTask` の future（数 KB）を作って `FuturesUnordered` へ移していた。移すたびに future 全体の写しと、
+  `FuturesUnordered` のノードの `Arc` の確保・解放が 1 回ずつ要る。HTTP/2 のストリームと同じ `TaskPool::spawn_inline_with`
+  （スロットの中で作ってその場で 1 回 poll する。F-158・F-300・F-323）にした。待ちに入った要求は実行器のタスクとして残り、
+  応答を積むたびと送り終えたときに `ConnWaker` でメインループを起こす（メインループの select から `FuturesUnordered` の腕が消えた）。
+- f319c → f324p: h3-plain 5.58 → 5.35（epoll、−4.1%）・6.07 → 5.52（io_uring、−9.1%）、h3-wasm 8.20 → 8.12（−1.0%）・
+  9.27 → 8.76（−5.5%）、static-h3 31.03 → 31.32（+0.9%）・33.60 → 32.97（−1.9%）。h2c-plain（対照）は ±2%。
+
+### 2. `classify` が引いたルートをタスクへ渡す・一時の `Vec` を使い回す
+
+- メインループの `classify`（ストリーミングにするかの下見）とタスクの `h3_route_request` が、要求ごとに設定を読み
+  （`CURRENT_CONFIG.load()`、1 回 100 命令超）、ルートを 2 回引いていた。`classify` が引いた値がワーカーのルートの表の値
+  （`RouteMatch::Worker`）なら、`Wasm` のエンジンの写しと一緒にタスクへ渡す（`ClassifiedRoute`）。トラフィック制御のあるルートは
+  下見では乱数を引かずに `Owned` を返すので（abort は常に当たり、分割は先頭）、下見が `Worker` を返すのは乱数の要らないルートだけで、
+  本番の抽選と同じ値になる。`Owned` はタスクが引き直す。メトリクス・管理 API の要求は `classify` がルートを引く前にバッファ経路へ
+  回すので、ルートを渡された要求はタスクでもルートの照合へ進む。`classify` の中のルートの照合も、入口で読んだ設定を使う
+  （`resolve_route_in`）。
+- 本文まで揃った要求・送り終えたストリームの ID を集める `Vec` を、束ごとに確保せずに使い回す（`ev_done`）。
+- f324p → f324r: h3-plain 5.65 → 5.41（epoll、−4.2%）・5.70 → 5.88（io_uring、+3.2%）、h3-wasm 8.15 → 7.84（−3.8%）・
+  8.94 → 8.96、static-h3 31.77 → 32.51（+2.3%）・32.63 → 32.87（+0.7%）。io_uring の h3-plain・static-h3 の増えは同じ組の中の揺れ
+  （同じビルドの f324p-uring が前の比較では 5.52）の範囲。プロファイル（io_uring の h3-plain）で `memmove` 6.79 → 5.01%、
+  `process_h3_events` 5.14 → 4.36%、`select_route`・ルートのキャッシュ（LRU）・`FuturesUnordered` が上位から消えた。
+- 1・2 を合わせて h3-plain は epoll で約 −8%、io_uring で約 −6〜9%。
+
+### 残っている費用（f324r、io_uring の h3-plain のプロファイル）
+
+- 上位は quiche: `StreamMap::get_or_create` 3.9%・`Connection::recv` 3.6%・`RecvBuf::ready` 3.3%・`process_readable_stream` 2.4%・
+  `stream_do_send` 2.3%・`do_stream_recv` 2.2%・`SendBuf` 2.1%・優先度の赤黒木（`intrusive_collections`）合わせて約 5%。
+  確保（`__rust_alloc` 5.7%・`VeilAlloc` 1.5%）と `memmove` 5.0% の多くも quiche のストリームの作成・破棄。
+- veil 側: `process_h3_events` 4.4%・`handle_request_impl` 1.3%・`h3_check_field_section` 1.2%・arc_swap 1.6%（`classify` の
+  設定の読み取り）。
 
 ## 受け入れ条件
 

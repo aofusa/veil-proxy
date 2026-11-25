@@ -384,9 +384,9 @@ pub async fn run_http3_server_async(
     let notify = crate::http3_stream::H3Notify::new();
     // F-46: バックエンドタスクの型付きプール（本ワーカースレッドの全接続で共有）。
     let backend_spawner = crate::http3_stream::backend_task_spawner();
-    // B-97: バッファ経路の要求 Future（静的配信・gRPC・Wasm・buffering=full 等）。メインループは
-    // これを await せず、起床したものだけを select のアームと `poll_buffered_once` で進める。
-    let mut buffered_futs = futures::stream::FuturesUnordered::new();
+    // B-97・F-324: バッファ経路の要求（静的配信・gRPC・Wasm・buffering=full 等）の型付きプール（本ワーカースレッドの
+    // 全接続で共有）。メインループは要求を await しない。
+    let buffered_pool = crate::runtime::TaskPool::new();
 
     // B-94: サーバ接続 ID 導出鍵（プロセスで 1 個。初回アクセス時に乱数で生成）。
     let cid_key: &hmac::Key = &SERVER_CID_KEY;
@@ -608,7 +608,6 @@ pub async fn run_http3_server_async(
                 }
                 let outcome = futures::select_biased! {
                     r = futures::FutureExt::fuse(ms.recv_batch()) => MsOutcome::Batch(r),
-                    _ = futures::FutureExt::fuse(std::future::poll_fn(|cx| poll_buffered_arm(&mut buffered_futs, cx))) => MsOutcome::Notified,
                     _ = futures::FutureExt::fuse(notify.wait()) => MsOutcome::Notified,
                     _ = futures::FutureExt::fuse(crate::runtime::time::sleep(timeout_duration)) => MsOutcome::Timeout,
                 };
@@ -695,7 +694,6 @@ pub async fn run_http3_server_async(
             // フォールバック: POLL_ADD + recvmsg/recvmmsg（F-33/F-115）
             let recv_outcome = futures::select_biased! {
                 r = futures::FutureExt::fuse(socket.recv_gro_async(&mut recv_buf)) => RecvOutcome::Packet(r),
-                _ = futures::FutureExt::fuse(std::future::poll_fn(|cx| poll_buffered_arm(&mut buffered_futs, cx))) => RecvOutcome::Notified,
                 _ = futures::FutureExt::fuse(notify.wait()) => RecvOutcome::Notified,
                 _ = futures::FutureExt::fuse(crate::runtime::time::sleep(timeout_duration)) => RecvOutcome::Timeout,
             };
@@ -844,14 +842,14 @@ pub async fn run_http3_server_async(
                     }
                 }
 
-                // B-97: 新しいバッファ経路の要求を Future 集合へ移し、その場で 1 回 poll する
+                // B-97: 新しいバッファ経路の要求をプールのスロットの中で作り、その場で 1 回 poll する
                 // （await せずに完了する要求は、直後の drive_proxy_streams で同じイテレーション内に
-                // 送出される）。
-                if !handler.new_buffered.is_empty() {
-                    for (task, headers, body) in handler.new_buffered.drain(..) {
-                        buffered_futs.push(buffered_request_task(task, headers, body));
-                    }
-                    poll_buffered_once(&mut buffered_futs);
+                // 送出される）。待ちに入った要求は実行器のタスクとして残り、応答を積むたびと送り終えたときに
+                // `ConnWaker` でメインループを起こす。F-324: `FuturesUnordered` へ移すと要求ごとに future の写し
+                // （数 KB）と `Arc` の確保・解放が 1 回ずつ要った（HTTP/2 のストリームと同じ `spawn_inline_with`）
+                for (task, headers, body) in handler.new_buffered.drain(..) {
+                    let _ = buffered_pool
+                        .spawn_inline_with(|| buffered_request_task(task, headers, body));
                 }
 
                 // F-32: ストリーミングストリームを駆動。バックエンドタスクが生成したレスポンス

@@ -37,52 +37,42 @@ pub(super) struct H3BufferedTask {
     /// `classify` が引いたキャッシュの結果（当たり・バッファ経路へ回した外れ）。`Some` の要求は `classify` が
     /// セキュリティの検査を済ませている（F-257）
     pub(super) cache: Option<crate::proxy::cache_lookup::CacheLookup>,
+    /// `classify` が引いたルート（`None` はタスクが設定を読んで引く。F-324）
+    pub(super) routed: Option<ClassifiedRoute>,
 }
 
-/// バッファ経路の要求 Future を即座に 1 回だけ poll する（B-97）。
+/// `classify` が引いたルート（F-324）。バッファ経路の要求のタスクが設定を読み直さず、ルートも引き直さないように渡す。
 ///
-/// キャッシュに当たる静的配信・ローカル応答のように await せずに完了する要求は、ここで
-/// 応答をチャネルへ積み終え、同じイテレーションの `drive_proxy_streams` で送出される
-/// （タスクとして spawn すると、メインループのイテレーション末尾の `yield_now` まで実行されず、
-/// 応答の送出が 1 イテレーション遅れて `h3_file` 3B で約 12% 退行した）。
-///
-/// 待ちに入った Future は `FuturesUnordered` に残り、起床するとメインループの select の
-/// アームで poll される。ここでの poll は no-op Waker で行うが、`FuturesUnordered` は
-/// 各 Future に自前の Waker を渡すため取りこぼしはない（select のアームが実 Waker で
-/// poll し直してから待機に入る）。
-pub(super) fn poll_buffered_once<F: std::future::Future<Output = ()>>(
-    futs: &mut futures::stream::FuturesUnordered<F>,
-) {
-    use futures::StreamExt;
-    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-    while let std::task::Poll::Ready(Some(())) = futs.poll_next_unpin(&mut cx) {}
+/// 持つのはワーカーのルートの表の値だけ（トラフィック制御の無いルート。下見と本番で同じ値になる）。`classify` は
+/// メトリクス・管理 API の要求をルートを引く前にバッファ経路へ回すので、これがある要求はタスクでもルートの照合へ進む。
+pub(super) struct ClassifiedRoute {
+    /// ルートの値。`None` は合うルートが無い（404）
+    target: Option<std::rc::Rc<crate::l7::RouteTarget>>,
+    /// Wasm のモジュールのあるルートのエンジンのワーカーの写し（[`h3_route_request`] と同じ）
+    #[cfg(feature = "wasm")]
+    wasm_engine: Option<std::rc::Rc<crate::wasm::WorkerEngine>>,
 }
 
-/// メインループの select アーム: 起床したバッファ経路の要求 Future を進める（B-97）。
-///
-/// 1 件でも完了したら `Ready`。完了しない進捗（応答断片の送出）は Future 内の
-/// `ConnWaker::notify` が notify アームを起こす。空のときは `Pending` のまま（`Ready(None)`
-/// で select を空回りさせない）。
-pub(super) fn poll_buffered_arm<F: std::future::Future<Output = ()>>(
-    futs: &mut futures::stream::FuturesUnordered<F>,
-    cx: &mut std::task::Context<'_>,
-) -> std::task::Poll<()> {
-    use futures::StreamExt;
-    let mut completed = false;
-    while let std::task::Poll::Ready(Some(())) = futs.poll_next_unpin(cx) {
-        completed = true;
-    }
-    if completed {
-        std::task::Poll::Ready(())
-    } else {
-        std::task::Poll::Pending
+impl ClassifiedRoute {
+    /// `config` は `classify` が要求の入口で 1 回だけ読んだ設定
+    pub(super) fn new(
+        config: &crate::config::RuntimeConfig,
+        target: Option<&std::rc::Rc<crate::l7::RouteTarget>>,
+    ) -> Self {
+        #[cfg(not(feature = "wasm"))]
+        let _ = config;
+        Self {
+            #[cfg(feature = "wasm")]
+            wasm_engine: target.and_then(|t| h3_wasm_engine(config, &t.backend)),
+            target: target.cloned(),
+        }
     }
 }
 
 /// バッファ経路の要求タスク本体。
 ///
 /// `async fn` にせず `async move` のブロックを返す（`async fn` は引数をフューチャの状態に 2 度置く（受け取った値と、
-/// 本体の局所変数へ移した値）。`H3BufferedTask` は 250 バイト近くあり、要求ごとに作って `FuturesUnordered` へ移す）
+/// 本体の局所変数へ移した値）。`H3BufferedTask` は 250 バイト近くあり、要求ごとにタスクのプールのスロットの中で作る）
 // clippy の `manual_async_fn` は `async fn` へ戻すよう勧めるが、戻すと上の 2 度置きでフューチャが大きくなる
 #[allow(clippy::manual_async_fn)]
 pub(super) fn buffered_request_task(
@@ -726,17 +716,25 @@ impl H3BufferedTask {
         // 設定は要求の入口で 1 回だけ読み、メトリクス・管理 API・経路の解決をここで決めて手放す（Guard を `.await`
         // をまたいで持たない。arc_swap のスレッドの速いスロットは 8 個で、埋まると以後の読み取りが全部、全ワーカー
         // 共有の参照カウントへの書き込みになる。以前はこの Guard を要求の終わり〈上流への中継の間も〉まで持っていた。B-501）
-        let routed = {
-            let config = CURRENT_CONFIG.load();
-            h3_route_request(
-                &config,
-                method,
-                path,
-                authority,
-                headers,
-                &self.client_ip,
-                &self.peer_addr,
-            )
+        let routed = match self.routed.take() {
+            // `classify` が引いたルート（F-324）
+            Some(r) => H3Routed::Route {
+                route: r.target.map(crate::l7::RouteMatch::Worker),
+                #[cfg(feature = "wasm")]
+                wasm_engine: r.wasm_engine,
+            },
+            None => {
+                let config = CURRENT_CONFIG.load();
+                h3_route_request(
+                    &config,
+                    method,
+                    path,
+                    authority,
+                    headers,
+                    &self.client_ip,
+                    &self.peer_addr,
+                )
+            }
         };
         #[cfg(feature = "wasm")]
         let wasm_engine;
@@ -2428,6 +2426,23 @@ enum H3Routed {
     },
 }
 
+/// Wasm のモジュールのあるルートのエンジンのワーカーの写し（要求の並びに持たせる。以後のフェーズは設定を読み直さない）
+#[cfg(feature = "wasm")]
+#[inline]
+fn h3_wasm_engine(
+    config: &crate::config::RuntimeConfig,
+    backend: &Backend,
+) -> Option<std::rc::Rc<crate::wasm::WorkerEngine>> {
+    if backend.modules_arc().is_some_and(|m| !m.is_empty()) {
+        config
+            .wasm_filter_engine
+            .as_ref()
+            .map(crate::wasm::worker_engine)
+    } else {
+        None
+    }
+}
+
 /// HTTP/3 の要求のメトリクス・管理 API・経路の解決（同期。`config` は要求の入口で 1 回だけ読んだもの）
 #[inline]
 fn h3_route_request(
@@ -2481,13 +2496,9 @@ fn h3_route_request(
         true,
     );
     #[cfg(feature = "wasm")]
-    let wasm_engine = match &route {
-        Some(r) if r.backend.modules_arc().is_some_and(|m| !m.is_empty()) => config
-            .wasm_filter_engine
-            .as_ref()
-            .map(crate::wasm::worker_engine),
-        _ => None,
-    };
+    let wasm_engine = route
+        .as_ref()
+        .and_then(|r| h3_wasm_engine(config, &r.backend));
     H3Routed::Route {
         route,
         #[cfg(feature = "wasm")]
