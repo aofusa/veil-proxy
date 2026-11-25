@@ -21,6 +21,8 @@ struct Conn {
     status_ok: bool,
     /// Bytes of a partly written request.
     pending: Vec<u8>,
+    /// A response said `Connection: close`: send nothing more and open the connection again when the server closes it.
+    closing: bool,
 }
 
 fn build_requests(a: &Args) -> Vec<Vec<u8>> {
@@ -59,11 +61,12 @@ fn find_crlf2(b: &[u8]) -> Option<usize> {
     None
 }
 
-// 先頭から `\r\n\r\n` までのヘッダを見て本文の長さを返す
-fn head_info(h: &[u8]) -> (usize, bool, bool) {
+// 先頭から `\r\n\r\n` までのヘッダを見て本文の長さ・chunked・2xx・`Connection: close` を返す
+fn head_info(h: &[u8]) -> (usize, bool, bool, bool) {
     let ok = h.len() > 12 && h[9] == b'2';
     let mut cl = 0usize;
     let mut chunked = false;
+    let mut close = false;
     let mut i = 0;
     while i + 1 < h.len() {
         // 行の先頭
@@ -78,6 +81,9 @@ fn head_info(h: &[u8]) -> (usize, bool, bool) {
                 cl = cl * 10 + (h[j] - b'0') as usize;
                 j += 1;
             }
+        } else if c == b'c' && h.len() - i > 11 && h[i..i + 11].eq_ignore_ascii_case(b"connection:") {
+            let e = h[i..].iter().position(|&x| x == b'\r').unwrap_or(h.len() - i);
+            close = h[i + 11..i + e].windows(5).any(|w| w.eq_ignore_ascii_case(b"close"));
         } else if c == b't'
             && h.len() - i > 26
             && h[i..i + 18].eq_ignore_ascii_case(b"transfer-encoding:")
@@ -92,7 +98,7 @@ fn head_info(h: &[u8]) -> (usize, bool, bool) {
             None => break,
         }
     }
-    (cl, chunked, ok)
+    (cl, chunked, ok, close)
 }
 
 // chunked の本文を飛ばす: 全部読めたら消費したバイト数を返す
@@ -181,6 +187,7 @@ pub fn run(
             next: (tid + i) % reqs.len(),
             status_ok: true,
             pending: Vec::new(),
+            closing: false,
         });
     }
     let fixed = a.rate > 0.0;
@@ -190,10 +197,10 @@ pub fn run(
     // 空き接続は FIFO で回す。LIFO だと同じ数本だけが温まり続けて、残りの接続に要求が届かない
     // （接続数を増やしても負荷の形が変わらず、外部の計測で見える頭打ちを再現できなかった）
     let mut free: VecDeque<usize> = VecDeque::with_capacity(conns.len());
+    let depth = a.pipeline.max(1);
     if fixed {
         free.extend(0..conns.len());
     } else {
-        let depth = a.pipeline.max(1);
         for i in 0..conns.len() {
             for _ in 0..depth {
                 let c = &mut conns[i];
@@ -241,7 +248,8 @@ pub fn run(
         for ei in 0..n as usize {
             let idx = events[ei].u64 as usize;
             let c = &mut conns[idx];
-            // 読む
+            // 読む（相手が閉じていたら、届いている応答を数えてから張り直す）
+            let mut eof = false;
             loop {
                 if c.len == c.buf.len() {
                     c.buf.resize(c.buf.len() * 2, 0);
@@ -249,10 +257,7 @@ pub fn run(
                 // SAFETY: バッファの残りへ読む
                 let r = unsafe { libc::read(c.fd, c.buf[c.len..].as_mut_ptr().cast(), c.buf.len() - c.len) };
                 if r == 0 {
-                    rep.errors += 1;
-                    let mut ev = libc::epoll_event { events: 0, u64: 0 };
-                    // SAFETY: 閉じた接続を外す
-                    unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_DEL, c.fd, &mut ev) };
+                    eof = true;
                     break;
                 }
                 if r < 0 {
@@ -283,9 +288,10 @@ pub fn run(
                     }
                 } else {
                     let Some(h) = find_crlf2(&c.buf[off..c.len]) else { break };
-                    let (cl, chunked, ok) = head_info(&c.buf[off..off + h]);
+                    let (cl, chunked, ok, close) = head_info(&c.buf[off..off + h]);
                     off += h;
                     c.status_ok = ok;
+                    c.closing |= close;
                     c.chunked = chunked;
                     c.skip = cl;
                     if record {
@@ -305,7 +311,9 @@ pub fn run(
                         rep.non2xx += 1;
                     }
                 }
-                if fixed {
+                if c.closing {
+                    // 閉じられる接続には送らない（張り直してから送る）
+                } else if fixed {
                     if c.inflight.is_empty() {
                         free.push_back(idx);
                     }
@@ -325,13 +333,61 @@ pub fn run(
                 c.buf.copy_within(off..c.len, 0);
                 c.len -= off;
             }
+            if eof {
+                // 応答の届かなかった要求は失敗。`Connection: close` の後の正しい切断なら 0 件
+                rep.errors += c.inflight.len() as u64;
+                let mut ev = libc::epoll_event { events: 0, u64: 0 };
+                // SAFETY: 閉じた接続を外して閉じる
+                unsafe {
+                    libc::epoll_ctl(ep, libc::EPOLL_CTL_DEL, c.fd, &mut ev);
+                    libc::close(c.fd);
+                }
+                c.fd = -1;
+                match connect_nb(&addr) {
+                    Ok(fd) => {
+                        c.fd = fd;
+                        c.len = 0;
+                        c.inflight.clear();
+                        c.skip = 0;
+                        c.chunked = false;
+                        c.pending.clear();
+                        c.closing = false;
+                        let mut ev = libc::epoll_event {
+                            events: libc::EPOLLIN as u32,
+                            u64: idx as u64,
+                        };
+                        // SAFETY: fd と ev は有効
+                        unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+                        if record {
+                            rep.reconnects += 1;
+                        }
+                        if fixed {
+                            free.push_back(idx);
+                        } else {
+                            for _ in 0..depth {
+                                let r = &reqs[c.next];
+                                c.next = (c.next + 1) % reqs.len();
+                                c.inflight.push_back(now_ns(base));
+                                if !write_all(c, r) {
+                                    rep.errors += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("connect: {}", e);
+                        rep.errors += 1;
+                    }
+                }
+                continue;
+            }
             if !c.pending.is_empty() {
                 let p = std::mem::take(&mut c.pending);
                 write_all(c, &p);
             }
         }
     }
-    for c in &conns {
+    for c in conns.iter().filter(|c| c.fd >= 0) {
         // SAFETY: 終了時に閉じる
         unsafe { libc::close(c.fd) };
     }
@@ -353,10 +409,14 @@ mod tests {
 
     #[test]
     fn reads_the_length_and_status() {
-        let (cl, ch, ok) = head_info(b"HTTP/1.1 200 OK\r\ncontent-length: 123\r\nx: y\r\n\r\n");
-        assert_eq!((cl, ch, ok), (123, false, true));
-        let (_, ch, ok) = head_info(b"HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\n\r\n");
+        let (cl, ch, ok, close) = head_info(b"HTTP/1.1 200 OK\r\ncontent-length: 123\r\nx: y\r\n\r\n");
+        assert_eq!((cl, ch, ok, close), (123, false, true, false));
+        let (_, ch, ok, _) = head_info(b"HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\n\r\n");
         assert!(ch && !ok);
+        let (cl, _, _, close) = head_info(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\n");
+        assert_eq!((cl, close), (2, true));
+        let (_, _, _, close) = head_info(b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n");
+        assert!(!close);
     }
 
     #[test]

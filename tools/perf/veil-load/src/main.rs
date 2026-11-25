@@ -137,6 +137,8 @@ pub struct Report {
     pub non2xx: u64,
     pub bytes: u64,
     pub max_lag_ns: u64,
+    /// Connections opened again after the server closed one (HTTP/1.1 `Connection: close`).
+    pub reconnects: u64,
 }
 
 impl Report {
@@ -148,6 +150,7 @@ impl Report {
             non2xx: 0,
             bytes: 0,
             max_lag_ns: 0,
+            reconnects: 0,
         }
     }
 }
@@ -276,6 +279,7 @@ fn main() {
         total.non2xx += r.non2xx;
         total.bytes += r.bytes;
         total.max_lag_ns = total.max_lag_ns.max(r.max_lag_ns);
+        total.reconnects += r.reconnects;
     }
     let rps = total.ok as f64 / elapsed;
     let us = |v: u64| v as f64 / 1000.0;
@@ -283,7 +287,7 @@ fn main() {
     let ratio = if args.rate > 0.0 { rps / args.rate } else { 0.0 };
     if args.tsv {
         println!(
-            "{}\t{:.0}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.4}\t{}\t{}\t{:.0}",
+            "{}\t{:.0}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.4}\t{}\t{}\t{:.0}\t{}",
             args.label,
             rps,
             us(h.mean()),
@@ -296,10 +300,11 @@ fn main() {
             total.errors,
             total.non2xx,
             total.bytes as f64 / total.ok.max(1) as f64,
+            total.reconnects,
         );
     } else {
         println!(
-            "rps={:.0} mean_us={:.1} p50_us={:.1} p90_us={:.1} p99_us={:.1} p999_us={:.1} max_us={:.1} rate_ratio={:.4} errors={} non2xx={} bytes_per_resp={:.0} max_lag_us={:.1}",
+            "rps={:.0} mean_us={:.1} p50_us={:.1} p90_us={:.1} p99_us={:.1} p999_us={:.1} max_us={:.1} rate_ratio={:.4} errors={} non2xx={} bytes_per_resp={:.0} max_lag_us={:.1} reconnects={}",
             rps,
             us(h.mean()),
             us(h.percentile(50.0)),
@@ -312,6 +317,7 @@ fn main() {
             total.non2xx,
             total.bytes as f64 / total.ok.max(1) as f64,
             us(total.max_lag_ns),
+            total.reconnects,
         );
     }
 }

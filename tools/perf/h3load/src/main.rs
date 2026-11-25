@@ -85,12 +85,17 @@ struct Args {
     total_requests: Option<u64>,
     duration: Option<Duration>,
     threads: usize,
-    url: String,
+    url: Option<String>,
+    /// `-H name: value`（繰り返し可。全リクエストに付ける）
+    headers: Vec<(String, String)>,
+    /// `-i FILE`: 1 行 1 URL の一覧。リクエストごとに順に回す（h2load の `-i` と同じ。host:port は全行で同じであること）
+    uri_file: Option<String>,
 }
 
 fn print_help() {
     eprintln!(
-        "h3load [-c CONNECTIONS] [-m MAX_CONCURRENT_STREAMS] [-n TOTAL_REQUESTS] [-t THREADS] [-d SECONDS] URL\n\
+        "h3load [-c CONNECTIONS] [-m MAX_CONCURRENT_STREAMS] [-n TOTAL_REQUESTS] [-t THREADS] [-d SECONDS]\n\
+         \x20      [-H 'NAME: VALUE']... (URL | -i URI_FILE)\n\
          \n\
          ポータブル HTTP/3 (QUIC) 負荷生成ツール（h2load 互換の出力書式）。\n\
          \n\
@@ -100,6 +105,8 @@ fn print_help() {
          \x20 -n N   総リクエスト数（-d と排他。両方省略時は -n 1000）\n\
          \x20 -d SEC 秒数で指定した時間だけ実行（-n と排他）\n\
          \x20 -t N   tokio ワーカースレッド数（既定 1）\n\
+         \x20 -H H   全リクエストに付けるヘッダ（`名前: 値`。繰り返し可）\n\
+         \x20 -i F   1 行 1 URL の一覧をリクエストごとに順に回す（host:port は全行で同じ）\n\
          \x20 URL    https://host:port/path のみ対応\n\
          \n\
          注意: 証明書検証は常に無効化する。自己署名証明書を使う\n\
@@ -134,6 +141,8 @@ fn parse_args() -> Result<Args, String> {
     let mut duration: Option<Duration> = None;
     let mut threads = 1usize;
     let mut url: Option<String> = None;
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut uri_file: Option<String> = None;
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -179,6 +188,14 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "-t: 整数値が必要".to_string())?
             }
+            "-H" => {
+                let v = next_val()?;
+                let (n, x) = v
+                    .split_once(':')
+                    .ok_or_else(|| format!("-H: `名前: 値` の形が必要: {v}"))?;
+                headers.push((n.trim().to_ascii_lowercase(), x.trim().to_string()));
+            }
+            "-i" => uri_file = Some(next_val()?),
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -204,7 +221,9 @@ fn parse_args() -> Result<Args, String> {
         return Err("-c / -m / -t は 1 以上を指定すること".to_string());
     }
 
-    let url = url.ok_or_else(|| "URL が指定されていない".to_string())?;
+    if url.is_none() && uri_file.is_none() {
+        return Err("URL が指定されていない".to_string());
+    }
 
     Ok(Args {
         connections,
@@ -213,6 +232,8 @@ fn parse_args() -> Result<Args, String> {
         duration,
         threads,
         url,
+        headers,
+        uri_file,
     })
 }
 
@@ -435,9 +456,14 @@ async fn send_one_request(
     send_request: &mut SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
     authority: &str,
     path: &str,
+    headers: &[(String, String)],
 ) -> Result<(u16, u64), Box<dyn std::error::Error + Send + Sync>> {
     let uri = format!("https://{authority}{path}");
-    let request = Request::builder().method("GET").uri(uri).body(())?;
+    let mut builder = Request::builder().method("GET").uri(uri);
+    for (n, v) in headers {
+        builder = builder.header(n.as_str(), v.as_str());
+    }
+    let request = builder.body(())?;
 
     let mut stream = send_request.send_request(request).await?;
     stream.finish().await?;
@@ -459,7 +485,8 @@ async fn run_connection(
     peer_addr: SocketAddr,
     host: String,
     authority: String,
-    path: String,
+    paths: Arc<Vec<String>>,
+    headers: Arc<Vec<(String, String)>>,
     max_concurrent: usize,
     budget: Arc<Budget>,
 ) -> Stats {
@@ -508,18 +535,23 @@ async fn run_connection(
         .map(Duration::from_millis);
 
     let mut workers = tokio::task::JoinSet::new();
-    for _ in 0..max_concurrent {
+    for worker in 0..max_concurrent {
         let mut send_request = send_request.clone();
         let budget = Arc::clone(&budget);
         let authority = authority.clone();
-        let path = path.clone();
+        let paths = Arc::clone(&paths);
+        let headers = Arc::clone(&headers);
         let diag_conn = slow_threshold.map(|_| conn.clone());
         workers.spawn(async move {
             let mut local = Stats::default();
+            // `-i` の一覧はストリームごとにずらした位置から順に回す
+            let mut next = worker;
             while budget.try_acquire() {
                 local.started += 1;
                 let req_start = Instant::now();
-                let result = send_one_request(&mut send_request, &authority, &path).await;
+                let path = &paths[next % paths.len()];
+                next = next.wrapping_add(1);
+                let result = send_one_request(&mut send_request, &authority, path, &headers).await;
                 if let (Some(th), Some(c)) = (slow_threshold, diag_conn.as_ref()) {
                     let took = req_start.elapsed();
                     if took > th {
@@ -566,9 +598,11 @@ async fn run(
     args: Args,
     host: String,
     authority: String,
-    path: String,
+    paths: Vec<String>,
     peer_addr: SocketAddr,
 ) -> Stats {
+    let paths = Arc::new(paths);
+    let headers = Arc::new(args.headers.clone());
     let endpoint = match build_endpoint() {
         Ok(e) => e,
         Err(e) => {
@@ -588,7 +622,8 @@ async fn run(
         let endpoint = endpoint.clone();
         let host = host.clone();
         let authority = authority.clone();
-        let path = path.clone();
+        let paths = Arc::clone(&paths);
+        let headers = Arc::clone(&headers);
         let budget = Arc::clone(&budget);
         let max_concurrent = args.max_concurrent;
         conns.spawn(run_connection(
@@ -596,7 +631,8 @@ async fn run(
             peer_addr,
             host,
             authority,
-            path,
+            paths,
+            headers,
             max_concurrent,
             budget,
         ));
@@ -628,12 +664,45 @@ fn main() {
         }
     };
 
-    let (host, port, path) = match parse_url(&args.url) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("h3load: {e}");
-            std::process::exit(1);
+    // URL か `-i` の一覧（全行の host:port は同じ）から接続先とパスの一覧を作る
+    let urls: Vec<String> = match &args.uri_file {
+        Some(f) => match std::fs::read_to_string(f) {
+            Ok(s) => s
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
+            Err(e) => {
+                eprintln!("h3load: {f}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => vec![args.url.clone().unwrap_or_default()],
+    };
+    let mut target: Option<(String, u16)> = None;
+    let mut paths = Vec::with_capacity(urls.len());
+    for u in &urls {
+        let (h, p, path) = match parse_url(u) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("h3load: {e}");
+                std::process::exit(1);
+            }
+        };
+        match &target {
+            None => target = Some((h, p)),
+            Some((th, tp)) if *th == h && *tp == p => {}
+            Some(_) => {
+                eprintln!("h3load: -i の URL は全部同じ host:port であること: {u}");
+                std::process::exit(1);
+            }
         }
+        paths.push(path);
+    }
+    let Some((host, port)) = target else {
+        eprintln!("h3load: URL が 1 つも無い");
+        std::process::exit(1);
     };
     let authority = if port == 443 {
         host.clone()
@@ -669,7 +738,7 @@ fn main() {
     };
 
     let start = Instant::now();
-    let stats = rt.block_on(run(args, host, authority, path, peer_addr));
+    let stats = rt.block_on(run(args, host, authority, paths, peer_addr));
     let elapsed = start.elapsed();
 
     print_summary(&stats, elapsed);
