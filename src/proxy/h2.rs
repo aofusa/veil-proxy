@@ -727,10 +727,13 @@ pub(super) fn h2_spawn_for_request<S, V>(
             .unwrap_or_default()
     });
 
-    if let Ok(host_str) = std::str::from_utf8(&authority) {
-        connection_metric.set_host(host_str);
-    } else {
-        connection_metric.set_host("unknown");
+    // メトリクスのラベルが要るのは接続の最初の要求だけ（ストリームごとに UTF-8 を検査しない。h1 と同じ。F-323）
+    if connection_metric.wants_host() {
+        if let Ok(host_str) = std::str::from_utf8(&authority) {
+            connection_metric.set_host(host_str);
+        } else {
+            connection_metric.set_host("unknown");
+        }
     }
 
     let head_req = parts.method.as_ref() == b"HEAD";

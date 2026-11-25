@@ -981,8 +981,10 @@ pub fn wait_for_completions() -> std::io::Result<()> {
 
     poll_completions();
     take_armed_timer_result_if_fired();
+    // 起床ごとに 1 回だけ時刻を読み、粗い時計（`coarse_now`）にも使う（F-323）
+    let now = timer::refresh_now();
     if timer::has_timers() {
-        timer::fire_expired(Instant::now());
+        timer::fire_expired(now);
     }
     Ok(())
 }
@@ -1522,6 +1524,8 @@ impl Executor {
         let result: Rc<RefCell<Option<R>>> = Rc::new(RefCell::new(None));
         let setter = result.clone();
 
+        // 粗い時計（`timer::coarse_now`）に前の `block_on` の時刻を残さない（F-323）
+        timer::refresh_now();
         spawn(async move {
             let r = future.await;
             *setter.borrow_mut() = Some(r);
@@ -1533,7 +1537,7 @@ impl Executor {
             // （park は無関係な完了が来るまで戻らない）、満了済みタイマーのタスクが
             // 任意の時間ストールし得る。ヒープが空なら `Instant::now()` すら呼ばない。
             if timer::has_timers() {
-                timer::fire_expired(Instant::now());
+                timer::fire_expired(timer::refresh_now());
             }
 
             // Ready なタスクを実行（上で起こしたタスクも含む）
@@ -1553,6 +1557,7 @@ impl Executor {
             }
         }
 
+        timer::clear_loop_now();
         // RefMut の一時値を result より先にドロップするため一旦ローカルに束ねる。
         let value = result
             .borrow_mut()

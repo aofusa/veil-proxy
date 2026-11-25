@@ -147,7 +147,8 @@ impl Stream {
             receiving_headers: false,
             content_length: None,
             received_body_size: 0,
-            last_activity: std::time::Instant::now(),
+            // 実行器が起床ごとに読んだ時刻（ストリームごとに時刻を読まない。アイドルの判定は秒単位。F-323）
+            last_activity: crate::runtime::time::coarse_now(),
             recv_timeout_secs: 0,
             tunnel: false,
             #[cfg(feature = "grpc")]
@@ -410,7 +411,7 @@ impl Stream {
     /// 最終アクティビティ時刻を更新
     #[inline]
     pub fn update_activity(&mut self) {
-        self.last_activity = std::time::Instant::now();
+        self.last_activity = crate::runtime::time::coarse_now();
     }
 
     /// アイドルタイムアウトを超過しているか確認

@@ -1208,10 +1208,20 @@ pub(crate) fn request_target_is_clean(target: &[u8]) -> bool {
 
 /// `:path` に空白・制御文字（0x00〜0x20・0x7F）が無いか（要求行に書いたとき分割されない）。
 /// `#` を含むもの・UTF-8 でないものも断る（[`request_target_is_clean`]。B-373）。
+///
+/// 1 回の走査で見る（HTTP/2・HTTP/3 の要求ごと。ASCII だけの要求先は UTF-8 として正しいので、0x80 以上の
+/// バイトがあるときだけ UTF-8 を検査する。F-323）。
 #[cfg(any(feature = "http2", feature = "http3"))]
 #[inline]
 pub(crate) fn is_valid_request_target(path: &[u8]) -> bool {
-    !path.is_empty() && path.iter().all(|&b| b > 0x20 && b != 0x7f) && request_target_is_clean(path)
+    let mut non_ascii = false;
+    for &b in path {
+        if b <= 0x20 || b == 0x7f || b == b'#' {
+            return false;
+        }
+        non_ascii |= b >= 0x80;
+    }
+    !path.is_empty() && (!non_ascii || std::str::from_utf8(path).is_ok())
 }
 
 // ====================
@@ -2483,6 +2493,14 @@ mod idempotent_method_tests {
         assert!(!super::is_valid_request_target(b"/admin#x"));
         assert!(!super::is_valid_request_target(b"/admin\xff"));
         assert!(!super::is_valid_request_target(b"/a b"));
+        // F-323: 1 回の走査にしても同じ判定
+        assert!(!super::is_valid_request_target(b""));
+        assert!(!super::is_valid_request_target(b"/a\x7f"));
+        assert!(!super::is_valid_request_target(b"/a\x00"));
+        assert!(!super::is_valid_request_target("/\u{65e5}#x".as_bytes()));
+        assert!(!super::is_valid_request_target(b"/\xe6\x97"));
+        assert!(!super::is_valid_request_target(b"/\xe6\x97 "));
+        assert!(super::is_valid_request_target(b"/baseline2?a=1&b=1"));
     }
 }
 

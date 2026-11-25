@@ -254,6 +254,21 @@ impl TimerState {
 
 thread_local! {
     static TIMERS: RefCell<TimerState> = RefCell::new(TimerState::new());
+    /// 実行器が起床ごとに 1 回だけ読む時刻（[`refresh_now`]。reactor 版と同じ。F-323）
+    static LOOP_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// 起床ごとに 1 回だけ時刻を読み直して保持する（`executor` の park からの起床・`block_on` の周回から呼ぶ）
+#[inline]
+pub(crate) fn refresh_now() -> Instant {
+    let now = Instant::now();
+    LOOP_NOW.with(|c| c.set(Some(now)));
+    now
+}
+
+/// `block_on` を抜けるときに保持した時刻を捨てる（次の `block_on` の前に古い時刻を返さない）
+pub(crate) fn clear_loop_now() {
+    LOOP_NOW.with(|c| c.set(None));
 }
 
 /// 現在のスレッドの最近接タイマーデッドラインを返す（`executor::wait_for_completions` の
@@ -302,8 +317,13 @@ pub struct Sleep {
 impl Sleep {
     /// 指定した Duration 後に完了する Sleep Future を作成する
     pub fn new(duration: Duration) -> Self {
+        let now = if duration >= COARSE_CLOCK_MIN {
+            coarse_now()
+        } else {
+            Instant::now()
+        };
         Self {
-            deadline: Instant::now() + duration,
+            deadline: now + duration,
             token: 0,
             registered: false,
             idle: false,
@@ -361,14 +381,24 @@ impl Drop for Sleep {
 // sleep / timeout API
 // ====================
 
-/// 指定した Duration スリープする
-/// reactor 版（起床ごとに 1 回読む粗い時計）と同じ公開 API。io_uring 版は既存の
-/// ロジックを変えないため、その場で正確な時刻を返す。
+/// 直近の起床時に読んだ時刻（実行器のループの外のスレッドではその場で読む。reactor 版と同じ）。
+///
+/// 要求ごとに作られる長いタイムアウト（I/O の 30〜60 秒）の期限・HTTP/2 のストリームの最終活動時刻・アクセスログが
+/// 無効なときの要求の開始時刻で、毎回 `Instant::now()` を読まないために使う（aofish の h2c の `Respond` で
+/// `clock_gettime` がユーザー時間の 2.9%。F-323）。値は最大で「起床後に動いたタスクの処理時間」だけ古いので、
+/// 精度が必要な用途には使わないこと。
 #[inline]
 pub fn coarse_now() -> Instant {
-    Instant::now()
+    // None のときに値を保存しない（実行器のループが無いスレッドで初回の時刻に固定しない）
+    LOOP_NOW.with(|c| c.get()).unwrap_or_else(Instant::now)
 }
 
+/// これ以上のタイムアウトは粗い時計で期限を計算する（早まっても誤差は起床後の処理時間分で、
+/// 秒単位のタイムアウトには影響しない）。短いスリープは「少なくとも指定時間眠る」を
+/// 保証するため正確な時刻を使う（reactor 版と同じ）。
+const COARSE_CLOCK_MIN: Duration = Duration::from_secs(1);
+
+/// 指定した Duration スリープする
 pub fn sleep(duration: Duration) -> Sleep {
     Sleep::new(duration)
 }
@@ -378,9 +408,9 @@ pub fn sleep(duration: Duration) -> Sleep {
 /// タイムアウト前に Future が完了すれば `Ok(R)` を返す。
 /// タイムアウトした場合は `Err(Elapsed)` を返す。
 ///
-/// タイマー（[`Sleep`]）は内側の Future が最初の poll で終わらなかったときに作る。io_uring の `Sleep::new` は
-/// 正確な時計（`clock_gettime`）を読むので、その場で終わる Future（パイプラインで溜める応答の書き込み等）に
-/// 時計とタイマーの費用を払わせない（F-322。期限は最初の poll からで、作った直後に poll する使い方では同じ）。
+/// タイマー（[`Sleep`]）は内側の Future が最初の poll で終わらなかったときに作る。その場で終わる Future
+/// （パイプラインで溜める応答の書き込み等）にタイマーの登録（1 秒未満の期限は正確な時計の読み取りも）の費用を
+/// 払わせない（F-322。期限は最初の poll からで、作った直後に poll する使い方では同じ）。
 pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
     Timeout {
         future,
