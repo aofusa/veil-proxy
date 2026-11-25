@@ -293,9 +293,7 @@ pub(crate) async fn serve(
             crate::api::dispatch::serve_extended_connect(&req, entry, comp.as_deref(), req_rx, out)
                 .await;
         #[cfg(feature = "wasm")]
-        if let Some(engine) = wasm.engine {
-            crate::wasm::on_request_complete_async(engine, wasm.modules).await;
-        }
+        crate::wasm::on_request_complete_async(&wasm.modules).await;
         return result;
     }
 
@@ -363,9 +361,7 @@ pub(crate) async fn serve(
     server.release();
 
     #[cfg(feature = "wasm")]
-    if let Some(engine) = wasm.engine {
-        crate::wasm::on_request_complete_async(engine, wasm.modules).await;
-    }
+    crate::wasm::on_request_complete_async(&wasm.modules).await;
     result
 }
 
@@ -374,8 +370,7 @@ pub(crate) async fn serve(
 struct WasmPhase {
     /// モジュールが書き換えたヘッダ（書き換えなし・モジュールなしは None）
     headers: Option<Vec<(Bytes, Bytes)>>,
-    /// 終わったら `on_request_complete` を呼ぶエンジンとモジュール
-    engine: Option<Arc<crate::wasm::FilterEngine>>,
+    /// 終わったら `on_request_complete` を呼ぶモジュール（エンジンも持つ。B-501）
     modules: crate::wasm_plugin_config::WasmModules,
 }
 
@@ -388,17 +383,24 @@ async fn wasm_request_headers(
 ) -> Result<WasmPhase, (u16, u64)> {
     let none = || WasmPhase {
         headers: None,
-        engine: None,
         modules: crate::wasm::empty_wasm_modules(),
     };
     let Some(modules) = modules.filter(|m| !m.is_empty()) else {
         return Ok(none());
     };
-    let config = CURRENT_CONFIG.load();
-    let Some(engine) = config.wasm_filter_engine.clone() else {
+    // エンジンのワーカーの写しを要求の並びに持たせる（設定の Guard をトンネルの `.await` へ持ち越さない。B-501）
+    let Some(engine) = CURRENT_CONFIG
+        .load()
+        .wasm_filter_engine
+        .as_ref()
+        .map(crate::wasm::worker_engine)
+    else {
         return Ok(none());
     };
-    let modules = crate::wasm_plugin_config::WasmModules::for_request(modules.clone());
+    let modules = crate::wasm_plugin_config::WasmModules::for_request(modules.clone(), engine);
+    let Some(engine) = modules.engine() else {
+        return Ok(none());
+    };
     // B-408: ゲストに見せる `:authority`・`:scheme`・プロトコル（トンネルは上流へ GET の Upgrade として渡す）
     modules.set_request_info(crate::wasm::RequestInfo {
         authority: Arc::from(std::str::from_utf8(&req.authority).unwrap_or("")),
@@ -416,9 +418,8 @@ async fn wasm_request_headers(
         .map(|(n, v)| (n.to_vec(), v.to_vec()))
         .collect();
     let result = engine
-        .clone()
         .on_request_headers_with_modules_async(
-            modules.clone(),
+            &modules,
             Arc::from(std::str::from_utf8(&req.path).unwrap_or("/")),
             Arc::from("GET"),
             headers_vec,
@@ -436,7 +437,6 @@ async fn wasm_request_headers(
                     .map(|(n, v)| (Bytes::from(n.to_ascii_lowercase()), Bytes::from(v)))
                     .collect(),
             ),
-            engine: Some(engine),
             modules,
         }),
         crate::wasm::FilterResult::LocalResponse(resp) => {
@@ -455,7 +455,7 @@ async fn wasm_request_headers(
             {
                 let _ = out.body(Bytes::from(resp.body)).await;
             }
-            crate::wasm::on_request_complete_async(engine, modules).await;
+            crate::wasm::on_request_complete_async(&modules).await;
             Err((resp.status_code, len))
         }
     }

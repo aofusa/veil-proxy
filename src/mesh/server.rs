@@ -384,13 +384,21 @@ async fn tls_accept(
     let fut = async {
         #[cfg(veil_ktls)]
         {
-            let c = crate::config::CURRENT_CONFIG.load();
+            // 設定の Guard はハンドシェイクの `.await` へ持ち越さない（B-501）
+            let (ktls, fallback, cork) = {
+                let c = crate::config::CURRENT_CONFIG.load();
+                (
+                    c.ktls_config.enabled,
+                    c.ktls_config.fallback_enabled,
+                    c.ktls_config.tcp_cork_enabled,
+                )
+            };
             crate::ktls_rustls::accept_with_peer_cert(
                 stream,
                 server_config,
-                c.ktls_config.enabled,
-                c.ktls_config.fallback_enabled,
-                c.ktls_config.tcp_cork_enabled,
+                ktls,
+                fallback,
+                cork,
                 Some(initial),
             )
             .await
@@ -445,15 +453,16 @@ async fn handle(stream: TcpStream, peer: SocketAddr, laddr: SocketAddr) {
     } else {
         local()
     };
-    // virtualOutbound は元の宛先に対応するリスナーへ渡す
-    let table = state().listeners.load();
-    let table_version = table.version;
-    let target: Arc<MeshListener> = if lst.use_original_dst {
-        table.find_original_dst(dst).cloned().unwrap_or(lst)
-    } else {
-        lst
+    // virtualOutbound は元の宛先に対応するリスナーへ渡す（表の Guard は区画の中だけ。`.await` へ持ち越さない。B-501）
+    let (table_version, target): (_, Arc<MeshListener>) = {
+        let table = state().listeners.load();
+        let target = if lst.use_original_dst {
+            table.find_original_dst(dst).cloned().unwrap_or(lst)
+        } else {
+            lst
+        };
+        (table.version, target)
     };
-    drop(table);
     // 静的なリスナー（ブートストラップ）は LDS で変わらないので選び直さない
     let relookup = !STATIC_LISTENERS
         .get()

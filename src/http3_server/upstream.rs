@@ -30,15 +30,14 @@ pub(super) async fn apply_h3_wasm_response_headers(
     if wasm_modules.is_empty() {
         return Ok(header_store);
     }
-    let config = CURRENT_CONFIG.load();
-    let Some(ref wasm_engine) = config.wasm_filter_engine else {
+    // エンジンは要求の並びが持つもの（設定の Guard を Wasm の呼び出しの間持たない。B-501）
+    let Some(wasm_engine) = wasm_modules.engine() else {
         return Ok(header_store);
     };
 
     // ヘッダはエンジンへムーブする（エンジンは成功でも失敗でも回収して返す。F-43）
     match wasm_engine
-        .clone()
-        .on_response_headers_with_modules_async(wasm_modules.clone(), status, header_store, true)
+        .on_response_headers_with_modules_async(wasm_modules, status, header_store, true)
         .await
     {
         crate::wasm::FilterResult::Continue { headers, .. } => Ok(headers),
@@ -56,7 +55,7 @@ pub(super) async fn apply_h3_wasm_response_trailers(
     wasm_modules: &crate::wasm_plugin_config::WasmModules,
     trailers: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let Some(wasm_engine) = CURRENT_CONFIG.load().wasm_filter_engine.clone() else {
+    let Some(wasm_engine) = wasm_modules.engine() else {
         return trailers;
     };
     // ローカル応答のときに元のトレーラを返すため複製を渡す（トレーラとモジュールのある応答だけ）
@@ -91,10 +90,7 @@ pub(super) async fn finish_h3_wasm_lifecycle(
     if modules.is_empty() {
         return;
     }
-    let config = CURRENT_CONFIG.load();
-    if let Some(ref wasm_engine) = config.wasm_filter_engine {
-        crate::wasm::on_request_complete_async(wasm_engine.clone(), modules.clone()).await;
-    }
+    crate::wasm::on_request_complete_async(modules).await;
 }
 
 /// B-39: HTTP/3 → H2C 上流プロキシ（gRPC 等。バッファ型）

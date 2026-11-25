@@ -723,15 +723,28 @@ impl H3BufferedTask {
             );
         }
 
-        // メトリクスエンドポイント（設定可能なパス）
-        {
+        // 設定は要求の入口で 1 回だけ読み、メトリクス・管理 API・経路の解決をここで決めて手放す（Guard を `.await`
+        // をまたいで持たない。arc_swap のスレッドの速いスロットは 8 個で、埋まると以後の読み取りが全部、全ワーカー
+        // 共有の参照カウントへの書き込みになる。以前はこの Guard を要求の終わり〈上流への中継の間も〉まで持っていた。B-501）
+        let routed = {
             let config = CURRENT_CONFIG.load();
-            let prom_config = &config.prometheus_config;
-
-            let path_str = std::str::from_utf8(path).unwrap_or("/");
-            if prom_config.enabled && path_str == prom_config.path && method == b"GET" {
+            h3_route_request(
+                &config,
+                method,
+                path,
+                authority,
+                headers,
+                &self.client_ip,
+                &self.peer_addr,
+            )
+        };
+        #[cfg(feature = "wasm")]
+        let wasm_engine;
+        let backend_result = match routed {
+            // メトリクスエンドポイント（設定可能なパス）
+            H3Routed::Metrics { allowed } => {
                 // IPアドレス制限チェック
-                if !prom_config.is_ip_allowed(self.client_ip.as_str()) {
+                if !allowed {
                     self.send_error_response(403, b"Forbidden").await?;
                     let user_agent_slice: &[u8] = if user_agent.is_empty() {
                         &[]
@@ -783,23 +796,10 @@ impl H3BufferedTask {
                 );
                 return Ok(());
             }
-        }
-
-        // バックエンド選択（統合ルーティング）
-        let config = CURRENT_CONFIG.load();
-
-        // B-483: 管理 API（`/__admin/*`）とキャッシュの PURGE。HTTP/1.1・HTTP/2 と同じく経路の解決の前に受ける
-        // （以前は普通のルートへ流れ、`Authorization` ごと上流へ送られ得た）
-        #[cfg(feature = "admin")]
-        if crate::proxy::is_admin_request(&config.admin_config, method, path) {
-            let auth = headers
-                .iter()
-                .find(|h| h.name().eq_ignore_ascii_case(b"authorization"))
-                .and_then(|h| std::str::from_utf8(h.value()).ok());
-            if let Some((status, json, body)) =
-                crate::proxy::admin_response(&config, method, path, self.client_ip.as_str(), auth)
-            {
-                drop(config);
+            // B-483: 管理 API（`/__admin/*`）とキャッシュの PURGE。HTTP/1.1・HTTP/2 と同じく経路の解決の前に受ける
+            // （以前は普通のルートへ流れ、`Authorization` ごと上流へ送られ得た）
+            #[cfg(feature = "admin")]
+            H3Routed::Admin { status, json, body } => {
                 let body_len = body.len() as u64;
                 let hdrs: &[(&[u8], &[u8])] = if json {
                     &[(b"content-type", b"application/json")]
@@ -822,29 +822,18 @@ impl H3BufferedTask {
                 );
                 return Ok(());
             }
-        }
-
-        // ヘッダーをゼロコピーのバイト列スライスとして参照（HashMap 不要）
-        let headers_raw: Vec<(&[u8], &[u8])> = headers
-            .iter()
-            .filter(|h| !h.name().starts_with(b":")) // 疑似ヘッダーを除外
-            .map(|h| (h.name(), h.value()))
-            .collect();
-
-        // パス/クエリ分離（スキャンを1回に統一）
-        let query_start_pos = path.iter().position(|&b| b == b'?');
-        let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
-        let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(path);
-
-        let backend_result = crate::l7::resolve_route(
-            authority,
-            path_without_query,
-            method,
-            &headers_raw,
-            raw_query,
-            &self.peer_addr,
-            true,
-        );
+            H3Routed::Route {
+                route,
+                #[cfg(feature = "wasm")]
+                    wasm_engine: engine,
+            } => {
+                #[cfg(feature = "wasm")]
+                {
+                    wasm_engine = engine;
+                }
+                route
+            }
+        };
 
         // F-169: File/MemoryFile バックエンドの圧縮ネゴシエーションに使う
         // （従来は破棄していたため、HTTP/3 の静的配信では圧縮が一切効いていなかった）。
@@ -991,20 +980,19 @@ impl H3BufferedTask {
         #[cfg(feature = "wasm")]
         let mut wasm_request_body_override: Option<Bytes> = None;
         #[cfg(feature = "wasm")]
-        {
-            let config = CURRENT_CONFIG.load();
-            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+        if let (Some(backend_modules), Some(engine)) = (backend.modules_arc(), wasm_engine) {
+            {
                 let path_str = std::str::from_utf8(path).unwrap_or("/");
                 let method_str = std::str::from_utf8(method).unwrap_or("GET");
 
-                // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
-                let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
-                    crate::wasm_plugin_config::WasmModules::for_request(backend_modules.clone())
-                } else {
-                    crate::wasm::empty_wasm_modules()
-                };
+                // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）。エンジンは入口で決めた
+                // ワーカーの写し（設定を読み直さない。B-501）
+                let modules_to_apply = crate::wasm_plugin_config::WasmModules::for_request(
+                    backend_modules.clone(),
+                    engine,
+                );
 
-                if !modules_to_apply.is_empty() {
+                if let Some(wasm_engine) = modules_to_apply.engine() {
                     // B-408: ゲストに見せる `:authority`・`:scheme`・プロトコル
                     modules_to_apply.set_request_info(crate::wasm::RequestInfo {
                         authority: std::sync::Arc::from(
@@ -1201,10 +1189,11 @@ impl H3BufferedTask {
                     buffering.mode == crate::buffering::BufferingMode::Full && !is_grpc;
 
                 // HTTP/3専用圧縮設定を解決
-                // 優先順位: パス設定 > HTTP/3設定 > デフォルト
-                let config = CURRENT_CONFIG.load();
-                let effective_compression =
-                    resolve_http3_compression_config(path_compression, &config.http3_config);
+                // 優先順位: パス設定 > HTTP/3設定 > デフォルト（設定の Guard は上流への中継の間持たない。B-501）
+                let effective_compression = resolve_http3_compression_config(
+                    path_compression,
+                    &CURRENT_CONFIG.load().http3_config,
+                );
 
                 // F-132: WASM on_request_body で書き換えられた本文があればそれを使う。
                 #[cfg(feature = "wasm")]
@@ -1256,8 +1245,11 @@ impl H3BufferedTask {
                     self.send_error_response(404, b"Not Found").await?;
                     (404, 9)
                 } else {
-                    let file_compression =
-                        resolve_http3_compression_config(route_compression, &config.http3_config);
+                    let file_compression = resolve_http3_compression_config(
+                        route_compression,
+                        // 設定の Guard はこの文の中だけ（B-501）
+                        &CURRENT_CONFIG.load().http3_config,
+                    );
                     let sreq = static_request_h3(method, headers);
                     self.send_static_response(
                         &sreq,
@@ -1290,8 +1282,11 @@ impl H3BufferedTask {
                 // F-169: HTTP/3 専用圧縮設定を解決（Proxy 経路の `handle_proxy` と同じ
                 // 優先順位: パス設定 > HTTP/3 設定 > デフォルト）。従来 SendFile は
                 // `route_compression` を破棄しており圧縮が一切効いていなかった。
-                let file_compression =
-                    resolve_http3_compression_config(route_compression, &config.http3_config);
+                let file_compression = resolve_http3_compression_config(
+                    route_compression,
+                    // 設定の Guard はこの文の中だけ（B-501）
+                    &CURRENT_CONFIG.load().http3_config,
+                );
                 self.handle_sendfile(SendFileRequest {
                     base_path,
                     is_dir: *is_dir,
@@ -1808,8 +1803,8 @@ impl H3BufferedTask {
                 if !is_grpc_ct {
                     if let Some(modules) = wasm_modules {
                         if !modules.is_empty() {
-                            let config = CURRENT_CONFIG.load();
-                            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                            // エンジンは要求の並びが持つもの（B-501）
+                            if let Some(wasm_engine) = modules.engine() {
                                 match crate::wasm::http_executor::apply_wasm_response_body(
                                     wasm_engine,
                                     modules,
@@ -2410,5 +2405,92 @@ mod tests {
         assert_eq!(&lens[0].1[..], b"8");
         assert_eq!(h.iter().filter(|(n, _)| &n[..] == b"host").count(), 1);
         assert_eq!(b, new_body);
+    }
+}
+
+/// HTTP/3 の要求の入口で設定を読んで決めること（設定の Guard を区画の中だけで使うために、結果を値で返す。B-501）
+enum H3Routed {
+    /// メトリクスのエンドポイント（`allowed` は送信元の IP が許されているか）
+    Metrics { allowed: bool },
+    /// 管理 API・キャッシュの PURGE の応答（B-483）
+    #[cfg(feature = "admin")]
+    Admin {
+        status: u16,
+        json: bool,
+        body: Vec<u8>,
+    },
+    /// 経路の解決の結果。Wasm のモジュールのあるルートは、エンジンのワーカーの写しも（要求の並びに持たせる。
+    /// 以後のフェーズは設定を読み直さない）
+    Route {
+        route: Option<crate::l7::RouteMatch>,
+        #[cfg(feature = "wasm")]
+        wasm_engine: Option<std::rc::Rc<crate::wasm::WorkerEngine>>,
+    },
+}
+
+/// HTTP/3 の要求のメトリクス・管理 API・経路の解決（同期。`config` は要求の入口で 1 回だけ読んだもの）
+#[inline]
+fn h3_route_request(
+    config: &crate::config::RuntimeConfig,
+    method: &[u8],
+    path: &[u8],
+    authority: &[u8],
+    headers: &[h3::Header],
+    client_ip: &crate::http_utils::IpStr,
+    peer_addr: &std::net::SocketAddr,
+) -> H3Routed {
+    let prom_config = &config.prometheus_config;
+    if prom_config.enabled && path == prom_config.path.as_bytes() && method == b"GET" {
+        return H3Routed::Metrics {
+            allowed: prom_config.is_ip_allowed(client_ip.as_str()),
+        };
+    }
+    #[cfg(feature = "admin")]
+    if crate::proxy::is_admin_request(&config.admin_config, method, path) {
+        let auth = headers
+            .iter()
+            .find(|h| h.name().eq_ignore_ascii_case(b"authorization"))
+            .and_then(|h| std::str::from_utf8(h.value()).ok());
+        if let Some((status, json, body)) =
+            crate::proxy::admin_response(config, method, path, client_ip.as_str(), auth)
+        {
+            return H3Routed::Admin { status, json, body };
+        }
+    }
+
+    // ヘッダーをゼロコピーのバイト列スライスとして参照（HashMap 不要）
+    let headers_raw: Vec<(&[u8], &[u8])> = headers
+        .iter()
+        .filter(|h| !h.name().starts_with(b":")) // 疑似ヘッダーを除外
+        .map(|h| (h.name(), h.value()))
+        .collect();
+
+    // パス/クエリ分離（スキャンを1回に統一）
+    let query_start_pos = path.iter().position(|&b| b == b'?');
+    let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
+    let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(path);
+
+    let route = crate::l7::resolve_route_in(
+        config,
+        authority,
+        path_without_query,
+        method,
+        &headers_raw,
+        raw_query,
+        peer_addr,
+        true,
+    );
+    #[cfg(feature = "wasm")]
+    let wasm_engine = match &route {
+        Some(r) if r.backend.modules_arc().is_some_and(|m| !m.is_empty()) => config
+            .wasm_filter_engine
+            .as_ref()
+            .map(crate::wasm::worker_engine),
+        _ => None,
+    };
+    H3Routed::Route {
+        route,
+        #[cfg(feature = "wasm")]
+        wasm_engine,
     }
 }

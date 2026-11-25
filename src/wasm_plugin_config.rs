@@ -185,11 +185,17 @@ fn encode_json_string(s: &str, out: &mut String) {
 /// 応答ヘッダ・本文・`on_log`）に同じもの（の clone）を渡す。`instance_reuse` のモジュールはこれを手がかりに、
 /// 要求の間ずっと同じインスタンスの同じ http context でコールバックを呼ぶ（Envoy と同じ寿命）。
 /// モジュールの無いルートでは確保しない。
+///
+/// 要求の並びは、モジュールを走らせるエンジン（要求の入口で設定から取ったワーカーの写し）も持つ。各フェーズは
+/// 設定を読み直さずに [`WasmModules::engine`] から借りる（設定の Guard を Wasm の呼び出しの `.await` をまたいで
+/// 持つと、arc_swap のスレッドの速いスロットが埋まる。B-501）。
 #[derive(Clone, Default)]
 pub struct WasmModules {
     modules: Arc<Vec<ModuleRef>>,
     #[cfg(feature = "wasm")]
     sessions: Option<std::rc::Rc<crate::wasm::RequestSessions>>,
+    #[cfg(feature = "wasm")]
+    engine: Option<std::rc::Rc<crate::wasm::WorkerEngine>>,
 }
 
 impl WasmModules {
@@ -199,15 +205,22 @@ impl WasmModules {
             modules,
             #[cfg(feature = "wasm")]
             sessions: None,
+            #[cfg(feature = "wasm")]
+            engine: None,
         }
     }
 
-    /// 1 つの要求の並び（モジュールがあるときだけ要求ごとの状態を 1 つ確保する）
-    pub fn for_request(modules: Arc<Vec<ModuleRef>>) -> Self {
+    /// 1 つの要求の並び（モジュールがあるときだけ要求ごとの状態を 1 つ確保する）。`engine` は要求の入口で
+    /// 設定から取ったエンジン（[`crate::wasm::worker_engine`] のワーカーの写し）
+    #[cfg(feature = "wasm")]
+    pub fn for_request(
+        modules: Arc<Vec<ModuleRef>>,
+        engine: std::rc::Rc<crate::wasm::WorkerEngine>,
+    ) -> Self {
+        let any = !modules.is_empty();
         Self {
-            #[cfg(feature = "wasm")]
-            sessions: (!modules.is_empty())
-                .then(|| std::rc::Rc::new(crate::wasm::RequestSessions::default())),
+            sessions: any.then(|| std::rc::Rc::new(crate::wasm::RequestSessions::default())),
+            engine: any.then_some(engine),
             modules,
         }
     }
@@ -215,6 +228,14 @@ impl WasmModules {
     /// モジュールの並び
     pub fn modules(&self) -> &Arc<Vec<ModuleRef>> {
         &self.modules
+    }
+
+    /// 要求のモジュールを走らせるエンジン（[`Self::for_request`] で置いたもの。要求に紐づかない並びは `None`）
+    #[cfg(feature = "wasm")]
+    pub fn engine(&self) -> Option<&Arc<crate::wasm::FilterEngine>> {
+        self.engine
+            .as_deref()
+            .map(crate::wasm::WorkerEngine::engine)
     }
 
     /// 要求ごとの状態

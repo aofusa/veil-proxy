@@ -104,9 +104,8 @@ pub async fn on_request(
     let ip: Arc<str> = Arc::from(ctx.peer.ip().to_string());
     let r = w
         .engine
-        .clone()
         .on_request_headers_with_modules_async(
-            crate::wasm_plugin_config::WasmModules::shared(w.modules.clone()),
+            &crate::wasm_plugin_config::WasmModules::shared(w.modules.clone()),
             path,
             method,
             hv,
@@ -145,9 +144,8 @@ pub async fn on_response(
             .collect();
         let r = w
             .engine
-            .clone()
             .on_response_headers_with_modules_async(
-                crate::wasm_plugin_config::WasmModules::shared(w.modules.clone()),
+                &crate::wasm_plugin_config::WasmModules::shared(w.modules.clone()),
                 status,
                 hv,
                 false,

@@ -877,6 +877,7 @@
 | B-498 | P2 | 完了（feat/httparena-perf） | [bugs/B-498-tls-cipher-suites-order-not-server-preference.md](bugs/B-498-tls-cipher-suites-order-not-server-preference.md) | `[tls] cipher_suites` の記載順がサーバの優先にならない（rustls の `ignore_client_order` を立てていないので、クライアントの順で選ぶ。文書は「記載順 = サーバ優先度順」）。E2E はクライアントとサーバが同じ順で見分けられない |
 | B-499 | P1 | 完了（feat/httparena-perf） | [bugs/B-499-wasm-local-response-missing-connection-close.md](bugs/B-499-wasm-local-response-missing-connection-close.md) | HTTP/1.1 で Wasm のローカルレスポンスの後に閉じるとき（接続の集約〈F-303〉が接続を動かす・クライアントの `Connection: close` 等）、応答に `Connection: close` を付けていなかった（B-360 の漏れ）。クライアントは閉じられる接続で次の要求を送って失う（aofish の io_uring で 5 秒に約 125 本・パイプラインで約 2,000 要求） |
 | B-500 | P1 | 完了（feat/httparena-perf） | [bugs/B-500-concentrate-sheds-pipelining-connections.md](bugs/B-500-concentrate-sheds-pipelining-connections.md) | 接続の集約（F-303）が要求をパイプラインで送ってくる HTTP/1.1 の接続を動かし、クライアントが送っている途中の要求を失わせる（蓄積が空でも次の要求は送る途中にある。16 本ずつのパイプラインで張り直し 1 回につき 15 要求、aofish の io_uring で 5 秒に約 930 要求）。パイプラインを見た接続は動かさない |
+| B-501 | P1 | 着手（feat/httparena-perf） | [bugs/B-501-arc-swap-guard-held-across-await.md](bugs/B-501-arc-swap-guard-held-across-await.md) | arc_swap の Guard を `.await` をまたいで持つと、スレッドの速いスロット（8 個）が埋まり、以後の設定の読み取りが全部、全ワーカー共有の参照カウントへの加算・減算になる。HTTP/2 の接続は接続の間、HTTP/3 は要求の終わりまで、Proxy-Wasm は各フェーズで Guard を持っていた。clippy の `await_holding_invalid_type` で検出し、要求の入口で 1 回だけ読む形にした |
 
 ---
 

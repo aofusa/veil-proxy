@@ -29,9 +29,9 @@ where
 {
     use http2::Http2Connection;
 
-    // HTTP/2 設定をCURRENT_CONFIGから取得（ホットリロード対応）
-    let config = CURRENT_CONFIG.load();
-    let settings = config.http2_config.to_http2_settings();
+    // HTTP/2 設定をCURRENT_CONFIGから取得（ホットリロード対応）。設定の Guard は接続の間持たない（arc_swap の
+    // スレッドの速いスロットは 8 個で、埋まると以後の読み取りが全部、全ワーカー共有の参照カウントへの書き込みになる。B-501）
+    let settings = CURRENT_CONFIG.load().http2_config.to_http2_settings();
 
     // HTTP/2 コネクションを作成
     let mut conn = Http2Connection::new(tls_stream, settings);
@@ -1822,6 +1822,77 @@ pub(super) async fn h2_serve_buffered(
     (status, resp_size, req_size)
 }
 
+/// [`h2_dispatch`] の入口で設定を読んで決めること（設定の Guard を区画の中だけで使うために、結果を値で返す。B-501）
+#[cfg(feature = "http2")]
+enum H2Routed {
+    /// メトリクスのエンドポイント（`allowed` は送信元の IP が許されているか）
+    Metrics { allowed: bool },
+    /// 管理 API の応答（B-29）
+    #[cfg(feature = "admin")]
+    Admin(u16, Vec<(Bytes, Bytes)>, Vec<u8>),
+    /// 経路の解決の結果。Wasm のモジュールのあるルートは、エンジンのワーカーの写しも（要求の並びに持たせる。
+    /// 以後のフェーズは設定を読み直さない）
+    Route {
+        route: Option<crate::l7::RouteMatch>,
+        #[cfg(feature = "wasm")]
+        wasm_engine: Option<std::rc::Rc<crate::wasm::WorkerEngine>>,
+    },
+}
+
+/// [`h2_dispatch`] のメトリクス・管理 API・経路の解決（同期。`config` は要求の入口で 1 回だけ読んだもの）
+#[cfg(feature = "http2")]
+#[inline]
+fn h2_route_request(
+    config: &crate::config::RuntimeConfig,
+    ctx: &H2RequestCtx,
+    method: &[u8],
+    path: &[u8],
+    client_ip: &str,
+    headers_raw: &[(&[u8], &[u8])],
+) -> H2Routed {
+    let prom = &config.prometheus_config;
+    if prom.enabled && path == prom.path.as_bytes() && method == b"GET" {
+        return H2Routed::Metrics {
+            allowed: prom.is_ip_allowed(client_ip),
+        };
+    }
+    #[cfg(feature = "admin")]
+    if config.admin_config.enabled {
+        if let Some((status, headers, body)) =
+            h2_admin_response(config, method, path, client_ip, headers_raw)
+        {
+            return H2Routed::Admin(status, headers, body);
+        }
+    }
+
+    let query_start = path.iter().position(|&b| b == b'?');
+    let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
+    let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
+    let route = crate::l7::resolve_route_in(
+        config,
+        &ctx.authority,
+        path_wo_query,
+        method,
+        headers_raw,
+        raw_query,
+        &ctx.client_socket_addr,
+        true,
+    );
+    #[cfg(feature = "wasm")]
+    let wasm_engine = match &route {
+        Some(r) if r.backend.modules_arc().is_some_and(|m| !m.is_empty()) => config
+            .wasm_filter_engine
+            .as_ref()
+            .map(crate::wasm::worker_engine),
+        _ => None,
+    };
+    H2Routed::Route {
+        route,
+        #[cfg(feature = "wasm")]
+        wasm_engine,
+    }
+}
+
 /// バッファ経路のルーティング + ディスパッチ。戻り値 `(status, resp_size)`。
 #[cfg(feature = "http2")]
 pub(super) async fn h2_dispatch(
@@ -1851,15 +1922,17 @@ pub(super) async fn h2_dispatch(
         .map(|h| (h.name.as_ref(), h.value.as_ref()))
         .collect();
 
-    // 設定は要求の入口で 1 回だけ読み、経路の解決の後で手放す（読むたびに費用がかかる。await をまたいで持たない）
-    let config = CURRENT_CONFIG.load();
-
-    // メトリクスエンドポイント。
-    {
-        let prom = &config.prometheus_config;
-        if prom.enabled && path == prom.path.as_bytes() && method == b"GET" {
-            let allowed = prom.is_ip_allowed(client_ip);
-            drop(config);
+    // 設定は要求の入口で 1 回だけ読み、経路の解決の後で手放す（読むたびに費用がかかる）。Guard はこの関数の中で
+    // 区切って `.await` をまたいで持たない（arc_swap のスレッドの速いスロットを埋める。B-501）
+    let routed = {
+        let config = CURRENT_CONFIG.load();
+        h2_route_request(&config, ctx, method, path, client_ip, &headers_raw)
+    };
+    #[cfg(feature = "wasm")]
+    let wasm_engine;
+    let backend_result = match routed {
+        // メトリクスエンドポイント。
+        H2Routed::Metrics { allowed } => {
             if !allowed {
                 return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
             }
@@ -1871,35 +1944,23 @@ pub(super) async fn h2_dispatch(
             ));
             return h2_emit_full(resp_tx, notify, 200, headers, Bytes::from(body)).await;
         }
-    }
-
-    // 管理 API（B-29）。
-    #[cfg(feature = "admin")]
-    if config.admin_config.enabled {
-        if let Some((status, headers, body)) =
-            h2_admin_response(&config, method, path, client_ip, &headers_raw)
-        {
-            drop(config);
+        // 管理 API（B-29）。
+        #[cfg(feature = "admin")]
+        H2Routed::Admin(status, headers, body) => {
             return h2_emit_full(resp_tx, notify, status, headers, Bytes::from(body)).await;
         }
-    }
-
-    let query_start = path.iter().position(|&b| b == b'?');
-    let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
-    let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
-    let authority = &ctx.authority[..];
-
-    let backend_result = crate::l7::resolve_route_in(
-        &config,
-        authority,
-        path_wo_query,
-        method,
-        &headers_raw,
-        raw_query,
-        &ctx.client_socket_addr,
-        true,
-    );
-    drop(config);
+        H2Routed::Route {
+            route,
+            #[cfg(feature = "wasm")]
+                wasm_engine: engine,
+        } => {
+            #[cfg(feature = "wasm")]
+            {
+                wasm_engine = engine;
+            }
+            route
+        }
+    };
 
     // F-321: ルートの値はワーカーの表から借りる（要求ごとに共有の `Arc` を複製しない）
     let route = match backend_result {
@@ -1946,20 +2007,18 @@ pub(super) async fn h2_dispatch(
     let mut wasm_request_headers_override: Option<Vec<crate::http2::hpack::HeaderField>> = None;
     #[cfg(feature = "wasm")]
     let wasm_modules_to_apply: crate::wasm_plugin_config::WasmModules = 'modules: {
-        // フィルタの無いルートは設定を読まない
-        if backend.modules_arc().is_none() {
+        // フィルタの無いルート・エンジンの無い設定（入口で決めた。B-501）
+        let (Some(backend_modules), Some(engine)) = (backend.modules_arc(), wasm_engine) else {
             break 'modules crate::wasm::empty_wasm_modules();
-        }
-        let config = CURRENT_CONFIG.load();
-        if let Some(ref wasm_engine) = config.wasm_filter_engine {
+        };
+        {
             let path_str = std::str::from_utf8(path).unwrap_or("/");
             let method_str = std::str::from_utf8(method).unwrap_or("GET");
-            let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
-                crate::wasm_plugin_config::WasmModules::for_request(backend_modules.clone())
-            } else {
-                crate::wasm::empty_wasm_modules()
-            };
-            if !modules_to_apply.is_empty() {
+            let modules_to_apply = crate::wasm_plugin_config::WasmModules::for_request(
+                backend_modules.clone(),
+                engine,
+            );
+            if let Some(wasm_engine) = modules_to_apply.engine() {
                 // B-408: ゲストに見せる `:authority`・`:scheme`・プロトコル（疑似ヘッダはホストが context から作る）
                 modules_to_apply.set_request_info(crate::wasm::RequestInfo {
                     authority: Arc::from(std::str::from_utf8(&ctx.authority).unwrap_or("")),
@@ -1977,9 +2036,8 @@ pub(super) async fn h2_dispatch(
                     .map(|h| (h.name.to_vec(), h.value.to_vec()))
                     .collect();
                 let wasm_result = wasm_engine
-                    .clone()
                     .on_request_headers_with_modules_async(
-                        modules_to_apply.clone(),
+                        &modules_to_apply,
                         Arc::from(path_str),
                         Arc::from(method_str),
                         headers_vec,
@@ -2006,11 +2064,7 @@ pub(super) async fn h2_dispatch(
                             Bytes::from(resp.body),
                         )
                         .await;
-                        crate::wasm::on_request_complete_async(
-                            wasm_engine.clone(),
-                            modules_to_apply.clone(),
-                        )
-                        .await;
+                        crate::wasm::on_request_complete_async(&modules_to_apply).await;
                         return (st, sz);
                     }
                     crate::wasm::FilterResult::Continue { headers, .. } => {
@@ -2028,8 +2082,6 @@ pub(super) async fn h2_dispatch(
                 }
             }
             modules_to_apply
-        } else {
-            crate::wasm::empty_wasm_modules()
         }
     };
 
@@ -2039,8 +2091,7 @@ pub(super) async fn h2_dispatch(
     let mut wasm_request_body_override: Option<Bytes> = None;
     #[cfg(feature = "wasm")]
     if !ctx.body.is_empty() && !wasm_modules_to_apply.is_empty() {
-        let config = CURRENT_CONFIG.load();
-        if let Some(ref wasm_engine) = config.wasm_filter_engine {
+        if let Some(wasm_engine) = wasm_modules_to_apply.engine() {
             if wasm_engine.wants_request_body(&wasm_modules_to_apply) {
                 let method_arc: Arc<str> = Arc::from(std::str::from_utf8(method).unwrap_or("GET"));
                 let path_arc: Arc<str> = Arc::from(std::str::from_utf8(path).unwrap_or("/"));
@@ -2089,11 +2140,7 @@ pub(super) async fn h2_dispatch(
                             Bytes::from(resp.body),
                         )
                         .await;
-                        crate::wasm::on_request_complete_async(
-                            wasm_engine.clone(),
-                            wasm_modules_to_apply.clone(),
-                        )
-                        .await;
+                        crate::wasm::on_request_complete_async(&wasm_modules_to_apply).await;
                         return (st, sz);
                     }
                 }
@@ -2106,8 +2153,7 @@ pub(super) async fn h2_dispatch(
     // 即座に抜ける（コスト増なし）。
     #[cfg(feature = "wasm")]
     if !ctx.trailers.is_empty() && !wasm_modules_to_apply.is_empty() {
-        let config = CURRENT_CONFIG.load();
-        if let Some(ref wasm_engine) = config.wasm_filter_engine {
+        if let Some(wasm_engine) = wasm_modules_to_apply.engine() {
             let trailers_vec: Vec<(Vec<u8>, Vec<u8>)> = ctx
                 .trailers
                 .iter()
@@ -2136,11 +2182,7 @@ pub(super) async fn h2_dispatch(
                     )
                     .await;
                     // ローカルレスポンスでも on_log を呼ぶ（B-300）
-                    crate::wasm::on_request_complete_async(
-                        wasm_engine.clone(),
-                        wasm_modules_to_apply.clone(),
-                    )
-                    .await;
+                    crate::wasm::on_request_complete_async(&wasm_modules_to_apply).await;
                     return (st, sz);
                 }
                 // F-133 調査結果: リクエストトレイラー自体が上流バックエンドへ転送される
@@ -2340,18 +2382,7 @@ pub(super) async fn h2_dispatch(
     };
 
     #[cfg(feature = "wasm")]
-    {
-        if !wasm_modules_to_apply.is_empty() {
-            let config = CURRENT_CONFIG.load();
-            if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                crate::wasm::on_request_complete_async(
-                    wasm_engine.clone(),
-                    wasm_modules_to_apply.clone(),
-                )
-                .await;
-            }
-        }
-    }
+    crate::wasm::on_request_complete_async(&wasm_modules_to_apply).await;
 
     result
 }

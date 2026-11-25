@@ -76,8 +76,8 @@ pub(super) async fn apply_h2_wasm_response_headers(
     if wasm_modules.is_empty() {
         return Ok(header_store);
     }
-    let config = CURRENT_CONFIG.load();
-    let Some(ref wasm_engine) = config.wasm_filter_engine else {
+    // エンジンは要求の並びが持つもの（設定の Guard を Wasm の呼び出しの間持たない。B-501）
+    let Some(wasm_engine) = wasm_modules.engine() else {
         return Ok(header_store);
     };
 
@@ -90,8 +90,7 @@ pub(super) async fn apply_h2_wasm_response_headers(
         .collect();
 
     let wasm_result = wasm_engine
-        .clone()
-        .on_response_headers_with_modules_async(wasm_modules.clone(), status, vec_headers, true)
+        .on_response_headers_with_modules_async(wasm_modules, status, vec_headers, true)
         .await;
 
     match wasm_result {
@@ -120,8 +119,7 @@ pub(super) async fn apply_h2_wasm_response_trailers(
     if wasm_modules.is_empty() {
         return trailers;
     }
-    let config = CURRENT_CONFIG.load();
-    let Some(ref wasm_engine) = config.wasm_filter_engine else {
+    let Some(wasm_engine) = wasm_modules.engine() else {
         return trailers;
     };
 

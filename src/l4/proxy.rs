@@ -1097,11 +1097,14 @@ async fn accept_l4_tls_client(
     peer_addr: SocketAddr,
 ) -> Option<KtlsServerStream> {
     let tls_config = l4_server_tls_config()?;
-    let runtime = CURRENT_CONFIG.load();
-    let acceptor = RustlsAcceptor::new(tls_config)
-        .with_ktls(runtime.ktls_config.enabled)
-        .with_fallback(runtime.ktls_config.fallback_enabled)
-        .with_tcp_cork(runtime.ktls_config.tcp_cork_enabled);
+    // 設定の Guard はハンドシェイクの `.await` へ持ち越さない（B-501）
+    let acceptor = {
+        let runtime = CURRENT_CONFIG.load();
+        RustlsAcceptor::new(tls_config)
+            .with_ktls(runtime.ktls_config.enabled)
+            .with_fallback(runtime.ktls_config.fallback_enabled)
+            .with_tcp_cork(runtime.ktls_config.tcp_cork_enabled)
+    };
 
     match timeout(handshake_timeout, acceptor.accept(client, None)).await {
         Ok(Ok(stream)) => Some(stream),

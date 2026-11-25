@@ -488,7 +488,7 @@ mod f132_h3_lifecycle_tests {
         apply_wasm_request_body, apply_wasm_response_body, set_content_length_header,
         WasmBodyOutcome,
     };
-    use crate::wasm::{on_request_complete_async, FilterEngine, ModuleConfig, WasmConfig};
+    use crate::wasm::{FilterEngine, ModuleConfig, WasmConfig};
     use std::sync::Arc;
 
     const FIXTURE: &str = "tests/fixtures/wasm/header_filter.wasm";
@@ -545,9 +545,9 @@ mod f132_h3_lifecycle_tests {
                 true,
                 None,
             ));
-            futures::executor::block_on(on_request_complete_async(
-                engine.clone(),
-                crate::wasm_plugin_config::WasmModules::shared(modules.clone()),
+            // 要求に紐づかない並び（エンジンを持たない）なので on_log はエンジンから直接呼ぶ
+            futures::executor::block_on(engine.on_log_with_modules_async(
+                &crate::wasm_plugin_config::WasmModules::shared(modules.clone()),
             ));
         }
 
@@ -2409,29 +2409,30 @@ mod b408_pseudo_header_phase_tests {
         std::fs::create_dir_all(&dir).unwrap();
         for reuse in [false, true] {
             let engine = engine(&dir, reuse);
-            let modules = WasmModules::for_request(Arc::new(vec![ModuleRef::from_name("m")]));
+            let modules = WasmModules::for_request(
+                Arc::new(vec![ModuleRef::from_name("m")]),
+                crate::wasm::worker_engine(&engine),
+            );
             modules.set_request_info(RequestInfo {
                 authority: Arc::from("a.example"),
                 scheme: "https",
                 protocol: "HTTP/2",
             });
-            let r =
-                futures::executor::block_on(engine.clone().on_request_headers_with_modules_async(
-                    modules.clone(),
-                    Arc::from("/p?q=1"),
-                    Arc::from("GET"),
-                    vec![],
-                    Arc::from("127.0.0.1"),
-                    true,
-                ));
+            let r = futures::executor::block_on(engine.on_request_headers_with_modules_async(
+                &modules,
+                Arc::from("/p?q=1"),
+                Arc::from("GET"),
+                vec![],
+                Arc::from("127.0.0.1"),
+                true,
+            ));
             assert!(matches!(r, FilterResult::Continue { .. }));
-            let r =
-                futures::executor::block_on(engine.clone().on_response_headers_with_modules_async(
-                    modules.clone(),
-                    200,
-                    vec![(b"x-u".to_vec(), b"1".to_vec())],
-                    true,
-                ));
+            let r = futures::executor::block_on(engine.on_response_headers_with_modules_async(
+                &modules,
+                200,
+                vec![(b"x-u".to_vec(), b"1".to_vec())],
+                true,
+            ));
             let FilterResult::Continue { headers, .. } = r else {
                 panic!("expected Continue (reuse={reuse})");
             };
@@ -2444,8 +2445,61 @@ mod b408_pseudo_header_phase_tests {
                 ],
                 "reuse={reuse}"
             );
-            futures::executor::block_on(crate::wasm::on_request_complete_async(engine, modules));
+            futures::executor::block_on(crate::wasm::on_request_complete_async(&modules));
         }
+        // ワーカーのエンジンの写しはスレッドローカルの破棄の前に手放す
+        crate::wasm::release_worker_engine();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B-501: 要求の並びのエンジンはワーカーの写し。同じエンジンなら同じ写しを返し（要求ごとに共有の `Arc` を
+    // 複製しない）、設定のエンジンが変わったらアイドル点で古い写しを手放す（要求が持っている写しは生きたまま）
+    #[test]
+    fn worker_engine_follows_the_configured_engine() {
+        use std::rc::Rc;
+        let dir = std::env::temp_dir().join(format!("veil-b501-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = engine(&dir, true);
+        let b = engine(&dir, true);
+
+        let a1 = crate::wasm::worker_engine(&a);
+        let a2 = crate::wasm::worker_engine(&a);
+        assert!(Rc::ptr_eq(&a1, &a2));
+        assert!(Arc::ptr_eq(a1.engine(), &a));
+        assert_eq!(
+            Arc::strong_count(&a),
+            2,
+            "the worker copy holds the Arc once"
+        );
+
+        // 今のエンジンのままなら手放さない
+        crate::wasm::release_stale_worker_engine(Some(&a));
+        assert!(Rc::ptr_eq(&crate::wasm::worker_engine(&a), &a1));
+
+        // 要求の並び: モジュールがあるときだけエンジンを持つ
+        let modules =
+            WasmModules::for_request(Arc::new(vec![ModuleRef::from_name("m")]), Rc::clone(&a1));
+        assert!(modules.engine().is_some_and(|e| Arc::ptr_eq(e, &a)));
+        let empty = WasmModules::for_request(Arc::new(vec![]), Rc::clone(&a1));
+        assert!(empty.engine().is_none());
+        drop(empty);
+
+        // 設定のエンジンが変わった: 写しを手放す。要求の並びと a1 はまだ持つ
+        drop(a2);
+        crate::wasm::release_stale_worker_engine(Some(&b));
+        assert_eq!(Arc::strong_count(&a), 2);
+        drop(modules);
+        drop(a1);
+        assert_eq!(Arc::strong_count(&a), 1, "the stale engine is released");
+
+        // 新しいエンジンの写しを作る。エンジンの無い設定になったら手放す
+        let b1 = crate::wasm::worker_engine(&b);
+        assert!(Arc::ptr_eq(b1.engine(), &b));
+        drop(b1);
+        crate::wasm::release_stale_worker_engine(None);
+        assert_eq!(Arc::strong_count(&b), 1);
+
+        crate::wasm::release_worker_engine();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

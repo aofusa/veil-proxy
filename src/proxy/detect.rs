@@ -349,9 +349,8 @@ pub async fn handle_h2c_connection(
 ) {
     use http2::Http2Connection;
 
-    // HTTP/2設定を取得
-    let config = CURRENT_CONFIG.load();
-    let settings = config.http2_config.to_http2_settings();
+    // HTTP/2設定を取得（設定の Guard は接続の間持たない。B-501）
+    let settings = CURRENT_CONFIG.load().http2_config.to_http2_settings();
 
     // Http2ConnectionはTcpStreamでも動作可能
     // 既に読み込んだデータ（プリフェース）を初期バッファとして渡す

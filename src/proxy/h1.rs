@@ -492,17 +492,6 @@ pub(super) async fn handle_requests(
                     return;
                 }
 
-                // 設定はここから経路の解決まで 1 回読んだものを使う（読み取りは 1 回 100 命令ほどかかる）
-                let config = CURRENT_CONFIG.load();
-
-                // 管理 API の照合にしか使わない（有効なときだけ検査する。無効なら下の分岐に入らない）
-                #[cfg(feature = "admin")]
-                let path_str = if config.admin_config.enabled {
-                    std::str::from_utf8(&path_bytes).unwrap_or("/")
-                } else {
-                    "/"
-                };
-
                 // Expect: 100-continue ヘッダーがある場合、ボディ送信前に 100 Continue を返す。
                 // B-210: 返すのはルートの検査（`[route.security]` の本文の上限・IP・メソッド・レート制限）を通った後
                 // （以前はここで返していたため、ルートの上限で 413 にする要求もクライアントが本文を送り始め、
@@ -510,298 +499,110 @@ pub(super) async fn handle_requests(
                 let early_continue =
                     content_length > 0 && !defer_size && check_expect_continue(&headers_for_proxy);
 
-                // メトリクスエンドポイントの処理（設定可能なパス）
-                // Prometheusスクレイピング用の特別なパス
-                {
-                    let prom_config = &config.prometheus_config;
+                // 設定はここから経路の解決まで 1 回読んだものを使う（読み取りは 1 回 100 命令ほどかかる）。Guard は
+                // この区画の中だけで使い、`.await` へ持ち越さない（arc_swap のスレッドの速いスロットは 8 個で、埋まると
+                // 以後の読み取りが全部、全ワーカー共有の参照カウントへの書き込みになる。B-501）
+                // Wasm のモジュールのあるルートは、エンジンのワーカーの写しも区画の中で取る（要求の並びに持たせる。
+                // 以後のフェーズは設定を読み直さない）
+                #[cfg(feature = "wasm")]
+                let mut wasm_engine = None;
+                let (early, backend_result) = {
+                    let config = CURRENT_CONFIG.load();
+                    // メトリクス・管理 API の応答（経路の解決の前に返す）
+                    if let Some(early) = h1_management_response(
+                        &config,
+                        &method_bytes,
+                        &path_bytes,
+                        client_ip,
+                        &headers_for_proxy,
+                    ) {
+                        (Some(early), None)
+                    } else {
+                        // Backend選択（統合ルーティング対応）
+                        // パス/クエリ分離（スキャンを1回に統一）
+                        let query_start_pos = path_bytes.iter().position(|&b| b == b'?');
+                        let path_without_query = query_start_pos
+                            .map(|i| &path_bytes[..i])
+                            .unwrap_or(&path_bytes);
 
-                    // パスとメソッドをチェック
-                    if prom_config.enabled
-                        && path_bytes.as_ref() == prom_config.path.as_bytes()
-                        && method_bytes.as_ref() == b"GET"
-                    {
-                        let start_instant = Instant::now();
+                        // ルーティングの送信元条件に使うアドレス。`client_ip` は呼び出し側で
+                        // `peer_addr.ip()` から作った文字列なので、毎リクエスト文字列から
+                        // パースし直さず（DTrace で `read_ipv4_addr` がホットスポットに出ていた）
+                        // `peer_addr` をそのまま使う（送信元条件が見るのは IP のみ）。
+                        let client_socket_addr = peer_addr;
 
-                        // IPアドレス制限チェック
-                        if !prom_config.is_ip_allowed(client_ip) {
-                            let err_buf = ERR_MSG_FORBIDDEN.to_vec();
-                            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                            log_access(
-                                &method_bytes,
-                                &host_bytes,
-                                &path_bytes,
-                                &user_agent,
-                                0,
-                                403,
-                                0,
-                                start_instant,
-                                client_ip,
-                                "",
-                            );
-                            accumulated.clear();
-                            return;
-                        }
-
-                        let metrics_response = build_metrics_response();
-                        let resp_size = metrics_response.len() as u64;
-
-                        let write_result =
-                            timeout(WRITE_TIMEOUT, tls_stream.write_all(metrics_response)).await;
-                        if let Ok((Ok(_), _)) = write_result {
-                            log_access(
-                                &method_bytes,
-                                &host_bytes,
-                                &path_bytes,
-                                &user_agent,
-                                0,
-                                200,
-                                resp_size,
-                                start_instant,
-                                client_ip,
-                                "",
-                            );
-                        }
-
-                        // メトリクスエンドポイントは常に接続を閉じる
-                        accumulated.clear();
-                        return;
-                    }
-                }
-
-                // 管理 API エンドポイントの処理（F-20: キャッシュ Purge）
-                // PURGE メソッド、または admin.path_prefix 配下の /cache/purge を処理する
-                #[cfg(feature = "admin")]
-                {
-                    let admin_config = &config.admin_config;
-                    let is_purge_method = method_bytes.as_ref() == b"PURGE";
-                    // パフォーマンス最適化: 事前計算済みプレフィックスを使用（format! 排除）
-                    let is_admin_purge_path =
-                        path_str.starts_with(&admin_config.cache_purge_prefix);
-
-                    if admin_config.enabled && (is_purge_method || is_admin_purge_path) {
-                        let start_instant = Instant::now();
-
-                        // IP制限チェック
-                        let response = if !admin_config.is_ip_allowed(client_ip) {
-                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-                        } else {
-                            // Authorization ヘッダーを取得
-                            let auth = headers_for_proxy.iter().find_map(|(name, value)| {
-                                if name.eq_ignore_ascii_case(b"authorization") {
-                                    std::str::from_utf8(value).ok()
+                        // ヘッダーをゼロコピーのバイト列スライスとして参照し、
+                        // クエリ文字列は生バイトのまま渡す（HashMap 割り当て不要）
+                        // headers_for_proxy は既に accumulated から切り出し済みの Bytes なので、
+                        // ここでは参照を並べるだけで新たなコピーは発生しない。
+                        let backend_result = {
+                            // 16 個まではスタックの配列に並べる（要求ごとに Vec を確保しない。F-202）。それより多いときだけ確保する。
+                            let mut raw_buf: [(&[u8], &[u8]); 16] = [(&[], &[]); 16];
+                            let raw_vec: Vec<(&[u8], &[u8])>;
+                            let headers_raw: &[(&[u8], &[u8])] =
+                                if headers_for_proxy.len() <= raw_buf.len() {
+                                    for (slot, (k, v)) in
+                                        raw_buf.iter_mut().zip(headers_for_proxy.iter())
+                                    {
+                                        *slot = (k.as_ref(), v.as_ref());
+                                    }
+                                    &raw_buf[..headers_for_proxy.len()]
                                 } else {
-                                    None
-                                }
-                            });
+                                    raw_vec = headers_for_proxy
+                                        .iter()
+                                        .map(|(k, v)| (k.as_ref(), v.as_ref()))
+                                        .collect();
+                                    &raw_vec
+                                };
+                            let raw_query: &[u8] =
+                                query_start_pos.map(|i| &path_bytes[i + 1..]).unwrap_or(b"");
 
-                            if !admin_config.check_auth_from(client_ip, auth) {
-                                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-                            } else {
-                                handle_cache_purge(path_str, is_purge_method)
-                            }
+                            crate::l7::resolve_route_in(
+                                &config,
+                                &host_bytes,
+                                path_without_query,
+                                &method_bytes,
+                                headers_raw,
+                                raw_query,
+                                &client_socket_addr,
+                                true,
+                            )
                         };
-
-                        let resp_size = response.len() as u64;
-                        let status = if response.starts_with(b"HTTP/1.1 200") {
-                            200
-                        } else if response.starts_with(b"HTTP/1.1 401") {
-                            401
-                        } else if response.starts_with(b"HTTP/1.1 403") {
-                            403
-                        } else {
-                            400
-                        };
-                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(response)).await;
+                        #[cfg(feature = "wasm")]
+                        if backend_result
+                            .as_ref()
+                            .is_some_and(|r| r.backend.modules_arc().is_some_and(|m| !m.is_empty()))
+                        {
+                            wasm_engine = config
+                                .wasm_filter_engine
+                                .as_ref()
+                                .map(crate::wasm::worker_engine);
+                        }
+                        (None, backend_result)
+                    }
+                };
+                if let Some(early) = early {
+                    let resp_size = early.response.len() as u64;
+                    let write_result =
+                        timeout(WRITE_TIMEOUT, tls_stream.write_all(early.response)).await;
+                    if !early.log_only_on_success || matches!(write_result, Ok((Ok(_), _))) {
                         log_access(
                             &method_bytes,
                             &host_bytes,
                             &path_bytes,
                             &user_agent,
                             0,
-                            status,
-                            resp_size,
-                            start_instant,
+                            early.status,
+                            if early.log_size { resp_size } else { 0 },
+                            early.start,
                             client_ip,
                             "",
                         );
-                        accumulated.clear();
-                        return;
                     }
+                    // メトリクス・管理 API の応答は常に接続を閉じる
+                    accumulated.clear();
+                    return;
                 }
-
-                // 管理 API エンドポイントの処理（F-21: /config, /stats, /reload, /tls/reload）
-                #[cfg(feature = "admin")]
-                {
-                    let admin_config = &config.admin_config;
-
-                    if admin_config.enabled
-                        && path_str.starts_with(&admin_config.path_prefix)
-                        && method_bytes.as_ref() != b"PURGE"
-                        && !path_str.starts_with(&admin_config.cache_purge_prefix)
-                    {
-                        // GET /__admin/config, GET /__admin/stats,
-                        // POST /__admin/reload, POST /__admin/tls/reload のみを処理
-                        let path_suffix = &path_str[admin_config.path_prefix.len()..];
-                        let is_known_endpoint = matches!(
-                            (method_bytes.as_ref(), path_suffix),
-                            (b"GET", "/config")
-                                | (b"GET", "/stats")
-                                | (b"GET", "/vds")
-                                | (b"POST", "/reload")
-                                | (b"POST", "/tls/reload")
-                        );
-
-                        if is_known_endpoint {
-                            let start_instant = Instant::now();
-
-                            // IP制限チェック
-                            let response: Vec<u8> = if !admin_config.is_ip_allowed(client_ip) {
-                                b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"error\":\"403\"}".to_vec()
-                            } else {
-                                // Authorization ヘッダーを取得
-                                let auth = headers_for_proxy.iter().find_map(|(name, value)| {
-                                    if name.eq_ignore_ascii_case(b"authorization") {
-                                        std::str::from_utf8(value).ok()
-                                    } else {
-                                        None
-                                    }
-                                });
-
-                                if !admin_config.check_auth_from(client_ip, auth) {
-                                    b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"error\":\"401\"}".to_vec()
-                                } else {
-                                    // 認証成功: エンドポイントに応じた処理
-                                    match (method_bytes.as_ref(), path_suffix) {
-                                        (b"GET", "/config") => {
-                                            // 設定情報をJSON形式で返す（secret はマスク）
-                                            let body = build_admin_config_json(&config);
-                                            let mut resp = format!(
-                                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                                body.len()
-                                            ).into_bytes();
-                                            resp.extend_from_slice(body.as_bytes());
-                                            resp
-                                        }
-                                        (b"GET", "/stats") => {
-                                            // 起動からの経過時間を返す
-                                            // PROXY_START_TIME を初回アクセスで初期化
-                                            let uptime_secs = PROXY_START_TIME.elapsed().as_secs();
-                                            let body = format!("{{\"uptime_secs\":{}}}", uptime_secs);
-                                            let mut resp = format!(
-                                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                                body.len()
-                                            ).into_bytes();
-                                            resp.extend_from_slice(body.as_bytes());
-                                            resp
-                                        }
-                                        (b"GET", "/vds") => {
-                                            // F-211: VDS の状態（接続・適用中の版・最後の NACK の理由・更新回数）
-                                            let body = admin_vds_json();
-                                            let mut resp = format!(
-                                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                                body.len()
-                                            ).into_bytes();
-                                            resp.extend_from_slice(body.as_bytes());
-                                            resp
-                                        }
-                                        (b"POST", "/reload") => {
-                                            // 設定リロードフラグを立てる
-                                            use std::sync::atomic::Ordering;
-                                            RELOAD_FLAG.store(true, Ordering::Relaxed);
-                                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec()
-                                        }
-                                        (b"POST", "/tls/reload") => {
-                                            // TLS証明書リロードフラグを立てる
-                                            use std::sync::atomic::Ordering;
-                                            TLS_RELOAD_FLAG.store(true, Ordering::Relaxed);
-                                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec()
-                                        }
-                                        _ => {
-                                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-                                        }
-                                    }
-                                }
-                            };
-
-                            let resp_size = response.len() as u64;
-                            let status = if response.starts_with(b"HTTP/1.1 200") {
-                                200
-                            } else if response.starts_with(b"HTTP/1.1 401") {
-                                401
-                            } else if response.starts_with(b"HTTP/1.1 403") {
-                                403
-                            } else {
-                                400
-                            };
-                            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(response)).await;
-                            log_access(
-                                &method_bytes,
-                                &host_bytes,
-                                &path_bytes,
-                                &user_agent,
-                                0,
-                                status,
-                                resp_size,
-                                start_instant,
-                                client_ip,
-                                "",
-                            );
-                            accumulated.clear();
-                            return;
-                        }
-                    }
-                }
-
-                // Backend選択（統合ルーティング対応）
-                // パス/クエリ分離（スキャンを1回に統一）
-                let query_start_pos = path_bytes.iter().position(|&b| b == b'?');
-                let path_without_query = query_start_pos
-                    .map(|i| &path_bytes[..i])
-                    .unwrap_or(&path_bytes);
-
-                // ルーティングの送信元条件に使うアドレス。`client_ip` は呼び出し側で
-                // `peer_addr.ip()` から作った文字列なので、毎リクエスト文字列から
-                // パースし直さず（DTrace で `read_ipv4_addr` がホットスポットに出ていた）
-                // `peer_addr` をそのまま使う（送信元条件が見るのは IP のみ）。
-                let client_socket_addr = peer_addr;
-
-                // ヘッダーをゼロコピーのバイト列スライスとして参照し、
-                // クエリ文字列は生バイトのまま渡す（HashMap 割り当て不要）
-                // headers_for_proxy は既に accumulated から切り出し済みの Bytes なので、
-                // ここでは参照を並べるだけで新たなコピーは発生しない。
-                let backend_result = {
-                    // 16 個まではスタックの配列に並べる（要求ごとに Vec を確保しない。F-202）。それより多いときだけ確保する。
-                    let mut raw_buf: [(&[u8], &[u8]); 16] = [(&[], &[]); 16];
-                    let raw_vec: Vec<(&[u8], &[u8])>;
-                    let headers_raw: &[(&[u8], &[u8])] = if headers_for_proxy.len() <= raw_buf.len()
-                    {
-                        for (slot, (k, v)) in raw_buf.iter_mut().zip(headers_for_proxy.iter()) {
-                            *slot = (k.as_ref(), v.as_ref());
-                        }
-                        &raw_buf[..headers_for_proxy.len()]
-                    } else {
-                        raw_vec = headers_for_proxy
-                            .iter()
-                            .map(|(k, v)| (k.as_ref(), v.as_ref()))
-                            .collect();
-                        &raw_vec
-                    };
-                    let raw_query: &[u8] =
-                        query_start_pos.map(|i| &path_bytes[i + 1..]).unwrap_or(b"");
-
-                    crate::l7::resolve_route_in(
-                        &config,
-                        &host_bytes,
-                        path_without_query,
-                        &method_bytes,
-                        headers_raw,
-                        raw_query,
-                        &client_socket_addr,
-                        true,
-                    )
-                };
-                // ここから先の await へ持ち越さない
-                drop(config);
 
                 // F-321: ルートの値はワーカーの表から借りる（要求ごとに共有の `Arc` を複製しない）
                 let route = match backend_result {
@@ -944,11 +745,16 @@ pub(super) async fn handle_requests(
                 // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
                 #[cfg(feature = "wasm")]
                 // B-177: 要求ごとの Wasm の状態（instance_reuse のモジュールは要求の間同じ context を使う）
+                // エンジンは経路の解決のときに取ったワーカーの写し（B-501。エンジンの無い設定ではモジュールを走らせない）
                 let modules_to_apply: crate::wasm_plugin_config::WasmModules =
-                    if let Some(backend_modules) = backend.modules_arc() {
-                        crate::wasm_plugin_config::WasmModules::for_request(backend_modules.clone())
-                    } else {
-                        crate::wasm::empty_wasm_modules()
+                    match (backend.modules_arc(), wasm_engine) {
+                        (Some(backend_modules), Some(engine)) => {
+                            crate::wasm_plugin_config::WasmModules::for_request(
+                                backend_modules.clone(),
+                                engine,
+                            )
+                        }
+                        _ => crate::wasm::empty_wasm_modules(),
                     };
 
                 #[cfg(feature = "wasm")]
@@ -965,8 +771,7 @@ pub(super) async fn handle_requests(
                         },
                         protocol: if http10 { "HTTP/1.0" } else { "HTTP/1.1" },
                     });
-                    let config = CURRENT_CONFIG.load();
-                    if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                    if let Some(wasm_engine) = modules_to_apply.engine() {
                         // routes内で指定されたmodulesを優先
                         let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
                         let method_str = std::str::from_utf8(&method_bytes).unwrap_or("GET");
@@ -979,9 +784,8 @@ pub(super) async fn handle_requests(
                                 .collect();
 
                             let wasm_result = wasm_engine
-                                .clone()
                                 .on_request_headers_with_modules_async(
-                                    modules_to_apply.clone(),
+                                    &modules_to_apply,
                                     Arc::from(path_str),
                                     Arc::from(method_str),
                                     headers_vec,
@@ -1043,11 +847,7 @@ pub(super) async fn handle_requests(
                                         "",
                                     );
                                     // WASMライフサイクルコールバック: リクエスト完了
-                                    crate::wasm::on_request_complete_async(
-                                        wasm_engine.clone(),
-                                        modules_to_apply.clone(),
-                                    )
-                                    .await;
+                                    crate::wasm::on_request_complete_async(&modules_to_apply).await;
                                     accumulated.clear();
                                     if client_wants_close
                                         || is_websocket
@@ -1092,8 +892,7 @@ pub(super) async fn handle_requests(
                     {
                         (initial_body, content_length, is_chunked, headers_for_proxy)
                     } else {
-                        let config = CURRENT_CONFIG.load();
-                        match config.wasm_filter_engine.as_ref() {
+                        match modules_to_apply.engine() {
                             Some(wasm_engine)
                                 if wasm_engine.wants_request_body(&modules_to_apply) =>
                             {
@@ -1199,11 +998,8 @@ pub(super) async fn handle_requests(
                                             client_ip,
                                             "",
                                         );
-                                        crate::wasm::on_request_complete_async(
-                                            wasm_engine.clone(),
-                                            modules_to_apply.clone(),
-                                        )
-                                        .await;
+                                        crate::wasm::on_request_complete_async(&modules_to_apply)
+                                            .await;
                                         accumulated.clear();
                                         if client_wants_close {
                                             return;
@@ -1304,16 +1100,7 @@ pub(super) async fn handle_requests(
                             // WASMライフサイクルコールバック: リクエスト完了
                             #[cfg(feature = "wasm")]
                             {
-                                if !modules_to_apply.is_empty() {
-                                    let config = CURRENT_CONFIG.load();
-                                    if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                        crate::wasm::on_request_complete_async(
-                                            wasm_engine.clone(),
-                                            modules_to_apply.clone(),
-                                        )
-                                        .await;
-                                    }
-                                }
+                                crate::wasm::on_request_complete_async(&modules_to_apply).await;
                             }
                         }
                         // WebSocket 接続終了後は HTTP 接続も終了
@@ -1382,16 +1169,7 @@ pub(super) async fn handle_requests(
                         // WASMライフサイクルコールバック: リクエスト完了
                         #[cfg(feature = "wasm")]
                         {
-                            if !modules_to_apply.is_empty() {
-                                let config = CURRENT_CONFIG.load();
-                                if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                    crate::wasm::on_request_complete_async(
-                                        wasm_engine.clone(),
-                                        modules_to_apply.clone(),
-                                    )
-                                    .await;
-                                }
-                            }
+                            crate::wasm::on_request_complete_async(&modules_to_apply).await;
                         }
 
                         tls_stream = stream_back;
@@ -1509,6 +1287,222 @@ enum RequestHeadParse {
     /// まだ揃っていない
     Partial,
     Invalid,
+}
+
+/// メトリクス・管理 API の応答（経路の解決の前に返す。接続は閉じる）。設定の Guard を書き込みの `.await` へ
+/// 持ち越さないために、応答を作るところ（[`h1_management_response`]）と書くところを分ける（B-501）
+struct H1EarlyResponse {
+    response: Vec<u8>,
+    status: u16,
+    /// アクセスログに応答の大きさを書くか（メトリクスの 403 は 0 を書く）
+    log_size: bool,
+    /// 書き込みが成功したときだけアクセスログを書く（メトリクスの応答）
+    log_only_on_success: bool,
+    start: Instant,
+}
+
+impl H1EarlyResponse {
+    /// 管理 API の応答（状態は応答の先頭から読む）
+    #[cfg(feature = "admin")]
+    fn admin(response: Vec<u8>, start: Instant) -> Self {
+        let status = if response.starts_with(b"HTTP/1.1 200") {
+            200
+        } else if response.starts_with(b"HTTP/1.1 401") {
+            401
+        } else if response.starts_with(b"HTTP/1.1 403") {
+            403
+        } else {
+            400
+        };
+        Self {
+            response,
+            status,
+            log_size: true,
+            log_only_on_success: false,
+            start,
+        }
+    }
+}
+
+/// メトリクスのエンドポイント・管理 API（キャッシュの PURGE・`/__admin/*`）の要求なら、その応答を作る（同期。
+/// `config` は要求の入口で 1 回だけ読んだもの）
+fn h1_management_response(
+    config: &crate::config::RuntimeConfig,
+    method_bytes: &[u8],
+    path_bytes: &[u8],
+    client_ip: &str,
+    headers_for_proxy: &[(Bytes, Bytes)],
+) -> Option<H1EarlyResponse> {
+    // メトリクスエンドポイントの処理（設定可能なパス）
+    // Prometheusスクレイピング用の特別なパス
+    let prom_config = &config.prometheus_config;
+    if prom_config.enabled && path_bytes == prom_config.path.as_bytes() && method_bytes == b"GET" {
+        let start = Instant::now();
+        // IPアドレス制限チェック
+        if !prom_config.is_ip_allowed(client_ip) {
+            return Some(H1EarlyResponse {
+                response: ERR_MSG_FORBIDDEN.to_vec(),
+                status: 403,
+                log_size: false,
+                log_only_on_success: false,
+                start,
+            });
+        }
+        return Some(H1EarlyResponse {
+            response: build_metrics_response(),
+            status: 200,
+            log_size: true,
+            log_only_on_success: true,
+            start,
+        });
+    }
+
+    // 管理 API の照合にしか使わない（有効なときだけ検査する。無効なら下の分岐に入らない）
+    #[cfg(feature = "admin")]
+    let path_str = if config.admin_config.enabled {
+        std::str::from_utf8(path_bytes).unwrap_or("/")
+    } else {
+        "/"
+    };
+
+    // 管理 API エンドポイントの処理（F-20: キャッシュ Purge）
+    // PURGE メソッド、または admin.path_prefix 配下の /cache/purge を処理する
+    #[cfg(feature = "admin")]
+    {
+        let admin_config = &config.admin_config;
+        let is_purge_method = method_bytes == b"PURGE";
+        // パフォーマンス最適化: 事前計算済みプレフィックスを使用（format! 排除）
+        let is_admin_purge_path = path_str.starts_with(&admin_config.cache_purge_prefix);
+
+        if admin_config.enabled && (is_purge_method || is_admin_purge_path) {
+            let start_instant = Instant::now();
+
+            // IP制限チェック
+            let response = if !admin_config.is_ip_allowed(client_ip) {
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            } else {
+                // Authorization ヘッダーを取得
+                let auth = headers_for_proxy.iter().find_map(|(name, value)| {
+                    if name.eq_ignore_ascii_case(b"authorization") {
+                        std::str::from_utf8(value).ok()
+                    } else {
+                        None
+                    }
+                });
+
+                if !admin_config.check_auth_from(client_ip, auth) {
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                } else {
+                    handle_cache_purge(path_str, is_purge_method)
+                }
+            };
+
+            return Some(H1EarlyResponse::admin(response, start_instant));
+        }
+    }
+
+    // 管理 API エンドポイントの処理（F-21: /config, /stats, /reload, /tls/reload）
+    #[cfg(feature = "admin")]
+    {
+        let admin_config = &config.admin_config;
+
+        if admin_config.enabled
+            && path_str.starts_with(&admin_config.path_prefix)
+            && method_bytes != b"PURGE"
+            && !path_str.starts_with(&admin_config.cache_purge_prefix)
+        {
+            // GET /__admin/config, GET /__admin/stats,
+            // POST /__admin/reload, POST /__admin/tls/reload のみを処理
+            let path_suffix = &path_str[admin_config.path_prefix.len()..];
+            let is_known_endpoint = matches!(
+                (method_bytes, path_suffix),
+                (b"GET", "/config")
+                    | (b"GET", "/stats")
+                    | (b"GET", "/vds")
+                    | (b"POST", "/reload")
+                    | (b"POST", "/tls/reload")
+            );
+
+            if is_known_endpoint {
+                let start_instant = Instant::now();
+
+                // IP制限チェック
+                let response: Vec<u8> = if !admin_config.is_ip_allowed(client_ip) {
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"error\":\"403\"}".to_vec()
+                } else {
+                    // Authorization ヘッダーを取得
+                    let auth = headers_for_proxy.iter().find_map(|(name, value)| {
+                        if name.eq_ignore_ascii_case(b"authorization") {
+                            std::str::from_utf8(value).ok()
+                        } else {
+                            None
+                        }
+                    });
+
+                    if !admin_config.check_auth_from(client_ip, auth) {
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"error\":\"401\"}".to_vec()
+                    } else {
+                        // 認証成功: エンドポイントに応じた処理
+                        match (method_bytes, path_suffix) {
+                            (b"GET", "/config") => {
+                                // 設定情報をJSON形式で返す（secret はマスク）
+                                let body = build_admin_config_json(config);
+                                let mut resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                ).into_bytes();
+                                resp.extend_from_slice(body.as_bytes());
+                                resp
+                            }
+                            (b"GET", "/stats") => {
+                                // 起動からの経過時間を返す
+                                // PROXY_START_TIME を初回アクセスで初期化
+                                let uptime_secs = PROXY_START_TIME.elapsed().as_secs();
+                                let body = format!("{{\"uptime_secs\":{}}}", uptime_secs);
+                                let mut resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                ).into_bytes();
+                                resp.extend_from_slice(body.as_bytes());
+                                resp
+                            }
+                            (b"GET", "/vds") => {
+                                // F-211: VDS の状態（接続・適用中の版・最後の NACK の理由・更新回数）
+                                let body = admin_vds_json();
+                                let mut resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                ).into_bytes();
+                                resp.extend_from_slice(body.as_bytes());
+                                resp
+                            }
+                            (b"POST", "/reload") => {
+                                // 設定リロードフラグを立てる
+                                use std::sync::atomic::Ordering;
+                                RELOAD_FLAG.store(true, Ordering::Relaxed);
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec()
+                            }
+                            (b"POST", "/tls/reload") => {
+                                // TLS証明書リロードフラグを立てる
+                                use std::sync::atomic::Ordering;
+                                TLS_RELOAD_FLAG.store(true, Ordering::Relaxed);
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec()
+                            }
+                            _ => {
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                            }
+                        }
+                    }
+                };
+
+                return Some(H1EarlyResponse::admin(response, start_instant));
+            }
+        }
+    }
+    #[cfg(not(feature = "admin"))]
+    let _ = headers_for_proxy;
+    None
 }
 
 /// 蓄積の先頭のヘッダ部を読み、揃っていれば切り出す。

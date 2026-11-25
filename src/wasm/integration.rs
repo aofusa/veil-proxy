@@ -36,16 +36,72 @@ pub fn empty_wasm_modules() -> crate::wasm_plugin_config::WasmModules {
     crate::wasm_plugin_config::WasmModules::shared(EMPTY.with(Arc::clone))
 }
 
-/// 要求の終わり（`on_log`）。`instance_reuse` のモジュールはここで要求の http context を消す（B-177）
-pub async fn on_request_complete_async(
-    engine: Arc<FilterEngine>,
-    modules: crate::wasm_plugin_config::WasmModules,
-) {
+/// 要求の終わり（`on_log`）。`instance_reuse` のモジュールはここで要求の http context を消す（B-177）。
+/// エンジンは要求の並びが持つもの（要求の入口で置いた。B-501）
+pub async fn on_request_complete_async(modules: &crate::wasm_plugin_config::WasmModules) {
     if modules.is_empty() {
         return;
     }
+    if let Some(engine) = modules.engine() {
+        engine.on_log_with_modules_async(modules).await;
+    }
+}
 
-    engine.on_log_with_modules_async(modules).await;
+/// ワーカーのエンジンの写し（B-501）。要求の並びはこれを `Rc` で持つ（要求ごとに全ワーカー共有の `Arc` の
+/// 参照カウントへ書かない。F-321 と同じ）。元の `Arc` を持っておくので、エンジンが差し替わるまで同じ番地が
+/// 別のエンジンに使い回されることはない
+pub struct WorkerEngine(Arc<FilterEngine>);
+
+impl WorkerEngine {
+    /// エンジン
+    #[inline]
+    pub fn engine(&self) -> &Arc<FilterEngine> {
+        &self.0
+    }
+}
+
+thread_local! {
+    static WORKER_ENGINE: std::cell::RefCell<Option<std::rc::Rc<WorkerEngine>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `engine`（今の設定のエンジン）のワーカーの写し（B-501）。設定が差し替わってエンジンが変わったら写し直す
+pub fn worker_engine(engine: &Arc<FilterEngine>) -> std::rc::Rc<WorkerEngine> {
+    WORKER_ENGINE.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(rc) = c.as_ref() {
+            if Arc::ptr_eq(&rc.0, engine) {
+                return std::rc::Rc::clone(rc);
+            }
+        }
+        let rc = std::rc::Rc::new(WorkerEngine(Arc::clone(engine)));
+        *c = Some(std::rc::Rc::clone(&rc));
+        rc
+    })
+}
+
+/// ワーカーのエンジンの写しを手放す（ワーカーのスレッドの終わりで、ランタイムが生きているうちに呼ぶ。
+/// スレッドローカルの破棄の中でエンジンを落とさない。B-118 と同じ）
+pub fn release_worker_engine() {
+    let _ = WORKER_ENGINE.try_with(|c| {
+        let old = c.borrow_mut().take();
+        drop(old);
+    });
+}
+
+/// ワーカーのエンジンの写しが `current`（今の設定のエンジン）でなければ手放す（ワーカーのアイドル点で呼ぶ。
+/// リロードの後に Wasm の要求の来ないワーカーが古いエンジンを持ち続けない）
+pub fn release_stale_worker_engine(current: Option<&Arc<FilterEngine>>) {
+    let stale = WORKER_ENGINE
+        .try_with(|c| {
+            c.borrow()
+                .as_ref()
+                .is_some_and(|rc| !current.is_some_and(|cur| Arc::ptr_eq(&rc.0, cur)))
+        })
+        .unwrap_or(false);
+    if stale {
+        release_worker_engine();
+    }
 }
 
 /// Execute on_done callback for WASM modules when request context is destroyed

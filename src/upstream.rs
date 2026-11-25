@@ -958,17 +958,24 @@ pub fn release_worker_routes() {
         };
         drop(old);
     });
+    // Wasm のエンジンのワーカーの写しも同じ時点で手放す（B-501）
+    #[cfg(feature = "wasm")]
+    crate::wasm::release_worker_engine();
 }
 
 /// このスレッドのルートの表が今の設定のものでなければ手放す（ワーカーのアイドル点で呼ぶ。リロードの後に要求の
-/// 来ないワーカーが古い設定の値〈上流のグループ等〉を持ち続けない）
+/// 来ないワーカーが古い設定の値〈上流のグループ・Wasm のエンジン〉を持ち続けない）
 pub fn release_stale_worker_routes() {
+    let config = CURRENT_CONFIG.load();
     let stale = WORKER_ROUTES
         .try_with(|w| {
             let w = w.borrow();
-            w.gen != u64::MAX && w.gen != CURRENT_CONFIG.load().optimized_router.generation()
+            w.gen != u64::MAX && w.gen != config.optimized_router.generation()
         })
         .unwrap_or(false);
+    #[cfg(feature = "wasm")]
+    crate::wasm::release_stale_worker_engine(config.wasm_filter_engine.as_ref());
+    drop(config);
     if stale {
         release_worker_routes();
     }

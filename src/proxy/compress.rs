@@ -445,8 +445,8 @@ pub(crate) async fn wasm_filter_response_body(
     wasm_modules: &crate::wasm_plugin_config::WasmModules,
     body: Bytes,
 ) -> Result<Bytes, crate::wasm::LocalResponse> {
-    let config = CURRENT_CONFIG.load();
-    let Some(engine) = config.wasm_filter_engine.as_ref() else {
+    // エンジンは要求の並びが持つもの（設定の Guard を Wasm の呼び出しの間持たない。B-501）
+    let Some(engine) = wasm_modules.engine() else {
         return Ok(body);
     };
     match crate::wasm::http_executor::apply_wasm_response_body(engine, wasm_modules, body, true)

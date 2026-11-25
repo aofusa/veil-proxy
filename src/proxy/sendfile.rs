@@ -1010,8 +1010,8 @@ pub(super) async fn h1_wasm_response_head(
     if wasm_modules.is_empty() {
         return Ok(head);
     }
-    let config = CURRENT_CONFIG.load();
-    let Some(ref wasm_engine) = config.wasm_filter_engine else {
+    // エンジンは要求の並びが持つもの（設定の Guard を Wasm の呼び出しの間持たない。B-501）
+    let Some(wasm_engine) = wasm_modules.engine() else {
         return Ok(head);
     };
     let status_end = match head.windows(2).position(|w| w == b"\r\n") {
@@ -1035,8 +1035,7 @@ pub(super) async fn h1_wasm_response_head(
         ));
     }
     let result = wasm_engine
-        .clone()
-        .on_response_headers_with_modules_async(wasm_modules.clone(), status, current, true)
+        .on_response_headers_with_modules_async(wasm_modules, status, current, true)
         .await;
     let modified = match result {
         crate::wasm::FilterResult::Continue { headers, .. } => headers,

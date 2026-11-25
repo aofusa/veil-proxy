@@ -56,7 +56,8 @@ pub use instance_pool::RequestSessions;
 pub use integration::{
     empty_wasm_modules, on_context_destroy, on_http_call_complete, on_queue_ready,
     on_request_complete, on_request_complete_async, on_tick, process_pending_http_calls,
-    resume_after_http_call, PendingHttpCallInfo, TickConfig, WasmHttpCallResult,
+    release_stale_worker_engine, release_worker_engine, resume_after_http_call, worker_engine,
+    PendingHttpCallInfo, TickConfig, WasmHttpCallResult, WorkerEngine,
 };
 pub use persistent_context::{
     cleanup_old_contexts,

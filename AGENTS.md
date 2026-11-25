@@ -158,6 +158,10 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   （`config::load_backend` を呼ぶのは表を作るときだけ。トラフィック制御が要求ごとに選んだ `Backend` だけが `RouteMatch::Owned`。F-321）。
 - `CURRENT_CONFIG.load()` は 1 回で 100 命令を超える。HTTP/1.1 の要求処理では 1 回だけ読み、`resolve_route_in` へ渡す。
   「機能が有効か」だけを見る値は、設定を保存する箇所の隣で静的な値へ写す（`set_access_log_enabled` 等。F-297）。
+- arc_swap の Guard（`CURRENT_CONFIG.load()` 等）を `.await` をまたいで持たない。速いスロットはスレッドに 8 個で、埋まると以後の
+  読み取りが全部、全ワーカー共有の参照カウントへの加算・減算になる（接続の間持つと 1 ワーカー 8 接続で埋まる）。値を取り出して区画で
+  区切る（`drop()` では足りない。clippy の `await_holding_invalid_type` が検出する）。Proxy-Wasm の各フェーズは要求の並びのエンジン
+  （`WasmModules::engine()`）を使い、設定を読み直さない（B-501）。
 - 要求ごとの `async fn` で `await` をまたぐ局所変数はフューチャの状態になり、接続ごとの冷たいメモリに載る。ヘッダ解析の作業用配列の
   ような大きなものは同期関数へ切り出す（`proxy::h1::parse_request_head`）。`handle_api_handler` の `Box::pin` は外さない
   （ワーカーの中で温かいブロックを回せる。外すと命令数は減るがサイクルが増える。F-297）。

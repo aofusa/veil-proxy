@@ -258,8 +258,8 @@ impl FilterEngine {
     ///
     /// F-43/F-148: `modules` は `Arc` 共有（呼び出しごとの `Vec<ModuleRef>` deep copy 排除）。
     pub async fn on_request_headers_with_modules_async(
-        self: Arc<Self>,
-        modules: crate::wasm_plugin_config::WasmModules,
+        &self,
+        modules: &crate::wasm_plugin_config::WasmModules,
         path: Arc<str>,
         method: Arc<str>,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
@@ -268,7 +268,7 @@ impl FilterEngine {
     ) -> FilterResult {
         // 呼び出し元の future に本体（数 KB）を埋め込まない（Wasm を使わない要求の move が重くなる。B-240）
         Box::pin(self.on_request_headers_with_modules(
-            &modules,
+            modules,
             &path,
             &method,
             headers,
@@ -910,9 +910,9 @@ impl FilterEngine {
     ) -> super::types::HttpCallResponse {
         use super::types::HttpCallResponse;
 
-        // 上流解決（ArcSwap ロード、ロックなし）
-        let config = crate::config::CURRENT_CONFIG.load();
-        let resolved = config
+        // 上流解決（ArcSwap ロード、ロックなし。Guard は offload の `.await` へ持ち越さない。B-501）
+        let resolved = crate::config::CURRENT_CONFIG
+            .load()
             .upstream_groups
             .get(&call.upstream)
             .and_then(|group| group.select("0.0.0.0"))
@@ -1098,15 +1098,15 @@ impl FilterEngine {
     ///
     /// F-43/F-148: `modules` は `Arc` 共有（呼び出しごとの `Vec<ModuleRef>` deep copy 排除）。
     pub async fn on_response_headers_with_modules_async(
-        self: Arc<Self>,
-        modules: crate::wasm_plugin_config::WasmModules,
+        &self,
+        modules: &crate::wasm_plugin_config::WasmModules,
         status: u16,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         end_of_stream: bool,
     ) -> FilterResult {
         // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
         Box::pin(self.on_response_headers_with_modules(
-            &modules,
+            modules,
             status,
             headers,
             end_of_stream,
@@ -1411,14 +1411,14 @@ impl FilterEngine {
     /// Execute on_request_body for specified modules ASYNCHRONOUSLY
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with the thread-per-core runtime.
     pub async fn on_request_body_with_modules_async(
-        self: Arc<Self>,
-        modules: crate::wasm_plugin_config::WasmModules,
+        &self,
+        modules: &crate::wasm_plugin_config::WasmModules,
         body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
         // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
         Box::pin(self.on_request_body_with_modules(
-            &modules,
+            modules,
             body,
             end_of_stream,
             None,
@@ -1604,14 +1604,14 @@ impl FilterEngine {
     /// Execute on_response_body for specified modules ASYNCHRONOUSLY
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with the thread-per-core runtime.
     pub async fn on_response_body_with_modules_async(
-        self: Arc<Self>,
-        modules: crate::wasm_plugin_config::WasmModules,
+        &self,
+        modules: &crate::wasm_plugin_config::WasmModules,
         body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
         // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
         Box::pin(self.on_response_body_with_modules(
-            &modules,
+            modules,
             body,
             end_of_stream,
             modules.sessions(),
@@ -1719,11 +1719,11 @@ impl FilterEngine {
     /// Execute on_log for specified modules ASYNCHRONOUSLY
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with the thread-per-core runtime.
     pub async fn on_log_with_modules_async(
-        self: Arc<Self>,
-        modules: crate::wasm_plugin_config::WasmModules,
+        &self,
+        modules: &crate::wasm_plugin_config::WasmModules,
     ) {
         // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
-        Box::pin(self.on_log_with_modules(&modules, modules.sessions())).await;
+        Box::pin(self.on_log_with_modules(modules, modules.sessions())).await;
     }
 
     /// Execute on_log for a single module

@@ -22,6 +22,14 @@ disallowed-methods = [
     { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "ホットパス禁止（AGENTS.md、B-107）: 同期 DNS（getaddrinfo）。runtime::dns::resolve を使う。起動時・専用スレッド・offload 内のみ理由付き allow 可" },
 ]
 
+# B-501: arc_swap の Guard を `.await` をまたいで持たない。arc_swap はスレッドごとに 8 個の速いスロットで Guard を守り、
+# 埋まっていると以後の読み取りは全ワーカー共有の参照カウントへの加算・減算（共有の行への書き込み）に落ちる。接続や
+# 待ちのある要求の間ずっと持つと、1 ワーカーに 8 本を超えたところで全部の読み取りが遅い経路になる。必要な値を
+# 取り出してから手放す（`Arc` の複製も共有の行への書き込みなので、要求ごとにはワーカーの表から借りる）
+await-holding-invalid-types = [
+    { path = "arc_swap::Guard", reason = "B-501: a Guard held across .await pins one of the thread's 8 fast arc_swap slots; when they run out every load on the worker falls back to shared refcount writes. Take the values you need and drop the Guard first" },
+]
+
 # 引数数・型複雑度の閾値（プロジェクト判断）:
 # - ホットパスでは接続/リクエストごとの状態を構造体へ詰め直すコスト（ムーブ・再借用の整理）を
 #   避け、借用の集合をそのまま引数で渡すスタイルを許容する（最大 16 引数の転送系関数がある）。
