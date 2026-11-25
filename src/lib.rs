@@ -264,6 +264,9 @@ pub mod otel;
 pub mod pool;
 #[doc(hidden)]
 pub mod resilience;
+// F-321: スレッドごとに行を分けた計数器（要求ごとの計数で全ワーカーが同じ行へ書かない）。使うのはキャッシュだけ
+#[cfg(feature = "cache")]
+pub(crate) mod striped;
 
 /// Proxy-Wasm プラグイン設定（TOML テーブル記法・ルート単位上書き、F-148）。
 /// `wasm` feature に依存せず常にコンパイルされる（`config.rs` が型として使うため）。

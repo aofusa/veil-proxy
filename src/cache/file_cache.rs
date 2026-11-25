@@ -344,10 +344,10 @@ pub struct OpenFileCache {
     entries: DashMap<Box<[u8]>, CachedFileInfo, foldhash::quality::RandomState>,
     /// キャッシュエントリの有効期間（ナノ秒、ロックフリー atomic）
     valid_duration_nanos: AtomicU64,
-    /// キャッシュヒット数
-    hits: AtomicU64,
+    /// キャッシュヒット数（F-321: スレッドごとに行を分けて数える。要求ごとに全ワーカーが同じ行へ書かない）
+    hits: crate::striped::StripedCounter,
     /// キャッシュミス数
-    misses: AtomicU64,
+    misses: crate::striped::StripedCounter,
     /// 最大エントリ数（ロックフリー atomic）
     max_entries: AtomicUsize,
 }
@@ -358,8 +358,8 @@ impl OpenFileCache {
         Self {
             entries: DashMap::with_capacity_and_hasher(1024, path_key_hasher()),
             valid_duration_nanos: AtomicU64::new(60_000_000_000), // デフォルト60秒
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            hits: crate::striped::StripedCounter::new(),
+            misses: crate::striped::StripedCounter::new(),
             max_entries: AtomicUsize::new(10_000),
         }
     }
@@ -381,13 +381,13 @@ impl OpenFileCache {
         // まずキャッシュから検索（ヒット時は syscall ゼロ・非同期待機なし）
         if let Some(entry) = self.entries.get(path_key(path)) {
             if entry.usable(valid_duration, None) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
+                self.hits.incr();
                 return Some(entry.clone());
             }
         }
 
         // キャッシュミス: ファイルシステムから取得（オフロードで非同期）
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.misses.incr();
 
         let info = self.fetch_file_info(path).await?;
 
@@ -604,13 +604,13 @@ impl OpenFileCache {
     /// キャッシュヒット数を取得
     #[inline]
     pub fn hits(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
+        self.hits.get()
     }
 
     /// キャッシュミス数を取得
     #[inline]
     pub fn misses(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
+        self.misses.get()
     }
 
     /// ヒット率を取得（パーセンテージ）
@@ -638,8 +638,8 @@ impl OpenFileCache {
 
     /// 統計情報をリセット
     pub fn reset_stats(&self) {
-        self.hits.store(0, Ordering::Relaxed);
-        self.misses.store(0, Ordering::Relaxed);
+        self.hits.reset();
+        self.misses.reset();
     }
 
     /// 設定を考慮したヒット判定のみ（フェッチしない・syscall/offload 一切なし、B-65）。
@@ -669,7 +669,7 @@ impl OpenFileCache {
             });
         let entry = self.entries.get(path_key(path))?;
         if entry.usable(valid_duration, config.and_then(|c| c.watch_gen)) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.hits.incr();
             Some(entry.clone())
         } else {
             None
@@ -722,13 +722,13 @@ impl OpenFileCache {
         if let Some(entry) = self.entries.get(path_key(path)) {
             // ルーティングごとの有効期間で判定
             if entry.usable(valid_duration, watch_gen) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
+                self.hits.incr();
                 return Some(entry.clone());
             }
         }
 
         // キャッシュミス: ファイルシステムから取得（オフロードで非同期）
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.misses.incr();
 
         // F-272: 開く前に世代を読む（読み込み中の差し替えを新しい世代で残さない）
         let stamp = super::watch::stamp(watch_gen);

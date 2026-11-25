@@ -597,26 +597,49 @@ fn new_route_lru(cap: NonZeroUsize) -> RouteLru {
     LruCache::with_hasher(cap, foldhash::quality::RandomState::default())
 }
 
+/// スレッドのルートキャッシュ（世代・本体・その世代の当たりと外れの数）
+struct TlRouteCache {
+    generation: u64,
+    lru: RouteLru,
+    hits: u64,
+    misses: u64,
+}
+
+impl TlRouteCache {
+    /// `gen` の表のキャッシュにする（世代が違えば空にして数え直す）
+    #[inline]
+    fn for_generation(&mut self, gen: u64) {
+        if self.generation != gen {
+            let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
+                .unwrap_or(NonZeroUsize::new(10000).unwrap());
+            self.lru = new_route_lru(cap);
+            self.generation = gen;
+            self.hits = 0;
+            self.misses = 0;
+        }
+    }
+}
+
 thread_local! {
-    /// スレッドローカル LRU キャッシュ: (世代, キャッシュ本体)
-    static TL_ROUTE_CACHE: RefCell<(u64, RouteLru)> = {
+    /// スレッドローカル LRU キャッシュ
+    static TL_ROUTE_CACHE: RefCell<TlRouteCache> = {
         let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
             .unwrap_or(NonZeroUsize::new(10000).unwrap());
-        RefCell::new((0, new_route_lru(cap)))
+        RefCell::new(TlRouteCache { generation: 0, lru: new_route_lru(cap), hits: 0, misses: 0 })
     };
 }
 
-/// LRUキャッシュのファサード（グローバル統計のみ保持）
+/// LRUキャッシュのファサード（表の世代だけを持つ）
 ///
 /// 実際のキャッシュデータはスレッドローカルに格納されるため
 /// ロック競合が発生しない。
+///
+/// F-321: 当たり・外れの数もスレッドごとに数える。以前は全ワーカーがこの構造体の `hits`・`misses` へ要求ごとに書き、
+/// 要求ごとに読む `generation` と同じキャッシュラインだったので、多コアでは書き込みも読み込みもコアの間でラインを
+/// 奪い合っていた。
 pub struct RouteCache {
-    /// この表のキャッシュの世代（`clear` で新しい値にする。B-386）
+    /// この表のキャッシュの世代（`clear` で新しい値にする。B-386）。要求ごとに読み、書くのはリロードのときだけ
     generation: AtomicU64,
-    /// キャッシュヒット数（Atomic、全スレッド合算）
-    hits: AtomicU64,
-    /// キャッシュミス数（Atomic、全スレッド合算）
-    misses: AtomicU64,
 }
 
 impl RouteCache {
@@ -625,8 +648,6 @@ impl RouteCache {
         CACHE_CAPACITY.store(capacity.max(1), Ordering::Relaxed);
         Self {
             generation: AtomicU64::new(CACHE_GENERATION.fetch_add(1, Ordering::Relaxed)),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
         }
     }
 
@@ -634,19 +655,14 @@ impl RouteCache {
     pub fn get(&self, key: &RouteCacheKey) -> Option<Option<usize>> {
         let gen = self.generation.load(Ordering::Relaxed);
         TL_ROUTE_CACHE.with(|cell| {
-            let mut borrow = cell.borrow_mut();
+            let mut c = cell.borrow_mut();
             // 世代が変わっていたらキャッシュをクリア
-            if borrow.0 != gen {
-                let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
-                    .unwrap_or(NonZeroUsize::new(10000).unwrap());
-                borrow.1 = new_route_lru(cap);
-                borrow.0 = gen;
-            }
-            if let Some(&result) = borrow.1.get(key) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
+            c.for_generation(gen);
+            if let Some(&result) = c.lru.get(key) {
+                c.hits += 1;
                 Some(result)
             } else {
-                self.misses.fetch_add(1, Ordering::Relaxed);
+                c.misses += 1;
                 None
             }
         })
@@ -656,23 +672,23 @@ impl RouteCache {
     pub fn put(&self, key: RouteCacheKey, route_idx: Option<usize>) {
         let gen = self.generation.load(Ordering::Relaxed);
         TL_ROUTE_CACHE.with(|cell| {
-            let mut borrow = cell.borrow_mut();
-            if borrow.0 != gen {
-                let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
-                    .unwrap_or(NonZeroUsize::new(10000).unwrap());
-                borrow.1 = new_route_lru(cap);
-                borrow.0 = gen;
-            }
-            borrow.1.put(key, route_idx);
+            let mut c = cell.borrow_mut();
+            c.for_generation(gen);
+            c.lru.put(key, route_idx);
         });
     }
 
-    /// キャッシュ統計を取得
+    /// 呼んだスレッドのこの表のキャッシュの（当たり, 外れ）の数（試験と `Debug` だけが読む）
     pub fn stats(&self) -> (u64, u64) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-        )
+        let gen = self.generation.load(Ordering::Relaxed);
+        TL_ROUTE_CACHE.with(|cell| {
+            let c = cell.borrow();
+            if c.generation == gen {
+                (c.hits, c.misses)
+            } else {
+                (0, 0)
+            }
+        })
     }
 
     /// 全スレッドのこの表のキャッシュを無効化（新しい世代にする）
@@ -821,7 +837,8 @@ impl OptimizedRouter {
         self.cache.clear();
     }
 
-    /// Get cache statistics
+    /// Route cache statistics `(hits, misses)` of the calling thread for this table
+    /// (each worker counts its own lookups)
     pub fn cache_stats(&self) -> (u64, u64) {
         self.cache.stats()
     }

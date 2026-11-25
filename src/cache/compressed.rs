@@ -127,8 +127,9 @@ mod enabled {
         /// シャード横断の read ロックを取るため、ホットパスにもなり得る
         /// `try_insert` からは呼ばず、専用カウンタを都度更新する）
         entry_count: AtomicUsize,
-        hits: AtomicU64,
-        misses: AtomicU64,
+        /// 当たり・外れの数（F-321: スレッドごとに行を分けて数える）
+        hits: crate::striped::StripedCounter,
+        misses: crate::striped::StripedCounter,
     }
 
     impl CompressedCache {
@@ -137,8 +138,8 @@ mod enabled {
                 entries: DashMap::with_capacity(64),
                 total_bytes: AtomicU64::new(0),
                 entry_count: AtomicUsize::new(0),
-                hits: AtomicU64::new(0),
-                misses: AtomicU64::new(0),
+                hits: crate::striped::StripedCounter::new(),
+                misses: crate::striped::StripedCounter::new(),
             }
         }
 
@@ -168,7 +169,7 @@ mod enabled {
             if variant.cached_at.elapsed() >= ttl {
                 return None;
             }
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.hits.incr();
             Some(variant.data.clone())
         }
 
@@ -272,7 +273,7 @@ mod enabled {
         if let Some(hit) = COMPRESSED_CACHE.try_hit(path, key, ident, cfg) {
             return hit;
         }
-        COMPRESSED_CACHE.misses.fetch_add(1, Ordering::Relaxed);
+        COMPRESSED_CACHE.misses.incr();
         let stamp = crate::cache::watch::stamp(cfg.watch_gen);
         let compressed = compress();
         let len = compressed.len() as u64;
@@ -305,12 +306,12 @@ mod enabled {
 
     /// キャッシュヒット数（テスト・診断用）。
     pub fn hits() -> u64 {
-        COMPRESSED_CACHE.hits.load(Ordering::Relaxed)
+        COMPRESSED_CACHE.hits.get()
     }
 
     /// キャッシュミス数（テスト・診断用）。
     pub fn misses() -> u64 {
-        COMPRESSED_CACHE.misses.load(Ordering::Relaxed)
+        COMPRESSED_CACHE.misses.get()
     }
 
     #[cfg(test)]

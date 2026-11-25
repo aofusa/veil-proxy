@@ -200,8 +200,9 @@ struct ContentCache {
     entries: DashMap<PathBuf, CachedContent>,
     /// 現在キャッシュされている `data` の合計バイト数（admission control 用）
     total_bytes: AtomicU64,
-    hits: AtomicU64,
-    misses: AtomicU64,
+    /// 当たり・外れの数（F-321: スレッドごとに行を分けて数える）
+    hits: crate::striped::StripedCounter,
+    misses: crate::striped::StripedCounter,
 }
 
 impl ContentCache {
@@ -209,8 +210,8 @@ impl ContentCache {
         Self {
             entries: DashMap::with_capacity(256),
             total_bytes: AtomicU64::new(0),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            hits: crate::striped::StripedCounter::new(),
+            misses: crate::striped::StripedCounter::new(),
         }
     }
 
@@ -329,7 +330,7 @@ impl ContentCache {
         }
         if !cfg.revalidate_mtime {
             // ホットパス: DashMap ルックアップ + TTL 判定 + Bytes::clone() のみ。
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.hits.incr();
             return Some((entry.data.clone(), entry.mime_type.clone()));
         }
         // revalidate_mtime = true: 明示的に選択された trade-off として毎回 stat を実行する
@@ -348,7 +349,7 @@ impl ContentCache {
         })
         .await;
         if current_mtime == cached_mtime {
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.hits.incr();
             return Some((cached_data, cached_mime));
         }
         // mtime 不一致: 陳腐化しているため呼び出し元は再読み込みへフォールスルーする。
@@ -378,7 +379,7 @@ impl ContentCache {
             return Some(hit);
         }
 
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.misses.incr();
 
         // F-272: 読む前に世代を読む（読み込み中の差し替えを新しい世代で残さない）
         let stamp = super::watch::stamp(cfg.watch_gen);
@@ -436,7 +437,7 @@ impl ContentCache {
         match self.try_hit(path, cfg, Some(version)).await {
             Some((data, _mime)) => Some(data),
             None => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
+                self.misses.incr();
                 None
             }
         }
@@ -587,13 +588,13 @@ pub fn clear() {
 /// キャッシュヒット数を取得
 #[inline]
 pub fn hits() -> u64 {
-    CONTENT_CACHE.hits.load(Ordering::Relaxed)
+    CONTENT_CACHE.hits.get()
 }
 
 /// キャッシュミス数を取得
 #[inline]
 pub fn misses() -> u64 {
-    CONTENT_CACHE.misses.load(Ordering::Relaxed)
+    CONTENT_CACHE.misses.get()
 }
 
 /// 現在のエントリ数を取得
@@ -771,13 +772,13 @@ mod tests {
 
         let first = get(&cache, &path, &cfg);
         assert_eq!(first.as_deref(), Some(&b"hello world"[..]));
-        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
-        assert_eq!(cache.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.misses.get(), 1);
+        assert_eq!(cache.hits.get(), 0);
 
         let second = get(&cache, &path, &cfg);
         assert_eq!(second.as_deref(), Some(&b"hello world"[..]));
-        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
-        assert_eq!(cache.hits.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.misses.get(), 1);
+        assert_eq!(cache.hits.get(), 1);
 
         // 参照カウント共有であることを確認（同一バイト列を指す）
         assert_eq!(first.unwrap(), second.unwrap());
@@ -805,14 +806,14 @@ mod tests {
         cfg.valid_duration_secs = 0; // 即座に期限切れ扱い
 
         let _ = get(&cache, &path, &cfg);
-        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.misses.get(), 1);
         // 有効期間0秒なので次回アクセスは必ずミス（TTL切れ）扱いになる
         // 理由付き allow: 単体テストのみ（ホットパス外）。TTL 経過を確実にするための待機。
         #[allow(clippy::disallowed_methods)]
         std::thread::sleep(Duration::from_millis(5));
         let _ = get(&cache, &path, &cfg);
-        assert_eq!(cache.misses.load(Ordering::Relaxed), 2);
-        assert_eq!(cache.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.misses.get(), 2);
+        assert_eq!(cache.hits.get(), 0);
     }
 
     #[test]
@@ -837,7 +838,7 @@ mod tests {
 
         // 2回目も常にミス（キャッシュされていないため）
         let _ = get(&cache, &path, &cfg);
-        assert_eq!(cache.misses.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.misses.get(), 2);
     }
 
     #[test]
@@ -874,9 +875,9 @@ mod tests {
         assert_eq!(cache.entries.len(), 0);
         assert_eq!(cache.total_bytes.load(Ordering::Relaxed), 0);
 
-        let initial_misses = cache.misses.load(Ordering::Relaxed);
+        let initial_misses = cache.misses.get();
         let _ = get(&cache, &path, &cfg);
-        assert_eq!(cache.misses.load(Ordering::Relaxed), initial_misses + 1);
+        assert_eq!(cache.misses.get(), initial_misses + 1);
     }
 
     /// F-169: 本体キャッシュの明示的な `invalidate` は、同じパスの圧縮結果キャッシュ
