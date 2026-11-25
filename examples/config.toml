@@ -1660,13 +1660,15 @@ watch = false
 # interpreter = false
 
 # CPU の量（max_execution_time_ms）と yield の間隔（yield_interval_us）の測り方
-# - "clock": フィルタが走っている間、専用スレッドが yield_interval_us ごとに wasmtime のエポックを進め
-#   （しばらく走っていなければ 100ms ごと）、走っているコールバックが関数の入口とループの戻りで見る。
-#   見るまでに走った時間は 1 周期分までしか数えない（ページフォールト・長いホスト関数を CPU に数えない）
-# - "fuel": wasmtime の fuel でゲストの命令を正確に数える。ゲストのコードが遅くなる（Wasm の 1 要求の
-#   CPU が 3〜14% 多い）。veil_wasm_fuel_consumed_total はこちらでだけ記録する
+# - "clock": フィルタが走っている間、専用スレッドが yield_interval_us（max_execution_time_ms の 4 分の 1 まで）
+#   ごとに wasmtime のエポックを進め（しばらく走っていなければ 100ms ごと）、走っているコールバックが関数の入口と
+#   ループの戻りで見て、前に見たときからそのスレッドが使った CPU 時間を足す（他のスレッドに CPU を取られていた
+#   時間・ページフォールトでディスクを待った時間は数えない。Windows は見るまでの実時間を 1 周期分まで数える）
+# - "fuel": wasmtime の fuel でゲストの命令を数える。ゲストのコードが遅くなる（Wasm の 1 要求の CPU が
+#   3〜14% 多い）。veil_wasm_fuel_consumed_total はこちらでだけ記録する
 # エンジンの設定なので、.cwasm を直接指定するモジュールは同じ方式でコンパイルしたものに限る
-# デフォルト: "clock"
+# デフォルト: "clock"。Pulley インタープリタ（interpreter = true、OpenBSD・NetBSD・FreeBSD aarch64 は常に）では
+# "fuel"（ゲストのコードが 10〜30 倍遅く、時間で測ると fuel で収まっていたモジュールが上限を超える）
 # metering = "clock"
 
 # Proxy-Wasm の gRPC 呼び出しで上流へ新しく接続する（TCP + TLS）のを待つ時間の上限（ミリ秒）
@@ -1684,7 +1686,8 @@ watch = false
 
 # デフォルト設定
 # [wasm.defaults]
-# 最大実行時間（ミリ秒）
+# 1 回のコールバックの CPU の量（ミリ秒。metering の方式で数える）。新しいインスタンスの起動時のコールバック
+# （_start・proxy_on_vm_start・proxy_on_configure）は別の枠で、この値の 10 倍
 # デフォルト: 100
 # max_execution_time_ms = 100
 # コールバックが同じワーカーの他の要求へ制御を返す間隔（マイクロ秒の目安。metering = "clock" では

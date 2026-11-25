@@ -173,7 +173,7 @@ row("gRPC", True, grpc)
 wasm = line(
     ts("Proxy-Wasm filter time p99", [
         (q(0.99, "veil_wasm_filter_duration_seconds", "filter, phase", SEL), "{{filter}} {{phase}}")], "s", w=12),
-    ts("Proxy-Wasm fuel per second (metering = fuel)", [
+    ts("Proxy-Wasm fuel per second (fuel metering)", [
         (f'sum by (filter, phase) (rate(veil_wasm_fuel_consumed_total{{{SEL}}}[{RI}]))', "{{filter}} {{phase}}")], "short", w=12),
 )
 row("Proxy-Wasm", True, wasm)

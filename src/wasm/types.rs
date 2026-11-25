@@ -30,11 +30,13 @@ pub struct WasmConfig {
     pub interpreter: bool,
 
     /// ゲストの CPU の上限（`max_execution_time_ms`）と協調的な yield（`yield_interval_us`）の計り方（F-319）。
-    /// 既定の `clock` はエポックを進める専用スレッドで走った時間を測る（ゲストのコードに入る検査はエポックの比較だけ）。
-    /// `fuel` は wasmtime の fuel で命令数を数える（正確だがゲストが遅くなる。`veil_wasm_fuel_consumed_total` は
-    /// `fuel` のときだけ記録する）。エンジンの設定なので、明示した `.cwasm` は同じ方式でコンパイルしたものに限る
+    /// `clock` はエポックを進める専用スレッドの割り込みで、スレッドの CPU 時間を数える（ゲストのコードに入る検査は
+    /// エポックの比較だけ）。`fuel` は wasmtime の fuel で命令数を数える（ゲストが遅くなる。
+    /// `veil_wasm_fuel_consumed_total` は `fuel` のときだけ記録する）。未指定なら `clock`、ただし Pulley
+    /// インタープリタでは `fuel`（`metering::resolve`）。エンジンの設定なので、明示した `.cwasm` は同じ方式で
+    /// コンパイルしたものに限る
     #[serde(default)]
-    pub metering: Metering,
+    pub metering: Option<Metering>,
 
     /// Proxy-Wasm の gRPC 呼び出しで上流へ新しく接続する（TCP + TLS）のを待つ時間の上限（ミリ秒）。
     /// ゲストの `timeout_ms` がこれより長くても接続はこの時間で諦める（F-283）
@@ -78,7 +80,7 @@ impl Default for WasmConfig {
             defaults: WasmDefaults::default(),
             modules: Vec::new(),
             interpreter: false,
-            metering: Metering::default(),
+            metering: None,
             grpc_connect_timeout_ms: DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: DEFAULT_SHARED_DATA_MAX_KEYS,
@@ -87,11 +89,10 @@ impl Default for WasmConfig {
 }
 
 /// ゲストの CPU の上限と yield の計り方（`[wasm] metering`。F-319。`super::metering`）
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Metering {
-    /// エポック（専用スレッドが `yield_interval_us` ごとに進める）で、走った時間を測る
-    #[default]
+    /// エポック（専用スレッドが `yield_interval_us` ごとに進める）の割り込みで、スレッドの CPU 時間を測る
     Clock,
     /// wasmtime の fuel で、ゲストの命令数を数える
     Fuel,

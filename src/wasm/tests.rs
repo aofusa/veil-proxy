@@ -2224,7 +2224,9 @@ mod failure_policy_tests {
     #[test]
     fn fuel_exhaustion_is_a_failure() {
         let m = wat("(i32.const 1)", "(loop $l (br $l)) (i32.const 0)", "");
-        let f = build(&m, None, false, |d| d.max_execution_time_ms = 1).unwrap();
+        // 起動時のコールバックは収まり、終わらない要求のコールバックだけが上限を超える大きさ（`clock` は CPU 時間で
+        // 数えるので、デバッグビルドの起動時のコールバックにも少し余裕を持たせる）
+        let f = build(&m, None, false, |d| d.max_execution_time_ms = 20).unwrap();
         assert_eq!(status(&request(&f.engine, true)), Some(503));
     }
 

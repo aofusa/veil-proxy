@@ -218,8 +218,9 @@ impl ModuleRegistry {
         config.async_stack_size(ASYNC_STACK_SIZE);
 
         // CPU の上限と協調的な yield の計り方（`[wasm] metering`。F-319）。fuel はゲストの基本ブロックごとに残量の
-        // 検査を入れるので `"fuel"` のときだけ有効にする（既定の `"clock"` はエポックだけで測る。`super::metering`）
-        config.consume_fuel(wasm_config.metering == super::types::Metering::Fuel);
+        // 検査を入れるので `"fuel"` のとき（未指定なら Pulley のとき）だけ有効にする（`"clock"` はエポックだけで測る。
+        // `super::metering`）
+        config.consume_fuel(super::metering::resolve(wasm_config) == super::types::Metering::Fuel);
 
         // エポック割り込み（`clock` の CPU の上限・yield と、両方の方式の実時間の上限）
         // 専用スレッドがエンジンのエポックを進め、Store の締切と照合する

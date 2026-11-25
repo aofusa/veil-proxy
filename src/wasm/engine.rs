@@ -3192,7 +3192,7 @@ mod exec_smoke_tests {
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
             // エポックの代わりに時間を進める試験（fuel の方式の締切はエポックのティック数）
-            metering: crate::wasm::Metering::Fuel,
+            metering: Some(crate::wasm::Metering::Fuel),
         };
         let engine = FilterEngine::new(&config).expect("engine");
         let module = engine
@@ -3281,7 +3281,7 @@ mod exec_smoke_tests {
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
             // エポックの代わりに時間を進める試験（fuel の方式の締切はエポックのティック数）
-            metering: crate::wasm::Metering::Fuel,
+            metering: Some(crate::wasm::Metering::Fuel),
         };
         let engine = FilterEngine::new(&config).expect("engine");
         let module = engine
@@ -3370,7 +3370,7 @@ mod exec_smoke_tests {
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
             // エポックの代わりに時間を進める試験（fuel の方式の締切はエポックのティック数）
-            metering: crate::wasm::Metering::Fuel,
+            metering: Some(crate::wasm::Metering::Fuel),
         };
         FilterEngine::new(&config).ok()
     }

@@ -9,10 +9,16 @@
 //!   交互 A/B で、Wasm の経路の 1 要求の CPU が `clock` より 3〜14% 多い）。エポックは 100 ms ごとに進め、実時間の
 //!   上限だけに使う（B-173）。
 //!
-//! `clock` の走った時間は、区間（呼び出しを始めてから、または譲ったあと再開してから）の実時間を、エポック 1 つ分
-//! （[`Limits::tick`]）までに切り詰めて足す。エポックの検査はゲストのコードの中にしか無いので、ページフォールトで
-//! ディスクを待った時間（B-336）・ホスト関数の中の時間で割り込みが遅れても、そのぶんを CPU に数えない（fuel も
-//! ゲストの命令しか数えない）。
+//! `clock` の走った時間は、締切に届くたびにスレッドの CPU 時間（`CLOCK_THREAD_CPUTIME_ID`）の差を足す。他のスレッドに
+//! CPU を取られていた時間・ページフォールトでディスクを待った時間（B-336）は入らない（壁時計で数えると、CPU を
+//! 取り合う負荷の下で走った時間を最大で数倍に数え、重い `on_configure` が上限を超えた）。区間（呼び出しを始めてから、
+//! または譲ったあと再開してから）の最初の検査と、スレッドの CPU 時間を読めない OS（Windows）は、実時間をエポック
+//! 1 つ分（[`Limits::tick`]）までに切り詰めて足す。読むのは締切に届いたとき（走り続けるゲストでエポックごと）と
+//! 再開したときだけで、エポックの間に終わる普通のコールバックは読まない。
+//!
+//! 既定は `clock`。ただし Pulley インタープリタ（`interpreter = true`、OpenBSD・NetBSD・FreeBSD aarch64 は常に）では
+//! `fuel` にする（[`resolve`]）。インタープリタはゲストのコードが 10〜30 倍遅く、時間で測ると fuel で収まっていた
+//! モジュールが上限を超える。
 //!
 //! 専用スレッドは、Wasm の呼び出しが無い間は 100 ms ごとにしか起きない（呼び出しを始めたワーカーが起こす。
 //! サイドカーのように多くのプロセスを並べる配置でアイドルの起床を増やさない）。
@@ -29,6 +35,17 @@ use wasmtime::{AsContextMut, Engine, Store, UpdateDeadline};
 
 use super::context::HostState;
 use super::types::{Metering, WasmConfig};
+
+/// `[wasm] metering` の実際の値（未指定なら、Pulley インタープリタでは `fuel`、それ以外は `clock`）
+pub(crate) fn resolve(config: &WasmConfig) -> Metering {
+    config
+        .metering
+        .unwrap_or(if super::registry::uses_pulley(config) {
+            Metering::Fuel
+        } else {
+            Metering::Clock
+        })
+}
 
 /// `fuel` の方式でエポックを進める間隔（B-173。`Window::fuel_ticks` と合わせて実時間の上限になる）
 const FUEL_EPOCH_TICK: Duration = Duration::from_millis(100);
@@ -54,6 +71,15 @@ pub(crate) enum Window {
 }
 
 impl Window {
+    /// CPU の上限（`max_execution_time_ms`）の倍率。起動時のコールバックは正規表現の組み立て・設定やデータの読み込みで
+    /// 普通のコールバックより重く、インスタンスごとに 1 度だけ走る（暴走するモジュールは起動時の検査で拒否する）
+    fn budget_scale(self) -> u32 {
+        match self {
+            Window::Callback => 1,
+            Window::Lifecycle => 10,
+        }
+    }
+
     /// 実時間の上限（`clock`）
     fn wall(self) -> Duration {
         match self {
@@ -79,7 +105,9 @@ pub(crate) struct Limits {
     cpu: Duration,
     /// 譲る間隔（`yield_interval_us`）
     yield_interval: Duration,
-    /// エポックを進める間隔（`clock`）
+    /// エポックを進める間隔（`clock`。`yield_interval` と CPU の上限の 4 分の 1 の短い方を
+    /// [`MIN_TICK`]〜[`IDLE_TICK`] に収める。区間の最初の検査は実時間をこの間隔まで数えるので、上限が小さくても
+    /// その誤差は上限の 4 分の 1 まで）
     tick: Duration,
     /// `fuel` の燃料（約 1M で 1 ms）
     fuel: u64,
@@ -93,10 +121,12 @@ impl Limits {
         let yield_us = config.defaults.yield_interval_us.max(1);
         let yield_interval = Duration::from_micros(yield_us);
         Self {
-            metering: config.metering,
+            metering: resolve(config),
             cpu: Duration::from_millis(max_ms),
             yield_interval,
-            tick: yield_interval.clamp(MIN_TICK, IDLE_TICK),
+            tick: yield_interval
+                .min(Duration::from_millis(max_ms) / 4)
+                .clamp(MIN_TICK, IDLE_TICK),
             fuel: max_ms.saturating_mul(1_000_000),
             fuel_yield: yield_us.saturating_mul(1_000),
         }
@@ -128,18 +158,24 @@ pub(crate) struct Meter {
     armed_at: Instant,
     /// 走った時間をどこまで足したか
     counted_to: Instant,
+    /// `counted_to` のときのスレッドの CPU 時間（区間の最初の検査の前・読めない OS では無し）
+    cpu_mark: Option<Duration>,
     /// 呼び出しを始めてから走った時間
     run: Duration,
+    /// CPU の上限（`max_execution_time_ms` に [`Window::budget_scale`] を掛けたもの）
+    budget: Duration,
     /// 実時間の上限
     wall: Duration,
 }
 
 impl Meter {
     /// 呼び出しの始まり（CPU と実時間の両方を測り直す）
-    fn arm(&mut self, now: Instant, window: Window) {
+    fn arm(&mut self, now: Instant, window: Window, limits: &Limits) {
         self.armed_at = now;
         self.counted_to = now;
+        self.cpu_mark = None;
         self.run = Duration::ZERO;
+        self.budget = limits.cpu.saturating_mul(window.budget_scale());
         self.wall = window.wall();
     }
 
@@ -147,26 +183,67 @@ impl Meter {
     fn rearm_wall(&mut self, now: Instant, window: Window) {
         self.armed_at = now;
         self.counted_to = now;
+        self.cpu_mark = None;
         self.wall = window.wall();
+    }
+
+    /// 再開の記録（[`Resumed`]）の持ち主の印（ストアの中の `HostState` は動かない）
+    fn id(&self) -> usize {
+        std::ptr::from_ref(self) as usize
     }
 }
 
+/// 上限を入れる前（[`arm`] の前）のストアは CPU の上限が 0（fuel の方式で燃料が 0 なのと同じく、最初の検査で止まる）
 impl Default for Meter {
     fn default() -> Self {
         let now = crate::runtime::time::coarse_now();
         Self {
             armed_at: now,
             counted_to: now,
+            cpu_mark: None,
             run: Duration::ZERO,
+            budget: Duration::ZERO,
             wall: Window::Callback.wall(),
         }
     }
 }
 
+/// 譲ったゲストが再開したときの記録（[`Resume`]）
+#[derive(Clone, Copy, Debug)]
+struct Resumed {
+    /// 再開したゲストの [`Meter::id`]（呼び出しを始めてからゲストが走り出すまでの間に同じスレッドで他のゲストが
+    /// 再開しても、その記録を自分のものと取り違えない）
+    owner: usize,
+    at: Instant,
+    /// 再開したときのスレッドの CPU 時間
+    cpu: Option<Duration>,
+}
+
 thread_local! {
-    /// このスレッドで最後に再開したゲストの再開の時刻（[`Resume`]）。呼び出しを始めるたびに消す（[`arm`]）ので、
-    /// 走っているゲストがここに値を見たら、それは自分が譲ってから再開した時刻
-    static RESUMED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// このスレッドで最後に再開したゲストの記録（[`Resume`]）。呼び出しを始めるたびに消す（[`arm`]）
+    static RESUMED: Cell<Option<Resumed>> = const { Cell::new(None) };
+}
+
+/// このスレッドが使った CPU 時間（`clock` の数え方。読めない OS では `None` で、実時間で数える）
+#[cfg(unix)]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` は書き込める `timespec`。CLOCK_THREAD_CPUTIME_ID は対象の全 unix にある（seccomp は clock_gettime を
+    // 許可済み・capsicum の capability mode でも使える）
+    let r = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    if r != 0 {
+        return None;
+    }
+    Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+/// Windows のスレッドの CPU 時間（`GetThreadTimes`）はスケジューラの刻み（約 15.6 ms）でしか進まないので使わない
+#[cfg(not(unix))]
+fn thread_cpu_time() -> Option<Duration> {
+    None
 }
 
 /// コールバックを呼ぶ前に上限を入れる（呼び出しごと。`clock` は時刻の読み取りもしない）
@@ -178,15 +255,15 @@ pub(crate) fn arm(
     let mut ctx = ctx.as_context_mut();
     match limits.metering {
         Metering::Fuel => {
-            ctx.set_fuel(limits.fuel)?;
+            ctx.set_fuel(limits.fuel.saturating_mul(u64::from(window.budget_scale())))?;
             ctx.fuel_async_yield_interval(Some(limits.fuel_yield))?;
             ctx.set_epoch_deadline(window.fuel_ticks());
         }
         Metering::Clock => {
             ctx.data_mut()
                 .meter
-                .arm(crate::runtime::time::coarse_now(), window);
-            RESUMED_AT.with(|c| c.set(None));
+                .arm(crate::runtime::time::coarse_now(), window, limits);
+            RESUMED.with(|c| c.set(None));
             ctx.set_epoch_deadline(1);
         }
     }
@@ -207,7 +284,7 @@ pub(crate) fn rearm_wall(
             ctx.data_mut()
                 .meter
                 .rearm_wall(crate::runtime::time::coarse_now(), window);
-            RESUMED_AT.with(|c| c.set(None));
+            RESUMED.with(|c| c.set(None));
             ctx.set_epoch_deadline(1);
         }
     }
@@ -237,14 +314,26 @@ pub(crate) fn fuel_consumed(store: &Store<HostState>, limits: &Limits) -> Option
 
 /// エポックの締切に届いたゲストの扱いを決める（`clock`）
 fn on_epoch(m: &mut Meter, limits: &Limits, now: Instant) -> anyhow::Result<UpdateDeadline> {
-    match decide(m, limits, now, RESUMED_AT.with(Cell::get)) {
+    let resumed = resumed_by(m);
+    match decide(m, limits, now, thread_cpu_time(), resumed) {
         Decision::OutOfCpu => Err(wasmtime::Trap::OutOfFuel.into()),
         Decision::OutOfTime => Err(wasmtime::Trap::Interrupt.into()),
         Decision::Continue => Ok(UpdateDeadline::Continue(1)),
         // 再開したときに締切を引き直す（wasmtime は yield から戻ってから `set_epoch_deadline` する）ので、待つ間に
         // エポックが進んでも、再開した直後にまた譲ることはない
-        Decision::Yield => Ok(UpdateDeadline::YieldCustom(1, Box::pin(Resume::default()))),
+        Decision::Yield => Ok(UpdateDeadline::YieldCustom(
+            1,
+            Box::pin(Resume {
+                owner: m.id(),
+                yielded: false,
+            }),
+        )),
     }
+}
+
+/// このスレッドの再開の記録のうち、`m` のゲストのもの
+fn resumed_by(m: &Meter) -> Option<Resumed> {
+    RESUMED.with(Cell::get).filter(|r| r.owner == m.id())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -255,15 +344,31 @@ enum Decision {
     Yield,
 }
 
-/// [`on_epoch`] の本体（時刻を引数にして試験できるようにする）。`resumed_at` は譲ったあと再開した時刻
-fn decide(m: &mut Meter, limits: &Limits, now: Instant, resumed_at: Option<Instant>) -> Decision {
+/// [`on_epoch`] の本体（時刻を引数にして試験できるようにする）。`cpu_now` はスレッドの CPU 時間、`resumed` は
+/// このゲストが譲ったあと再開したときの記録
+fn decide(
+    m: &mut Meter,
+    limits: &Limits,
+    now: Instant,
+    cpu_now: Option<Duration>,
+    resumed: Option<Resumed>,
+) -> Decision {
     // 今の区間の始まり: 譲ったあとなら再開した時刻、まだ譲っていなければ呼び出しを始めた時刻
-    let segment_start = resumed_at.unwrap_or(m.armed_at);
-    let from = segment_start.max(m.counted_to);
-    // エポック 1 つ分を超える遅れ（ページフォールト・ホスト関数）は CPU に数えない
-    m.run += now.saturating_duration_since(from).min(limits.tick);
+    let segment_start = resumed.map_or(m.armed_at, |r| r.at);
+    // 最後に数えたあとに再開していれば、再開したところから数える
+    let (from, from_cpu) = match resumed {
+        Some(r) if r.at > m.counted_to => (r.at, r.cpu),
+        _ => (m.counted_to, m.cpu_mark),
+    };
+    m.run += match (cpu_now, from_cpu) {
+        // 他のスレッドに CPU を取られていた時間・ディスクを待った時間（B-336）は入らない
+        (Some(cpu_now), Some(from_cpu)) => cpu_now.saturating_sub(from_cpu),
+        // 区間の最初の検査と、スレッドの CPU 時間を読めない OS: エポック 1 つ分を超える遅れは数えない
+        _ => now.saturating_duration_since(from).min(limits.tick),
+    };
     m.counted_to = now;
-    if m.run >= limits.cpu {
+    m.cpu_mark = cpu_now;
+    if m.run >= m.budget {
         return Decision::OutOfCpu;
     }
     if now.saturating_duration_since(m.armed_at) >= m.wall {
@@ -277,9 +382,10 @@ fn decide(m: &mut Meter, limits: &Limits, now: Instant, resumed_at: Option<Insta
     }
 }
 
-/// 譲るためのフューチャ（最初の poll で自分を起こして戻り、次の poll で再開した時刻を残す）
-#[derive(Default)]
+/// 譲るためのフューチャ（最初の poll で自分を起こして戻り、次の poll で再開の記録を残す）
 struct Resume {
+    /// 譲ったゲストの [`Meter::id`]
+    owner: usize,
     yielded: bool,
 }
 
@@ -288,7 +394,12 @@ impl Future for Resume {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if self.yielded {
-            RESUMED_AT.with(|c| c.set(Some(Instant::now())));
+            let resumed = Resumed {
+                owner: self.owner,
+                at: Instant::now(),
+                cpu: thread_cpu_time(),
+            };
+            RESUMED.with(|c| c.set(Some(resumed)));
             Poll::Ready(())
         } else {
             self.yielded = true;
@@ -401,13 +512,20 @@ mod tests {
         Limits::new(&config)
     }
 
-    fn meter(at: Instant) -> Meter {
-        Meter {
-            armed_at: at,
-            counted_to: at,
-            run: Duration::ZERO,
-            wall: Window::Callback.wall(),
-        }
+    /// `at` に 1 回のコールバックとして上限を入れたもの
+    fn meter(at: Instant, l: &Limits) -> Meter {
+        let mut m = Meter::default();
+        m.arm(at, Window::Callback, l);
+        m
+    }
+
+    /// 再開の記録（スレッドの CPU 時間を読めない OS と同じく、実時間で数える）
+    fn resumed(at: Instant) -> Option<Resumed> {
+        Some(Resumed {
+            owner: 0,
+            at,
+            cpu: None,
+        })
     }
 
     const MS: Duration = Duration::from_millis(1);
@@ -416,7 +534,10 @@ mod tests {
     fn the_tick_follows_the_yield_interval_within_bounds() {
         assert_eq!(limits(100, 1_000).tick, MS);
         assert_eq!(limits(100, 10).tick, MIN_TICK);
-        assert_eq!(limits(100, 10_000_000).tick, IDLE_TICK);
+        assert_eq!(limits(1_000, 10_000_000).tick, IDLE_TICK);
+        // CPU の上限が小さいときは上限の 4 分の 1（区間の最初の検査の誤差を抑える）
+        assert_eq!(limits(1, 1_000).tick, MS / 4);
+        assert_eq!(limits(100, 10_000_000).tick, 25 * MS);
         assert_eq!(limits(100, 0).yield_interval, Duration::from_micros(1));
     }
 
@@ -425,14 +546,17 @@ mod tests {
     fn a_short_segment_continues_and_a_long_one_yields() {
         let l = limits(100, 1_000);
         let t0 = Instant::now();
-        let mut m = meter(t0);
-        assert_eq!(decide(&mut m, &l, t0 + MS / 4, None), Decision::Continue);
-        assert_eq!(decide(&mut m, &l, t0 + MS, None), Decision::Yield);
+        let mut m = meter(t0, &l);
+        assert_eq!(
+            decide(&mut m, &l, t0 + MS / 4, None, None),
+            Decision::Continue
+        );
+        assert_eq!(decide(&mut m, &l, t0 + MS, None, None), Decision::Yield);
         assert_eq!(m.run, MS);
         // 再開した区間は再開した時刻から測る
-        let resumed = t0 + 5 * MS;
+        let at = t0 + 5 * MS;
         assert_eq!(
-            decide(&mut m, &l, resumed + MS / 4, Some(resumed)),
+            decide(&mut m, &l, at + MS / 4, None, resumed(at)),
             Decision::Continue
         );
         assert_eq!(m.run, MS + MS / 4);
@@ -443,20 +567,20 @@ mod tests {
     fn the_cpu_budget_counts_only_the_running_segments() {
         let l = limits(10, 1_000);
         let t0 = Instant::now();
-        let mut m = meter(t0);
+        let mut m = meter(t0, &l);
         // 1 ms 走って譲り、9 ms 待ってから再開する（最初の区間は呼び出しの始まりから）
-        let mut resumed = None;
+        let mut last = None;
         let mut now = t0;
         for round in 1..=10 {
             now += MS;
-            let d = decide(&mut m, &l, now, resumed);
+            let d = decide(&mut m, &l, now, None, last);
             if round < 10 {
                 assert_eq!(d, Decision::Yield, "round {round}");
             } else {
                 assert_eq!(d, Decision::OutOfCpu, "round {round}");
             }
             now += 9 * MS;
-            resumed = Some(now);
+            last = resumed(now);
         }
         assert_eq!(m.run, 10 * MS);
     }
@@ -466,8 +590,8 @@ mod tests {
     fn a_stall_counts_at_most_one_tick() {
         let l = limits(100, 1_000);
         let t0 = Instant::now();
-        let mut m = meter(t0);
-        let d = decide(&mut m, &l, t0 + Duration::from_millis(500), None);
+        let mut m = meter(t0, &l);
+        let d = decide(&mut m, &l, t0 + Duration::from_millis(500), None, None);
         assert_eq!(d, Decision::Yield);
         assert_eq!(m.run, MS);
     }
@@ -477,16 +601,16 @@ mod tests {
     fn the_wall_limit_includes_the_time_spent_yielding() {
         let l = limits(100, 1_000);
         let t0 = Instant::now();
-        let mut m = meter(t0);
-        let resumed = t0 + Duration::from_millis(1_200);
+        let mut m = meter(t0, &l);
+        let at = t0 + Duration::from_millis(1_200);
         assert_eq!(
-            decide(&mut m, &l, resumed + MS, Some(resumed)),
+            decide(&mut m, &l, at + MS, None, resumed(at)),
             Decision::OutOfTime
         );
-        let mut m = meter(t0);
+        let mut m = meter(t0, &l);
         m.wall = Window::Lifecycle.wall();
         assert_eq!(
-            decide(&mut m, &l, resumed + MS, Some(resumed)),
+            decide(&mut m, &l, at + MS, None, resumed(at)),
             Decision::Yield
         );
     }
@@ -496,14 +620,99 @@ mod tests {
     fn rearming_the_wall_limit_keeps_the_cpu_used() {
         let l = limits(100, 1_000);
         let t0 = Instant::now();
-        let mut m = meter(t0);
-        assert_eq!(decide(&mut m, &l, t0 + MS, None), Decision::Yield);
+        let mut m = meter(t0, &l);
+        assert_eq!(decide(&mut m, &l, t0 + MS, None, None), Decision::Yield);
         let t1 = t0 + Duration::from_secs(5);
         m.rearm_wall(t1, Window::Callback);
-        assert_eq!(decide(&mut m, &l, t1 + MS, None), Decision::Yield);
+        assert_eq!(decide(&mut m, &l, t1 + MS, None, None), Decision::Yield);
         assert_eq!(m.run, 2 * MS);
-        m.arm(t1, Window::Callback);
+        m.arm(t1, Window::Callback, &l);
         assert_eq!(m.run, Duration::ZERO);
+    }
+
+    // 起動時のコールバックは CPU の上限が 10 倍（実時間の上限は約 60 秒）
+    #[test]
+    fn startup_callbacks_get_ten_times_the_budget() {
+        let l = limits(10, 1_000);
+        let t0 = Instant::now();
+        let c0 = Duration::from_secs(1);
+        let mut m = Meter::default();
+        m.arm(t0, Window::Lifecycle, &l);
+        assert_eq!(decide(&mut m, &l, t0 + MS, Some(c0), None), Decision::Yield);
+        let d = decide(&mut m, &l, t0 + 60 * MS, Some(c0 + 50 * MS), None);
+        assert_eq!(d, Decision::Yield);
+        let d = decide(&mut m, &l, t0 + 120 * MS, Some(c0 + 99 * MS), None);
+        assert_eq!(d, Decision::OutOfCpu);
+        // 上限を入れる前のストアは最初の検査で止まる
+        let mut fresh = Meter::default();
+        assert_eq!(decide(&mut fresh, &l, t0, None, None), Decision::OutOfCpu);
+    }
+
+    // スレッドの CPU 時間を読めるときは、検査の間に CPU が進んだぶんだけを数える（CPU を取り合う負荷の下で、他の
+    // スレッドが走っていた時間を数えない）。区間の最初の検査だけは CPU の起点が無いので実時間（エポック 1 つ分まで）
+    #[test]
+    fn the_cpu_clock_does_not_count_the_time_other_threads_ran() {
+        let l = limits(10, 1_000);
+        let t0 = Instant::now();
+        let c0 = Duration::from_secs(3);
+        let mut m = meter(t0, &l);
+        assert_eq!(
+            decide(&mut m, &l, t0 + MS / 4, Some(c0), None),
+            Decision::Continue
+        );
+        assert_eq!(m.run, MS / 4);
+        // 実時間で 40 ms のあいだ、このスレッドは 2 ms しか走れなかった（譲る判断は実時間の区間で行う）
+        let d = decide(&mut m, &l, t0 + 40 * MS, Some(c0 + 2 * MS), None);
+        assert_eq!(d, Decision::Yield);
+        assert_eq!(m.run, MS / 4 + 2 * MS);
+        // 譲っている間に他の要求が 50 ms 使い、再開してから 1 ms 走った
+        let at = t0 + 100 * MS;
+        let back = Some(Resumed {
+            owner: 0,
+            at,
+            cpu: Some(c0 + 52 * MS),
+        });
+        let d = decide(&mut m, &l, at + MS, Some(c0 + 53 * MS), back);
+        assert_eq!(d, Decision::Yield);
+        assert_eq!(m.run, MS / 4 + 3 * MS);
+        // 上限は CPU 時間で効く
+        let d = decide(&mut m, &l, at + 2 * MS, Some(c0 + 60 * MS), back);
+        assert_eq!(d, Decision::OutOfCpu);
+    }
+
+    // 呼び出しを始めてからゲストが走り出すまでの間（インスタンスの枠を待つ等）に同じスレッドで再開した他のゲストの
+    // 記録は使わない
+    #[test]
+    fn a_resume_of_another_guest_is_not_taken_for_ours() {
+        let t0 = Instant::now();
+        let ours = meter(t0, &limits(100, 1_000));
+        let theirs = Resumed {
+            owner: ours.id().wrapping_add(1),
+            at: t0 + MS,
+            cpu: Some(Duration::ZERO),
+        };
+        RESUMED.with(|c| c.set(Some(theirs)));
+        assert!(resumed_by(&ours).is_none());
+        let mine = Resumed {
+            owner: ours.id(),
+            ..theirs
+        };
+        RESUMED.with(|c| c.set(Some(mine)));
+        assert!(resumed_by(&ours).is_some());
+        RESUMED.with(|c| c.set(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_thread_cpu_time_advances_with_work() {
+        let a = thread_cpu_time().expect("CLOCK_THREAD_CPUTIME_ID");
+        let mut x = 0u64;
+        let until = Instant::now() + 5 * MS;
+        while Instant::now() < until {
+            x = std::hint::black_box(x.wrapping_add(1));
+        }
+        let b = thread_cpu_time().expect("CLOCK_THREAD_CPUTIME_ID");
+        assert!(b > a, "{a:?} -> {b:?} ({x})");
     }
 
     /// `clock`: 終わらないゲストは約 1 ms ごとに譲りながら走り、`max_execution_time_ms` で打ち切られる（`OutOfFuel`。
@@ -564,15 +773,22 @@ mod tests {
     }
 
     #[test]
-    fn resume_yields_once_and_records_the_resume_time() {
-        RESUMED_AT.with(|c| c.set(None));
+    fn resume_yields_once_and_records_the_resume() {
+        RESUMED.with(|c| c.set(None));
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut r = Resume::default();
+        let mut r = Resume {
+            owner: 7,
+            yielded: false,
+        };
         assert!(Pin::new(&mut r).poll(&mut cx).is_pending());
-        assert!(RESUMED_AT.with(Cell::get).is_none());
+        assert!(RESUMED.with(Cell::get).is_none());
         let before = Instant::now();
         assert!(Pin::new(&mut r).poll(&mut cx).is_ready());
-        assert!(RESUMED_AT.with(Cell::get).is_some_and(|t| t >= before));
+        let got = RESUMED.with(Cell::get).expect("recorded");
+        assert_eq!(got.owner, 7);
+        assert!(got.at >= before);
+        assert_eq!(got.cpu.is_some(), cfg!(unix));
+        RESUMED.with(|c| c.set(None));
     }
 }
