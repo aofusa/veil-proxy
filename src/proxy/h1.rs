@@ -989,9 +989,17 @@ pub(super) async fn handle_requests(
                                     // ローカルレスポンスを返送。F-271: 本文を読み切れたら接続を続ける
                                     // （以前は毎回閉じていた）
                                     let start_instant = Instant::now();
+                                    // B-189: chunked + `Expect: 100-continue` で本文がまだ届いていなければ、
+                                    // クライアントは 100 Continue を待っている（読み捨てを待つと止まる）ので閉じる
+                                    let expect_waiting = is_chunked
+                                        && chunked_end.is_none()
+                                        && initial_body.is_empty()
+                                        && check_expect_continue(&headers_for_proxy);
+                                    // B-499: 閉じると分かっているなら応答に `Connection: close` を付ける
                                     let response = wasm_local_response_h1(
                                         &resp,
                                         method_bytes.as_ref() == b"HEAD",
+                                        client_wants_close || is_websocket || expect_waiting,
                                     );
                                     let resp_size = response.len() as u64;
                                     let write_result =
@@ -1019,12 +1027,6 @@ pub(super) async fn handle_requests(
                                     )
                                     .await;
                                     accumulated.clear();
-                                    // B-189: chunked + `Expect: 100-continue` で本文がまだ届いていなければ、
-                                    // クライアントは 100 Continue を待っている（読み捨てを待つと止まる）ので閉じる
-                                    let expect_waiting = is_chunked
-                                        && chunked_end.is_none()
-                                        && initial_body.is_empty()
-                                        && check_expect_continue(&headers_for_proxy);
                                     if client_wants_close
                                         || is_websocket
                                         || expect_waiting
@@ -1152,6 +1154,7 @@ pub(super) async fn handle_requests(
                                         let response = wasm_local_response_h1(
                                             &resp,
                                             method_bytes.as_ref() == b"HEAD",
+                                            client_wants_close,
                                         );
                                         let resp_size = response.len() as u64;
                                         let write_result =
@@ -1730,9 +1733,14 @@ pub(super) async fn handle_backend(
                 match sendfile::h1_wasm_response_head(header, status, &wasm_modules).await {
                     Ok(h) => h,
                     Err(resp) => {
-                        return sendfile::write_h1_wasm_local(&mut tls_stream, &resp, sreq.head)
-                            .await
-                            .map(|(st, n)| (tls_stream, st, n, client_wants_close));
+                        return sendfile::write_h1_wasm_local(
+                            &mut tls_stream,
+                            &resp,
+                            sreq.head,
+                            client_wants_close,
+                        )
+                        .await
+                        .map(|(st, n)| (tls_stream, st, n, client_wants_close));
                     }
                 };
             #[cfg(not(feature = "wasm"))]
@@ -2251,7 +2259,14 @@ async fn pump_api_chunked_body(
 /// 書くとクライアントは残りを次の応答の先頭として読む）。HEAD は Content-Length を本文の長さのまま付ける
 /// （GET と同じヘッダ）。1xx・204・304 は補わない。
 #[cfg(feature = "wasm")]
-pub(super) fn wasm_local_response_h1(resp: &crate::wasm::LocalResponse, head: bool) -> Vec<u8> {
+///
+/// `close` は応答の後にクライアントの接続を閉じるとき（`Connection: close` を付け、モジュールの `Connection`・
+/// `Keep-Alive` は付けない。B-499: 付けないとクライアントは閉じられる接続で次の要求を送って失う。B-360 と同じ）。
+pub(super) fn wasm_local_response_h1(
+    resp: &crate::wasm::LocalResponse,
+    head: bool,
+    close: bool,
+) -> Vec<u8> {
     let no_body_status = matches!(resp.status_code, 100..=199 | 204 | 304);
     let write_body = !head && !no_body_status;
     let mut response = Vec::with_capacity(
@@ -2266,10 +2281,17 @@ pub(super) fn wasm_local_response_h1(resp: &crate::wasm::LocalResponse, head: bo
         ),
     );
     for (k, v) in &resp.headers {
+        if close && (k.eq_ignore_ascii_case(b"connection") || k.eq_ignore_ascii_case(b"keep-alive"))
+        {
+            continue;
+        }
         response.extend_from_slice(k);
         response.extend_from_slice(b": ");
         response.extend_from_slice(v);
         response.extend_from_slice(b"\r\n");
+    }
+    if close {
+        response.extend_from_slice(b"Connection: close\r\n");
     }
     // F-62: モジュールが Content-Length を設定していない場合は補完する（欠落するとクライアントは接続
     // クローズまでボディを待ち続け、TLS では close_notify 無しの EOF エラーになる）
@@ -2864,15 +2886,33 @@ mod b188_wasm_local_response_tests {
 
     #[test]
     fn head_and_bodyless_statuses_have_no_body() {
-        let get = String::from_utf8(wasm_local_response_h1(&resp(200), false)).unwrap();
+        let get = String::from_utf8(wasm_local_response_h1(&resp(200), false, false)).unwrap();
         assert!(get.ends_with("Content-Length: 5\r\n\r\nhello"), "{get}");
         // HEAD: GET と同じヘッダで本文なし
-        let head = String::from_utf8(wasm_local_response_h1(&resp(200), true)).unwrap();
+        let head = String::from_utf8(wasm_local_response_h1(&resp(200), true, false)).unwrap();
         assert!(head.ends_with("Content-Length: 5\r\n\r\n"), "{head}");
         for st in [204, 304, 103] {
-            let r = String::from_utf8(wasm_local_response_h1(&resp(st), false)).unwrap();
+            let r = String::from_utf8(wasm_local_response_h1(&resp(st), false, false)).unwrap();
             assert!(r.ends_with("x-a: 1\r\n\r\n"), "{st}: {r}");
             assert!(!r.contains("Content-Length"), "{st}: {r}");
         }
+    }
+
+    /// 応答の後に閉じるときは `Connection: close` を付け、モジュールの `Connection`・`Keep-Alive` は付けない（B-499）
+    #[test]
+    fn closing_response_says_connection_close() {
+        let mut r = resp(200);
+        r.headers
+            .push((b"Connection".to_vec(), b"keep-alive".to_vec()));
+        r.headers
+            .push((b"keep-alive".to_vec(), b"timeout=5".to_vec()));
+        let out = String::from_utf8(wasm_local_response_h1(&r, false, true)).unwrap();
+        assert!(out.contains("\r\nConnection: close\r\n"), "{out}");
+        assert!(!out.contains("keep-alive"), "{out}");
+        assert!(out.ends_with("Content-Length: 5\r\n\r\nhello"), "{out}");
+        // 続けるときはモジュールのヘッダのまま
+        let keep = String::from_utf8(wasm_local_response_h1(&r, false, false)).unwrap();
+        assert!(keep.contains("Connection: keep-alive"), "{keep}");
+        assert!(!keep.contains("Connection: close"), "{keep}");
     }
 }

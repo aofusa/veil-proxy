@@ -1347,7 +1347,7 @@ pub(super) async fn proxy_h2c(
         match super::compress::wasm_filter_response_body(wasm_modules, body).await {
             Ok(b) => response.body = b,
             Err(local) => {
-                let out = super::h1::wasm_local_response_h1(&local, false);
+                let out = super::h1::wasm_local_response_h1(&local, false, client_wants_close);
                 let len = out.len() as u64;
                 let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(out)).await;
                 return Some((client_stream, local.status_code, len, client_wants_close));
@@ -1427,6 +1427,7 @@ pub(super) async fn proxy_h2c(
                     &mut client_stream,
                     &resp,
                     method == b"HEAD",
+                    client_wants_close,
                 )
                 .await
                 .map(|(st, n)| (client_stream, st, n, client_wants_close));

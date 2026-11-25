@@ -875,6 +875,7 @@
 | B-496 | P1 | 完了（feat/httparena-perf） | [bugs/B-496-content-cache-reinsert-drops-compressed.md](bugs/B-496-content-cache-reinsert-drops-compressed.md) | 静的コンテンツキャッシュへ同じ版の本体を入れ直すと圧縮結果を捨てる。open_file_cache が当たらない間、HTTP/2・HTTP/3 の静的配信が要求ごとに br・gzip で圧縮し直す（1 要求 1.3〜1.6 ms の CPU） |
 | B-497 | P2 | 未着手（要再現） | [bugs/B-497-h2-p99-stuck-at-run-length.md](bugs/B-497-h2-p99-stuck-at-run-length.md) | HttpArena の HTTP/2 の計測で、要求の遅延の最大が計測の長さ（約 5 秒）に張り付く（veil・veil-api とも、h2c でも。nginx 等は 0.01〜0.3 秒。結果の `p99_latency` の欄は 2026-11-16 の計測では h2load の最大）。計測のほぼ全期間返らない要求がある |
 | B-498 | P2 | 完了（feat/httparena-perf） | [bugs/B-498-tls-cipher-suites-order-not-server-preference.md](bugs/B-498-tls-cipher-suites-order-not-server-preference.md) | `[tls] cipher_suites` の記載順がサーバの優先にならない（rustls の `ignore_client_order` を立てていないので、クライアントの順で選ぶ。文書は「記載順 = サーバ優先度順」）。E2E はクライアントとサーバが同じ順で見分けられない |
+| B-499 | P1 | 完了（feat/httparena-perf） | [bugs/B-499-wasm-local-response-missing-connection-close.md](bugs/B-499-wasm-local-response-missing-connection-close.md) | HTTP/1.1 で Wasm のローカルレスポンスの後に閉じるとき（接続の集約〈F-303〉が接続を動かす・クライアントの `Connection: close` 等）、応答に `Connection: close` を付けていなかった（B-360 の漏れ）。クライアントは閉じられる接続で次の要求を送って失う（aofish の io_uring で 5 秒に約 125 本・パイプラインで約 2,000 要求） |
 
 ---
 

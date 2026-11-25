@@ -194,9 +194,14 @@ where
                 Ok(h) => h,
                 // 応答ヘッダの段のローカルレスポンス（B-300。上流の本文は読み切っている）
                 Err(resp) => {
-                    return super::sendfile::write_h1_wasm_local(client_stream, &resp, is_head)
-                        .await
-                        .map(|(st, n)| (st, n, backend_wants_keep_alive, false));
+                    return super::sendfile::write_h1_wasm_local(
+                        client_stream,
+                        &resp,
+                        is_head,
+                        close,
+                    )
+                    .await
+                    .map(|(st, n)| (st, n, backend_wants_keep_alive, false));
                 }
             };
             // B-296: 溜めない応答はヘッダと最初の本文を送り、残りを区切りどおりに流す
@@ -275,7 +280,8 @@ where
                             body_result = BufferedBodyResult::Memory(body);
                         }
                         Err(local) => {
-                            let response = super::h1::wasm_local_response_h1(&local, is_head);
+                            let response =
+                                super::h1::wasm_local_response_h1(&local, is_head, close);
                             let len = response.len() as u64;
                             let _ = timeout(
                                 Duration::from_secs(buffering_config.client_write_timeout_secs),

@@ -323,6 +323,7 @@ pub(super) async fn transfer_response_with_compression(
                             client_stream,
                             &resp,
                             false,
+                            close,
                         )
                         .await
                         {
@@ -794,7 +795,7 @@ pub(super) async fn transfer_compressed_response<R: AsyncReader + AsyncReadRent 
         Ok(h) => h,
         // 応答ヘッダの段のローカルレスポンス（B-300。上流の本文は読み切っている）
         Err(resp) => {
-            return super::sendfile::write_h1_wasm_local(client_stream, &resp, false)
+            return super::sendfile::write_h1_wasm_local(client_stream, &resp, false, close)
                 .await
                 .map(|(_, n)| (n, backend_wants_keep_alive));
         }

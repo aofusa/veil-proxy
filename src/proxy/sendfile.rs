@@ -321,7 +321,7 @@ pub(super) async fn handle_sendfile(
         match h1_wasm_response_head(header_buf, response_status, &wasm_modules).await {
             Ok(h) => h,
             Err(resp) => {
-                return write_h1_wasm_local(&mut tls_stream, &resp, sreq.head)
+                return write_h1_wasm_local(&mut tls_stream, &resp, sreq.head, client_wants_close)
                     .await
                     .map(|(st, n)| (tls_stream, st, n, client_wants_close));
             }
@@ -1071,15 +1071,17 @@ pub(super) type HeadLocal = crate::wasm::LocalResponse;
 pub(super) type HeadLocal = std::convert::Infallible;
 
 /// 応答ヘッダの段のローカルレスポンスを、元の応答の代わりに送る（B-300）。元の応答の本文は送らないので、
-/// 接続は続けられる（`client_wants_close` に従う）。戻り値は `(ステータス, 書いた長さ)`、書けなければ `None`。
+/// 接続は続けられる（`client_wants_close` に従う）。`close` は応答の後に閉じるとき（`Connection: close` を付ける。
+/// B-499）。戻り値は `(ステータス, 書いた長さ)`、書けなければ `None`。
 pub(super) async fn write_h1_wasm_local<S: crate::runtime::io::AsyncWriteRentExt>(
     stream: &mut S,
     resp: &HeadLocal,
     head_method: bool,
+    close: bool,
 ) -> Option<(u16, u64)> {
     #[cfg(feature = "wasm")]
     {
-        let bytes = super::h1::wasm_local_response_h1(resp, head_method);
+        let bytes = super::h1::wasm_local_response_h1(resp, head_method, close);
         let len = bytes.len() as u64;
         match timeout(WRITE_TIMEOUT, stream.write_all(bytes)).await {
             Ok((Ok(_), _)) => Some((resp.status_code, len)),
@@ -1088,7 +1090,7 @@ pub(super) async fn write_h1_wasm_local<S: crate::runtime::io::AsyncWriteRentExt
     }
     #[cfg(not(feature = "wasm"))]
     {
-        let _ = (stream, head_method);
+        let _ = (stream, head_method, close);
         match *resp {}
     }
 }

@@ -537,6 +537,7 @@ pub(super) async fn transfer_https_response_with_compression(
                             client_stream,
                             &resp,
                             false,
+                            close,
                         )
                         .await
                         {
