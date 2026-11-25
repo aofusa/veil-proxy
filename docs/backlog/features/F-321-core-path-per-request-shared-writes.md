@@ -1,6 +1,6 @@
 # F-321: 本体の要求の経路から「全ワーカーで共有する行への書き込み」を無くす（ルートのキャッシュの統計・共有の `Arc` の参照カウント・キャッシュの当たりの数）
 
-**状態: 着手（2026-11-25、feat/httparena-perf。F-317 の子。Wasm を通らない経路〈veil-api・`Respond`・静的配信〉の多コアでの膨らみ。Wasm の側は F-318）**
+**状態: 完了（2026-11-25、feat/httparena-perf。F-317 の子。Wasm を通らない経路〈veil-api・`Respond`・静的配信〉の多コアでの膨らみ。Wasm の側は F-318）**
 
 ## 今の状態（測った値）
 
@@ -56,6 +56,20 @@ HttpArena（64 スレッド。2026-11-24 の結果）の 1 要求あたりの CP
 - 改修 3 のうちキャッシュの当たり・外れの数（`file_cache`・`content_cache`・`compressed`）: `src/striped.rs` の `StripedCounter`
   （128 バイトにそろえた 64 本の行。スレッドは最初に足したときに行を割り当てられ、読むときに合計する）に替えた。
   `cache` feature の無いビルドでは作らない。
+- 改修 2（ルートの値）: `upstream::select_route` はワーカーのルートの表（`WORKER_ROUTES`。ルートの照合の索引の世代
+  〈`OptimizedRouter::generation`。リロード・`clear_cache` で変わる〉ごとに作り直す）から `RouteMatch::Worker(Rc<RouteTarget>)`
+  （前置き・`Backend`・圧縮の設定）を返し、呼び出し側（HTTP/1.1・HTTP/2 の下見と本番・HTTP/3 の下見と要求・WebSocket）は借りる。
+  要求ごとに `Arc` を複製しない。トラフィック制御（`resolved_traffic`）が要求ごとに選ぶ `Backend` だけは `RouteMatch::Owned`。
+  固定応答（`Respond`）の応答のバイト列は表を作るときにワーカーごとに複製する（`FixedResponse::for_worker`。4 KiB まで。
+  セキュリティの設定・モジュールは同じもの）。`Server`・`Alt-Svc` の値の `Bytes`（`pool::LOCAL_SERVER_HEADER_VALUE` 等。
+  値が差し替わったら写し直す）と空のモジュール列（`wasm::empty_wasm_modules`）もスレッドの写しにした。古い世代の表はワーカーの
+  アイドル点（`release_stale_worker_routes`）で、表はワーカーのスレッドの終わり（`release_worker_routes`）で手放す。
+- 測った値は F-317 の「計測の記録」（aofish の交互 A/B: `Respond` の h1 +8〜11%・パイプライン +12〜26%・h2c +18〜21%、
+  1 要求の CPU −6〜−22%。Wasm の経路は揺れの中）。
+- 見送り: 接続の数（`CURRENT_CONNECTIONS`）は接続ごとに 2 回の加減で、要求ごとではない（limited-conn でも 10 要求に 2 回）。
+  受理のループは上限の判定に毎回読むので、行を分けると判定ごとに全部の行を読むことになる。aofish（8 スレッド）では差が測れないので
+  変えない。`perf c2c` は aofish（WSL2）にハードウェアのカウンタが無く使えない（使えるのは `cpu-clock` だけ）。
+- AGENTS.md の F-148/F-159 の規則に「共有の `Arc`・`Bytes` の複製もコア間の書き込みになる（ルートの値はワーカーの表から借りる）」を足した。
 
 ## 確かめ方（実装の前と後）
 

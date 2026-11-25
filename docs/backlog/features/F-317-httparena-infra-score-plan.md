@@ -116,6 +116,69 @@ Proxy-Wasm の改善、または veil に大きな変更を加えずに結果を
 - 手元: ノート PC（4 CPU、共有の機械で ±5% 程度揺れる）、veil-load（h1・h2c）、サーバの CPU は `/proc/<pid>/task/*/schedstat`。
   スクリプト（`infra_score.py`・`scen.py`・`cpu_table.py`・`measure.py`）・設定・結果は `docs/artifacts/benchmark/httparena-perf/`（git 管理外）。
 
+## 計測の記録
+
+### 土台（aofish、2026-11-25）
+
+- aofish（16 スレッド = 8 コア × SMT、WSL2）。サーバは CPU 0-7（物理 4 コア）、負荷ツールは 8-15。計測は WSL のロック
+  `/tmp/vp-bench.lock` を取って行う。ビルドは GitHub の枝を取り出して `--features full`（io_uring）と `full,epoll` の 2 つ。
+- 設定は HttpArena のエントリと同じ（静的配信は `sendfile`・`open_file_cache`・`static_file_cache`・圧縮、`/baseline11`・`/pipeline`・
+  `/json` は Proxy-Wasm のフィルタ、`/plain3` は Wasm を通らない `Respond`）。ワーカーは既定（8 本）。
+- 負荷: veil-load（h1・パイプライン 16 本・h2c）、h2load（h2・静的 h2）、wrk（TLS の json・静的）、h3load（h3）。1 回 5 秒・1 秒の
+  暖機、2 つのビルドを交互に 2 巡。サーバの CPU は `/proc/<pid>/task/*/schedstat`（1 要求の µs）。
+- 道具と結果は `docs/artifacts/benchmark/httparena-perf/scripts/aofish/`（`bench.py`・`abcmp.py`・`scale.sh`・`prof*.sh`）と
+  `results/aofish/`（git 管理外）。
+- wrk の TLS（json-tls・static-tls）で、どのビルドでも時々「timeout が接続の数（234〜256）・計測が 3 秒で終わる」回が出る。WSL2 の
+  時計が戻る既知の現象（B-357）で、その回の rps は水増しされる。比較から外す。
+
+### B-495・B-496・B-498（main → b498、2 巡の平均。rps / 1 要求の CPU µs）
+
+| 負荷 | epoll main | epoll b498 | io_uring main | io_uring b498 |
+|---|---|---|---|---|
+| static-h2（h2load 64 × 32） | 6,917 / 1,107 | 362,752 / 20.8 | 6,454 / 1,178 | 339,084 / 22.3 |
+| static-h3（h3load 16 × 64） | 1,396 / 674 | 31,452 / 30.1 | 1,390 / 681 | 30,178 / 31.5 |
+| static-tls（wrk 256） | 125,090 / 58.7 | 223,640 / 30.9 | 142,867 / 66.7 | 226,144 / 31.6 |
+
+その他の負荷は ±5% の揺れの中。
+
+### B-499・B-500（失った要求）
+
+- io_uring のビルドで、Wasm のルートへの HTTP/1.1 で接続の集約（F-303）が接続を動かすたびに要求を失っていた。B-499（Wasm のローカル
+  レスポンスに `Connection: close` が無い）を直した後も、パイプライン（16 本）で 5 秒に約 930 要求（張り直し 62 回 × 15 本）を失い、
+  B-500（パイプラインの接続を動かさない）で 0 になった（h1-wasm: 250 → 0、pipe-wasm: 1,936〜4,109 → 0）。
+
+### F-321（b498 → f321）
+
+| 負荷 | epoll rps | epoll CPU | io_uring rps | io_uring CPU |
+|---|---|---|---|---|
+| h1-plain | +11.2% | −10.8% | +8.4% | −6.0% |
+| pipe-plain | +12.2% | −11.8% | +26.3% | −21.9% |
+| h2c-plain（64 × 100） | +17.8% | −14.7% | +20.8% | −17.7% |
+| h2-plain（h2load 64 × 100） | +11.8% | −12.1% | +6.4% | −12.1% |
+
+Wasm を通る負荷・静的配信・HTTP/3 は ±4% の中（Wasm の要求ごとの費用は F-318・F-319）。
+
+伸び方（ワーカー 1・2・4・8 本、使わないサーバの CPU は空回りで埋めてクロックをそろえる。1 要求の CPU µs、io_uring b498 → f321）:
+
+| 負荷 | 1 本 | 2 本 | 4 本 | 8 本 |
+|---|---|---|---|---|
+| h2c-plain | 3.03 → 3.05 | 3.28 → 3.26 | 3.17 → 2.70 | 3.37 → 2.87 |
+| h1-plain | 36.0 → 42.5 | 27.0 → 34.3 | 19.8 → 16.7 | 11.5 → 10.3 |
+
+- h2c はワーカーの数によらず平ら（8 コアの aofish では共有の行の奪い合いはまだ小さい。f321 は 4・8 本で 15% 下がる）。
+- h1 はワーカーが少ないほど 1 要求が重い（逆向き）。ワーカーが少ないと負荷ツールのスレッドが眠りがちで、ループバックの送信が相手の
+  起床（別の CPU への IPI）まで払うため（F-295）。1 本と 8 本の比較は h1 では意味を持たない。io_uring のパイプラインは epoll より
+  ワーカーが少ないときに大きく重い（1 本で 42 µs と 12 µs）。原因は未調査（F-322 の後に見る）。
+
+### F-322（f321 → f322。B-500 を含む）
+
+| 負荷 | epoll rps | epoll CPU | io_uring rps | io_uring CPU |
+|---|---|---|---|---|
+| pipe-plain（`Respond`、256 × 16） | +22.7% | −44.0% | +35.5% | −45.7% |
+| pipe-wasm（Wasm、256 × 16） | +87.5% | −47.3% | +60.7% | −38.0% |
+
+その他は ±3% の中（h1-wasm の io_uring の −5.6% は次の A/B で見直す）。
+
 ## 子チケット
 
 - [B-495](../bugs/B-495-performance-section-default-zero-ofc.md)・[B-496](../bugs/B-496-content-cache-reinsert-drops-compressed.md)・

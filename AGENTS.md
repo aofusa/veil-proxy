@@ -153,8 +153,9 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   増えすぎたら圧縮する（遅延パージだけだとヒープが「要求レート × タイムアウト」まで膨らむ。reactor も同じ。B-117）。
 - プロキシ応答の中間バッファをリクエストごとに確保しない。ヘッダ解析回数を増やさない（B-72 第 2 弾）。
 - HTTP/2 レスポンスヘッダは `Vec<(Bytes, Bytes)>`（F-165）。per-stream 固定費は接続あたり 1 回で済まないか先に考える（F-162）。
-- `config::load_backend` はリクエストごとに呼ばれる。ルート単位の派生値は設定ロード時に `Route` の
-  `#[serde(skip)]` フィールドへ解決し、ホットパスは `Arc` clone のみ（F-148/F-159、B-64）。
+- ルート単位の派生値は設定ロード時に `Route` の `#[serde(skip)]` フィールドへ解決する（F-148/F-159、B-64）。共有の `Arc`・`Bytes` の
+  複製・破棄もコア間の書き込みになるので、要求ごとのルートの値は `upstream::select_route` が返すワーカーの表（`RouteMatch`）から借りる
+  （`config::load_backend` を呼ぶのは表を作るときだけ。トラフィック制御が要求ごとに選んだ `Backend` だけが `RouteMatch::Owned`。F-321）。
 - `CURRENT_CONFIG.load()` は 1 回で 100 命令を超える。HTTP/1.1 の要求処理では 1 回だけ読み、`resolve_route_in` へ渡す。
   「機能が有効か」だけを見る値は、設定を保存する箇所の隣で静的な値へ写す（`set_access_log_enabled` 等。F-297）。
 - 要求ごとの `async fn` で `await` をまたぐ局所変数はフューチャの状態になり、接続ごとの冷たいメモリに載る。ヘッダ解析の作業用配列の
