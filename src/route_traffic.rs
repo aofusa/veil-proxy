@@ -269,14 +269,25 @@ impl FixedResponse {
 
 impl FixedResponse {
     /// ワーカーのルートの表（F-321）に置く写し: 応答のバイト列をワーカーごとに複製する（要求ごとの `Bytes` の
-    /// 複製が全ワーカー共有の参照カウントへ書かない）。セキュリティ設定・モジュールは同じもの（レート制限の区画・
-    /// Wasm のインスタンスの対応はその同一性で決まる）。大きい応答は複製しない（送る費用に比べて参照カウントの
-    /// 費用は小さく、ワーカーの数だけメモリを使う）
+    /// 複製が全ワーカー共有の参照カウントへ書かない）。セキュリティ設定は同じもの（レート制限の区画はその同一性で
+    /// 決まる）。Proxy-Wasm のモジュールの並びはワーカーごとの写し（中の設定の `Arc` は同じもの。F-318）。大きい応答の
+    /// バイト列は複製しない（送る費用に比べて参照カウントの費用は小さく、ワーカーの数だけメモリを使う）
     pub(crate) fn for_worker(this: &Arc<Self>) -> Arc<Self> {
         /// 複製する HTTP/1.1 の応答全体の大きさの上限
         const WORKER_COPY_MAX: usize = 4 * 1024;
         if this.h1_close.len() > WORKER_COPY_MAX || this.h1_keepalive.len() > WORKER_COPY_MAX {
-            return Arc::clone(this);
+            if this.modules.is_none() {
+                return Arc::clone(this);
+            }
+            return Arc::new(FixedResponse {
+                headers: this.headers.clone(),
+                body: this.body.clone(),
+                h1_keepalive: this.h1_keepalive.clone(),
+                h1_close: this.h1_close.clone(),
+                security: this.security.clone(),
+                modules: crate::config::worker_modules(this.modules.as_ref()),
+                ..**this
+            });
         }
         let copy = |b: &Bytes| Bytes::copy_from_slice(b);
         let h1_keepalive = copy(&this.h1_keepalive);
@@ -295,7 +306,7 @@ impl FixedResponse {
             drop_server: this.drop_server,
             drop_alt_svc: this.drop_alt_svc,
             security: this.security.clone(),
-            modules: this.modules.clone(),
+            modules: crate::config::worker_modules(this.modules.as_ref()),
         })
     }
 
@@ -999,6 +1010,54 @@ mod tests {
             Bytes::from(vec![b'x'; 8192]),
         ));
         assert!(Arc::ptr_eq(&FixedResponse::for_worker(&big), &big));
+    }
+
+    /// F-318: Proxy-Wasm のモジュールの並びはワーカーごとの写し（大きい応答でも）。中の設定は同じ `Arc`
+    /// （Wasm のインスタンスの対応は設定の同一性で決まる）
+    #[test]
+    fn for_worker_copies_the_module_list_and_keeps_configurations() {
+        use crate::wasm_plugin_config::ModuleRef;
+        let conf: Arc<[u8]> = Arc::from(&b"{}"[..]);
+        let modules = Some(Arc::new(vec![ModuleRef {
+            name: "m".to_string(),
+            configuration: Some(conf.clone()),
+        }]));
+        let check = |w: &FixedResponse, r: &FixedResponse| {
+            let (wm, rm) = (w.modules.as_ref().unwrap(), r.modules.as_ref().unwrap());
+            assert!(!Arc::ptr_eq(wm, rm));
+            assert_eq!(wm[0].name, "m");
+            assert!(Arc::ptr_eq(wm[0].configuration.as_ref().unwrap(), &conf));
+        };
+        let small = Arc::new(
+            FixedResponse::new(200, vec![], Bytes::from_static(b"ok"))
+                .with_modules(modules.clone()),
+        );
+        check(&FixedResponse::for_worker(&small), &small);
+
+        let big = Arc::new(
+            FixedResponse::new(200, vec![], Bytes::from(vec![b'x'; 8192]))
+                .with_modules(modules.clone()),
+        );
+        let w = FixedResponse::for_worker(&big);
+        check(&w, &big);
+        // 大きい応答のバイト列は複製しない
+        assert_eq!(w.h1_keepalive.as_ptr(), big.h1_keepalive.as_ptr());
+        assert_eq!(w.body.as_ptr(), big.body.as_ptr());
+        assert_eq!(w.status, big.status);
+
+        let redirect = Backend::Redirect(
+            Arc::from("https://example.com/"),
+            301,
+            false,
+            modules.clone(),
+            Arc::new(SecurityConfig::default()),
+        )
+        .for_worker();
+        let Backend::Redirect(_, _, _, Some(wm), _) = &redirect else {
+            panic!("redirect must keep its modules");
+        };
+        assert!(!Arc::ptr_eq(wm, modules.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(wm[0].configuration.as_ref().unwrap(), &conf));
     }
 
     fn status(b: &Backend) -> u16 {

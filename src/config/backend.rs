@@ -108,16 +108,34 @@ impl std::fmt::Debug for Backend {
     }
 }
 
+/// Proxy-Wasm のモジュールの並びのワーカーごとの写し（[`Backend::for_worker`]）。中の設定の `Arc` は同じもの
+/// （Wasm のインスタンスの対応は設定の同一性で決まる）
+pub(crate) fn worker_modules(modules: Option<&Arc<Vec<ModuleRef>>>) -> Option<Arc<Vec<ModuleRef>>> {
+    modules.map(|m| Arc::new(m.as_ref().clone()))
+}
+
 impl Backend {
     /// ワーカーのルートの表（F-321）に置く値。固定応答は応答のバイト列をワーカーごとに複製する
-    /// （[`crate::route_traffic::FixedResponse::for_worker`]）。他は同じ値
+    /// （[`crate::route_traffic::FixedResponse::for_worker`]）。Proxy-Wasm のモジュールの並びはワーカーごとの写しに
+    /// する（要求ごとに並びの `Arc` を複製する。F-318）。他は同じ値
     pub(crate) fn for_worker(self) -> Self {
-        match self {
+        let mut b = match self {
             Backend::Respond(r) => {
-                Backend::Respond(crate::route_traffic::FixedResponse::for_worker(&r))
+                return Backend::Respond(crate::route_traffic::FixedResponse::for_worker(&r));
             }
             b => b,
-        }
+        };
+        let modules = match &mut b {
+            Backend::Proxy(_, _, _, _, _, m) => m,
+            Backend::MemoryFile(_, _, _, m) => m,
+            Backend::SendFile(_, _, _, _, _, _, _, _, m, _) => m,
+            Backend::Redirect(_, _, _, m, _) => m,
+            Backend::Respond(_) => return b,
+            #[cfg(feature = "handler")]
+            Backend::Handler(_, _, m, _) => m,
+        };
+        *modules = worker_modules(modules.as_ref());
+        b
     }
 
     /// このバックエンドのセキュリティ設定を取得

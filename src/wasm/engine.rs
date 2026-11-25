@@ -23,22 +23,16 @@ use crate::wasm_plugin_config::ModuleRef;
 /// 実効設定の解決はここで `Arc` clone のみ（参照カウント増加）で行い、
 /// バイト列のディープコピーは発生しない（F-148）。設定ロード時に既に
 /// `to_bytes()` 済みのバイト列を持ち回るだけ。
-fn resolve_effective_modules(
-    registry: &ModuleRegistry,
-    modules: &[ModuleRef],
-) -> Vec<(Arc<LoadedModule>, Arc<[u8]>)> {
-    modules
-        .iter()
-        .filter_map(|r| {
-            registry.get_module(&r.name).map(|m| {
-                let config = r
-                    .configuration
-                    .clone()
-                    .unwrap_or_else(|| m.configuration.clone());
-                (m, config)
-            })
-        })
-        .collect()
+fn resolve_effective_modules<'a>(
+    registry: &'a ModuleRegistry,
+    modules: &'a [ModuleRef],
+) -> impl DoubleEndedIterator<Item = (&'a LoadedModule, &'a Arc<[u8]>)> + 'a {
+    // F-318: 借りるだけにする（以前は段ごとにモジュールと設定の `Arc` を複製して `Vec` に集めていた。どちらも
+    // 全ワーカーで共有する参照カウントへの書き込み）
+    modules.iter().filter_map(move |r| {
+        let m = registry.loaded_module(&r.name)?;
+        Some((m, r.configuration.as_ref().unwrap_or(&m.configuration)))
+    })
 }
 
 /// 失敗の種類（F-293）。トラップ以外の失敗に付けてメトリクス・ログの `reason` にする
@@ -190,9 +184,9 @@ impl FilterEngine {
         end_of_stream: bool,
         sessions: Option<&RequestSessions>,
     ) -> FilterResult {
-        let resolved = resolve_effective_modules(&self.registry, modules);
+        let mut resolved = resolve_effective_modules(&self.registry, modules).peekable();
 
-        if resolved.is_empty() {
+        if resolved.peek().is_none() {
             return FilterResult::Continue {
                 headers,
                 body: None,
@@ -205,7 +199,7 @@ impl FilterEngine {
 
         let mut current_headers = headers;
 
-        for (module, config) in &resolved {
+        for (module, config) in resolved {
             let (returned, result) = self
                 .execute_on_request_headers(
                     module,
@@ -1065,9 +1059,11 @@ impl FilterEngine {
         end_of_stream: bool,
         sessions: Option<&RequestSessions>,
     ) -> FilterResult {
-        let resolved = resolve_effective_modules(&self.registry, modules);
+        let mut resolved = resolve_effective_modules(&self.registry, modules)
+            .rev()
+            .peekable();
 
-        if resolved.is_empty() {
+        if resolved.peek().is_none() {
             return FilterResult::Continue {
                 headers,
                 body: None,
@@ -1077,7 +1073,7 @@ impl FilterEngine {
         let mut current_headers = headers;
 
         // Execute in reverse order for response
-        for (module, config) in resolved.iter().rev() {
+        for (module, config) in resolved {
             // F-09: WASM フィルタ実行時間を計測
             let _wasm_start = std::time::Instant::now();
             let (returned, result) = self
@@ -1384,9 +1380,9 @@ impl FilterEngine {
         request: Option<&RequestMeta<'_>>,
         sessions: Option<&RequestSessions>,
     ) -> BodyFilterResult {
-        let resolved = resolve_effective_modules(&self.registry, modules);
+        let mut resolved = resolve_effective_modules(&self.registry, modules).peekable();
 
-        if resolved.is_empty() {
+        if resolved.peek().is_none() {
             // F-61: モジュール未登録時はゼロコピーでそのまま返す
             return BodyFilterResult::Continue { body };
         }
@@ -1394,7 +1390,7 @@ impl FilterEngine {
         // F-61: `Bytes` の参照カウント共有でフィルタチェーンを回す（deep copy なし）
         let mut current_body = body;
 
-        for (module, config) in &resolved {
+        for (module, config) in resolved {
             let result = self
                 .execute_on_request_body(
                     module,
@@ -1563,9 +1559,11 @@ impl FilterEngine {
         end_of_stream: bool,
         sessions: Option<&RequestSessions>,
     ) -> BodyFilterResult {
-        let resolved = resolve_effective_modules(&self.registry, modules);
+        let mut resolved = resolve_effective_modules(&self.registry, modules)
+            .rev()
+            .peekable();
 
-        if resolved.is_empty() {
+        if resolved.peek().is_none() {
             // F-61: モジュール未登録時はゼロコピーでそのまま返す
             return BodyFilterResult::Continue { body };
         }
@@ -1574,7 +1572,7 @@ impl FilterEngine {
         let mut current_body = body;
 
         // Execute in reverse order for response
-        for (module, config) in resolved.iter().rev() {
+        for (module, config) in resolved {
             let result = self
                 .execute_on_response_body(
                     module,
@@ -1709,7 +1707,7 @@ impl FilterEngine {
     ) {
         let resolved = resolve_effective_modules(&self.registry, modules);
 
-        for (module, config) in &resolved {
+        for (module, config) in resolved {
             if let Err(e) = self.execute_on_log(module, config, sessions).await {
                 ftlog::error!("[wasm:{}] on_log error: {}", module.name, e);
             }
@@ -1780,7 +1778,7 @@ impl FilterEngine {
 
         let mut any_pending = false;
 
-        for (module, config) in &resolved {
+        for (module, config) in resolved {
             match self.execute_on_done(module, config).await {
                 Ok(keep_alive) => {
                     if keep_alive {
@@ -1893,9 +1891,9 @@ impl FilterEngine {
         modules: &[ModuleRef],
         trailers: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> FilterResult {
-        let resolved = resolve_effective_modules(&self.registry, modules);
+        let mut resolved = resolve_effective_modules(&self.registry, modules).peekable();
 
-        if resolved.is_empty() {
+        if resolved.peek().is_none() {
             return FilterResult::Continue {
                 headers: trailers,
                 body: None,
@@ -1904,7 +1902,7 @@ impl FilterEngine {
 
         let mut current_trailers = trailers;
 
-        for (module, config) in &resolved {
+        for (module, config) in resolved {
             let result = self
                 .execute_on_request_trailers(module, config, &current_trailers)
                 .await;
@@ -1991,9 +1989,11 @@ impl FilterEngine {
         modules: &[ModuleRef],
         trailers: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> FilterResult {
-        let resolved = resolve_effective_modules(&self.registry, modules);
+        let mut resolved = resolve_effective_modules(&self.registry, modules)
+            .rev()
+            .peekable();
 
-        if resolved.is_empty() {
+        if resolved.peek().is_none() {
             return FilterResult::Continue {
                 headers: trailers,
                 body: None,
@@ -2003,7 +2003,7 @@ impl FilterEngine {
         let mut current_trailers = trailers;
 
         // Execute in reverse order for response
-        for (module, config) in resolved.iter().rev() {
+        for (module, config) in resolved {
             let result = self
                 .execute_on_response_trailers(module, config, &current_trailers)
                 .await;
@@ -2505,7 +2505,7 @@ impl FilterEngine {
     pub async fn on_new_connection_with_modules(&self, modules: &[ModuleRef]) -> NetworkAction {
         let resolved = resolve_effective_modules(&self.registry, modules);
 
-        for (module, config) in &resolved {
+        for (module, config) in resolved {
             match self.execute_on_new_connection(module, config).await {
                 Ok(NetworkAction::Close) => return NetworkAction::Close,
                 Ok(NetworkAction::Continue) => {}
@@ -2592,14 +2592,14 @@ impl FilterEngine {
         end_of_stream: bool,
         direction: NetworkDataDirection,
     ) -> NetworkFilterResult {
-        let resolved = resolve_effective_modules(&self.registry, modules);
+        let mut resolved = resolve_effective_modules(&self.registry, modules).peekable();
 
-        if resolved.is_empty() {
+        if resolved.peek().is_none() {
             return NetworkFilterResult::Continue { data };
         }
 
         let mut current = data;
-        for (module, config) in &resolved {
+        for (module, config) in resolved {
             // Bytes の clone は参照カウント共有のみ（deep copy なし）。
             let result = self
                 .execute_on_network_data(module, config, current.clone(), end_of_stream, direction)
@@ -2725,7 +2725,7 @@ impl FilterEngine {
     async fn run_network_close(&self, modules: &[ModuleRef], callback_name: &str) {
         let resolved = resolve_effective_modules(&self.registry, modules);
 
-        for (module, config) in &resolved {
+        for (module, config) in resolved {
             if let Err(e) = self
                 .execute_on_network_close(module, config, callback_name)
                 .await

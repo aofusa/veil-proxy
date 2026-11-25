@@ -431,6 +431,11 @@ impl ModuleRegistry {
         self.modules.get(name).cloned()
     }
 
+    /// 読み込んだモジュールを借りる（要求ごとの経路。`Arc` を複製しない。F-318）
+    pub(crate) fn loaded_module(&self, name: &str) -> Option<&LoadedModule> {
+        self.modules.get(name).map(|m| &**m)
+    }
+
     /// 読み込んだモジュール（起動時の検証用。B-301）
     pub(crate) fn modules(&self) -> impl Iterator<Item = &Arc<LoadedModule>> {
         self.modules.values()
