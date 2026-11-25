@@ -454,23 +454,19 @@ impl FilterEngine {
             .map_err(|(e, _)| e)
     }
 
-    /// 1 回の HTTP のコールバックに使うインスタンスと http context を用意する（F-271・B-177）。
-    ///
-    /// - `instance_reuse` のモジュール: このスレッドのプールの空いているインスタンス（無ければ新しく作る）に
-    ///   http context を作る。`sessions`（要求ごとの状態）があれば、同じ要求の前のフェーズで作った context を
-    ///   同じインスタンスで使い続ける（Envoy と同じ寿命。`proxy_on_delete` は `on_log` の後）。
-    /// - 使い回さないモジュール: 新しいインスタンスでライフサイクルを走らせ、HTTP context（ID 2）を作る。
-    ///
-    /// 失敗したら `http_ctx` を返す（呼び出し元はヘッダ等を回収できる）。
-    async fn open_session(
-        &self,
-        module: &LoadedModule,
-        configuration: &Arc<[u8]>,
-        mut http_ctx: HttpContext,
-        sessions: Option<&RequestSessions>,
-    ) -> Result<Session, (anyhow::Error, Box<HttpContext>)> {
-        // B-408: 要求の属性（`:authority`・`:scheme`・プロトコル）は要求のどの段でもゲストに見せる。応答の段・`on_log` の
-        // context には要求が無いので、要求ヘッダの段と同じメソッドとパスも見せる（`:path`・`request.path` 等）
+    /// モジュールのものを入れた空の http context（新しいインスタンス・使い回さないモジュール用）
+    fn module_ctx(module: &LoadedModule, configuration: &Arc<[u8]>) -> HttpContext {
+        let mut http_ctx = HttpContext::for_module(1, module);
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_root_id = module.root_id.clone();
+        http_ctx.plugin_configuration = configuration.clone();
+        http_ctx.plugin_data = module.data_files.clone();
+        http_ctx
+    }
+
+    /// B-408: 要求の属性（`:authority`・`:scheme`・プロトコル）は要求のどの段でもゲストに見せる。応答の段・`on_log` の
+    /// context には要求が無いので、要求ヘッダの段と同じメソッドとパスも見せる（`:path`・`request.path` 等）
+    fn set_request_attrs(http_ctx: &mut HttpContext, sessions: Option<&RequestSessions>) {
         if let Some(s) = sessions {
             if http_ctx.request_info.is_none() {
                 http_ctx.request_info = s.request_info().cloned();
@@ -481,6 +477,24 @@ impl FilterEngine {
                 }
             }
         }
+    }
+
+    /// 1 回の HTTP のコールバックに使うインスタンスと http context を用意する（F-271・B-177）。
+    ///
+    /// - `instance_reuse` のモジュール: このスレッドのプールの空いているインスタンス（無ければ新しく作る）に
+    ///   http context を作る。`sessions`（要求ごとの状態）があれば、同じ要求の前のフェーズで作った context を
+    ///   同じインスタンスで使い続ける（Envoy と同じ寿命。`proxy_on_delete` は `on_log` の後）。
+    /// - 使い回さないモジュール: 新しいインスタンスでライフサイクルを走らせ、HTTP context（ID 2）を作る。
+    ///
+    /// ストアの http context はモジュールのものだけを入れた空の状態で、要求の属性（B-408）だけを入れて
+    /// `proxy_on_context_create` を呼ぶ。段の値（ヘッダ・本文等）は呼び出し元が返った後に入れる（F-318。
+    /// プールの context を作り直さない。Envoy でも context の作成の時点では要求のヘッダは見えない）。
+    async fn open_session(
+        &self,
+        module: &LoadedModule,
+        configuration: &Arc<[u8]>,
+        sessions: Option<&RequestSessions>,
+    ) -> anyhow::Result<Session> {
         let root_context_id = 1i32;
         if module.instance_reuse {
             let module_key = module as *const LoadedModule as usize;
@@ -490,7 +504,8 @@ impl FilterEngine {
             {
                 match slot.acquire().await {
                     Some(p) => {
-                        let mut sess = Session::pooled(p, slot, context_id, true, http_ctx);
+                        let mut sess = Session::pooled(p, slot, context_id, true);
+                        Self::set_request_attrs(&mut sess.store.data_mut().http_ctx, sessions);
                         if let Err(e) = self.prepare_pooled(&mut sess).await {
                             return Err(self.fail_pooled(sess, sessions, module_key, e));
                         }
@@ -506,30 +521,33 @@ impl FilterEngine {
                 }
             }
 
-            // 新しい context（空いているインスタンス、無ければ新しく作る）
-            let (slot, p, http_ctx) = match module.pool.take_free(configuration) {
-                Some((slot, p)) => (slot, p, http_ctx),
+            // 新しい context（空いているインスタンス、無ければ新しく作る）。プールのインスタンスの http context は
+            // 前の要求の終わりに空へ戻したもの（`close_session`）
+            let (slot, p) = match module.pool.take_free(configuration) {
+                Some(free) => free,
                 None => {
                     let (store, instance) = self
-                        .new_configured_instance(module, configuration, http_ctx)
-                        .await?;
+                        .new_configured_instance(
+                            module,
+                            configuration,
+                            Self::module_ctx(module, configuration),
+                        )
+                        .await
+                        .map_err(|(e, _)| e)?;
                     let slot = InstanceSlot::new_in_use(configuration.clone());
                     module.pool.register(&slot);
-                    let mut p = PooledInstance {
+                    let p = PooledInstance {
                         store,
                         instance,
                         next_context_id: 2,
                     };
-                    let ctx = std::mem::replace(
-                        &mut p.store.data_mut().http_ctx,
-                        HttpContext::for_module(1, module),
-                    );
-                    (slot, p, ctx)
+                    (slot, p)
                 }
             };
             let context_id = p.next_context_id;
-            let mut sess = Session::pooled(p, slot, context_id, sessions.is_some(), http_ctx);
+            let mut sess = Session::pooled(p, slot, context_id, sessions.is_some());
             sess.next_context_id = context_id.saturating_add(1);
+            Self::set_request_attrs(&mut sess.store.data_mut().http_ctx, sessions);
             if let Err(e) = self.prepare_pooled(&mut sess).await {
                 return Err(self.fail_pooled(sess, None, module_key, e));
             }
@@ -551,8 +569,14 @@ impl FilterEngine {
         }
 
         let (mut store, instance) = self
-            .new_configured_instance(module, configuration, http_ctx)
-            .await?;
+            .new_configured_instance(
+                module,
+                configuration,
+                Self::module_ctx(module, configuration),
+            )
+            .await
+            .map_err(|(e, _)| e)?;
+        Self::set_request_attrs(&mut store.data_mut().http_ctx, sessions);
         // Step 4: Create HTTP context with root as parent
         let http_context_id = 2i32; // HTTP context ID
         if let Some(Err(e)) = exports::call(
@@ -564,10 +588,7 @@ impl FilterEngine {
         )
         .await
         {
-            return Err((
-                e.context(FailKind("lifecycle")),
-                Box::new(store.into_data().http_ctx),
-            ));
+            return Err(e.context(FailKind("lifecycle")));
         }
 
         Ok(Session {
@@ -600,21 +621,21 @@ impl FilterEngine {
         .await
     }
 
-    /// プールのインスタンスの準備に失敗した: インスタンスを捨てて `http_ctx` を返す
+    /// プールのインスタンスの準備に失敗した: インスタンスを捨てる
     fn fail_pooled(
         &self,
         sess: Session,
         sessions: Option<&RequestSessions>,
         module_key: usize,
         e: anyhow::Error,
-    ) -> (anyhow::Error, Box<HttpContext>) {
+    ) -> anyhow::Error {
         if let Some(slot) = sess.slot.as_ref() {
             slot.discard();
             if let Some(r) = sessions {
                 r.remove(module_key, slot);
             }
         }
-        (e, Box::new(sess.into_ctx()))
+        e
     }
 
     /// コールバックが済んだインスタンスを片付ける（F-271・B-177）。`ok` はコールバックが成功したか。
@@ -664,8 +685,8 @@ impl FilterEngine {
                 r.remove(module_key, &slot);
             }
         }
-        // 要求の中身（ヘッダ・本文）をプールの間に持ち続けない
-        sess.store.data_mut().http_ctx = HttpContext::for_module(1, module);
+        // 要求の中身（ヘッダ・本文）をプールの間に持ち続けない。モジュールのものは残す（F-318）
+        sess.store.data_mut().http_ctx.recycle();
         slot.release(PooledInstance {
             store: sess.store,
             instance: sess.instance,
@@ -980,21 +1001,17 @@ impl FilterEngine {
     ) -> (Vec<(Vec<u8>, Vec<u8>)>, anyhow::Result<ModuleAction>) {
         let num_headers = headers.len() as i32;
 
-        // Create context（文字列は Arc 共有、ヘッダはムーブ）
-        let mut http_ctx = HttpContext::for_module(1, module);
-        http_ctx.set_request(method.clone(), path.clone(), headers, client_ip.clone());
-        http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_root_id = module.root_id.clone();
-        http_ctx.plugin_configuration = configuration.clone();
-        http_ctx.plugin_data = module.data_files.clone();
-
-        let mut sess = match self
-            .open_session(module, configuration, http_ctx, sessions)
-            .await
-        {
+        let mut sess = match self.open_session(module, configuration, sessions).await {
             Ok(s) => s,
-            Err((e, ctx)) => return (ctx.request_headers, Err(e)),
+            Err(e) => return (headers, Err(e)),
         };
+        // 文字列は Arc 共有、ヘッダはムーブ
+        sess.store.data_mut().http_ctx.set_request(
+            method.clone(),
+            path.clone(),
+            headers,
+            client_ip.clone(),
+        );
 
         let run = self
             .run_headers_module(
@@ -1148,20 +1165,11 @@ impl FilterEngine {
         let num_headers = headers.len() as i32;
 
         // Create context（ヘッダはムーブ）
-        let mut http_ctx = HttpContext::for_module(1, module);
-        http_ctx.set_response(status, headers);
-        http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_root_id = module.root_id.clone();
-        http_ctx.plugin_configuration = configuration.clone();
-        http_ctx.plugin_data = module.data_files.clone();
-
-        let mut sess = match self
-            .open_session(module, configuration, http_ctx, sessions)
-            .await
-        {
+        let mut sess = match self.open_session(module, configuration, sessions).await {
             Ok(s) => s,
-            Err((e, ctx)) => return (ctx.response_headers, Err(e)),
+            Err(e) => return (headers, Err(e)),
         };
+        sess.store.data_mut().http_ctx.set_response(status, headers);
 
         let run = self
             .run_headers_module(
@@ -1491,7 +1499,8 @@ impl FilterEngine {
         }
 
         // Create context（F-271: 要求のメソッド・パス・ヘッダも見えるようにする）
-        let mut http_ctx = HttpContext::for_module(1, module);
+        let mut sess = self.open_session(module, configuration, sessions).await?;
+        let http_ctx = &mut sess.store.data_mut().http_ctx;
         if let Some(r) = request {
             http_ctx.set_request(
                 r.method.clone(),
@@ -1502,18 +1511,6 @@ impl FilterEngine {
         }
         let body_len = body.len();
         http_ctx.set_request_body(body, end_of_stream);
-        http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_root_id = module.root_id.clone();
-        http_ctx.plugin_configuration = configuration.clone();
-        http_ctx.plugin_data = module.data_files.clone();
-
-        let mut sess = match self
-            .open_session(module, configuration, http_ctx, sessions)
-            .await
-        {
-            Ok(s) => s,
-            Err((e, _)) => return Err(e),
-        };
 
         // Call proxy_on_request_body
         // Signature: (context_id, body_size, end_of_stream) -> action
@@ -1651,21 +1648,12 @@ impl FilterEngine {
         }
 
         // Create context
-        let mut http_ctx = HttpContext::for_module(1, module);
+        let mut sess = self.open_session(module, configuration, sessions).await?;
         let body_len = body.len();
-        http_ctx.set_response_body(body, end_of_stream);
-        http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_root_id = module.root_id.clone();
-        http_ctx.plugin_configuration = configuration.clone();
-        http_ctx.plugin_data = module.data_files.clone();
-
-        let mut sess = match self
-            .open_session(module, configuration, http_ctx, sessions)
-            .await
-        {
-            Ok(s) => s,
-            Err((e, _)) => return Err(e),
-        };
+        sess.store
+            .data_mut()
+            .http_ctx
+            .set_response_body(body, end_of_stream);
 
         // Call proxy_on_response_body
         // Signature: (context_id, body_size, end_of_stream) -> action
@@ -1750,15 +1738,7 @@ impl FilterEngine {
     ) -> anyhow::Result<()> {
         // F-148: `config_size` に `configuration.len()` を渡すため、実体のバッファも必ず同じものを積む
         // （サイズだけ非ゼロで中身が空だと、モジュールが proxy_get_buffer(PluginConfiguration) で空を読む）。
-        let mut http_ctx = HttpContext::for_module(1, module);
-        http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_root_id = module.root_id.clone();
-        http_ctx.plugin_configuration = configuration.clone();
-        http_ctx.plugin_data = module.data_files.clone();
-        let mut sess = self
-            .open_session(module, configuration, http_ctx, sessions)
-            .await
-            .map_err(|(e, _)| e)?;
+        let mut sess = self.open_session(module, configuration, sessions).await?;
 
         // Call proxy_on_log
         // Signature: (context_id) -> void
@@ -1968,17 +1948,8 @@ impl FilterEngine {
         trailers: &[(Vec<u8>, Vec<u8>)],
     ) -> anyhow::Result<ModuleResult> {
         // Create context
-        let mut http_ctx = HttpContext::for_module(1, module);
-        http_ctx.request_trailers = trailers.to_vec();
-        http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_root_id = module.root_id.clone();
-        http_ctx.plugin_configuration = configuration.clone();
-        http_ctx.plugin_data = module.data_files.clone();
-
-        let mut sess = self
-            .open_session(module, configuration, http_ctx, None)
-            .await
-            .map_err(|(e, _)| e)?;
+        let mut sess = self.open_session(module, configuration, None).await?;
+        sess.store.data_mut().http_ctx.request_trailers = trailers.to_vec();
 
         // Call proxy_on_request_trailers
         // Signature: (context_id, num_trailers) -> action
@@ -2076,17 +2047,8 @@ impl FilterEngine {
         trailers: &[(Vec<u8>, Vec<u8>)],
     ) -> anyhow::Result<ModuleResult> {
         // Create context
-        let mut http_ctx = HttpContext::for_module(1, module);
-        http_ctx.response_trailers = trailers.to_vec();
-        http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_root_id = module.root_id.clone();
-        http_ctx.plugin_configuration = configuration.clone();
-        http_ctx.plugin_data = module.data_files.clone();
-
-        let mut sess = self
-            .open_session(module, configuration, http_ctx, None)
-            .await
-            .map_err(|(e, _)| e)?;
+        let mut sess = self.open_session(module, configuration, None).await?;
+        sess.store.data_mut().http_ctx.response_trailers = trailers.to_vec();
 
         // Call proxy_on_response_trailers
         // Signature: (context_id, num_trailers) -> action
@@ -2908,13 +2870,11 @@ impl Drop for SlotGuard {
 
 impl Session {
     fn pooled(
-        mut p: PooledInstance,
+        p: PooledInstance,
         slot: std::rc::Rc<InstanceSlot>,
         context_id: i32,
         request_scoped: bool,
-        http_ctx: HttpContext,
     ) -> Self {
-        p.store.data_mut().http_ctx = http_ctx;
         Session {
             store: p.store,
             instance: p.instance,
@@ -2923,10 +2883,6 @@ impl Session {
             request_scoped,
             next_context_id: p.next_context_id,
         }
-    }
-
-    fn into_ctx(self) -> HttpContext {
-        self.store.into_data().http_ctx
     }
 }
 
@@ -3210,23 +3166,18 @@ mod exec_smoke_tests {
                 (b":authority".to_vec(), b"example.com".to_vec()),
             ]
         };
-        let mut http_ctx = HttpContext::for_module(1, &module);
-        http_ctx.set_request(
+        let configuration = module.configuration.clone();
+        let mut sess =
+            match futures::executor::block_on(engine.open_session(&module, &configuration, None)) {
+                Ok(s) => s,
+                Err(e) => panic!("open_session must not error: {e}"),
+            };
+        sess.store.data_mut().http_ctx.set_request(
             Arc::from("GET"),
             Arc::from("/"),
             headers(),
             Arc::from("127.0.0.1"),
         );
-        let configuration = module.configuration.clone();
-        let mut sess = match futures::executor::block_on(engine.open_session(
-            &module,
-            &configuration,
-            http_ctx,
-            None,
-        )) {
-            Ok(s) => s,
-            Err((e, _)) => panic!("open_session must not error: {e}"),
-        };
         // 他のワーカー（4 スレッド）が同時に要求を処理する（合わせて epoch_deadline の 3 倍の呼び出し）
         let per_thread = engine.epoch_deadline * 3 / 4 + 1;
         std::thread::scope(|scope| {
@@ -3327,30 +3278,20 @@ mod exec_smoke_tests {
         ];
         let num_headers = headers.len() as i32;
 
-        let mut http_ctx = HttpContext::for_module(1, &module);
-        http_ctx.set_request(
+        // 本命リクエストの `proxy_on_request_headers` を実行する。
+        // モジュールは `dispatch_http_call` してから Pause を返す（F-62）。
+        let configuration = module.configuration.clone();
+        let mut sess =
+            match futures::executor::block_on(engine.open_session(&module, &configuration, None)) {
+                Ok(s) => s,
+                Err(e) => panic!("open_session must not error: {e}"),
+            };
+        sess.store.data_mut().http_ctx.set_request(
             Arc::from("GET"),
             Arc::from("/"),
             headers,
             Arc::from("127.0.0.1"),
         );
-        http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_root_id = module.root_id.clone();
-        http_ctx.plugin_configuration = module.configuration.clone();
-        http_ctx.plugin_data = module.data_files.clone();
-
-        // 本命リクエストの `proxy_on_request_headers` を実行する。
-        // モジュールは `dispatch_http_call` してから Pause を返す（F-62）。
-        let configuration = module.configuration.clone();
-        let mut sess = match futures::executor::block_on(engine.open_session(
-            &module,
-            &configuration,
-            http_ctx,
-            None,
-        )) {
-            Ok(s) => s,
-            Err((e, _)) => panic!("open_session must not error: {e}"),
-        };
         let action = futures::executor::block_on(engine.run_headers_module(
             &module,
             &mut sess,

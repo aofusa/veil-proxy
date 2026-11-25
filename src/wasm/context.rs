@@ -91,6 +91,16 @@ fn empty_str() -> Arc<str> {
     EMPTY.get_or_init(|| Arc::from("")).clone()
 }
 
+/// このスレッドの空の `Arc<str>`（要求の終わりに context を空へ戻すときに使う。[`empty_str`] はプロセスで 1 つなので、
+/// 要求ごとに全ワーカーが同じ参照カウントを上げ下げする。F-318）
+fn local_empty_str() -> Arc<str> {
+    thread_local! {
+        static EMPTY: Arc<str> = Arc::from("");
+    }
+    // スレッドの終わり（スレッドローカルの破棄の後）は共有のもの
+    EMPTY.try_with(Arc::clone).unwrap_or_else(|_| empty_str())
+}
+
 /// 空の [`PluginData`]（共有。要求ごとに確保しない）
 pub fn empty_plugin_data() -> PluginData {
     static EMPTY: std::sync::OnceLock<PluginData> = std::sync::OnceLock::new();
@@ -378,6 +388,112 @@ impl HttpContext {
             grpc_receive_message: Bytes::new(),
             #[cfg(feature = "grpc")]
             grpc_receive_trailing_metadata: Vec::new(),
+        }
+    }
+
+    /// 要求の終わりに、モジュールのもの（権限・shared data・プラグインの名前・ルート ID・設定・VM の設定・ファイル）を
+    /// 残して、[`Self::for_module`] で作ったときと同じ空の状態へ戻す（F-318）。
+    ///
+    /// プールのインスタンスの context を要求ごとに作り直すと、モジュールの `Arc` を全部複製し直して捨てる（全ワーカーが
+    /// 同じ行へ書く）。全フィールドを列挙する（足したフィールドを戻し忘れたらコンパイルで分かる）。
+    pub(crate) fn recycle(&mut self) {
+        let HttpContext {
+            context_id,
+            root_context_id,
+            request_headers,
+            request_body,
+            request_trailers,
+            request_path,
+            request_method,
+            request_query,
+            request_info,
+            request_body_complete,
+            response_status,
+            response_headers,
+            response_body,
+            response_trailers,
+            response_body_complete,
+            client_ip,
+            plugin_name: _,
+            plugin_root_id: _,
+            plugin_configuration: _,
+            vm_configuration: _,
+            plugin_data: _,
+            request_headers_modified,
+            request_body_modified,
+            response_headers_modified,
+            response_body_modified,
+            local_response,
+            downstream_data,
+            downstream_data_modified,
+            upstream_data,
+            upstream_data_modified,
+            close_requested,
+            stream_resumed,
+            pending_http_calls,
+            http_call_responses,
+            current_http_call_token,
+            metrics,
+            next_metric_id,
+            shared_data: _,
+            custom_properties,
+            capabilities: _,
+            tick_period_ms,
+            #[cfg(feature = "grpc")]
+            pending_grpc_calls,
+            #[cfg(feature = "grpc")]
+            cancelled_grpc_calls,
+            #[cfg(feature = "grpc")]
+            pending_grpc_streams,
+            #[cfg(feature = "grpc")]
+            grpc_receive_initial_metadata,
+            #[cfg(feature = "grpc")]
+            grpc_receive_message,
+            #[cfg(feature = "grpc")]
+            grpc_receive_trailing_metadata,
+        } = self;
+        *context_id = 1;
+        *root_context_id = 0;
+        request_headers.clear();
+        *request_body = BodyBuffer::empty();
+        request_trailers.clear();
+        *request_path = local_empty_str();
+        *request_method = local_empty_str();
+        request_query.clear();
+        *request_info = None;
+        *request_body_complete = false;
+        *response_status = 0;
+        response_headers.clear();
+        *response_body = BodyBuffer::empty();
+        response_trailers.clear();
+        *response_body_complete = false;
+        *client_ip = local_empty_str();
+        *request_headers_modified = false;
+        *request_body_modified = false;
+        *response_headers_modified = false;
+        *response_body_modified = false;
+        *local_response = None;
+        *downstream_data = BodyBuffer::empty();
+        *downstream_data_modified = false;
+        *upstream_data = BodyBuffer::empty();
+        *upstream_data_modified = false;
+        *close_requested = false;
+        *stream_resumed = false;
+        pending_http_calls.clear();
+        http_call_responses.clear();
+        *current_http_call_token = None;
+        metrics.clear();
+        *next_metric_id = 1;
+        custom_properties.clear();
+        *tick_period_ms = 0;
+        #[cfg(feature = "grpc")]
+        {
+            pending_grpc_calls.clear();
+            cancelled_grpc_calls.clear();
+            pending_grpc_streams.clear();
+            grpc_receive_initial_metadata.clear();
+            *grpc_receive_message = Bytes::new();
+            grpc_receive_trailing_metadata.clear();
         }
     }
 

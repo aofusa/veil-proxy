@@ -2503,3 +2503,109 @@ mod b408_pseudo_header_phase_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// F-318: プールのインスタンスの context を空へ戻すと、要求の中身は作り直したときと同じ空になり、モジュールのもの
+// （同じ `Arc`）は残る
+mod f318_recycle_tests {
+    use crate::wasm::capabilities::ModuleCapabilities;
+    use crate::wasm::context::{HttpContext, RequestInfo};
+    use crate::wasm::types::LocalResponse;
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    #[test]
+    fn recycle_clears_the_request_and_keeps_the_module() {
+        let mut ctx = HttpContext::new(1, ModuleCapabilities::default());
+        let name: Arc<str> = Arc::from("m");
+        let root: Arc<str> = Arc::from("r");
+        let conf: Arc<[u8]> = Arc::from(&b"{\"a\":1}"[..]);
+        ctx.plugin_name = name.clone();
+        ctx.plugin_root_id = Some(root.clone());
+        ctx.plugin_configuration = conf.clone();
+        let caps = ctx.capabilities.clone();
+        let shared = ctx.shared_data.clone();
+        let data = ctx.plugin_data.clone();
+        let vm_conf = ctx.vm_configuration.clone();
+
+        ctx.context_id = 7;
+        ctx.root_context_id = 1;
+        ctx.set_request(
+            Arc::from("POST"),
+            Arc::from("/p?q=1"),
+            vec![(b"a".to_vec(), b"1".to_vec())],
+            Arc::from("10.0.0.1"),
+        );
+        ctx.request_info = Some(RequestInfo {
+            authority: Arc::from("h.example"),
+            scheme: "https",
+            protocol: "HTTP/2",
+        });
+        ctx.set_request_body(Bytes::from_static(b"body"), true);
+        ctx.request_trailers = vec![(b"t".to_vec(), b"1".to_vec())];
+        ctx.set_response(503, vec![(b"b".to_vec(), b"2".to_vec())]);
+        ctx.set_response_body(Bytes::from_static(b"resp"), true);
+        ctx.response_trailers = vec![(b"u".to_vec(), b"2".to_vec())];
+        ctx.request_headers_modified = true;
+        ctx.request_body_modified = true;
+        ctx.response_headers_modified = true;
+        ctx.response_body_modified = true;
+        ctx.local_response = Some(LocalResponse {
+            status_code: 403,
+            headers: vec![],
+            body: b"no".to_vec(),
+        });
+        ctx.downstream_data = crate::wasm::context::BodyBuffer::Owned(b"d".to_vec());
+        ctx.downstream_data_modified = true;
+        ctx.upstream_data = crate::wasm::context::BodyBuffer::Owned(b"u".to_vec());
+        ctx.upstream_data_modified = true;
+        ctx.close_requested = true;
+        ctx.stream_resumed = true;
+        ctx.current_http_call_token = Some(3);
+        ctx.next_metric_id = 9;
+        ctx.custom_properties.insert("k".into(), b"v".to_vec());
+        ctx.tick_period_ms = 100;
+
+        ctx.recycle();
+
+        let fresh = HttpContext::new(1, ModuleCapabilities::default());
+        assert_eq!(ctx.context_id, fresh.context_id);
+        assert_eq!(ctx.root_context_id, fresh.root_context_id);
+        assert!(ctx.request_headers.is_empty());
+        assert!(ctx.request_body.is_empty());
+        assert!(ctx.request_trailers.is_empty());
+        assert_eq!(&*ctx.request_path, "");
+        assert_eq!(&*ctx.request_method, "");
+        assert_eq!(ctx.request_query, "");
+        assert!(ctx.request_info.is_none());
+        assert!(!ctx.request_body_complete);
+        assert_eq!(ctx.response_status, 0);
+        assert!(ctx.response_headers.is_empty());
+        assert!(ctx.response_body.is_empty());
+        assert!(ctx.response_trailers.is_empty());
+        assert!(!ctx.response_body_complete);
+        assert_eq!(&*ctx.client_ip, "");
+        assert!(!ctx.request_headers_modified && !ctx.request_body_modified);
+        assert!(!ctx.response_headers_modified && !ctx.response_body_modified);
+        assert!(ctx.local_response.is_none());
+        assert!(ctx.downstream_data.is_empty() && !ctx.downstream_data_modified);
+        assert!(ctx.upstream_data.is_empty() && !ctx.upstream_data_modified);
+        assert!(!ctx.close_requested && !ctx.stream_resumed);
+        assert!(ctx.pending_http_calls.is_empty() && ctx.http_call_responses.is_empty());
+        assert!(ctx.current_http_call_token.is_none());
+        assert!(ctx.metrics.is_empty());
+        assert_eq!(ctx.next_metric_id, fresh.next_metric_id);
+        assert!(ctx.custom_properties.is_empty());
+        assert_eq!(ctx.tick_period_ms, fresh.tick_period_ms);
+
+        assert!(Arc::ptr_eq(&ctx.plugin_name, &name));
+        assert!(ctx
+            .plugin_root_id
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r, &root)));
+        assert!(Arc::ptr_eq(&ctx.plugin_configuration, &conf));
+        assert!(Arc::ptr_eq(&ctx.vm_configuration, &vm_conf));
+        assert!(Arc::ptr_eq(&ctx.plugin_data, &data));
+        assert!(Arc::ptr_eq(&ctx.capabilities, &caps));
+        assert!(Arc::ptr_eq(&ctx.shared_data, &shared));
+    }
+}
