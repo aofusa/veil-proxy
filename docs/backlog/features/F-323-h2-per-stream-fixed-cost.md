@@ -58,6 +58,20 @@ HttpArena の baseline-h2（`h2load -c 256/1024 -m 100 -t 64`、TLS）と baseli
 - `drop_slot` は `Option::take()` で future 全体を一時領域へ写してから捨てていた（終わったタスクでは中身が `None` でも写す）。
   その場で `None` を書く（中身があればその場で drop）。io_uring・reactor の両方。
 
+- aofish（81aaa3cf、F-317 の「計測の記録」と同じ条件・交互 2 巡。f322 → t1）:
+
+  | 負荷 | epoll rps | epoll 1 要求の CPU | io_uring rps | io_uring 1 要求の CPU |
+  |---|---|---|---|---|
+  | h2c `Respond`（64 接続 × 100） | 2.72M → 3.20M（+17.3%） | 2.84 → 2.41 µs（−15.5%） | 2.57M → 3.08M（+19.6%） | 2.93 → 2.49 µs（−15.2%） |
+  | h2（TLS）`Respond`（64 接続 × 100） | 2.15M → 2.50M（+16.1%） | 3.55 → 3.00 µs（−15.4%） | 2.01M → 2.27M（+13.3%） | 3.79 → 3.34 µs（−11.8%） |
+
+  Wasm の h2c・h2（1 要求 19〜20 µs）は ±3% の中（Wasm の費用が大半）。HTTP/1.1・HTTP/3・静的配信も ±3% の中。
+- 1 の後の残り（aofish の perf、t1、epoll、h2c `Respond`）: ヘッダの処理が約 24%（`decode_and_set_headers` 7.9%〈検証・`:path` の
+  正規化を含む〉、HPACK の復号 4.9%、`take_request_parts` 2.7%、`recv_headers` 2.0%、`append_header_fragment` 1.7%、
+  `FrameDecoder::decode` の中の複写 2.8%〈HEADERS のブロックを `Vec` へ写し、ストリームの `pending_headers` へもう一度写す〉、
+  `from_utf8` 1.8%）、`drive_h2_streams` 4.9%、応答のチャネル（`try_recv`）1.9%、`h2_spawn_for_request` 2.1%、arc_swap 約 5.9%
+  （設定の Guard を接続の間持ち続けて遅い経路に落ちていた。[B-501](../bugs/B-501-arc-swap-guard-held-across-await.md) で直した）。
+
 ## 受け入れ条件
 
 - ノート PC の h2c `Respond`（16 接続 × 100 ストリーム）の 1 要求の CPU が半分以下（4.5 → 2.3 µs 以下）。ストリーミング・gRPC・
