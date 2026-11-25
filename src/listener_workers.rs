@@ -351,6 +351,8 @@ fn spawn_workers<S, Fut>(
                             // タイムアウト - ループを継続してshutdownチェック。
                             // F-183: アイドル点でアロケータに空き領域を OS へ返させる。
                             crate::alloc_tune::idle_tick();
+                            // F-321: リロードの後の古いルートの値を手放す
+                            crate::upstream::release_stale_worker_routes();
                             continue;
                         }
                     };
@@ -436,6 +438,8 @@ fn spawn_workers<S, Fut>(
             });
             // B-118: 待ちが切れて残った接続タスクをスレッドローカルが生きているうちに破棄する
             crate::runtime::shutdown_thread();
+            // F-321: ワーカーのルートの表も同じ（Backend をスレッドローカルの破棄の中で落とさない）
+            crate::upstream::release_worker_routes();
         });
         handles.push(handle);
     }

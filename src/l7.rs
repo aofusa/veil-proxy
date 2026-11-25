@@ -47,8 +47,37 @@ pub fn max_buffered_request_body() -> usize {
     MAX_BUFFERED_REQUEST_BODY.load(Ordering::Relaxed)
 }
 
-/// 照合したルート: パスの前置き・Backend・圧縮の設定（どれもルートが持つ解決済みの値の `Arc` の複製）。
-pub type RouteMatch = (Arc<[u8]>, Backend, Arc<CompressionConfig>);
+/// 照合したルートの値: パスの前置き・Backend・圧縮の設定。
+pub struct RouteTarget {
+    pub prefix: Arc<[u8]>,
+    pub backend: Backend,
+    pub compression: Arc<CompressionConfig>,
+}
+
+/// 要求に合ったルート（[`RouteTarget`] を参照で見せる）。
+///
+/// F-321: ふつうはワーカーのルートの表（`upstream` の `WORKER_ROUTES`）の値を `Rc` で共有する。以前は要求ごとに
+/// ルートの値の `Arc`（Backend の中の数本・前置き・圧縮の設定）を複製していて、全ワーカーが同じ参照カウントへ
+/// 書いていた（多コアではコアの間でキャッシュラインを奪い合う）。トラフィック制御（F-219）が要求ごとに選んだ
+/// Backend だけは所有する。
+pub enum RouteMatch {
+    /// ワーカーの表の値（複製はワーカーの中の参照カウントだけ）
+    Worker(std::rc::Rc<RouteTarget>),
+    /// 要求ごとに選んだ値
+    Owned(RouteTarget),
+}
+
+impl std::ops::Deref for RouteMatch {
+    type Target = RouteTarget;
+
+    #[inline]
+    fn deref(&self) -> &RouteTarget {
+        match self {
+            RouteMatch::Worker(t) => t,
+            RouteMatch::Owned(t) => t,
+        }
+    }
+}
 
 /// パスをクエリの前と後に分ける（`?` が無ければクエリは空）。
 #[inline]

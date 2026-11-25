@@ -3,6 +3,7 @@
 //! バックエンド検索、条件マッチング、ヘルスチェック関数を提供します。
 
 use crate::config::*;
+use crate::l7::{RouteMatch, RouteTarget};
 use crate::routing;
 use ftlog::{debug, warn};
 use std::collections::HashMap;
@@ -888,7 +889,7 @@ pub fn find_backend_unified(
     raw_query: &[u8],
     source_ip: &SocketAddr,
     config: &RuntimeConfig,
-) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
+) -> Option<RouteMatch> {
     select_route(
         &config.optimized_router,
         host,
@@ -913,7 +914,7 @@ pub fn find_backend_preview(
     raw_query: &[u8],
     source_ip: &SocketAddr,
     config: &RuntimeConfig,
-) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
+) -> Option<RouteMatch> {
     select_route(
         &config.optimized_router,
         host,
@@ -928,21 +929,113 @@ pub fn find_backend_preview(
     )
 }
 
-/// 照合したルートの Backend（トラフィック制御があればそれで選ぶ。F-219）。
+/// ワーカーのルートの表（F-321）: ルートの添字 → そのルートの値。ワーカーがそのルートを初めて引いたときに作る
+/// （ルートの値の `Arc` を複製するのはこのときだけ。要求ごとの複製は `Rc` でワーカーの中に閉じる）。ルートの照合の
+/// 索引の世代（[`routing::OptimizedRouter::generation`]。設定ごと・ルートのキャッシュを消すたびに変わる）が
+/// 変わったら空にする。古い世代の値はワーカーのアイドル点（[`release_worker_routes`]）でも手放す。
+struct WorkerRoutes {
+    gen: u64,
+    targets: Vec<Option<std::rc::Rc<RouteTarget>>>,
+}
+
+thread_local! {
+    static WORKER_ROUTES: std::cell::RefCell<WorkerRoutes> = const {
+        std::cell::RefCell::new(WorkerRoutes {
+            gen: u64::MAX,
+            targets: Vec::new(),
+        })
+    };
+}
+
+/// このスレッドのルートの表を手放す（ワーカーのスレッドの終わりで、ランタイムが生きているうちに呼ぶ。
+/// スレッドローカルの破棄の中で Backend を落とさない。B-118 と同じ）
+pub fn release_worker_routes() {
+    let _ = WORKER_ROUTES.try_with(|w| {
+        let old = {
+            let mut w = w.borrow_mut();
+            w.gen = u64::MAX;
+            std::mem::take(&mut w.targets)
+        };
+        drop(old);
+    });
+}
+
+/// このスレッドのルートの表が今の設定のものでなければ手放す（ワーカーのアイドル点で呼ぶ。リロードの後に要求の
+/// 来ないワーカーが古い設定の値〈上流のグループ等〉を持ち続けない）
+pub fn release_stale_worker_routes() {
+    let stale = WORKER_ROUTES
+        .try_with(|w| {
+            let w = w.borrow();
+            w.gen != u64::MAX && w.gen != CURRENT_CONFIG.load().optimized_router.generation()
+        })
+        .unwrap_or(false);
+    if stale {
+        release_worker_routes();
+    }
+}
+
+/// ルートのパスの前置き（解決済みなら `Arc` の複製のみ。F-159）
 #[inline]
-fn route_backend(
+fn route_prefix(route: &Route) -> Arc<[u8]> {
+    route
+        .resolved_path_prefix
+        .clone()
+        .unwrap_or_else(|| extract_path_prefix_arc(route))
+}
+
+/// ルートの圧縮の設定（解決済みなら `Arc` の複製のみ。F-159）
+#[inline]
+fn route_compression(route: &Route) -> Arc<CompressionConfig> {
+    route
+        .resolved_compression
+        .clone()
+        .unwrap_or_else(|| Arc::new(route.compression.clone().unwrap_or_default()))
+}
+
+/// 照合したルートの値（トラフィック制御があればそれで選ぶ。F-219）。トラフィック制御が選ばなかったときは
+/// ワーカーのルートの表から（F-321）。
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn route_match(
+    optimized_router: &routing::OptimizedRouter,
+    routes_len: usize,
+    route_idx: usize,
     route: &Route,
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
     method: &[u8],
     headers: &[(&[u8], &[u8])],
     draw: bool,
-) -> io::Result<Backend> {
+) -> io::Result<RouteMatch> {
     if let Some(t) = &route.resolved_traffic {
         if let Some(b) = t.select(method, headers, draw) {
-            return Ok(b);
+            return Ok(RouteMatch::Owned(RouteTarget {
+                prefix: route_prefix(route),
+                backend: b,
+                compression: route_compression(route),
+            }));
         }
     }
-    load_backend(route, upstream_groups)
+    let gen = optimized_router.generation();
+    WORKER_ROUTES.with(|w| {
+        let mut w = w.borrow_mut();
+        if w.gen != gen {
+            w.targets.clear();
+            w.gen = gen;
+        }
+        if let Some(Some(t)) = w.targets.get(route_idx) {
+            return Ok(RouteMatch::Worker(std::rc::Rc::clone(t)));
+        }
+        let t = std::rc::Rc::new(RouteTarget {
+            prefix: route_prefix(route),
+            backend: load_backend(route, upstream_groups)?.for_worker(),
+            compression: route_compression(route),
+        });
+        if w.targets.len() <= route_idx {
+            w.targets.resize(routes_len.max(route_idx + 1), None);
+        }
+        w.targets[route_idx] = Some(std::rc::Rc::clone(&t));
+        Ok(RouteMatch::Worker(t))
+    })
 }
 
 /// ルートの照合（`optimized_router` は `routes` から作ったもの）。
@@ -962,7 +1055,7 @@ fn select_route(
     routes: &[Route],
     upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
     draw: bool,
-) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
+) -> Option<RouteMatch> {
     // 引数の UTF-8 変換は debug が有効なときだけ評価する（以前は毎リクエスト 3 回
     // from_utf8 を計算していた。ftlog のマクロは無効レベルでは引数を評価しない）。
     debug!(
@@ -989,17 +1082,17 @@ fn select_route(
                 raw_query,
                 source_ip,
             ) {
-                if let Ok(backend) = route_backend(route, upstream_groups, method, headers, draw) {
-                    // F-159: 解決済みなら Arc clone のみ（malloc なし）。
-                    let prefix = route
-                        .resolved_path_prefix
-                        .clone()
-                        .unwrap_or_else(|| extract_path_prefix_arc(route));
-                    let compression = route
-                        .resolved_compression
-                        .clone()
-                        .unwrap_or_else(|| Arc::new(route.compression.clone().unwrap_or_default()));
-                    return Some((prefix, backend, compression));
+                if let Ok(m) = route_match(
+                    optimized_router,
+                    routes.len(),
+                    route_idx,
+                    route,
+                    upstream_groups,
+                    method,
+                    headers,
+                    draw,
+                ) {
+                    return Some(m);
                 }
             }
         }
@@ -1051,21 +1144,22 @@ fn select_route(
                     "[Routing] Matched route index: {} (path={:?} action={:?})",
                     route_idx, route.conditions.path, route.action
                 );
-                match route_backend(route, upstream_groups, method, headers, draw) {
-                    Ok(backend) => {
-                        // F-159: 解決済みなら Arc clone のみ（malloc なし）。
-                        let prefix = route
-                            .resolved_path_prefix
-                            .clone()
-                            .unwrap_or_else(|| extract_path_prefix_arc(route));
-                        let compression = route.resolved_compression.clone().unwrap_or_else(|| {
-                            Arc::new(route.compression.clone().unwrap_or_default())
-                        });
+                match route_match(
+                    optimized_router,
+                    routes.len(),
+                    route_idx,
+                    route,
+                    upstream_groups,
+                    method,
+                    headers,
+                    draw,
+                ) {
+                    Ok(m) => {
                         // キャッシュに保存（前の候補が動的な条件で外れたときは入れない。B-172）
                         if !dynamic_before {
                             optimized_router.cache_result(cache_key, Some(route_idx));
                         }
-                        return Some((prefix, backend, compression));
+                        return Some(m);
                     }
                     Err(e) => {
                         warn!(
@@ -1184,7 +1278,7 @@ pub(crate) fn find_backend_linear(
     cache_key: &routing::RouteCacheKey,
     optimized_router: &routing::OptimizedRouter,
     draw: bool,
-) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
+) -> Option<RouteMatch> {
     // 配列の順序で評価（first-match）
     // 前のルートが動的な条件（header・query）や Backend の組み立ての失敗で外れたか（B-172。
     // host・path で外れたかは見ず、条件を持つだけで数える。安全網の経路なので控えめに倒す）
@@ -1207,22 +1301,22 @@ pub(crate) fn find_backend_linear(
                 "Route[{}] matched (linear fallback): host={:?} path={:?} method={:?}",
                 i, route.conditions.host, route.conditions.path, route.conditions.method
             );
-            match route_backend(route, upstream_groups, method, headers, draw) {
-                Ok(backend) => {
-                    // F-159: 解決済みなら Arc clone のみ（malloc なし）。
-                    let prefix = route
-                        .resolved_path_prefix
-                        .clone()
-                        .unwrap_or_else(|| extract_path_prefix_arc(route));
-                    let compression = route
-                        .resolved_compression
-                        .clone()
-                        .unwrap_or_else(|| Arc::new(route.compression.clone().unwrap_or_default()));
+            match route_match(
+                optimized_router,
+                routes.len(),
+                i,
+                route,
+                upstream_groups,
+                method,
+                headers,
+                draw,
+            ) {
+                Ok(m) => {
                     // キャッシュに保存（前のルートが動的な条件で外れたときは入れない。B-172）
                     if !dynamic_before {
                         optimized_router.cache_result(*cache_key, Some(i));
                     }
-                    return Some((prefix, backend, compression));
+                    return Some(m);
                 }
                 Err(e) => {
                     warn!(
@@ -1458,11 +1552,11 @@ mod tests {
         let groups = Arc::new(HashMap::new());
         let ip: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let pick = |headers: &[(&[u8], &[u8])], query: &[u8]| -> String {
-            let (_, b, _) = select_route(
+            let m = select_route(
                 &router, b"h", b"/a", b"GET", headers, query, &ip, &routes, &groups, false,
             )
             .expect("a route matches");
-            match b {
+            match &m.backend {
                 Backend::Redirect(url, ..) => url.to_string(),
                 _ => unreachable!("only Redirect routes"),
             }
@@ -1476,6 +1570,54 @@ mod tests {
         // 当たったルートより前に動的な条件の候補が無いとき（1 つ目のルート）は今までどおりキャッシュに入る
         let key = routing::RouteCacheKey::new(b"h", b"/a", b"GET", &ip);
         assert_eq!(router.try_cache(&key), Some(Some(0)));
+    }
+
+    /// F-321: トラフィック制御の無いルートの値はワーカーの表から同じ `Rc` を返し、表の世代（ルートのキャッシュの
+    /// 消去・別の設定の索引）が変わったら作り直す。古い世代の表はアイドル点で手放す
+    #[test]
+    fn test_f321_worker_route_table() {
+        let routes: Vec<Route> = vec![toml::from_str(
+            "conditions = { path = \"/a\" }\naction = { type = \"Respond\", status = 200, body = \"ok\", content_type = \"text/plain\" }",
+        )
+        .unwrap()];
+        let mut router = routing::OptimizedRouter::with_cache_capacity(16);
+        router.add_route(0, None, routes[0].conditions.path.as_deref(), None);
+        router.finalize();
+        let groups = Arc::new(HashMap::new());
+        let ip: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let pick = |router: &routing::OptimizedRouter| -> std::rc::Rc<RouteTarget> {
+            match select_route(
+                router,
+                b"h",
+                b"/a",
+                b"GET",
+                &[],
+                b"",
+                &ip,
+                &routes,
+                &groups,
+                true,
+            ) {
+                Some(RouteMatch::Worker(t)) => t,
+                Some(RouteMatch::Owned(_)) => panic!("a plain route comes from the worker table"),
+                None => panic!("the route matches"),
+            }
+        };
+        let a = pick(&router);
+        let b = pick(&router);
+        assert!(std::rc::Rc::ptr_eq(&a, &b));
+        assert!(matches!(&a.backend, Backend::Respond(r) if r.body.as_ref() == b"ok"));
+        // ルートのキャッシュを消すと表の世代が変わり、作り直す
+        router.clear_cache();
+        let c = pick(&router);
+        assert!(!std::rc::Rc::ptr_eq(&a, &c));
+        // 表が今の設定のものでなければアイドル点で手放す（この試験の索引は今の設定のものではない）
+        release_stale_worker_routes();
+        WORKER_ROUTES.with(|w| assert!(w.borrow().targets.is_empty()));
+        let d = pick(&router);
+        assert!(!std::rc::Rc::ptr_eq(&c, &d));
+        release_worker_routes();
+        WORKER_ROUTES.with(|w| assert!(w.borrow().targets.is_empty()));
     }
 
     // ====================

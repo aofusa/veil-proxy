@@ -848,7 +848,8 @@ impl H3BufferedTask {
 
         // F-169: File/MemoryFile バックエンドの圧縮ネゴシエーションに使う
         // （従来は破棄していたため、HTTP/3 の静的配信では圧縮が一切効いていなかった）。
-        let (prefix, backend, route_compression) = match backend_result {
+        // F-321: ルートの値はワーカーの表から借りる（要求ごとに共有の `Arc` を複製しない）
+        let route = match backend_result {
             Some(b) => b,
             None => {
                 debug!(
@@ -928,6 +929,8 @@ impl H3BufferedTask {
             }
         };
 
+        let (prefix, backend, route_compression) =
+            (&route.prefix, &route.backend, &route.compression);
         // セキュリティチェック。本文は受信済みなので実際の長さでも上限を見る（HTTP/3 は content-length を
         // 省略できる。省略した要求が本文の上限を素通りしていた。B-132 の行列の試験で発見）
         let security = backend.security();
@@ -1201,7 +1204,7 @@ impl H3BufferedTask {
                 // 優先順位: パス設定 > HTTP/3設定 > デフォルト
                 let config = CURRENT_CONFIG.load();
                 let effective_compression =
-                    resolve_http3_compression_config(&path_compression, &config.http3_config);
+                    resolve_http3_compression_config(path_compression, &config.http3_config);
 
                 // F-132: WASM on_request_body で書き換えられた本文があればそれを使う。
                 #[cfg(feature = "wasm")]
@@ -1212,16 +1215,16 @@ impl H3BufferedTask {
 
                 let result = self
                     .handle_proxy(
-                        &upstream_group,
+                        upstream_group,
                         buffering_full,
-                        &security,
-                        &cache,
+                        security,
+                        cache,
                         &effective_compression,
                         client_encoding,
                         method,
                         authority,
                         path,
-                        &prefix,
+                        prefix,
                         headers,
                         effective_request_body,
                         #[cfg(feature = "wasm")]
@@ -1240,7 +1243,7 @@ impl H3BufferedTask {
             Backend::MemoryFile(data, mime_type, security, _) => {
                 // パス完全一致チェック
                 let path_str = std::str::from_utf8(path).unwrap_or("/");
-                let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
+                let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
 
                 let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
                     &path_str[prefix_str.len()..]
@@ -1254,17 +1257,17 @@ impl H3BufferedTask {
                     (404, 9)
                 } else {
                     let file_compression =
-                        resolve_http3_compression_config(&route_compression, &config.http3_config);
+                        resolve_http3_compression_config(route_compression, &config.http3_config);
                     let sreq = static_request_h3(method, headers);
                     self.send_static_response(
                         &sreq,
                         data.body.clone(),
-                        &mime_type,
+                        mime_type,
                         &data.validators,
-                        &security,
+                        security,
                         &file_compression,
                         None,
-                        Some(&data),
+                        Some(data),
                         false,
                         #[cfg(feature = "wasm")]
                         wasm_modules_to_apply.as_ref(),
@@ -1288,20 +1291,20 @@ impl H3BufferedTask {
                 // 優先順位: パス設定 > HTTP/3 設定 > デフォルト）。従来 SendFile は
                 // `route_compression` を破棄しており圧縮が一切効いていなかった。
                 let file_compression =
-                    resolve_http3_compression_config(&route_compression, &config.http3_config);
+                    resolve_http3_compression_config(route_compression, &config.http3_config);
                 self.handle_sendfile(SendFileRequest {
-                    base_path: &base_path,
-                    is_dir,
+                    base_path,
+                    is_dir: *is_dir,
                     index_file: index_file.as_deref(),
                     req_path: path,
-                    prefix: &prefix,
-                    security: &security,
+                    prefix,
+                    security,
                     compression: &file_compression,
                     sreq: static_request_h3(method, headers),
                     open_file_cache_config: open_file_cache_config.as_deref(),
                     canonical_base: canonical_base.as_deref(),
                     static_file_cache_config: static_file_cache_config.as_deref(),
-                    precompressed,
+                    precompressed: *precompressed,
                     #[cfg(feature = "wasm")]
                     wasm_modules: wasm_modules_to_apply.as_ref(),
                 })
@@ -1324,7 +1327,7 @@ impl H3BufferedTask {
                 }
             }
             Backend::Redirect(redirect_url, status_code, preserve_path, _, _) => self
-                .handle_redirect(&redirect_url, status_code, preserve_path, path, &prefix)
+                .handle_redirect(redirect_url, *status_code, *preserve_path, path, prefix)
                 .await
                 .unwrap_or((500, 0)),
             #[cfg(feature = "handler")]
@@ -1351,7 +1354,7 @@ impl H3BufferedTask {
                     self.client_ip.as_str(),
                     crate::api::request::HttpVersion::Http3,
                 );
-                let mut resp = crate::api::dispatch::call(&entry, req, comp.as_deref()).await;
+                let mut resp = crate::api::dispatch::call(entry, req, comp.as_deref()).await;
                 crate::api::dispatch::h2_h3_headers(&mut resp);
                 let status = resp.status_code();
                 if let Some(stream) = resp.take_stream() {

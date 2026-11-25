@@ -1351,9 +1351,10 @@ where
     );
     drop(config);
 
-    let Some((_prefix, backend, _rc)) = backend_result else {
+    let Some(route) = backend_result else {
         return H2StreamPlan::BUFFERED;
     };
+    let backend = &route.backend;
     // B-274: 本文の受信が止まったら打ち切る秒数（ルートの設定。ストリーミングかどうかによらない）
     let buffered = H2StreamPlan {
         streaming: None,
@@ -1361,7 +1362,7 @@ where
     };
     // ストリーミング受信のハンドラ（F-197）: 本文の上限は掛けない（gRPC はメッセージ単位で検査する）。
     #[cfg(feature = "handler")]
-    if let Backend::Handler(entry, sec, modules, _) = &backend {
+    if let Backend::Handler(entry, sec, modules, _) = backend {
         // B-317: ストリーミングの経路は `[route.security]`（IP・メソッド・レート制限）と Proxy-Wasm の要求の
         // フェーズを通らない。HEADERS に END_STREAM を付けないだけ（gRPC の普通の呼び出し）で、バッファ経路・
         // HTTP/1.1・HTTP/3 では拒否されるハンドラのルートへ届いていた（F5・F6）。検査で拒否される要求と
@@ -1378,7 +1379,7 @@ where
             ..buffered
         };
     }
-    let (upstream_group, security, buffering) = match &backend {
+    let (upstream_group, security, buffering) = match backend {
         Backend::Proxy(ug, sec, _comp, buf, cache, modules) => {
             if modules
                 .as_ref()
@@ -1896,7 +1897,8 @@ pub(super) async fn h2_dispatch(
     );
     drop(config);
 
-    let (prefix, backend, route_compression) = match backend_result {
+    // F-321: ルートの値はワーカーの表から借りる（要求ごとに共有の `Arc` を複製しない）
+    let route = match backend_result {
         Some(b) => b,
         None => {
             // 未登録のサービスへの gRPC は Trailers-Only の UNIMPLEMENTED（F-209）
@@ -1913,6 +1915,7 @@ pub(super) async fn h2_dispatch(
         }
     };
 
+    let (prefix, backend, route_compression) = (&route.prefix, &route.backend, &route.compression);
     // セキュリティチェック。
     let security = backend.security();
     let check_result = check_security(
@@ -2211,13 +2214,13 @@ pub(super) async fn h2_dispatch(
             }
             h2_proxy(
                 ctx,
-                &upstream_group,
+                upstream_group,
                 buffering_full,
-                &compression,
+                compression,
                 client_encoding,
-                &prefix,
-                &security,
-                &cache,
+                prefix,
+                security,
+                cache,
                 #[cfg(feature = "wasm")]
                 &wasm_modules_to_apply,
                 resp_tx,
@@ -2227,7 +2230,7 @@ pub(super) async fn h2_dispatch(
         }
         Backend::MemoryFile(data, mime_type, security, _) => {
             let path_str = std::str::from_utf8(path).unwrap_or("/");
-            let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
+            let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
             let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
                 &path_str[prefix_str.len()..]
             } else {
@@ -2247,10 +2250,10 @@ pub(super) async fn h2_dispatch(
                     data.body.clone(),
                     mime_type.as_ref(),
                     &data.validators,
-                    &security,
-                    &route_compression,
+                    security,
+                    route_compression,
                     None,
-                    Some(&data),
+                    Some(data),
                     false,
                 );
                 #[cfg(feature = "wasm")]
@@ -2283,16 +2286,16 @@ pub(super) async fn h2_dispatch(
         ) => {
             h2_sendfile(
                 ctx,
-                &base_path,
-                is_dir,
+                base_path,
+                *is_dir,
                 index_file.as_deref(),
-                &prefix,
-                &security,
-                &route_compression,
+                prefix,
+                security,
+                route_compression,
                 open_file_cache_config.as_deref(),
                 canonical_base.as_deref(),
                 static_file_cache_config.as_deref(),
-                precompressed,
+                *precompressed,
                 #[cfg(feature = "wasm")]
                 &wasm_modules_to_apply,
                 resp_tx,
@@ -2306,7 +2309,7 @@ pub(super) async fn h2_dispatch(
                 resp_tx,
                 notify,
                 r.status,
-                h2_fixed_headers(&r),
+                h2_fixed_headers(r),
                 r.body.clone(),
             )
             .await
@@ -2314,11 +2317,11 @@ pub(super) async fn h2_dispatch(
         Backend::Redirect(redirect_url, status_code, preserve_path, _, security) => {
             h2_redirect(
                 ctx,
-                &redirect_url,
-                status_code,
-                preserve_path,
-                &prefix,
-                &security,
+                redirect_url,
+                *status_code,
+                *preserve_path,
+                prefix,
+                security,
                 resp_tx,
                 notify,
             )
@@ -2326,16 +2329,8 @@ pub(super) async fn h2_dispatch(
         }
         #[cfg(feature = "handler")]
         Backend::Handler(entry, security, _, comp) => {
-            let (status, size, _) = h2_api_handler(
-                ctx,
-                &entry,
-                comp.as_deref(),
-                &security,
-                None,
-                resp_tx,
-                notify,
-            )
-            .await;
+            let (status, size, _) =
+                h2_api_handler(ctx, entry, comp.as_deref(), security, None, resp_tx, notify).await;
             (status, size)
         }
     };
@@ -5035,18 +5030,21 @@ pub(super) async fn h2_serve_streaming(
     );
 
     // 適格判定が外れる（config 再読込レース等）場合は req をドレインして 502。
-    let (prefix, upstream_group, compression, security) = match backend_result {
-        Some((prefix, Backend::Proxy(ug, sec, comp, _buf, _cache, _mods), _rc)) => {
-            (prefix, ug, comp, sec)
-        }
+    let Some(route) = backend_result else {
+        h2_drain_req(req_rx, notify).await;
+        let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+        return (s, sz, 0);
+    };
+    let (prefix, upstream_group, compression, security) = match &route.backend {
+        Backend::Proxy(ug, sec, comp, _buf, _cache, _mods) => (&route.prefix, ug, comp, sec),
         // ストリーミング受信のハンドラ（F-197）
         #[cfg(feature = "handler")]
-        Some((_prefix, Backend::Handler(entry, sec, _, comp), _rc)) if entry.streaming_request => {
+        Backend::Handler(entry, sec, _, comp) if entry.streaming_request => {
             return h2_api_handler(
                 ctx,
-                &entry,
+                entry,
                 comp.as_deref(),
-                &sec,
+                sec,
                 Some(req_rx),
                 resp_tx,
                 notify,
@@ -5054,13 +5052,13 @@ pub(super) async fn h2_serve_streaming(
             .await;
         }
         // 下見の後に固定応答になった（JWT の期限が切れた等。F-219・F-220）
-        Some((_prefix, Backend::Respond(r), _rc)) => {
+        Backend::Respond(r) => {
             h2_drain_req(req_rx, notify).await;
             let (s, sz) = h2_emit_full(
                 resp_tx,
                 notify,
                 r.status,
-                h2_fixed_headers(&r),
+                h2_fixed_headers(r),
                 r.body.clone(),
             )
             .await;
@@ -5105,9 +5103,9 @@ pub(super) async fn h2_serve_streaming(
             req_rx,
             &server.target,
             upstream_group.tls_profile(),
-            &prefix,
-            &security,
-            &compression,
+            prefix,
+            security,
+            compression,
             resp_tx,
             notify,
         )
@@ -5144,7 +5142,7 @@ pub(super) async fn h2_serve_streaming(
         .iter()
         .any(|h| header_pair_is_grpc(&h.name, &h.value));
     let final_path_owned =
-        compute_upstream_path(path_str, &prefix, &target.path_prefix, preserve_grpc_path);
+        compute_upstream_path(path_str, prefix, &target.path_prefix, preserve_grpc_path);
     let final_path = final_path_owned.as_str();
 
     let mut request = request_buf_get(1024);
@@ -5160,7 +5158,7 @@ pub(super) async fn h2_serve_streaming(
     }
     request.extend_from_slice(b"\r\n");
     let added = expanded_added_headers(
-        &security,
+        security,
         &ctx.client_ip,
         &ctx.authority,
         path_str,
@@ -5171,7 +5169,7 @@ pub(super) async fn h2_serve_streaming(
         ctx.headers
             .iter()
             .map(|h| (h.name.as_ref(), h.value.as_ref())),
-        &security,
+        security,
         &added,
     );
     request.extend_from_slice(b"Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n");
@@ -5182,9 +5180,9 @@ pub(super) async fn h2_serve_streaming(
             &mut *backend,
             request,
             req_rx,
-            &compression,
+            compression,
             client_encoding,
-            &security,
+            security,
             resp_tx,
             notify,
         )
@@ -5218,9 +5216,9 @@ pub(super) async fn h2_serve_streaming(
                     &mut backend,
                     request,
                     req_rx,
-                    &compression,
+                    compression,
                     client_encoding,
-                    &security,
+                    security,
                     resp_tx,
                     notify,
                 )
@@ -5239,9 +5237,9 @@ pub(super) async fn h2_serve_streaming(
             &mut backend,
             request,
             req_rx,
-            &compression,
+            compression,
             client_encoding,
-            &security,
+            security,
             resp_tx,
             notify,
         )

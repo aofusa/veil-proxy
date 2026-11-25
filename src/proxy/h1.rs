@@ -789,7 +789,8 @@ pub(super) async fn handle_requests(
                 // ここから先の await へ持ち越さない
                 drop(config);
 
-                let (prefix, backend, route_compression) = match backend_result {
+                // F-321: ルートの値はワーカーの表から借りる（要求ごとに共有の `Arc` を複製しない）
+                let route = match backend_result {
                     Some(b) => b,
                     None => {
                         let err_buf = ERR_MSG_NOT_FOUND.to_vec();
@@ -798,6 +799,9 @@ pub(super) async fn handle_requests(
                     }
                 };
 
+                let backend: &Backend = &route.backend;
+                let prefix: &Arc<[u8]> = &route.prefix;
+                let route_compression: &CompressionConfig = &route.compression;
                 // B-307: WebSocket のトンネルは Proxy のルートだけ。他のルート（ハンドラ・File・Respond・Redirect）は
                 // 通常の経路へ進める（ハンドラは 101 を返して接続を引き取る。F-261。認可・fault の応答はそのまま返る）
                 let is_websocket = is_websocket && matches!(backend, Backend::Proxy(..));
@@ -1206,7 +1210,7 @@ pub(super) async fn handle_requests(
                 // WebSocket Upgrade の場合は専用ハンドラーを使用
                 if is_websocket {
                     // WebSocket はプロキシバックエンドでのみ（上で Proxy 以外は外した）
-                    if let Backend::Proxy(ref upstream_group, ref security, _, _, _, _) = backend {
+                    if let Backend::Proxy(upstream_group, security, _, _, _, _) = backend {
                         debug!(
                             "WebSocket upgrade request detected for path: {}",
                             std::str::from_utf8(&path_bytes).unwrap_or("-")
@@ -1245,7 +1249,7 @@ pub(super) async fn handle_requests(
                             security,
                             &method_bytes,
                             &path_bytes,
-                            &prefix,
+                            prefix,
                             &headers_for_proxy,
                             &initial_body,
                             content_length,
@@ -1307,7 +1311,7 @@ pub(super) async fn handle_requests(
                 let result = handle_backend(
                     tls_stream,
                     backend,
-                    &route_compression,
+                    route_compression,
                     &method_bytes,
                     &path_bytes,
                     prefix,
@@ -1603,12 +1607,12 @@ pub(super) async fn drain_request_body(
 
 pub(super) async fn handle_backend(
     mut tls_stream: ServerTls,
-    backend: Backend,
+    backend: &Backend,
     // ルートの `[route.compression]`（静的配信の圧縮に使う。B-269）
     route_compression: &CompressionConfig,
     method: &Bytes,
     req_path: &Bytes,
-    prefix: Arc<[u8]>,
+    prefix: &Arc<[u8]>,
     content_length: usize,
     is_chunked: bool,
     // 所有で受け取る（ネイティブハンドラは複製せずに Request へ渡す。F-202）
@@ -1624,7 +1628,7 @@ pub(super) async fn handle_backend(
     // Proxy バックエンドはリクエストボディを上流へ転送して消費する。それ以外（File/Memory/
     // Redirect 等のローカル応答）はボディを読まないため、keep-alive 接続でボディが次の
     // リクエストに混入して 400 desync を起こす。ローカル応答の前に残りのボディを読み捨てる。
-    if !backend_consumes_request_body(&backend)
+    if !backend_consumes_request_body(backend)
         && (is_chunked || content_length > initial_body.len())
         && !drain_request_body(
             &mut tls_stream,
@@ -1647,14 +1651,14 @@ pub(super) async fn handle_backend(
             // フューチャを約 10KB に縮める。
             Box::pin(handle_proxy(
                 tls_stream,
-                &upstream_group,
-                &security,
-                &compression,
-                &buffering,
-                &cache,
+                upstream_group,
+                security,
+                compression,
+                buffering,
+                cache,
                 method,
                 req_path,
-                &prefix,
+                prefix,
                 content_length,
                 is_chunked,
                 &headers,
@@ -1669,7 +1673,7 @@ pub(super) async fn handle_backend(
             // ファイル完全一致チェック
             // MemoryFileはファイル指定なので、プレフィックス以降にパスがあれば404
             let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-            let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
+            let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
 
             let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
                 &path_str[prefix_str.len()..]
@@ -1703,7 +1707,7 @@ pub(super) async fn handle_backend(
             let plan = crate::static_response::plan(
                 &sreq,
                 rep_len,
-                &mime_type,
+                mime_type,
                 Some(rep_validators),
                 rep_compression,
             );
@@ -1711,7 +1715,7 @@ pub(super) async fn handle_backend(
             let vary = data.uses_precompressed()
                 || crate::static_response::compression_applies(
                     route_compression,
-                    &mime_type,
+                    mime_type,
                     data.len(),
                 );
             let body = match sibling {
@@ -1722,10 +1726,10 @@ pub(super) async fn handle_backend(
                 &plan,
                 rep_len,
                 Some(body.len() as u64),
-                &mime_type,
+                mime_type,
                 Some(rep_validators),
                 vary,
-                &security,
+                security,
             );
             // WASMレスポンスヘッダーフィルタを適用（後段で Connection ヘッダーを追記するため mut）
             #[cfg(feature = "wasm")]
@@ -1783,20 +1787,20 @@ pub(super) async fn handle_backend(
             );
             handle_sendfile(
                 tls_stream,
-                &base_path,
-                is_dir,
+                base_path,
+                *is_dir,
                 index_file.as_deref(),
                 req_path,
-                &prefix,
+                prefix,
                 client_wants_close,
-                &security,
+                security,
                 &sreq,
                 route_compression,
                 open_file_cache_config.as_deref(),
                 canonical_base.as_deref(),
                 wasm_modules,
                 static_file_cache_config.as_deref(),
-                precompressed,
+                *precompressed,
             )
             .await
         }
@@ -1825,13 +1829,13 @@ pub(super) async fn handle_backend(
         Backend::Redirect(redirect_url, status_code, preserve_path, _, security) => {
             handle_redirect(
                 tls_stream,
-                &redirect_url,
-                status_code,
-                preserve_path,
+                redirect_url,
+                *status_code,
+                *preserve_path,
                 req_path,
-                &prefix,
+                prefix,
                 client_wants_close,
-                &security,
+                security,
             )
             .await
         }
@@ -1841,9 +1845,9 @@ pub(super) async fn handle_backend(
             // ワーカーの中で同じ温かいブロックを回せる。外した版は命令数 −10%・サイクル +12%・スループット −8%）
             Box::pin(handle_api_handler(
                 tls_stream,
-                &entry,
+                entry,
                 comp.as_deref(),
-                &security,
+                security,
                 method,
                 req_path,
                 content_length,

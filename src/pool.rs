@@ -1402,11 +1402,41 @@ impl ServerHeaderGuard {
         self.guard.as_ref()
     }
 
-    /// 値を `Bytes` として取得（参照カウント clone のみ、ヒープ確保なし。F-166）。
+    /// 値を `Bytes` として取得（参照カウント clone のみ、ヒープ確保なし。F-166）。スレッドの写しを返す（F-321）
     #[inline]
     pub fn value_bytes(&self) -> Bytes {
-        (**self.guard).clone()
+        local_value(&LOCAL_SERVER_HEADER_VALUE, &self.guard)
     }
+}
+
+/// スレッドごとの値の写し（F-321）。要求ごとに全ワーカー共有の `Bytes` を複製すると、参照カウントの行を全ワーカーが
+/// 奪い合う。元の `Arc` を持っておくので、値が差し替わるまで同じ番地が別の値に使い回されることはない
+struct LocalValue {
+    src: Option<Arc<Bytes>>,
+    local: Bytes,
+}
+
+thread_local! {
+    static LOCAL_SERVER_HEADER_VALUE: RefCell<LocalValue> =
+        const { RefCell::new(LocalValue { src: None, local: Bytes::new() }) };
+    static LOCAL_ALT_SVC_VALUE: RefCell<LocalValue> =
+        const { RefCell::new(LocalValue { src: None, local: Bytes::new() }) };
+}
+
+/// `cur`（共有の値）のスレッドの写し（値が差し替わったら写し直す）
+#[inline]
+fn local_value(
+    cell: &'static std::thread::LocalKey<RefCell<LocalValue>>,
+    cur: &Arc<Bytes>,
+) -> Bytes {
+    cell.with(|c| {
+        let mut c = c.borrow_mut();
+        if !c.src.as_ref().is_some_and(|s| Arc::ptr_eq(s, cur)) {
+            c.local = Bytes::copy_from_slice(cur);
+            c.src = Some(Arc::clone(cur));
+        }
+        c.local.clone()
+    })
 }
 
 /// Serverヘッダー設定を初期化
@@ -1479,10 +1509,10 @@ impl AltSvcGuard {
         self.guard.as_ref()
     }
 
-    /// 値を `Bytes` として取得（参照カウント clone のみ、ヒープ確保なし。F-166）。
+    /// 値を `Bytes` として取得（参照カウント clone のみ、ヒープ確保なし。F-166）。スレッドの写しを返す（F-321）
     #[inline]
     pub fn value_bytes(&self) -> Bytes {
-        (**self.guard).clone()
+        local_value(&LOCAL_ALT_SVC_VALUE, &self.guard)
     }
 }
 
@@ -1759,6 +1789,27 @@ mod pooled_liveness_tests {
 
 #[cfg(test)]
 mod tests {
+    /// F-321: スレッドの写しは値ごとに 1 回だけ作り、値が差し替わったら作り直す
+    #[test]
+    fn local_value_copies_once_per_value() {
+        use super::{local_value, LocalValue};
+        use bytes::Bytes;
+        use std::cell::RefCell;
+        use std::sync::Arc;
+        thread_local! {
+            static T: RefCell<LocalValue> =
+                const { RefCell::new(LocalValue { src: None, local: Bytes::new() }) };
+        }
+        let v1 = Arc::new(Bytes::from_static(b"one"));
+        let a = local_value(&T, &v1);
+        let b = local_value(&T, &v1);
+        assert_eq!(&a[..], b"one");
+        assert_eq!(a.as_ptr(), b.as_ptr());
+        assert_ne!(a.as_ptr(), v1.as_ptr());
+        let v2 = Arc::new(Bytes::from_static(b"two"));
+        assert_eq!(&local_value(&T, &v2)[..], b"two");
+    }
+
     // B-16: splice パイプの checkout/return プールの回帰テスト。
     // 各テストは独立スレッドで実行されるため thread_local プールは常に空から始まる。
     // splice プール（SPLICE_PIPE_POOL / get_splice_pipe 等）は Linux 専用

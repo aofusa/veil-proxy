@@ -2116,17 +2116,18 @@ impl Http3Handler {
             false,
         );
 
-        let (prefix, backend, _route_compression) = match backend_result {
+        let route = match backend_result {
             Some(b) => b,
             None => return Decision::Buffer, // handle_request -> 404（gRPC 含む）
         };
+        let (prefix, backend) = (&route.prefix, &route.backend);
         // B-274: 本文の受信が止まったら打ち切る秒数（ストリーミング・バッファの両経路）
         self.classify_body_timeout = backend.security().client_body_timeout_secs;
 
         // F-209 #5: 要求本文をストリーミングで受けるハンドラ（gRPC のルート等）は、本文を待たずに呼んで
         // 届いた順に流す（HTTP/2 と同じ全二重）。本文の無い要求・それ以外のハンドラはバッファ経路。
         #[cfg(feature = "handler")]
-        if let Backend::Handler(entry, _, modules, comp) = &backend {
+        if let Backend::Handler(entry, _, modules, comp) = backend {
             // B-317: Proxy-Wasm のあるルートはバッファ経路で要求のフェーズを通す（ストリーミングの経路は
             // Wasm を走らせず、HEADERS で終えないだけで Wasm の認可を素通りできた。F14）
             if !entry.streaming_request
@@ -2205,7 +2206,7 @@ impl Http3Handler {
         }
 
         // Proxy バックエンドのみストリーミング対象。
-        let (upstream_group, path_compression, buffering, _modules, route_cache) = match &backend {
+        let (upstream_group, path_compression, buffering, _modules, route_cache) = match backend {
             Backend::Proxy(ug, _sec, comp, buf, cache, mods) => {
                 (ug.clone(), comp.clone(), buf.clone(), mods.clone(), cache)
             }
@@ -2358,7 +2359,7 @@ impl Http3Handler {
             // gRPC はサービス/メソッドのフルパスを保持する（B-39）。
             let final_path = compute_upstream_request_path(
                 std::str::from_utf8(path).unwrap_or("/"),
-                &prefix,
+                prefix,
                 &server.target.path_prefix,
                 is_grpc,
             );
@@ -2374,7 +2375,7 @@ impl Http3Handler {
         let request_head = if h2_upstream {
             Vec::new()
         } else {
-            let final_path = compute_backend_path(&server.target, path, &prefix);
+            let final_path = compute_backend_path(&server.target, path, prefix);
             build_h1_request_head(
                 &server.target,
                 method,

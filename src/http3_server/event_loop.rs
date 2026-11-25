@@ -1112,5 +1112,7 @@ pub fn run_http3_server(
         );
     // B-118: 残った接続タスクをスレッドローカルが生きているうちに破棄する
     crate::runtime::shutdown_thread();
+    // F-321: ワーカーのルートの表も同じ
+    crate::upstream::release_worker_routes();
     r
 }

@@ -250,7 +250,7 @@ pub(crate) async fn serve(
         .collect();
     let (path_wo_query, raw_query) = crate::l7::split_query(&req.path);
     // RFC 8441 §5: ルートの照合・検査は GET の要求として行う
-    let Some((prefix, backend, _comp)) = crate::l7::resolve_route(
+    let Some(route) = crate::l7::resolve_route(
         &req.authority,
         path_wo_query,
         b"GET",
@@ -263,10 +263,11 @@ pub(crate) async fn serve(
         return (r.0, r.1, 0);
     };
     drop(headers_raw);
+    let (prefix, backend) = (&route.prefix, &route.backend);
 
     // ハンドラのルート（F-262 の WebSocket ハンドラを HTTP/2・HTTP/3 のストリームの上で動かす）
     #[cfg(feature = "handler")]
-    if let Backend::Handler(entry, security, modules, comp) = &backend {
+    if let Backend::Handler(entry, security, modules, comp) = backend {
         let check = check_security(security, &req.client_ip, b"GET", req.header_size, 0, false);
         if check != SecurityCheckResult::Allowed {
             let r = out.error(check.status_code(), check.message()).await;
@@ -298,7 +299,7 @@ pub(crate) async fn serve(
         return result;
     }
 
-    let Backend::Proxy(upstream_group, security, _, _, _, modules) = &backend else {
+    let Backend::Proxy(upstream_group, security, _, _, _, modules) = backend else {
         // WebSocket のトンネルは Proxy のルートだけ（HTTP/1.1 は他のルートへアップグレードを渡さない。B-307）
         let r = out
             .error(
@@ -354,7 +355,7 @@ pub(crate) async fn serve(
         &server.target,
         upstream_group.tls_profile(),
         security,
-        &prefix,
+        prefix,
         req_rx,
         &out,
     )

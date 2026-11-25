@@ -698,6 +698,12 @@ impl RouteCache {
             Ordering::Relaxed,
         );
     }
+
+    /// この表のキャッシュの世代（表ごとに一意。`clear` で変わる）
+    #[inline]
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for RouteCache {
@@ -835,6 +841,13 @@ impl OptimizedRouter {
     /// Clear the cache (call on config reload)
     pub fn clear_cache(&self) {
         self.cache.clear();
+    }
+
+    /// Generation of this table's route cache (unique per table; changes on `clear_cache`).
+    /// Per-thread data derived from the routes is keyed by it
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.cache.generation()
     }
 
     /// Route cache statistics `(hits, misses)` of the calling thread for this table

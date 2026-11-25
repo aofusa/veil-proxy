@@ -268,6 +268,37 @@ impl FixedResponse {
 }
 
 impl FixedResponse {
+    /// ワーカーのルートの表（F-321）に置く写し: 応答のバイト列をワーカーごとに複製する（要求ごとの `Bytes` の
+    /// 複製が全ワーカー共有の参照カウントへ書かない）。セキュリティ設定・モジュールは同じもの（レート制限の区画・
+    /// Wasm のインスタンスの対応はその同一性で決まる）。大きい応答は複製しない（送る費用に比べて参照カウントの
+    /// 費用は小さく、ワーカーの数だけメモリを使う）
+    pub(crate) fn for_worker(this: &Arc<Self>) -> Arc<Self> {
+        /// 複製する HTTP/1.1 の応答全体の大きさの上限
+        const WORKER_COPY_MAX: usize = 4 * 1024;
+        if this.h1_close.len() > WORKER_COPY_MAX || this.h1_keepalive.len() > WORKER_COPY_MAX {
+            return Arc::clone(this);
+        }
+        let copy = |b: &Bytes| Bytes::copy_from_slice(b);
+        let h1_keepalive = copy(&this.h1_keepalive);
+        // 本文は HTTP/1.1 の応答全体の後ろ（HEAD はその前までを送る）
+        let body = h1_keepalive.slice(h1_keepalive.len() - this.body.len()..);
+        Arc::new(FixedResponse {
+            status: this.status,
+            headers: this
+                .headers
+                .iter()
+                .map(|(n, v)| (copy(n), copy(v)))
+                .collect(),
+            body,
+            h1_keepalive,
+            h1_close: copy(&this.h1_close),
+            drop_server: this.drop_server,
+            drop_alt_svc: this.drop_alt_svc,
+            security: this.security.clone(),
+            modules: this.modules.clone(),
+        })
+    }
+
     /// ヘッダだけ差し替えた写し（`headers` は方針をかけた後のもの。方針を 2 度かけない）
     fn with_headers(&self, headers: Vec<(Bytes, Bytes)>) -> Self {
         let (h1_keepalive, h1_close) = h1_fixed_bytes(
@@ -929,6 +960,46 @@ fn resolve_jwt(j: &JwtConfig, sec: &Arc<SecurityConfig>) -> io::Result<JwtRule> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-321: ワーカーの写しはバイト列を別の領域に複製し、セキュリティ設定・モジュールは同じものを指す。
+    /// 大きい応答は複製しない
+    #[test]
+    fn for_worker_copies_bytes_and_keeps_shared_settings() {
+        let sec = Arc::new(SecurityConfig::default());
+        let r = Arc::new(
+            FixedResponse::new(
+                200,
+                vec![(
+                    Bytes::from_static(b"content-type"),
+                    Bytes::from_static(b"text/plain"),
+                )],
+                Bytes::from_static(b"hello"),
+            )
+            .with_security(sec.clone()),
+        );
+        let w = FixedResponse::for_worker(&r);
+        assert!(!Arc::ptr_eq(&r, &w));
+        assert_eq!(w.status, r.status);
+        assert_eq!(w.headers, r.headers);
+        assert_eq!(w.body, r.body);
+        assert_eq!(w.h1_keepalive, r.h1_keepalive);
+        assert_eq!(w.h1_close, r.h1_close);
+        assert_ne!(w.h1_keepalive.as_ptr(), r.h1_keepalive.as_ptr());
+        assert_ne!(w.headers[0].1.as_ptr(), r.headers[0].1.as_ptr());
+        // 本文は HTTP/1.1 の応答全体の後ろ（HEAD はその前までを送る）
+        assert!(w.h1_keepalive.ends_with(b"hello"));
+        assert_eq!(
+            w.body.as_ptr(),
+            w.h1_keepalive[w.h1_keepalive.len() - 5..].as_ptr()
+        );
+        assert!(Arc::ptr_eq(&w.security, &sec));
+        let big = Arc::new(FixedResponse::new(
+            200,
+            vec![],
+            Bytes::from(vec![b'x'; 8192]),
+        ));
+        assert!(Arc::ptr_eq(&FixedResponse::for_worker(&big), &big));
+    }
 
     fn status(b: &Backend) -> u16 {
         match b {

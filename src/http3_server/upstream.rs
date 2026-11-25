@@ -631,6 +631,8 @@ pub async fn run_http3_server_async(
                     shrink_idle_conn_map(&mut connections.borrow_mut());
                     // F-183: アイドル点でアロケータに空き領域を OS へ返させる（1 秒に間引く）。
                     crate::alloc_tune::idle_tick();
+                    // F-321: リロードの後の古いルートの値を手放す
+                    crate::upstream::release_stale_worker_routes();
                 }
                 if let MsOutcome::Batch(result) = outcome {
                     match result {
@@ -724,6 +726,8 @@ pub async fn run_http3_server_async(
                     shrink_idle_conn_map(&mut connections.borrow_mut());
                     // F-183: アイドル点でアロケータに空き領域を OS へ返させる（1 秒に間引く）。
                     crate::alloc_tune::idle_tick();
+                    // F-321: リロードの後の古いルートの値を手放す
+                    crate::upstream::release_stale_worker_routes();
                     None
                 }
             };

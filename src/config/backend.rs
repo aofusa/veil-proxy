@@ -109,6 +109,17 @@ impl std::fmt::Debug for Backend {
 }
 
 impl Backend {
+    /// ワーカーのルートの表（F-321）に置く値。固定応答は応答のバイト列をワーカーごとに複製する
+    /// （[`crate::route_traffic::FixedResponse::for_worker`]）。他は同じ値
+    pub(crate) fn for_worker(self) -> Self {
+        match self {
+            Backend::Respond(r) => {
+                Backend::Respond(crate::route_traffic::FixedResponse::for_worker(&r))
+            }
+            b => b,
+        }
+    }
+
     /// このバックエンドのセキュリティ設定を取得
     #[inline]
     pub fn security(&self) -> &SecurityConfig {
