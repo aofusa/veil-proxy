@@ -1,6 +1,17 @@
 # B-498: `[tls] cipher_suites` の記載順がサーバの優先にならない（rustls の `ignore_client_order` を立てていない）
 
-**状態: 未着手（2026-11-25 起票。F-320 の調整〈暗号スイートの順〉を調べていて見つけた）**
+**状態: 完了（2026-11-25、feat/httparena-perf。同日起票。F-320 の調整〈暗号スイートの順〉を調べていて見つけた）**
+
+## 対応（2026-11-25）
+
+- `load_tls_config`（`src/config/tls_server.rs`）で、`cipher_suites` が空でないときに `ServerConfig::ignore_client_order = true`。
+  起動時・設定のリロード・証明書のリロード（`build_server_config_from_paths`）は全部この関数を通る。空のときは今までどおりクライアントの順。
+- HTTP/3: Linux の quiche（aws-lc）の TLS 1.3 の選び方（`ssl_choose_tls13_cipher`）は、サーバの一覧を「許すかどうか」にだけ使い、
+  順はクライアントの順（AES の命令の無い機械では ChaCha20 を優先）。サーバの順を使う口が無いので揃えられない。文書（英日の tls.md・
+  configuration.md・`examples/config.toml`）に「HTTP/1.1・HTTP/2 はサーバの順、HTTP/3 は一覧の中からクライアントの順」と書いた。
+- 試験: 単体 `config::cipher_suites_tests::negotiation_uses_server_order_only_when_listed`（メモリの中の rustls のハンドシェイク。クライアントは
+  ChaCha20 → AES-128 → AES-256 の順で送り、一覧ありはサーバの先頭、一覧なしはクライアントの先頭）。E2E の
+  `test_tls_cipher_suites_server_preference` はクライアントを AES-128 → AES-256 の順にした（直す前の veil では AES-128 が選ばれて落ちる）。
 
 ## 事象
 

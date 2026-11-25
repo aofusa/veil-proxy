@@ -2038,6 +2038,9 @@ pub(super) fn tls_handshake_negotiated_suite(
 }
 
 /// サーバは設定順の先頭（TLS13_AES_256_GCM_SHA384）を優先する。
+///
+/// クライアントは AES_128 → AES_256 の順で送る（B-498: 以前の試験は rustls の既定のクライアント〈AES_256 が先頭〉で、
+/// サーバとクライアントのどちらの順で選んでも通っていた）。
 #[tokio::test]
 #[ntest::timeout(15000)]
 pub(super) async fn test_tls_cipher_suites_server_preference() {
@@ -2046,12 +2049,18 @@ pub(super) async fn test_tls_cipher_suites_server_preference() {
         return;
     }
 
-    // デフォルトクライアント（AES256/AES128/CHACHA20 を提示）
-    let negotiated =
-        tokio::task::spawn_blocking(move || tls_handshake_negotiated_suite(PROXY_PORT, None))
-            .await
-            .unwrap()
-            .expect("handshake should succeed");
+    let negotiated = tokio::task::spawn_blocking(move || {
+        tls_handshake_negotiated_suite(
+            PROXY_PORT,
+            Some(vec![
+                test_crypto::cipher_suite::TLS13_AES_128_GCM_SHA256,
+                test_crypto::cipher_suite::TLS13_AES_256_GCM_SHA384,
+            ]),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("handshake should succeed");
 
     assert_eq!(
         negotiated, "TLS13_AES_256_GCM_SHA384",

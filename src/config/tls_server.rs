@@ -117,8 +117,8 @@ pub(super) fn load_tls_config(
 
     // F-50: [tls] cipher_suites による暗号スイートの取捨選択・優先度指定
     //
-    // 指定がある場合は CryptoProvider の cipher_suites を設定順（= サーバ優先度順）で
-    // 差し替える。不正な名前はここでエラーになる（起動時 / リロード時の検証）。
+    // 指定がある場合は CryptoProvider の cipher_suites を設定順で差し替え、下で `ignore_client_order` を立てて
+    // その順をサーバの優先にする（B-498）。不正な名前はここでエラーになる（起動時 / リロード時の検証）。
     let custom_suites = if !tls_config.cipher_suites.is_empty() {
         let suites = resolve_cipher_suites(&tls_config.cipher_suites)?;
         info!(
@@ -192,6 +192,11 @@ pub(super) fn load_tls_config(
     }
 
     apply_session_resumption(&mut config, tls_config)?;
+
+    // B-498: 暗号スイートを並べたときはその順で選ぶ（nginx の `ssl_prefer_server_ciphers on`）。rustls の既定は
+    // クライアントの順で、設定の順は「許すかどうか」にしか効いていなかった。並べないとき（rustls の既定の一覧）は
+    // クライアントの順のまま（AES の命令を持たないクライアントが ChaCha20 を選べる）。
+    config.ignore_client_order = !tls_config.cipher_suites.is_empty();
 
     // HTTP/2 有効時は ALPN を設定
     #[cfg(feature = "http2")]

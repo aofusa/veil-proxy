@@ -159,8 +159,12 @@ connection is otherwise indistinguishable from a cut one. nginx also closes with
 `[tls] cipher_suites` (names in `examples/config.toml`) restricts the cipher suites of HTTP/1.1, HTTP/2 and HTTP/3
 (F-314):
 
-- HTTP/3 runs TLS 1.3 only and uses the `TLS13_*` names of the list, in the listed order. A list without any TLS 1.3
-  name is a startup error while HTTP/3 is enabled.
+- HTTP/1.1 and HTTP/2 pick, among the suites the client offers, the first one **in the listed order** (server
+  preference, like nginx's `ssl_prefer_server_ciphers on`; B-498). Without a list, the client's order decides (so a
+  client without AES instructions can pick ChaCha20).
+- HTTP/3 runs TLS 1.3 only and uses the `TLS13_*` names of the list. Its TLS library has no server preference for
+  TLS 1.3, so it picks among the listed suites **in the client's order** (preferring ChaCha20 on a machine without
+  AES instructions). A list without any TLS 1.3 name is a startup error while HTTP/3 is enabled.
 - On Linux HTTP/3 accepts exactly those TLS 1.3 cipher suites. On FreeBSD, OpenBSD, NetBSD, macOS and Windows the TLS
   library of HTTP/3 (BoringSSL) cannot restrict the TLS 1.3 cipher suites, so a list that leaves out one of
   `TLS13_AES_128_GCM_SHA256`, `TLS13_AES_256_GCM_SHA384` and `TLS13_CHACHA20_POLY1305_SHA256` is a startup error

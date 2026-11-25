@@ -3119,6 +3119,75 @@ key_path = "/tmp/key.pem"
         let bad = vec!["NOT_A_SUITE".to_string()];
         assert!(build_server_config_from_paths(&cert_path, &key_path, false, false, &bad).is_err());
     }
+
+    /// 一覧を書いたときはサーバの順、書かないときはクライアントの順で選ぶ（B-498。rustls の既定はクライアントの順で、
+    /// 以前は設定の順が効いていなかった）。クライアントはサーバと逆の順で送る。
+    #[test]
+    // 理由付き allow: テストコード（証明書の一時ファイルの作成に同期 FS を使う。データプレーン非経由）。
+    #[allow(clippy::disallowed_methods)]
+    fn negotiation_uses_server_order_only_when_listed() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, ck.cert.pem()).unwrap();
+        std::fs::write(&key_path, ck.signing_key.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ck.cert.der().clone()).unwrap();
+
+        let mut provider = crate::tls_provider::provider::default_provider();
+        let pick = |name: &str| {
+            provider
+                .cipher_suites
+                .iter()
+                .copied()
+                .find(|s| format!("{:?}", s.suite()) == name)
+                .unwrap()
+        };
+        let client_suites = vec![
+            pick("TLS13_CHACHA20_POLY1305_SHA256"),
+            pick("TLS13_AES_128_GCM_SHA256"),
+            pick("TLS13_AES_256_GCM_SHA384"),
+        ];
+        provider.cipher_suites = client_suites;
+        let client_cfg = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let negotiate = |server_suites: &[&str]| {
+            let names: Vec<String> = server_suites.iter().map(|s| s.to_string()).collect();
+            let server_cfg =
+                build_server_config_from_paths(&cert_path, &key_path, false, false, &names)
+                    .unwrap();
+            let mut client = rustls::ClientConnection::new(
+                Arc::clone(&client_cfg),
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            )
+            .unwrap();
+            let mut server = rustls::ServerConnection::new(server_cfg).unwrap();
+            super::session_resumption_tests::pump(&mut client, &mut server);
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+            format!("{:?}", client.negotiated_cipher_suite().unwrap().suite())
+        };
+        // 一覧あり: サーバの先頭を選ぶ（クライアントでは最後・途中）
+        assert_eq!(
+            negotiate(&[
+                "TLS13_AES_256_GCM_SHA384",
+                "TLS13_AES_128_GCM_SHA256",
+                "TLS13_CHACHA20_POLY1305_SHA256"
+            ]),
+            "TLS13_AES_256_GCM_SHA384"
+        );
+        assert_eq!(
+            negotiate(&["TLS13_AES_128_GCM_SHA256", "TLS13_AES_256_GCM_SHA384"]),
+            "TLS13_AES_128_GCM_SHA256"
+        );
+        // 一覧なし（rustls の既定の一覧）: クライアントの先頭
+        assert_eq!(negotiate(&[]), "TLS13_CHACHA20_POLY1305_SHA256");
+    }
 }
 
 // ====================
@@ -3432,7 +3501,10 @@ mod session_resumption_tests {
     use super::{apply_session_resumption_mode, SessionResumption};
     use std::sync::Arc;
 
-    fn pump(client: &mut rustls::ClientConnection, server: &mut rustls::ServerConnection) {
+    pub(super) fn pump(
+        client: &mut rustls::ClientConnection,
+        server: &mut rustls::ServerConnection,
+    ) {
         for _ in 0..16 {
             let mut buf = Vec::new();
             while client.wants_write() {

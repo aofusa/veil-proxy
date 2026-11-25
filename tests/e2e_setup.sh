@@ -689,7 +689,7 @@ http2_enabled = true
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
 ktls_enabled = ${proxy_ktls_enabled}
-# F-50: cipher_suites の取捨選択・優先度（記載順 = サーバ優先度順）検証用。
+# F-50: cipher_suites の取捨選択・優先度（記載順 = サーバ優先度順。B-498）検証用。
 # CHACHA20 系を意図的に除外し、E2E で「除外スイートは拒否・先頭スイートが優先」を検証する。
 cipher_suites = [
     "TLS13_AES_256_GCM_SHA384",

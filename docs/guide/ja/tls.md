@@ -154,8 +154,12 @@ close_notify を確かめるクライアント（rustls・OpenSSL 3・Go）は�
 
 `[tls] cipher_suites`（名前は `examples/config.toml`）は HTTP/1.1・HTTP/2・HTTP/3 の暗号スイートを絞ります（F-314）。
 
-- HTTP/3 は TLS 1.3 だけなので、一覧の `TLS13_*` の名前を一覧の順で使います。TLS 1.3 の名前が 1 つも無い一覧は、
-  HTTP/3 が有効なら起動エラーです。
+- HTTP/1.1・HTTP/2 は、一覧のうちクライアントが送ったものを**一覧の順**で選びます（サーバの優先。nginx の
+  `ssl_prefer_server_ciphers on` と同じ。B-498）。一覧を書かないときはクライアントの順で選びます（AES の命令を持たない
+  クライアントが ChaCha20 を選べる）。
+- HTTP/3 は TLS 1.3 だけなので、一覧の `TLS13_*` の名前を使います。HTTP/3 の TLS ライブラリは TLS 1.3 でサーバの順を
+  持たないので、一覧のうちクライアントが送ったものを**クライアントの順**で選びます（AES の命令の無い機械では ChaCha20 を
+  優先します）。TLS 1.3 の名前が 1 つも無い一覧は、HTTP/3 が有効なら起動エラーです。
 - Linux の HTTP/3 はその TLS 1.3 の暗号スイートだけを受けます。FreeBSD・OpenBSD・NetBSD・macOS・Windows の HTTP/3 の
   TLS ライブラリ（BoringSSL）は TLS 1.3 の暗号スイートを絞れないので、`TLS13_AES_128_GCM_SHA256`・`TLS13_AES_256_GCM_SHA384`・
   `TLS13_CHACHA20_POLY1305_SHA256` のどれかが欠けた一覧は、HTTP/3 が有効なら起動エラーにします（HTTP/3 だけ黙って
