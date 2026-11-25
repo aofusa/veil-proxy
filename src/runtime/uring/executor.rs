@@ -1756,20 +1756,17 @@ impl<F: Future<Output = ()> + 'static> TaskPool<F> {
 
 /// 空きスロット（常に `None`）へ `make()` の結果を書く。
 ///
-/// `construct` を呼び出しのまま残すと、その戻り値の一時領域から `dst` への `memcpy` を LLVM が消し、
-/// `dst` へ直接作らせる（call slot optimization）。`dst` は `&mut` の引数なので書ける大きさと
-/// 別名が無いことが分かる。古い値の drop を挟むと消えないので `ptr::write` で書く。
+/// `make()`（future を作る閉包と、その中の async fn の呼び出し）をこの関数の中へ展開させ、future の初めの状態
+/// （引数と状態の番号）だけを `dst` へ書かせる。`make()` を別の関数の呼び出しのまま残すと、future 全体（HTTP/2 の
+/// ストリームで 12 KiB）を戻り値の一時領域から `dst` へ `memcpy` する（戻り値を直接 `dst` へ書かせる call slot
+/// optimization は、`dst` が書ける領域だと LLVM に分からないので行われない。F-323）。古い値の drop を挟まないように
+/// `ptr::write` で書く。
 #[inline(never)]
 fn write_empty_slot<F, M: FnOnce() -> F>(dst: &mut Option<F>, make: M) {
     debug_assert!(dst.is_none(), "pool slot reused before release");
     // SAFETY: 空きスロットは解放時（`poll_slot`・`drop_slot`）と作成時に `None` にしてあり、
     // 上書きで drop し損なう値は無い。`dst` は有効な `&mut`。
-    unsafe { std::ptr::write(dst, Some(construct(make))) }
-}
-
-#[inline(never)]
-fn construct<F, M: FnOnce() -> F>(make: M) -> F {
-    make()
+    unsafe { std::ptr::write(dst, Some(make())) }
 }
 
 impl<F: Future<Output = ()> + 'static> Default for TaskPool<F> {
@@ -1813,7 +1810,10 @@ impl<F: Future<Output = ()> + 'static> PoolPoll for PoolInner<F> {
         let cell = unsafe { &*cell };
         let had_future = {
             let mut guard = cell.borrow_mut();
-            guard.take().is_some() // in-place drop
+            // in-place drop（`take` は future 全体〈数 KB〉を写してから捨てる。F-323）
+            let had = guard.is_some();
+            *guard = None;
+            had
         };
         if had_future {
             // 正常完了時（poll_slot が解放済み）は free へ二重 push しない。

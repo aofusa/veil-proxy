@@ -1440,7 +1440,11 @@ pub(super) fn h2_client_socket_addr(client_ip: &str) -> SocketAddr {
 }
 
 /// per-stream リクエストタスク本体（F-116）。conn には一切触れない。
+///
+/// `#[inline]` は future を作る関数（引数を状態へ移すだけ）に効く。タスクのプールのスロットへ書く関数
+/// （`write_empty_slot`）の中へ展開させて、future 全体を一時領域から写さずにスロットの中で作る（F-323）。
 #[cfg(feature = "http2")]
+#[inline]
 pub(super) async fn h2_request_task(
     ctx: H2RequestCtx,
     req_rx: Option<crate::stream_channel::Receiver<Bytes>>,

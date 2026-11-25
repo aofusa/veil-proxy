@@ -1,6 +1,6 @@
 # F-323: HTTP/2 のストリームごとの固定費を減らす（その場で終わる要求はタスク・チャネルを通さずに応答を積む）
 
-**状態: 未着手（2026-11-25 起票。F-317 の子。先に B-497〈一部の接続が止まる〉と F-321〈共有の書き込み〉を見てから行う）**
+**状態: 着手（2026-11-25、feat/httparena-perf。F-317 の子。B-497・F-321 は完了）**
 
 ## 今の状態（測った値）
 
@@ -43,6 +43,20 @@ HttpArena の baseline-h2（`h2load -c 256/1024 -m 100 -t 64`、TLS）と baseli
 4. `Instant::now()`・`user-agent` の複製は、アクセスログ・計測が無効なら取らない。
 5. 1〜4 は perf（aofish の perf コンテナ、ノート PC はサイクルの交互 A/B）で上位に出た順に行う。h2load（`-m 100`）と同じ形の負荷は
    veil-load（h2c）と、aofish の HttpArena の h2load の Docker イメージ（TLS）で掛ける。
+
+## 進捗
+
+### 1. ストリームのタスクの future を写さない（2026-11-25）
+
+- aofish の perf（b498、epoll、h2c `Respond` 64 接続 × 100）で、ユーザー時間の 10.5% が `memmove` だった: タスクのプールの
+  `write_empty_slot`（5.5%）と `drop_slot`（5.0%）。HTTP/2 のストリームのタスク（`h2_request_task`）の future は 12,416 バイトある。
+- `write_empty_slot` は `#[inline(never)]` の `construct` が作った future を戻り値の一時領域から `memcpy` していた。この形は
+  「呼び出しの戻り値を直接スロットへ書かせる（call slot optimization）」ためだったが、今の LLVM はスロットが書ける領域だと
+  分からないので行わない（`construct` を unwind しない `extern "C"` にしても同じ。小さなクレートで確かめた）。`make()` を
+  `write_empty_slot` の中へ展開させると、future の初めの状態（引数 296 バイトと状態の番号）だけをスロットへ書く。
+  `h2_request_task` に `#[inline]` を付けて、future を作る関数を展開できるようにした。
+- `drop_slot` は `Option::take()` で future 全体を一時領域へ写してから捨てていた（終わったタスクでは中身が `None` でも写す）。
+  その場で `None` を書く（中身があればその場で drop）。io_uring・reactor の両方。
 
 ## 受け入れ条件
 
