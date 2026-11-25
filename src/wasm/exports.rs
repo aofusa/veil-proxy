@@ -9,11 +9,10 @@
 //! ホスト関数がゲストのメモリを取る確保関数は、同期のホスト関数から今のファイバーの上で呼ぶ
 //! （[`allocate_guest_memory`]）。続けて呼ぶコールバックも 1 回のファイバーの出入りで呼ぶ（[`call_chain`]）。
 
-use wasmtime::{
-    AsContextMut, Caller, Func, Instance, Memory, Store, TypedFunc, ValRaw, WasmParams, WasmResults,
-};
+use wasmtime::{Caller, Func, Instance, Memory, Store, TypedFunc, ValRaw, WasmParams, WasmResults};
 
 use super::context::HostState;
+use super::metering::{Limits, Window};
 
 /// 1 つのエクスポートの状態
 #[derive(Default)]
@@ -48,9 +47,9 @@ pub(crate) struct GuestExports {
     memory: Option<Memory>,
     /// 段を続けて呼ぶホスト関数（ストアごとに 1 つ。初めて使うときに作る。[`call_chain`]）
     chain: Export<(), ()>,
-    /// [`call_chain`] とホスト関数が受け渡す段・入れ直す燃料と締切・結果
+    /// [`call_chain`] とホスト関数が受け渡す段・入れ直す上限（`metering::arm`）・結果
     chain_steps: [Option<Step>; MAX_STEPS],
-    chain_arm: (u64, u64),
+    chain_arm: Option<(Limits, Window)>,
     chain_done: usize,
     chain_values: [Option<i32>; MAX_STEPS],
 }
@@ -218,7 +217,7 @@ pub(crate) async fn call_chain(
     store: &mut Store<HostState>,
     instance: Instance,
     steps: &[Step],
-    arm: (u64, u64),
+    arm: (Limits, Window),
 ) -> Chain {
     // ホスト関数の中では呼び出し元のインスタンスを引けないので、段のエクスポートを先に引いておく
     for step in steps {
@@ -258,7 +257,7 @@ pub(crate) async fn call_chain(
         for (slot, step) in e.chain_steps.iter_mut().zip(steps) {
             *slot = Some(*step);
         }
-        e.chain_arm = arm;
+        e.chain_arm = Some(arm);
         e.chain_done = 0;
         e.chain_values = [None; MAX_STEPS];
     }
@@ -276,14 +275,15 @@ pub(crate) async fn call_chain(
 /// [`call_chain`] のホスト関数（ファイバーの上で段を続けて呼ぶ）
 fn run_chain(mut caller: Caller<'_, HostState>) -> anyhow::Result<()> {
     let steps = caller.data().exports.chain_steps;
-    let (fuel, deadline) = caller.data().exports.chain_arm;
+    let arm = caller.data().exports.chain_arm;
     for (i, step) in steps.into_iter().enumerate() {
         let Some(step) = step else {
             break;
         };
         if i > 0 && matches!(step, Step::Delete(_)) {
-            caller.set_fuel(fuel)?;
-            caller.as_context_mut().set_epoch_deadline(deadline);
+            if let Some((limits, window)) = arm {
+                super::metering::arm(&mut caller, &limits, window)?;
+            }
         }
         let value = run_step(&mut caller, step)?;
         let e = &mut caller.data_mut().exports;
@@ -678,7 +678,14 @@ mod tests {
         poll_to_end(f.call_async(&mut *store, ())).0.unwrap()
     }
 
-    const ARM: (u64, u64) = (1_000_000_000, 10);
+    /// fuel の方式の上限（燃料 `fuel`・燃料 `fuel_yield` ごとに譲る）
+    fn fuel_arm(fuel: u64, fuel_yield: u64) -> (Limits, Window) {
+        (Limits::with_fuel(fuel, fuel_yield), Window::Callback)
+    }
+
+    fn arm() -> (Limits, Window) {
+        fuel_arm(1_000_000_000, 100)
+    }
 
     // F-319: 段は順に 1 回のファイバーの出入りで呼ばれ、`proxy_on_request_headers` の action が返る。fuel の区切りで
     // 止まっても続きから再開する。ホスト関数は 2 回目以降は作り直さない
@@ -686,7 +693,7 @@ mod tests {
     fn chain_runs_the_steps_in_order_and_resumes_after_yields() {
         let (mut store, instance) = chain_instance(100);
         let steps = [Step::ContextCreate(5, 1), Step::RequestHeaders(5, 3, 1)];
-        let (chain, pending) = poll_to_end(call_chain(&mut store, instance, &steps, ARM));
+        let (chain, pending) = poll_to_end(call_chain(&mut store, instance, &steps, arm()));
         assert!(chain.error.is_none(), "{:?}", chain.error);
         assert_eq!(chain.done, 2);
         assert_eq!(chain.values[..2], [None, Some(5)]);
@@ -695,7 +702,7 @@ mod tests {
         assert!(matches!(store.data().exports.chain, Export::Present(_)));
 
         let steps = [Step::Log(5), Step::Delete(5)];
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, ARM));
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm()));
         assert!(chain.error.is_none());
         assert_eq!(chain.done, 2);
         assert_eq!(trace(&mut store, instance), 1234);
@@ -706,7 +713,7 @@ mod tests {
     fn chain_stops_at_the_first_error() {
         let (mut store, instance) = chain_instance(1_000_000);
         let steps = [Step::ContextCreate(9, 1), Step::Log(9), Step::Delete(9)];
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, ARM));
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm()));
         let e = chain.error.expect("proxy_on_log traps");
         assert!(
             matches!(
@@ -725,7 +732,7 @@ mod tests {
         let (mut store, instance) = chain_instance(1_000_000);
         store.data_mut().exports.on_log = Export::Absent;
         let steps = [Step::Log(5), Step::Delete(5)];
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, ARM));
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm()));
         assert!(chain.error.is_none());
         assert_eq!(chain.done, 2);
         assert_eq!(chain.values[..2], [None, None]);
@@ -737,7 +744,7 @@ mod tests {
     fn chain_rearms_fuel_before_delete() {
         let (mut store, instance) = chain_instance(1_000_000);
         // 1 段が使う燃料を測り、その 1.5 倍だけ入れる: 1 段は走れるが、続けて 2 段は走れない
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &[Step::Log(5)], ARM));
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &[Step::Log(5)], arm()));
         assert!(chain.error.is_none());
         let fuel = (1_000_000_000 - store.get_fuel().unwrap()) * 3 / 2;
         let reset = instance
@@ -747,7 +754,12 @@ mod tests {
 
         store.set_fuel(fuel).unwrap();
         let steps = [Step::Log(5), Step::Delete(5)];
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, (fuel, 10)));
+        let (chain, _) = poll_to_end(call_chain(
+            &mut store,
+            instance,
+            &steps,
+            fuel_arm(fuel, 1_000_000),
+        ));
         assert!(chain.error.is_none(), "{:?}", chain.error);
         assert_eq!(trace(&mut store, instance), 34);
 
@@ -756,7 +768,12 @@ mod tests {
         poll_to_end(reset.call_async(&mut store, ())).0.unwrap();
         store.set_fuel(fuel).unwrap();
         let steps = [Step::Log(5), Step::Log(6)];
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, (fuel, 10)));
+        let (chain, _) = poll_to_end(call_chain(
+            &mut store,
+            instance,
+            &steps,
+            fuel_arm(fuel, 1_000_000),
+        ));
         assert!(matches!(
             chain
                 .error
@@ -773,7 +790,7 @@ mod tests {
         let (mut store, instance) = chain_instance(100);
         {
             let steps = [Step::ContextCreate(5, 1), Step::RequestHeaders(5, 3, 1)];
-            let mut f = Box::pin(call_chain(&mut store, instance, &steps, ARM));
+            let mut f = Box::pin(call_chain(&mut store, instance, &steps, arm()));
             let waker = futures::task::noop_waker();
             let mut cx = std::task::Context::from_waker(&waker);
             assert!(std::future::Future::poll(f.as_mut(), &mut cx).is_pending());
@@ -781,7 +798,7 @@ mod tests {
         // 取り出していたホスト関数は戻らない（次に作り直す）
         assert!(!matches!(store.data().exports.chain, Export::Present(_)));
         let steps = [Step::Log(5)];
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, ARM));
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm()));
         assert!(chain.error.is_none(), "{:?}", chain.error);
         assert_eq!(chain.done, 1);
     }

@@ -1659,6 +1659,16 @@ watch = false
 # （veil-wasmtime）を使うため Pulley 専用。false を指定すると起動時に警告ログが出る）。
 # interpreter = false
 
+# CPU の量（max_execution_time_ms）と yield の間隔（yield_interval_us）の測り方
+# - "clock": フィルタが走っている間、専用スレッドが yield_interval_us ごとに wasmtime のエポックを進め
+#   （しばらく走っていなければ 100ms ごと）、走っているコールバックが関数の入口とループの戻りで見る。
+#   見るまでに走った時間は 1 周期分までしか数えない（ページフォールト・長いホスト関数を CPU に数えない）
+# - "fuel": wasmtime の fuel でゲストの命令を正確に数える。ゲストのコードが遅くなる（Wasm の 1 要求の
+#   CPU が 3〜14% 多い）。veil_wasm_fuel_consumed_total はこちらでだけ記録する
+# エンジンの設定なので、.cwasm を直接指定するモジュールは同じ方式でコンパイルしたものに限る
+# デフォルト: "clock"
+# metering = "clock"
+
 # Proxy-Wasm の gRPC 呼び出しで上流へ新しく接続する（TCP + TLS）のを待つ時間の上限（ミリ秒）
 # ゲストの timeout_ms が長くても接続はこの時間で諦める（gRPC の実行スレッドは接続を同期で待つため）
 # デフォルト: 5000
@@ -1677,7 +1687,8 @@ watch = false
 # 最大実行時間（ミリ秒）
 # デフォルト: 100
 # max_execution_time_ms = 100
-# コールバックが同じワーカーの他の要求へ制御を返す間隔（マイクロ秒の目安。fuel の換算）
+# コールバックが同じワーカーの他の要求へ制御を返す間隔（マイクロ秒の目安。metering = "clock" では
+# エポックを進める周期で 100µs〜100ms に収める。"fuel" では fuel の換算）
 # 小さくすると CPU を長く使うフィルタと同じワーカーの他の要求の待ちが短くなるが、普通のコールバックも
 # 止まるので instance_reuse のインスタンスが同時に多く開き、要求ごとの費用が増える
 # デフォルト: 1000

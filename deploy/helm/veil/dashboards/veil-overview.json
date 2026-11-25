@@ -1431,7 +1431,7 @@
         },
         {
           "type": "timeseries",
-          "title": "Proxy-Wasm fuel per second",
+          "title": "Proxy-Wasm fuel per second (metering = fuel)",
           "id": 30,
           "datasource": {
             "type": "prometheus",

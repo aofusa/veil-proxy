@@ -72,8 +72,8 @@ included.
 | `veil_uring_cq_overflow_total` | Counter | - | Times an io_uring completion queue overflowed (io_uring backend only). Completions are not lost, but a non-zero value means the rings are small for the load |
 | `veil_grpc_stream_duration_seconds` | Histogram | method | Time from the start of a relayed gRPC call to its `grpc-status` trailer |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASM filter execution time |
-| `veil_wasm_fuel_consumed_total` | Counter | filter, phase | Total wasmtime fuel consumed by WASM filters |
-| `veil_wasm_failures_total` | Counter | filter, phase, reason, action | Proxy-Wasm filter failures (`reason`: trap, fuel, timeout, instantiate, lifecycle, http_call_resume, unsupported_pause; `action`: rejected, continued per `failure_policy`) |
+| `veil_wasm_fuel_consumed_total` | Counter | filter, phase | Total wasmtime fuel consumed by WASM filters (recorded only with `[wasm] metering = "fuel"`) |
+| `veil_wasm_failures_total` | Counter | filter, phase, reason, action | Proxy-Wasm filter failures (`reason`: trap, fuel (the callback ran out of `max_execution_time_ms`, with either `metering`), timeout, instantiate, lifecycle, http_call_resume, unsupported_pause; `action`: rejected, continued per `failure_policy`) |
 
 Label values are kept to a fixed set, so a client cannot create new time series by sending arbitrary values
 (each series stays in memory and in every scrape):

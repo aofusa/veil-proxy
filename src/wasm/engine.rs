@@ -12,6 +12,7 @@ use super::constants::{ACTION_CONTINUE, ACTION_PAUSE};
 use super::context::{HostState, HttpContext};
 use super::exports;
 use super::instance_pool::{InstanceSlot, PooledInstance, RequestSessions};
+use super::metering::{Limits, Window};
 use super::registry::{LoadedModule, ModuleRegistry};
 use super::types::{FilterAction, LocalResponse, WasmConfig};
 use crate::wasm_plugin_config::ModuleRef;
@@ -81,40 +82,35 @@ enum Settled {
 /// インスタンス枠が尽きたときに待つ上限（1+2+…+64 ≒ 127ms。B-299）
 const INSTANTIATE_RETRY_MAX_MS: u64 = 64;
 
-/// 起動時のコールバック（`_start` → root コンテキスト → `on_vm_start` → `on_configure`）の実時間の締切（エポックのティック数。
-/// `EPOCH_TICK` ごとに進むので約 60 秒）。起動時の検査（[`FilterEngine::validate`]）と、新しいインスタンスを作るとき
-/// （[`FilterEngine::new_configured_instance`]）の両方で使う。1 回のコールバックの締切（約 1 秒）と違い、インスタンスごとに
-/// 1 度だけ走る（暴走は燃料が止める）。
-///
-/// B-110: 以前は新しいインスタンスの起動時のコールバックにも 1 回のコールバックの締切を掛けていた。正規表現を起動時に組み立てる
-/// WAF のような重いモジュールは、燃料ごとに他の要求へ譲る間に負荷の下で 1 秒を超えて `interrupt` でトラップし、作りかけの
-/// インスタンスを捨てて次の要求がまた最初から作り直す（負荷が続く間は `fail_closed` の 503 が続き得る）。
-const LIFECYCLE_EPOCH_DEADLINE: u64 = 600;
+// 起動時のコールバック（`_start` → root コンテキスト → `on_vm_start` → `on_configure`）の実時間の締切は約 60 秒
+// （`metering::Window::Lifecycle`）。起動時の検査（[`FilterEngine::validate`]）と、新しいインスタンスを作るとき
+// （[`FilterEngine::new_configured_instance`]）の両方で使う。1 回のコールバックの締切（約 1 秒）と違い、インスタンスごとに
+// 1 度だけ走る（暴走は CPU の上限が止める）。
+//
+// B-110: 以前は新しいインスタンスの起動時のコールバックにも 1 回のコールバックの締切を掛けていた。正規表現を起動時に組み立てる
+// WAF のような重いモジュールは、燃料ごとに他の要求へ譲る間に負荷の下で 1 秒を超えて `interrupt` でトラップし、作りかけの
+// インスタンスを捨てて次の要求がまた最初から作り直す（負荷が続く間は `fail_closed` の 503 が続き得る）。
 
 /// Filter engine for executing WASM modules
 pub struct FilterEngine {
     /// Module registry
     registry: ModuleRegistry,
-    /// Default execution time limit (fuel)
-    fuel_limit: u64,
-    /// fuel を使い切る前にワーカーへ制御を返す間隔（`[wasm.defaults] yield_interval_us` × 1,000。
-    /// fuel は約 1M で 1ms で、`max_execution_time_ms` の換算と同じ）。
+    /// CPU の上限（`max_execution_time_ms`）・協調的な yield（`yield_interval_us`）・実時間の上限の計り方
+    /// （`[wasm] metering`。F-319。`super::metering`）。
     ///
-    /// B-175: 以前は 10,000（約 10µs）に固定していた。数十 µs の普通のコールバックでも何度も止まり、同じ
+    /// B-175: yield の間隔は以前 10µs 相当に固定していた。数十 µs の普通のコールバックでも何度も止まり、同じ
     /// ワーカーの他の要求のコールバックが割り込むので、1 ワーカーに同時に開いているインスタンスが接続数近くまで増え、
     /// `instance_reuse` のプールに戻せなかったインスタンスを要求ごとに作り直していた（JSON の 1 要求で
     /// 700µs 超）。既定の 1ms ごとでも CPU を長く使うフィルタは 1ms ごとに他の要求へ譲る（協調的な yield は保つ）。
-    fuel_yield_interval: u64,
-    /// Epoch deadline for timeout enforcement
     ///
-    /// B-173: エポックは時計。`registry::spawn_epoch_ticker` の専用スレッドが `EPOCH_TICK`（100ms）ごとに
-    /// 1 進める（以前は各呼び出しの直前に 1 進める「全スレッドの WASM 呼び出し回数」で、ワーカーが複数あると
-    /// 他のスレッドの 10 回の呼び出しの間に終わらない呼び出しが負荷の下で `interrupt` でトラップし、
-    /// フィルタが飛ばされていた）。各 store はコールバックの前に `current_epoch + epoch_deadline` を締切にする
-    /// ので、1 回のコールバックの実時間の上限は約 1〜1.1 秒（CPU の上限は fuel）。
-    /// F-62 の Pause/resume（`resolve_pending_http_calls_inline`）のように store を止めたまま外部 I/O を
-    /// 待つ経路では、再開の直前に締切を引き直す（B-56）。
-    epoch_deadline: u64,
+    /// B-173: エポックは時計（専用スレッドが進める。以前は各呼び出しの直前に 1 進める「全スレッドの WASM 呼び出し
+    /// 回数」で、ワーカーが複数あると他のスレッドの 10 回の呼び出しの間に終わらない呼び出しが負荷の下で `interrupt` で
+    /// トラップし、フィルタが飛ばされていた）。1 回のコールバックの実時間の上限は約 1 秒。F-62 の Pause/resume
+    /// （`resolve_pending_http_calls_inline`）のように store を止めたまま外部 I/O を待つ経路では、再開の直前に
+    /// 実時間の上限を引き直す（B-56）。
+    limits: Limits,
+    /// エポックを進める専用スレッド（`clock` はコールバックの前に起こす）
+    ticker: Arc<super::metering::Ticker>,
     /// 作った元の `[wasm]` とモジュール・`data_files` のファイルの印（B-404。実行可能なメモリを作れないリロードで、
     /// このエンジンを使い続けてよいかを判断する）
     source: super::source::WasmSource,
@@ -126,25 +122,13 @@ impl FilterEngine {
         // B-404: ファイルの印はモジュールを読む前に取る（読んでいる間に置き換えられたら、次のリロードは「変わった」と見る）
         let source = super::source::WasmSource::of(config);
         let registry = ModuleRegistry::new(config)?;
-
-        // Calculate fuel limit (roughly 1M instructions per ms)
-        let fuel_limit = config.defaults.max_execution_time_ms * 1_000_000;
-
-        // Epoch deadline: ticks after the current engine epoch before timeout.
-        // The ticker thread (registry::spawn_epoch_ticker) increments the epoch every 100ms, so deadline=10
-        // allows about 1s. Fuel consumption is the primary timeout mechanism for CPU-bound limits.
-        let epoch_deadline = 10;
-        let fuel_yield_interval = config
-            .defaults
-            .yield_interval_us
-            .max(1)
-            .saturating_mul(1_000);
+        let limits = Limits::new(config);
+        let ticker = super::metering::spawn_ticker(registry.engine(), &limits)?;
 
         Ok(Self {
             registry,
-            fuel_limit,
-            fuel_yield_interval,
-            epoch_deadline,
+            limits,
+            ticker,
             source,
         })
     }
@@ -299,34 +283,34 @@ impl FilterEngine {
     /// ページキャッシュが冷えていて遅いディスクが混んでいると、ゲストが何も悪くなくても 1 秒の締切に届いて
     /// `interrupt` でトラップし、正しい設定なのにサーバが起動しない（リロードなら拒否される）。
     fn validation_store(&self, module: &LoadedModule) -> anyhow::Result<Store<HostState>> {
-        let mut store = Store::new(
-            self.registry.engine(),
-            HostState::new(HttpContext::for_module(1, module)),
-        );
+        let mut store = self.new_store(HostState::new(HttpContext::for_module(1, module)));
         self.arm_lifecycle_store(&mut store)?;
         Ok(store)
     }
 
-    /// Store に 1 回のコールバックの燃料と締切を入れる
+    /// Store を作り、エポックの割り込みの扱いを入れる（`metering::install`。ストアごとに 1 回）
+    fn new_store(&self, state: HostState) -> Store<HostState> {
+        let mut store = Store::new(self.registry.engine(), state);
+        super::metering::install(&mut store, &self.limits, &self.ticker);
+        store
+    }
+
+    /// Store に 1 回のコールバックの上限を入れる
     fn arm_store(&self, store: &mut Store<HostState>) -> anyhow::Result<()> {
-        self.arm_store_until(store, self.epoch_deadline)
+        self.arm_store_until(store, Window::Callback)
     }
 
-    /// 起動時のコールバックを走らせる Store に燃料と締切を入れる。CPU の上限は 1 回のコールバックと同じ燃料で、実時間の締切
-    /// だけを長くする（[`LIFECYCLE_EPOCH_DEADLINE`]。B-336・B-110）
+    /// 起動時のコールバックを走らせる Store に上限を入れる。CPU の上限は 1 回のコールバックと同じで、実時間の締切
+    /// だけを長くする（`Window::Lifecycle`。B-336・B-110）
     fn arm_lifecycle_store(&self, store: &mut Store<HostState>) -> anyhow::Result<()> {
-        self.arm_store_until(store, LIFECYCLE_EPOCH_DEADLINE)
+        self.arm_store_until(store, Window::Lifecycle)
     }
 
-    fn arm_store_until(
-        &self,
-        store: &mut Store<HostState>,
-        epoch_deadline: u64,
-    ) -> anyhow::Result<()> {
-        store.set_fuel(self.fuel_limit)?;
-        store.fuel_async_yield_interval(Some(self.fuel_yield_interval))?;
-        store.set_epoch_deadline(epoch_deadline);
-        Ok(())
+    fn arm_store_until(&self, store: &mut Store<HostState>, window: Window) -> anyhow::Result<()> {
+        if !self.limits.uses_fuel() {
+            self.ticker.wake();
+        }
+        super::metering::arm(store, &self.limits, window)
     }
 
     /// 新しいインスタンスを作り、Proxy-Wasm SDK のライフサイクル（_start → root コンテキスト生成 → vm_start →
@@ -335,14 +319,14 @@ impl FilterEngine {
     /// - インスタンス枠（`total_memories`）が尽きていたら、上限付きで空きを待つ（B-299。fail closed で
     ///   一時的な枠切れをすぐ 503 にしない）。
     /// - ライフサイクルのトラップ・`on_vm_start`/`on_configure` の false は失敗（`lifecycle`。B-301）。
-    /// - ライフサイクルの実時間の締切は [`LIFECYCLE_EPOCH_DEADLINE`]（B-110）。要求のコールバックには戻す。
+    /// - ライフサイクルの実時間の締切は `Window::Lifecycle`（B-110）。要求のコールバックには戻す。
     async fn new_configured_instance(
         &self,
         module: &LoadedModule,
         configuration: &Arc<[u8]>,
         http_ctx: HttpContext,
     ) -> Result<(Store<HostState>, wasmtime::Instance), (anyhow::Error, Box<HttpContext>)> {
-        let mut store = Store::new(self.registry.engine(), HostState::new(http_ctx));
+        let mut store = self.new_store(HostState::new(http_ctx));
         if let Err(e) = self.arm_lifecycle_store(&mut store) {
             return Err((e, Box::new(store.into_data().http_ctx)));
         }
@@ -872,7 +856,7 @@ impl FilterEngine {
                         exports::Step::ContextCreate(context_id, parent),
                         exports::Step::RequestHeaders(sess.context_id, num_headers, eos),
                     ],
-                    (self.fuel_limit, self.epoch_deadline),
+                    (self.limits, Window::Callback),
                 )
                 .await;
                 if let Some(e) = chain.error {
@@ -909,16 +893,15 @@ impl FilterEngine {
             }
         };
 
-        // F-48: fuel 消費量を記録（ライフサイクル + コールバック 1 実行分）。
-        let consumed = self
-            .fuel_limit
-            .saturating_sub(sess.store.get_fuel().unwrap_or(0));
-        let phase = if request {
-            "request_headers"
-        } else {
-            "response_headers"
-        };
-        crate::metrics::observe_wasm_fuel_consumed(&module.name, phase, consumed);
+        // F-48: fuel 消費量を記録（ライフサイクル + コールバック 1 実行分。`metering = "fuel"` のときだけ）。
+        if let Some(consumed) = super::metering::fuel_consumed(&sess.store, &self.limits) {
+            let phase = if request {
+                "request_headers"
+            } else {
+                "response_headers"
+            };
+            crate::metrics::observe_wasm_fuel_consumed(&module.name, phase, consumed);
+        }
 
         Ok(action)
     }
@@ -968,7 +951,10 @@ impl FilterEngine {
                 // B-56: 外部 I/O を待っていた間にエポックが進んで（B-173 以降は時間で）締切が過ぎていると、
                 // resume 直後にトラップする。再開直前に猶予を与え直す。
                 // （外部 I/O の待ち時間はゲストの CPU 時間ではないため、これは制限の回避ではない）
-                store.set_epoch_deadline(self.epoch_deadline);
+                if !self.limits.uses_fuel() {
+                    self.ticker.wake();
+                }
+                super::metering::rearm_wall(&mut *store, &self.limits, Window::Callback);
 
                 // 応答をコンテキストへ格納して proxy_on_http_call_response を呼ぶ
                 let (num_headers, body_size, num_trailers) = (
@@ -1600,12 +1586,9 @@ impl FilterEngine {
         )
         .await
         .unwrap_or(Ok(0)); // Continue if not exported
-        crate::metrics::observe_wasm_fuel_consumed(
-            &module.name,
-            "request_body",
-            self.fuel_limit
-                .saturating_sub(sess.store.get_fuel().unwrap_or(0)),
-        );
+        if let Some(consumed) = super::metering::fuel_consumed(&sess.store, &self.limits) {
+            crate::metrics::observe_wasm_fuel_consumed(&module.name, "request_body", consumed);
+        }
 
         // Check for local response / modifications（B-299: トラップの前のローカルレスポンスも返す）
         let (ok, settled) = self.settle(module, &mut sess, run).await;
@@ -1745,12 +1728,9 @@ impl FilterEngine {
         )
         .await
         .unwrap_or(Ok(0)); // Continue if not exported
-        crate::metrics::observe_wasm_fuel_consumed(
-            &module.name,
-            "response_body",
-            self.fuel_limit
-                .saturating_sub(sess.store.get_fuel().unwrap_or(0)),
-        );
+        if let Some(consumed) = super::metering::fuel_consumed(&sess.store, &self.limits) {
+            crate::metrics::observe_wasm_fuel_consumed(&module.name, "response_body", consumed);
+        }
 
         // Check for local response / modifications（B-299: トラップの前のローカルレスポンスも返す）
         let (ok, settled) = self.settle(module, &mut sess, run).await;
@@ -1882,7 +1862,7 @@ impl FilterEngine {
             &mut sess.store,
             sess.instance,
             &steps[..n],
-            (self.fuel_limit, self.epoch_deadline),
+            (self.limits, Window::Callback),
         )
         .await;
         match chain.error {
@@ -3092,6 +3072,7 @@ mod exec_smoke_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            metering: Default::default(),
         };
         FilterEngine::new(&config).ok()
     }
@@ -3156,13 +3137,14 @@ mod exec_smoke_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            metering: Default::default(),
         };
         let engine = FilterEngine::new(&config).expect("engine");
         let module = engine
             .get_module("header_filter")
             .expect("module must be loaded");
         let mut store = engine.validation_store(&module).expect("store");
-        for _ in 0..engine.epoch_deadline * 2 {
+        for _ in 0..Window::Callback.fuel_ticks() * 2 {
             engine.registry.engine().increment_epoch();
         }
         let r = futures::executor::block_on(async {
@@ -3209,6 +3191,8 @@ mod exec_smoke_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            // エポックの代わりに時間を進める試験（fuel の方式の締切はエポックのティック数）
+            metering: crate::wasm::Metering::Fuel,
         };
         let engine = FilterEngine::new(&config).expect("engine");
         let module = engine
@@ -3230,7 +3214,7 @@ mod exec_smoke_tests {
                     Poll::Ready(r) => break r,
                     Poll::Pending => {
                         if yields == 0 {
-                            for _ in 0..engine.epoch_deadline * 2 {
+                            for _ in 0..Window::Callback.fuel_ticks() * 2 {
                                 engine.registry.engine().increment_epoch();
                             }
                         }
@@ -3247,7 +3231,7 @@ mod exec_smoke_tests {
         };
 
         // 要求のコールバックの締切は 1 回のコールバックのもの: それを超えてエポックを進めると、次の呼び出しはトラップする
-        for _ in 0..engine.epoch_deadline + 1 {
+        for _ in 0..Window::Callback.fuel_ticks() + 1 {
             engine.registry.engine().increment_epoch();
         }
         let create = instance
@@ -3296,6 +3280,8 @@ mod exec_smoke_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            // エポックの代わりに時間を進める試験（fuel の方式の締切はエポックのティック数）
+            metering: crate::wasm::Metering::Fuel,
         };
         let engine = FilterEngine::new(&config).expect("engine");
         let module = engine
@@ -3321,7 +3307,7 @@ mod exec_smoke_tests {
             Arc::from("127.0.0.1"),
         );
         // 他のワーカー（4 スレッド）が同時に要求を処理する（合わせて epoch_deadline の 3 倍の呼び出し）
-        let per_thread = engine.epoch_deadline * 3 / 4 + 1;
+        let per_thread = Window::Callback.fuel_ticks() * 3 / 4 + 1;
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
@@ -3383,6 +3369,8 @@ mod exec_smoke_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            // エポックの代わりに時間を進める試験（fuel の方式の締切はエポックのティック数）
+            metering: crate::wasm::Metering::Fuel,
         };
         FilterEngine::new(&config).ok()
     }
@@ -3460,7 +3448,7 @@ mod exec_smoke_tests {
         // 無関係な他リクエストの WASM 呼び出しがエンジン全体で epoch_deadline 回以上
         // 積み上がる（実運用では offload 待ちの間に他リクエストが WASM を呼ぶことで
         // 発生する。ここでは決定的に `increment_epoch()` を直接呼んで再現する）。
-        for _ in 0..engine.epoch_deadline {
+        for _ in 0..Window::Callback.fuel_ticks() {
             engine.registry.engine().increment_epoch();
         }
 

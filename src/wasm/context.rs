@@ -515,9 +515,10 @@ impl HttpContext {
 
     /// メソッドとパス（クエリ文字列も）を置く
     pub fn set_request_line(&mut self, method: std::sync::Arc<str>, path: std::sync::Arc<str>) {
-        // Extract query string
+        // Extract query string（プールの context の確保を使い回す。F-319）
+        self.request_query.clear();
         if let Some(pos) = path.find('?') {
-            self.request_query = path[pos + 1..].to_string();
+            self.request_query.push_str(&path[pos + 1..]);
         }
         self.request_method = method;
         self.request_path = path;
@@ -666,6 +667,8 @@ pub struct HostState {
     pub http_ctx: HttpContext,
     /// インスタンスのエクスポートの関数（引いたものをインスタンスの寿命の間使い回す。F-318）
     pub(crate) exports: super::exports::GuestExports,
+    /// CPU の上限・yield の計量（`[wasm] metering = "clock"`。F-319）
+    pub(crate) meter: super::metering::Meter,
 }
 
 impl HostState {
@@ -674,6 +677,7 @@ impl HostState {
         Self {
             http_ctx,
             exports: Default::default(),
+            meter: Default::default(),
         }
     }
 }

@@ -11,7 +11,7 @@ VeilはProxy-Wasm ABI v0.2.1に完全準拠したWASM拡張システムを提供
 - **Proxy-Wasm v0.2.1準拠**: Nginx/Envoyと100%互換
 - **AOTコンパイル・自動キャッシュ**: モジュールを AOT コンパイルし、初回ロード時に `.wasm` の隣へ中身の印を名前に入れたサイドカー（`<モジュール>.wasm.<ハッシュ>.cwasm`。`.wasm` の xxh3-128）を自動生成。次回起動時はそれを `deserialize` して高速起動する。`.wasm` の中身が変われば mtime に関係なく別のキャッシュになるので、古い版のモジュールを戻しても（`cp -p`・tar・パッケージの版下げ）新しい版のネイティブのコードを読まない。新しいキャッシュを書いたら前の中身のキャッシュは消す。wasmtime の版が違うキャッシュはコンパイルし直し、エラー時も再コンパイルへフォールバックする。以前の名前 `<モジュール>.wasm.cwasm` はもう読まず、消しもしない（設定で指定していなければ消してよい）。明示的な `.cwasm` パス指定も可。
 - **Pooling Allocator**: 高速なインスタンス化
-- **非同期実行（Head-of-Line ブロッキングなし）**: wasmtime async support + Fuel ベースの協調的 yield（ゲストの CPU 時間で約 1ms ごと。`yield_interval_us`）で実行。CPU バウンドなフィルタが io_uring ワーカーの他 I/O をストールさせない
+- **非同期実行（Head-of-Line ブロッキングなし）**: wasmtime async support + 協調的 yield（ゲストが走った時間で約 1ms ごと。`yield_interval_us`）で実行。CPU バウンドなフィルタが io_uring ワーカーの他 I/O をストールさせない。既定では走った時間を wasmtime のエポックで測る（`[wasm] metering = "clock"`。ゲストのコードに命令ごとの計量を入れない）
 - **Capability制限**: モジュールごとの細かい権限制御（デフォルト全て無効）
 - **Pulley インタープリタ選択**（`[wasm] interpreter = true`、F-135）: Cranelift ネイティブ JIT の代わりに wasmtime の Pulley ポータブルバイトコードインタープリタで実行し、ネイティブコードを一切生成しない。W^X 制約のあるホストや実行可能 `mmap` を許可できない環境向け。ネイティブ JIT より低速。既定は `false`（Cranelift JIT）。AOT サイドカーキャッシュはファイル名を分離（`.pulley.cwasm`）し、JIT 版と Pulley 版が同じキャッシュを奪い合って毎回再コンパイルする事態を避ける。**OpenBSD（全アーキ）・NetBSD（全アーキ）・FreeBSD aarch64 ではこの設定は常に無視され、常に Pulley が使われる**（B-52/B-55。`interpreter = false` を明示指定すると起動時に警告ログが出るが無視される）
 - **HTTP/3 が HTTP/1.1・HTTP/2 と同等のライフサイクルに対応**（F-132）: HTTP/3 経路でも `on_log` がすべての離脱点（`LocalResponse` による早期 return を含む）から確実に呼ばれるようになり、`Backend::File`（静的配信）ルートにも `on_response_headers` フィルタが適用される。`Backend::Proxy` ルートではリクエスト/レスポンスボディフィルタ（`on_request_body`/`on_response_body`）も動作する（HTTP/3 は WASM 適用時に本文全体を既にバッファしているため `end_of_stream=true` の1回呼びで実装）。レスポンス本文を書き換えた場合は `content-length` を新しい長さへ更新し、nghttp3 の `H3_MESSAGE_ERROR`（本文長不一致・重複)を回避する。
@@ -33,6 +33,10 @@ enabled = true
 # Cranelift ネイティブ JIT の代わりに Pulley インタープリタで実行する（F-135）。
 # デフォルト: false。OpenBSD では常に true 相当（B-52、この設定値は無視される）。
 # interpreter = false
+
+# CPU の量と yield の間隔の測り方: "clock"（既定。wasmtime のエポック）か
+# "fuel"（wasmtime の fuel。ゲストの命令を正確に数えるが、ゲストが遅くなる）
+# metering = "clock"
 
 # デフォルト設定（オプション）
 [wasm.defaults]
@@ -240,9 +244,10 @@ allowed_properties = ["plugin_data.*"]
 
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
-| `max_execution_time_ms` | 1 回のコールバックの CPU の量（ミリ秒。fuel で数え、1ms は約 100 万）。新しいインスタンスの起動時のコールバック（`_start`・`proxy_on_vm_start`・`proxy_on_configure`）は別の枠 | 100 |
-| `yield_interval_us` | 実行中のコールバックが同じワーカーの他の要求へ制御を返す間隔（マイクロ秒の目安。fuel で数える）。小さくすると CPU を長く使うフィルタの後ろで待つ他の要求の待ちが短くなるが、どのコールバックも頻繁に止まり、`instance_reuse` のインスタンスが同時に多く開き、要求ごとの費用が増える | 1000 |
+| `max_execution_time_ms` | 1 回のコールバックの CPU の量（ミリ秒）。走ってよい時間で、他の要求へ譲っていた時間は数えない（`metering = "fuel"` では fuel で数え、1ms は約 100 万）。新しいインスタンスの起動時のコールバック（`_start`・`proxy_on_vm_start`・`proxy_on_configure`）は別の枠 | 100 |
+| `yield_interval_us` | 実行中のコールバックが同じワーカーの他の要求へ制御を返す間隔（マイクロ秒の目安）。既定の `metering = "clock"` ではエポックを進めるスレッドの周期でもあり、100µs〜100ms に収める。`"fuel"` では fuel で数える。小さくすると CPU を長く使うフィルタの後ろで待つ他の要求の待ちが短くなるが、どのコールバックも頻繁に止まり、`instance_reuse` のインスタンスが同時に多く開き、要求ごとの費用が増える | 1000 |
 | `interpreter` | Cranelift ネイティブ JIT の代わりに Pulley インタープリタで実行する（F-135）。OpenBSD では常に `true` 相当（B-52） | false |
+| `metering` | `max_execution_time_ms` と `yield_interval_us` の測り方。`clock`（既定）: フィルタが走っている間、スレッドが `yield_interval_us` ごとに wasmtime のエポックを進め（しばらくフィルタが走っていなければ 100ms ごと）、走っているコールバックが関数の入口とループの戻りでそれを見る。見るまでの間に走った時間は 1 周期分までしか数えないので、ページフォールトや長いホスト関数の呼び出しを CPU に数えない。`fuel`: wasmtime の fuel でゲストの命令を正確に数える。ゲストのコードが遅くなり（veil の計測で Wasm の 1 要求の CPU が 3〜14% 多い）、`veil_wasm_fuel_consumed_total` はこちらでだけ記録する。エンジンの設定なので、`.cwasm` を直接指定するモジュールは同じ方式でコンパイルしたものに限り、変えるとサイドカーのキャッシュを作り直す | `clock` |
 | `grpc_connect_timeout_ms` | `proxy_grpc_call`・`proxy_grpc_stream` で gRPC の上流へ接続する（TCP と TLS）時間の上限。ゲストの `timeout_ms` が長くても接続はこの時間で諦める（到達できない上流で全プラグインの gRPC が止まらないように）。gRPC のスレッドが取り込む前の呼び出し・ストリームのメッセージはそれぞれ 4096 件までで、超えるとホスト関数は `InternalFailure` を返す | 5000 |
 | `http_call_max_timeout_ms` | `proxy_http_call` にプラグインが渡す `timeout_ms` の上限（負の値は 0 とみなす） | 60000 |
 | `shared_data_max_keys` | 1 モジュールの shared data のキーの数の上限。超える新しいキーの `proxy_set_shared_data` は `InternalFailure` を返す（既存のキーは更新できる） | 100000 |

@@ -70,6 +70,7 @@ pub fn load(
         grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
         http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
         shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+        metering: Default::default(),
     };
     let mut engine =
         FilterEngine::new(&cfg).map_err(|e| format!("wasm plugin {}: {:#}", name, e))?;

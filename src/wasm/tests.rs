@@ -397,6 +397,7 @@ mod interpreter_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            metering: Default::default(),
         }
     }
 
@@ -511,6 +512,7 @@ mod f132_h3_lifecycle_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            metering: Default::default(),
         };
         Some(FilterEngine::new(&config).expect("engine should build"))
     }
@@ -1555,6 +1557,7 @@ mod f133_network_filter_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            metering: Default::default(),
         };
         Some(FilterEngine::new(&config).expect("engine should build"))
     }
@@ -1737,6 +1740,7 @@ mod instance_reuse_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            metering: Default::default(),
         };
         Some(FilterEngine::new(&config).expect("engine should build"))
     }
@@ -1860,6 +1864,7 @@ mod instance_reuse_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            metering: Default::default(),
         };
         assert!(FilterEngine::new(&config).is_err());
     }
@@ -2117,6 +2122,7 @@ mod failure_policy_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            metering: Default::default(),
         };
         let engine = FilterEngine::new(&config)?;
         engine.validate()?;
@@ -2397,6 +2403,7 @@ mod b408_pseudo_header_phase_tests {
             grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
             http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
             shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            metering: Default::default(),
         };
         let engine = FilterEngine::new(&config).unwrap();
         engine.validate().unwrap();

@@ -27,6 +27,7 @@ pub mod integration;
 // OpenBSD は wasmtime 既定のファイバスタック（MAP_STACK なし）で SIGSEGV するため、
 // MAP_STACK 付きでスタックを確保する StackCreator を差し込む（B-52）。
 mod instance_pool;
+mod metering;
 #[cfg(target_os = "openbsd")]
 mod openbsd_stack;
 pub mod persistent_context;

@@ -39,9 +39,6 @@ pub struct LoadedModule {
     pub failure_policy: super::types::FailurePolicy,
 }
 
-/// B-173: エポックを進める間隔（`FilterEngine` の `epoch_deadline` = 10 で 1 回のコールバックは約 1 秒まで）
-pub(crate) const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(100);
-
 /// ゲストの呼び出し 1 回が使えるスタック（wasmtime の既定と同じ）
 const MAX_WASM_STACK: usize = 512 * 1024;
 
@@ -53,24 +50,6 @@ const MAX_WASM_STACK: usize = 512 * 1024;
 /// 入れ子のゲストがスタックの上限の検査より先にファイバーのガードページに届く）。
 const ASYNC_STACK_SIZE: usize = 2 * 1024 * 1024;
 const _: () = assert!(ASYNC_STACK_SIZE >= 2 * MAX_WASM_STACK + 512 * 1024);
-
-/// B-173: `engine` のエポックを `EPOCH_TICK` ごとに 1 進める専用スレッドを起こす。エンジンが捨てられたら
-/// （リロードで作り直したら）次の周期で終わる。データプレーンからは何も呼ばない。
-fn spawn_epoch_ticker(engine: &Engine) {
-    let weak = engine.weak();
-    let spawned = std::thread::Builder::new()
-        .name("veil-wasm-epoch".into())
-        .spawn(move || loop {
-            crate::server::cap_safe_sleep(EPOCH_TICK);
-            match weak.upgrade() {
-                Some(engine) => engine.increment_epoch(),
-                None => return,
-            }
-        });
-    if let Err(e) = spawned {
-        ftlog::warn!("[wasm] failed to start the epoch ticker thread: {}", e);
-    }
-}
 
 /// `config` のエンジンが Pulley インタープリタで動くか（ネイティブのコードを作らない）。
 ///
@@ -156,9 +135,8 @@ impl ModuleRegistry {
     /// Create a new module registry
     pub fn new(config: &WasmConfig) -> anyhow::Result<Self> {
         // Create engine with pooling allocator
+        // エポックを進める専用スレッドは `FilterEngine` が起こす（`metering::spawn_ticker`。B-173・F-319）
         let engine = Self::create_engine(config)?;
-        // B-173: エポックを時計にする（呼び出しの回数で進めない）
-        spawn_epoch_ticker(&engine);
         // NetBSD は OpenBSD と異なり MAP_STACK 強制が無いため OnDemand アロケータや
         // openbsd_stack（下記）は使わないが、wasmtime のネイティブ JIT 実行コード自体は
         // 未検証のため、OpenBSD と同様に安全側で Pulley インタープリタへ倒す（F-140）。
@@ -233,18 +211,18 @@ impl ModuleRegistry {
             config.allocation_strategy(wasmtime::InstanceAllocationStrategy::OnDemand);
         }
 
-        // 非同期サポートを有効化（fuel の区切りでワーカーへ制御を返すため）
+        // 非同期サポートを有効化（エポック・fuel の区切りでワーカーへ制御を返すため）
         // これにより Store::call_async などの非同期実行が可能になる
         config.async_support(true);
         config.max_wasm_stack(MAX_WASM_STACK);
         config.async_stack_size(ASYNC_STACK_SIZE);
 
-        // fuel によるCPU消費制限（主要なタイムアウト機構）
-        config.consume_fuel(true);
+        // CPU の上限と協調的な yield の計り方（`[wasm] metering`。F-319）。fuel はゲストの基本ブロックごとに残量の
+        // 検査を入れるので `"fuel"` のときだけ有効にする（既定の `"clock"` はエポックだけで測る。`super::metering`）
+        config.consume_fuel(wasm_config.metering == super::types::Metering::Fuel);
 
-        // エポック割り込みによるタイムアウト（補助的保護）
-        // エンジンのエポックを定期的にインクリメントし、
-        // Store のデッドラインと照合してタイムアウトを検出する
+        // エポック割り込み（`clock` の CPU の上限・yield と、両方の方式の実時間の上限）
+        // 専用スレッドがエンジンのエポックを進め、Store の締切と照合する
         config.epoch_interruption(true);
 
         // Pulley インタープリタ（F-135 / B-52）。
