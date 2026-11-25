@@ -72,6 +72,25 @@ HttpArena の baseline-h2（`h2load -c 256/1024 -m 100 -t 64`、TLS）と baseli
   `from_utf8` 1.8%）、`drive_h2_streams` 4.9%、応答のチャネル（`try_recv`）1.9%、`h2_spawn_for_request` 2.1%、arc_swap 約 5.9%
   （設定の Guard を接続の間持ち続けて遅い経路に落ちていた。[B-501](../bugs/B-501-arc-swap-guard-held-across-await.md) で直した）。
 
+### 2. ストリームごとの時刻の読み取りと UTF-8 の検査を減らす（2026-11-25、1b6d2d59）
+
+- io_uring の粗い時計（`coarse_now`）を reactor と同じく実行器の起床ごとに 1 回読む時刻にした。HTTP/2 のストリームの最終活動時刻
+  （`Stream::new`・`update_activity`）と 1 秒以上のタイムアウトの期限はこの時刻を使う（ストリームごとの `Instant::now()` が消える）。
+- 接続のメトリクスのホスト名は最初の要求のときだけ UTF-8 として読む（h1 と同じ `wants_host`）。`:path` の検査
+  （`is_valid_request_target`）を 1 回の走査にし、0x80 以上のバイトがあるときだけ UTF-8 を検査する。
+- aofish（f319a=b850a901 → f323m=68a04190、交互 3 巡。f323m は F-319 の最初の `clock` の計り方も含むので、この変更の効果は
+  Wasm の無い行で見る）:
+
+  | 負荷 | epoll 1 要求の CPU | io_uring 1 要求の CPU |
+  |---|---|---|
+  | h2c `Respond`（64 接続 × 100） | 2.42 → 2.19 µs（−9.5%） | 2.37 → 2.28 µs（−3.8%） |
+  | 静的配信の h2（TLS） | 19.68 → 18.43 µs（−6.4%） | 19.93 → 19.77 µs（−0.8%） |
+  | h1 `Respond` | 11.41 → 11.04 µs（−3.2%） | 10.23 → 10.05 µs（−1.8%） |
+
+- 1・2 を合わせて、aofish の h2c `Respond` の 1 要求の CPU は 2.84 → 2.19 µs（epoll、−23%）・2.93 → 2.28 µs（io_uring、−22%）。
+  改修内容の 1（その場で終わる要求の近道）・2（ヘッダの表の確保）・3（HPACK）は未着手（次に perf の上位に出るのはヘッダの処理の
+  約 24%）。
+
 ## 受け入れ条件
 
 - ノート PC の h2c `Respond`（16 接続 × 100 ストリーム）の 1 要求の CPU が半分以下（4.5 → 2.3 µs 以下）。ストリーミング・gRPC・

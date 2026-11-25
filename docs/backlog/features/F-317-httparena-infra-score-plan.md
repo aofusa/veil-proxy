@@ -103,7 +103,8 @@ Proxy-Wasm の改善、または veil に大きな変更を加えずに結果を
    イメージ）、perf。改修前の値（main）を記録する。
 2. **B-495・B-496・B-498**（小さい修正）: 設定を書かない利用者にも効く（B-498 は文書どおりの暗号スイートの選び方）。
 3. 本体の経路: **F-321 → F-322 → B-497 → F-323 → F-324**（veil-api と、F-325 の版の veil に効く）。
-4. Proxy-Wasm: **F-318 → F-319**（Proxy-Wasm の利用者に効く。エントリを Proxy-Wasm のまま出す場合の点にも効く）。
+4. Proxy-Wasm: **F-318 → F-319**（Proxy-Wasm の利用者に効く。エントリを Proxy-Wasm のまま出す場合の点にも効く）。F-319 の計測で、
+   epoll（コンテナのイメージ）の上限の負荷の差は送出の束ね方だと分かったので **F-326** に分けた（2026-11-26）。
 5. エントリ（手元だけ。提出しない）: F-320（Proxy-Wasm の版の設定と今の機能の調整）と F-325（ハンドラを組み込む版）を作り、HttpArena の
    検証と計測で比べる。veil-api のエントリも新しいコードで測る。
 6. main へマージ・push（タグは人の判断）。HttpArena への再提出（どちらの版を出すかを含む）は人の確認の後（F-269）。
@@ -186,7 +187,7 @@ Wasm を通る負荷・静的配信・HTTP/3 は ±4% の中（Wasm の要求ご
   [F-319](F-319-wasm-per-request-fixed-cost.md)・[F-320](F-320-httparena-veil-entry-config.md)・
   [F-321](F-321-core-path-per-request-shared-writes.md)・[F-322](F-322-h1-pipelined-response-coalescing.md)・
   [F-323](F-323-h2-per-stream-fixed-cost.md)・[F-324](F-324-h3-per-request-cost.md)・
-  [F-325](F-325-httparena-veil-compiled-handler-module.md)
+  [F-325](F-325-httparena-veil-compiled-handler-module.md)・[F-326](F-326-reactor-batched-sends.md)
 
 ## 関連
 
