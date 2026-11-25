@@ -1,5 +1,6 @@
 //! Properties Host Functions
 
+use crate::wasm::exports::GuestMemory;
 use std::sync::Arc;
 
 use wasmtime::{Caller, Linker};
@@ -103,8 +104,8 @@ pub(crate) fn get_property_value(state: &HostState, path: &str) -> Option<Proper
 
 /// Helper to write to WASM memory
 fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> bool {
-    let memory = match caller.get_export("memory") {
-        Some(wasmtime::Extern::Memory(mem)) => mem,
+    let memory = match caller.guest_memory() {
+        Some(mem) => mem,
         _ => return false,
     };
 
@@ -122,8 +123,7 @@ fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> b
 
 /// Helper to read string from WASM memory
 fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
-    let memory = caller.get_export("memory")?;
-    let memory = memory.into_memory()?;
+    let memory = caller.guest_memory()?;
     let data = memory.data(caller);
 
     let start = ptr as u32 as usize;
@@ -293,8 +293,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             // Read path from WASM memory（B-178: 短いパスはスタックで組み立てる）
             let mut path = PropertyPath::new();
             {
-                let memory = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                let memory = match caller.guest_memory() {
+                    Some(mem) => mem,
                     _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
                 };
                 let data = memory.data(&caller);
@@ -326,8 +326,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
 
             // Write return values
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
             };
 

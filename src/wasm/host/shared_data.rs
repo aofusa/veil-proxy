@@ -1,5 +1,6 @@
 //! Shared Data Host Functions
 
+use crate::wasm::exports::GuestMemory;
 use wasmtime::{Caller, Linker};
 
 use crate::wasm::constants::*;
@@ -7,8 +8,7 @@ use crate::wasm::context::HostState;
 
 /// Helper to read bytes from WASM memory
 fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
-    let memory = caller.get_export("memory")?;
-    let memory = memory.into_memory()?;
+    let memory = caller.guest_memory()?;
     let data = memory.data(caller);
 
     let start = ptr as u32 as usize;
@@ -62,8 +62,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             // Write value
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
             };
 

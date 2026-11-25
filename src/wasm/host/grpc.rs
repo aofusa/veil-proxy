@@ -5,6 +5,8 @@
 //! Otherwise returns UNIMPLEMENTED.
 
 #[cfg(feature = "grpc")]
+use crate::wasm::exports::GuestMemory;
+#[cfg(feature = "grpc")]
 use bytes::Bytes;
 use wasmtime::{Caller, Linker};
 
@@ -14,8 +16,7 @@ use crate::wasm::context::HostState;
 /// Helper to read memory from WASM
 #[cfg(feature = "grpc")]
 fn read_wasm_memory(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Option<Vec<u8>> {
-    let memory = caller.get_export("memory")?;
-    let memory = memory.into_memory()?;
+    let memory = caller.guest_memory()?;
     let data = memory.data(caller);
 
     let start = ptr as u32 as usize;
@@ -371,7 +372,7 @@ fn proxy_grpc_call_impl(
 
     // Write call_id to return pointer
     if return_call_id_ptr > 0 {
-        if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+        if let Some(memory) = caller.guest_memory() {
             let call_id_bytes = call_id.to_le_bytes();
             let data = memory.data_mut(&mut *caller);
             let ptr = return_call_id_ptr as u32 as usize;
@@ -505,7 +506,7 @@ fn proxy_grpc_stream_impl(
 
     // Write stream_id to return pointer
     if return_stream_id_ptr > 0 {
-        if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+        if let Some(memory) = caller.guest_memory() {
             let stream_id_bytes = stream_id.to_le_bytes();
             let data = memory.data_mut(&mut *caller);
             let ptr = return_stream_id_ptr as u32 as usize;

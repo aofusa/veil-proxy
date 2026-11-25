@@ -489,6 +489,30 @@ impl FilterEngine {
         configuration: &Arc<[u8]>,
         sessions: Option<&RequestSessions>,
     ) -> anyhow::Result<Session> {
+        self.open_session_with(module, configuration, sessions, false)
+            .await
+    }
+
+    /// [`Self::open_session`] と同じだが、プールのインスタンスで新しい http context を作るとき
+    /// `proxy_on_context_create` を呼ばずに `Session::create_pending` に残す（F-319。その段の最初の
+    /// コールバックと 1 回のファイバーの出入りで呼ぶ。[`exports::call_chain`]）
+    async fn open_session_deferred(
+        &self,
+        module: &LoadedModule,
+        configuration: &Arc<[u8]>,
+        sessions: Option<&RequestSessions>,
+    ) -> anyhow::Result<Session> {
+        self.open_session_with(module, configuration, sessions, true)
+            .await
+    }
+
+    async fn open_session_with(
+        &self,
+        module: &LoadedModule,
+        configuration: &Arc<[u8]>,
+        sessions: Option<&RequestSessions>,
+        defer_create: bool,
+    ) -> anyhow::Result<Session> {
         let root_context_id = 1i32;
         if module.instance_reuse {
             let module_key = module as *const LoadedModule as usize;
@@ -545,7 +569,10 @@ impl FilterEngine {
             if let Err(e) = self.prepare_pooled(&mut sess).await {
                 return Err(self.fail_pooled(sess, None, module_key, e));
             }
-            if let Some(Err(e)) = exports::call(
+            if defer_create {
+                // 作る段のエラーは呼んだ段の失敗として扱う（インスタンスを捨て、`sessions` からも外す）
+                sess.create_pending = Some((context_id, root_context_id));
+            } else if let Some(Err(e)) = exports::call(
                 &mut sess.store,
                 sess.instance,
                 |e| &mut e.on_context_create,
@@ -592,6 +619,7 @@ impl FilterEngine {
             slot: SlotGuard(None),
             request_scoped: false,
             next_context_id: 0,
+            create_pending: None,
         })
     }
 
@@ -646,10 +674,9 @@ impl FilterEngine {
         sessions: Option<&RequestSessions>,
         end_context: bool,
     ) {
-        let Some(slot) = sess.slot.take() else {
+        if sess.slot.as_ref().is_none() {
             return;
-        };
-        let module_key = module as *const LoadedModule as usize;
+        }
         let end = end_context || !sess.request_scoped;
         let mut ok = ok && sess.next_context_id < i32::MAX - 1;
         if ok && end {
@@ -667,6 +694,22 @@ impl FilterEngine {
                 exports::put(&mut sess.store, |e| &mut e.on_delete, func);
             }
         }
+        Self::release_session(module, sess, ok, sessions, end);
+    }
+
+    /// `proxy_on_delete` の後（または呼ばずに）インスタンスを片付ける（[`Self::close_session`]）。`end` は http context を
+    /// 消した（`sessions` から外す）
+    fn release_session(
+        module: &LoadedModule,
+        mut sess: Session,
+        ok: bool,
+        sessions: Option<&RequestSessions>,
+        end: bool,
+    ) {
+        let Some(slot) = sess.slot.take() else {
+            return;
+        };
+        let module_key = module as *const LoadedModule as usize;
         if !ok {
             slot.discard();
             if let Some(r) = sessions {
@@ -819,17 +862,51 @@ impl FilterEngine {
             |e| &mut e.on_response_headers
         };
         let eos = i32::from(end_of_stream);
-        let action = match exports::call(
-            &mut sess.store,
-            sess.instance,
-            pick,
-            callback_name,
-            (sess.context_id, num_headers, eos),
-        )
-        .await
-        {
-            Some(r) => r?,
-            None => 0, // Callback not exported, continue
+        let action = match sess.create_pending.take() {
+            // F-319: 作ったばかりの context は `proxy_on_context_create` と 1 回のファイバーの出入りで呼ぶ
+            Some((context_id, parent)) if request => {
+                let chain = exports::call_chain(
+                    &mut sess.store,
+                    sess.instance,
+                    &[
+                        exports::Step::ContextCreate(context_id, parent),
+                        exports::Step::RequestHeaders(sess.context_id, num_headers, eos),
+                    ],
+                    (self.fuel_limit, self.epoch_deadline),
+                )
+                .await;
+                if let Some(e) = chain.error {
+                    return Err(e);
+                }
+                chain.values[1].unwrap_or(0)
+            }
+            pending => {
+                if let Some((context_id, parent)) = pending {
+                    if let Some(Err(e)) = exports::call(
+                        &mut sess.store,
+                        sess.instance,
+                        |e| &mut e.on_context_create,
+                        "proxy_on_context_create",
+                        (context_id, parent),
+                    )
+                    .await
+                    {
+                        return Err(e);
+                    }
+                }
+                match exports::call(
+                    &mut sess.store,
+                    sess.instance,
+                    pick,
+                    callback_name,
+                    (sess.context_id, num_headers, eos),
+                )
+                .await
+                {
+                    Some(r) => r?,
+                    None => 0, // Callback not exported, continue
+                }
+            }
         };
 
         // F-48: fuel 消費量を記録（ライフサイクル + コールバック 1 実行分）。
@@ -995,7 +1072,10 @@ impl FilterEngine {
     ) -> (Vec<(Vec<u8>, Vec<u8>)>, anyhow::Result<ModuleAction>) {
         let num_headers = headers.len() as i32;
 
-        let mut sess = match self.open_session(module, configuration, sessions).await {
+        let mut sess = match self
+            .open_session_deferred(module, configuration, sessions)
+            .await
+        {
             Ok(s) => s,
             Err(e) => return (headers, Err(e)),
         };
@@ -1736,7 +1816,12 @@ impl FilterEngine {
     ) -> anyhow::Result<()> {
         // F-148: `config_size` に `configuration.len()` を渡すため、実体のバッファも必ず同じものを積む
         // （サイズだけ非ゼロで中身が空だと、モジュールが proxy_get_buffer(PluginConfiguration) で空を読む）。
-        let mut sess = self.open_session(module, configuration, sessions).await?;
+        let mut sess = self
+            .open_session_deferred(module, configuration, sessions)
+            .await?;
+        if sess.slot.as_ref().is_some() {
+            return self.log_pooled(module, sess, sessions).await;
+        }
 
         // Call proxy_on_log
         // Signature: (context_id) -> void
@@ -1766,6 +1851,60 @@ impl FilterEngine {
         }
         self.close_session(module, sess, ok, sessions, true).await;
 
+        Ok(())
+    }
+
+    /// プールのインスタンスの `proxy_on_log`。（作っていなければ `proxy_on_context_create`、）`proxy_on_log`、
+    /// `proxy_on_delete` を 1 回のファイバーの出入りで呼ぶ（F-319。以前は 2〜3 回）。段のエラーの扱いは別々に
+    /// 呼んでいたときと同じ（作る段の失敗はエラーで返し、`proxy_on_log`・`proxy_on_delete` の失敗はインスタンスを捨てる）
+    async fn log_pooled(
+        &self,
+        module: &LoadedModule,
+        mut sess: Session,
+        sessions: Option<&RequestSessions>,
+    ) -> anyhow::Result<()> {
+        let mut steps = [exports::Step::Log(sess.context_id); exports::MAX_STEPS];
+        let mut n = 0;
+        if let Some((context_id, parent)) = sess.create_pending.take() {
+            steps[n] = exports::Step::ContextCreate(context_id, parent);
+            n += 1;
+        }
+        let log_at = n;
+        steps[n] = exports::Step::Log(sess.context_id);
+        n += 1;
+        // `close_session` と同じ: context の ID を使い切ったインスタンスは消さずに捨てる
+        let delete = sess.next_context_id < i32::MAX - 1;
+        if delete {
+            steps[n] = exports::Step::Delete(sess.context_id);
+            n += 1;
+        }
+        let chain = exports::call_chain(
+            &mut sess.store,
+            sess.instance,
+            &steps[..n],
+            (self.fuel_limit, self.epoch_deadline),
+        )
+        .await;
+        match chain.error {
+            Some(e) if chain.done < log_at => {
+                Self::release_session(module, sess, false, sessions, true);
+                return Err(e);
+            }
+            Some(e) => {
+                if chain.done == log_at {
+                    ftlog::debug!("[wasm:{}] proxy_on_log error: {}", module.name, e);
+                }
+                Self::release_session(module, sess, false, sessions, true);
+            }
+            None => {
+                ftlog::debug!(
+                    "[wasm:{}] proxy_on_log({}) OK",
+                    module.name,
+                    sess.context_id
+                );
+                Self::release_session(module, sess, delete, sessions, true);
+            }
+        }
         Ok(())
     }
 
@@ -2844,6 +2983,8 @@ struct Session {
     request_scoped: bool,
     /// プールのインスタンスの次の http context の ID
     next_context_id: i32,
+    /// まだ呼んでいない `proxy_on_context_create` の (context, 親)（F-319。[`FilterEngine::open_session_deferred`]）
+    create_pending: Option<(i32, i32)>,
 }
 
 /// 取り出しているプールのインスタンスの枠。`close_session` を通らずに捨てられたら（エラーで途中で返った等）
@@ -2882,6 +3023,7 @@ impl Session {
             slot: SlotGuard(Some(slot)),
             request_scoped,
             next_context_id: p.next_context_id,
+            create_pending: None,
         }
     }
 }

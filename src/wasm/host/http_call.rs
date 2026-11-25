@@ -1,5 +1,6 @@
 //! HTTP Call Host Functions
 
+use crate::wasm::exports::GuestMemory;
 use wasmtime::{Caller, Linker};
 
 use crate::wasm::constants::*;
@@ -8,8 +9,7 @@ use crate::wasm::types::PendingHttpCall;
 
 /// Helper to read string from WASM memory
 fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
-    let memory = caller.get_export("memory")?;
-    let memory = memory.into_memory()?;
+    let memory = caller.guest_memory()?;
     let data = memory.data(caller);
 
     let start = ptr as u32 as usize;
@@ -90,8 +90,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
             // Read headers
             let headers_data = if headers_size > 0 {
-                let memory = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                let memory = match caller.guest_memory() {
+                    Some(mem) => mem,
                     _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
                 };
                 let data = memory.data(&caller);
@@ -107,8 +107,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
             // Read body
             let body_data = if body_size > 0 {
-                let memory = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                let memory = match caller.guest_memory() {
+                    Some(mem) => mem,
                     _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
                 };
                 let data = memory.data(&caller);
@@ -124,8 +124,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
             // Read trailers
             let trailers_data = if trailers_size > 0 {
-                let memory = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                let memory = match caller.guest_memory() {
+                    Some(mem) => mem,
                     _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
                 };
                 let data = memory.data(&caller);
@@ -177,8 +177,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             );
 
             // Write token to return pointer
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 

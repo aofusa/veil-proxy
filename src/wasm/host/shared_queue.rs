@@ -4,6 +4,7 @@
 //! A queue belongs to the module that registered it: only that module dequeues from it, and other modules enqueue
 //! only after resolving it by that module's name (the `vm_id`). All of it needs the `allow_shared_data` capability.
 
+use crate::wasm::exports::GuestMemory;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
@@ -319,7 +320,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 // Helper functions
 
 fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Option<String> {
-    let memory = caller.get_export("memory")?.into_memory()?;
+    let memory = caller.guest_memory()?;
     let data = memory.data(caller);
     let start = ptr as u32 as usize;
     let end = start + size as u32 as usize;
@@ -330,7 +331,7 @@ fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Optio
 }
 
 fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Option<Vec<u8>> {
-    let memory = caller.get_export("memory")?.into_memory()?;
+    let memory = caller.guest_memory()?;
     let data = memory.data(caller);
     let start = ptr as u32 as usize;
     let end = start + size as u32 as usize;
@@ -341,7 +342,7 @@ fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> Option
 }
 
 fn write_u32(caller: &mut Caller<'_, HostState>, ptr: i32, value: u32) -> bool {
-    if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+    if let Some(memory) = caller.guest_memory() {
         let data = memory.data_mut(caller);
         let start = ptr as u32 as usize;
         if start + 4 <= data.len() {
@@ -353,7 +354,7 @@ fn write_u32(caller: &mut Caller<'_, HostState>, ptr: i32, value: u32) -> bool {
 }
 
 fn write_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, bytes: &[u8]) -> bool {
-    if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+    if let Some(memory) = caller.guest_memory() {
         let data = memory.data_mut(caller);
         let start = ptr as u32 as usize;
         if start + bytes.len() <= data.len() {

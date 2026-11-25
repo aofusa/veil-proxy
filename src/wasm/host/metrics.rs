@@ -1,5 +1,6 @@
 //! Metrics Host Functions
 
+use crate::wasm::exports::GuestMemory;
 use wasmtime::{Caller, Linker};
 
 use crate::wasm::constants::*;
@@ -8,8 +9,7 @@ use crate::wasm::types::{Metric, MetricValue};
 
 /// Helper to read string from WASM memory
 fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
-    let memory = caller.get_export("memory")?;
-    let memory = memory.into_memory()?;
+    let memory = caller.guest_memory()?;
     let data = memory.data(caller);
 
     let start = ptr as u32 as usize;
@@ -69,8 +69,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             );
 
             // Write metric ID
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 
@@ -165,8 +165,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             // Write value
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 

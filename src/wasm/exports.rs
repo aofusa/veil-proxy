@@ -7,9 +7,11 @@
 //! 移し、呼んだ後に戻す（取り出している間に同じ関数を呼ぶ入れ子の呼び出しは、引き直して呼ぶ）。
 //!
 //! ホスト関数がゲストのメモリを取る確保関数は、同期のホスト関数から今のファイバーの上で呼ぶ
-//! （[`allocate_guest_memory`]）。
+//! （[`allocate_guest_memory`]）。続けて呼ぶコールバックも 1 回のファイバーの出入りで呼ぶ（[`call_chain`]）。
 
-use wasmtime::{Caller, Instance, Store, TypedFunc, ValRaw, WasmParams, WasmResults};
+use wasmtime::{
+    AsContextMut, Caller, Func, Instance, Memory, Store, TypedFunc, ValRaw, WasmParams, WasmResults,
+};
 
 use super::context::HostState;
 
@@ -42,6 +44,40 @@ pub(crate) struct GuestExports {
     memory_allocate: Export<i32, i32>,
     /// 確保関数を呼んでいる（確保の中からの再入は確保の失敗にする。[`allocate_guest_memory`]）
     allocating: bool,
+    /// ゲストの線形メモリ（[`GuestMemory`]）
+    memory: Option<Memory>,
+    /// 段を続けて呼ぶホスト関数（ストアごとに 1 つ。初めて使うときに作る。[`call_chain`]）
+    chain: Export<(), ()>,
+    /// [`call_chain`] とホスト関数が受け渡す段・入れ直す燃料と締切・結果
+    chain_steps: [Option<Step>; MAX_STEPS],
+    chain_arm: (u64, u64),
+    chain_done: usize,
+    chain_values: [Option<i32>; MAX_STEPS],
+}
+
+/// 1 回のファイバーの出入りで続けて呼べる段の数
+pub(crate) const MAX_STEPS: usize = 3;
+
+/// 1 回のファイバーの出入りで続けて呼ぶコールバック（[`call_chain`]）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// `proxy_on_context_create(context_id, parent_context_id)`
+    ContextCreate(i32, i32),
+    /// `proxy_on_request_headers(context_id, num_headers, end_of_stream)`
+    RequestHeaders(i32, i32, i32),
+    /// `proxy_on_log(context_id)`
+    Log(i32),
+    /// `proxy_on_delete(context_id)`。前に段があれば燃料と締切を入れ直してから呼ぶ（別に呼んでいたときと同じ）
+    Delete(i32),
+}
+
+/// [`call_chain`] の結果
+pub(crate) struct Chain {
+    /// 終わった段の数。`error` があれば、この番号の段（段に入る前の失敗も含む）で止まった
+    pub(crate) done: usize,
+    /// 段の戻り値（`proxy_on_request_headers` の action。戻り値の無い段・エクスポートの無い段は `None`）
+    pub(crate) values: [Option<i32>; MAX_STEPS],
+    pub(crate) error: Option<anyhow::Error>,
 }
 
 /// [`GuestExports`] のどのエクスポートか
@@ -121,6 +157,161 @@ where
     }
     put(store, pick, func);
     r
+}
+
+/// ゲストの線形メモリ（`memory` のエクスポート）を引いたまま持つ（F-319。ホスト関数は呼ばれるたびに名前の表を
+/// 引いていた）。ストアにはゲストのインスタンスが 1 つだけなので、最初に引いたものがそのストアの間ずっと使える
+pub(crate) trait GuestMemory {
+    fn guest_memory(&mut self) -> Option<Memory>;
+}
+
+impl GuestMemory for Caller<'_, HostState> {
+    fn guest_memory(&mut self) -> Option<Memory> {
+        if let Some(m) = self.data().exports.memory {
+            return Some(m);
+        }
+        let m = self.get_export("memory")?.into_memory()?;
+        self.data_mut().exports.memory = Some(m);
+        Some(m)
+    }
+}
+
+/// まだ引いていなければ引いておく（無い・型が合わなければ `Absent`）
+fn resolve<P, R>(store: &mut Store<HostState>, instance: Instance, pick: Pick<P, R>, name: &str)
+where
+    P: WasmParams,
+    R: WasmResults,
+{
+    if matches!(pick(&mut store.data_mut().exports), Export::Unknown) {
+        let found = match instance.get_typed_func::<P, R>(&mut *store, name) {
+            Ok(f) => Export::Present(f),
+            Err(_) => Export::Absent,
+        };
+        *pick(&mut store.data_mut().exports) = found;
+    }
+}
+
+fn present<P, R>(e: &Export<P, R>) -> Option<Func>
+where
+    P: WasmParams,
+    R: WasmResults,
+{
+    match e {
+        Export::Present(f) => Some(*f.func()),
+        _ => None,
+    }
+}
+
+/// コールバックを `steps` の順に、1 回のファイバーの出入りで続けて呼ぶ（F-319）。最初のエラーで止める。
+///
+/// wasmtime は `call_async` ごとにファイバーを作り、エンジンの `Arc`（全ワーカー共有）を複製して捨てる。要求ごとの
+/// `proxy_on_context_create` → `proxy_on_request_headers`、`proxy_on_log` → `proxy_on_delete` を別々に呼ぶと、1 要求で
+/// ファイバーの出入りが 4 回になる。ストアに置いた同期のホスト関数を 1 回 `call_async` し、その中から各コールバックを
+/// 今のファイバーの上で呼ぶ（[`allocate_guest_memory`] と同じ）。
+///
+/// - fuel の区切りでは外側のファイバーごと止まって再開する。取り消されたら段はエラーで戻るので、そこで止めて返す
+///   （続けて呼ぶと wasmtime の後始末の再開〈1 回で終わる前提〉の後にまた止まる）。
+/// - ゲストに入るたびにスタックの上限を測り直すので、段と確保関数の入れ子は今と同じ 2 段に収まる
+///   （`registry::ASYNC_STACK_SIZE`）。
+/// - `Delete` の前に燃料と締切を `arm`（fuel, エポックの締切）で入れ直す（別に呼んでいたときと同じ上限）。
+pub(crate) async fn call_chain(
+    store: &mut Store<HostState>,
+    instance: Instance,
+    steps: &[Step],
+    arm: (u64, u64),
+) -> Chain {
+    // ホスト関数の中では呼び出し元のインスタンスを引けないので、段のエクスポートを先に引いておく
+    for step in steps {
+        match step {
+            Step::ContextCreate(..) => resolve(
+                store,
+                instance,
+                |e| &mut e.on_context_create,
+                "proxy_on_context_create",
+            ),
+            Step::RequestHeaders(..) => resolve(
+                store,
+                instance,
+                |e| &mut e.on_request_headers,
+                "proxy_on_request_headers",
+            ),
+            Step::Log(_) => resolve(store, instance, |e| &mut e.on_log, "proxy_on_log"),
+            Step::Delete(_) => resolve(store, instance, |e| &mut e.on_delete, "proxy_on_delete"),
+        }
+    }
+    let chain = match std::mem::take(&mut store.data_mut().exports.chain) {
+        Export::Present(f) => f,
+        _ => match Func::wrap(&mut *store, run_chain).typed::<(), ()>(&*store) {
+            Ok(f) => f,
+            Err(e) => {
+                return Chain {
+                    done: 0,
+                    values: [None; MAX_STEPS],
+                    error: Some(e),
+                }
+            }
+        },
+    };
+    {
+        let e = &mut store.data_mut().exports;
+        e.chain_steps = [None; MAX_STEPS];
+        for (slot, step) in e.chain_steps.iter_mut().zip(steps) {
+            *slot = Some(*step);
+        }
+        e.chain_arm = arm;
+        e.chain_done = 0;
+        e.chain_values = [None; MAX_STEPS];
+    }
+    let r = chain.call_async(&mut *store, ()).await;
+    let e = &mut store.data_mut().exports;
+    e.chain = Export::Present(chain);
+    e.chain_steps = [None; MAX_STEPS];
+    Chain {
+        done: e.chain_done,
+        values: e.chain_values,
+        error: r.err(),
+    }
+}
+
+/// [`call_chain`] のホスト関数（ファイバーの上で段を続けて呼ぶ）
+fn run_chain(mut caller: Caller<'_, HostState>) -> anyhow::Result<()> {
+    let steps = caller.data().exports.chain_steps;
+    let (fuel, deadline) = caller.data().exports.chain_arm;
+    for (i, step) in steps.into_iter().enumerate() {
+        let Some(step) = step else {
+            break;
+        };
+        if i > 0 && matches!(step, Step::Delete(_)) {
+            caller.set_fuel(fuel)?;
+            caller.as_context_mut().set_epoch_deadline(deadline);
+        }
+        let value = run_step(&mut caller, step)?;
+        let e = &mut caller.data_mut().exports;
+        e.chain_values[i] = value;
+        e.chain_done = i + 1;
+    }
+    Ok(())
+}
+
+/// 1 つの段を今のファイバーの上で呼ぶ（エクスポートが無ければ呼ばずに `None`）
+fn run_step(caller: &mut Caller<'_, HostState>, step: Step) -> anyhow::Result<Option<i32>> {
+    let e = &caller.data().exports;
+    let (func, args, params, result) = match step {
+        Step::ContextCreate(c, p) => (present(&e.on_context_create), [c, p, 0], 2, false),
+        Step::RequestHeaders(c, n, eos) => (present(&e.on_request_headers), [c, n, eos], 3, true),
+        Step::Log(c) => (present(&e.on_log), [c, 0, 0], 1, false),
+        Step::Delete(c) => (present(&e.on_delete), [c, 0, 0], 1, false),
+    };
+    let Some(func) = func else {
+        return Ok(None);
+    };
+    let mut vals = args.map(ValRaw::i32);
+    let vals: &mut [ValRaw] = &mut vals[..params];
+    // SAFETY: `func` はこのストアのインスタンスのエクスポートで、段の型（`ContextCreate` は `(i32, i32) -> ()`、
+    // `RequestHeaders` は `(i32, i32, i32) -> i32`、`Log`・`Delete` は `(i32) -> ()`）であることを `typed` で確かめてある
+    // （`resolve`。型が合わなければ `Absent` で呼ばない）。`vals` の長さは引数の数で、戻り値（0〜1 個）より短くない。
+    unsafe { func.call_unchecked(&mut *caller, vals) }?;
+    Ok(result.then(|| vals[0].get_i32()))
 }
 
 /// ゲストのメモリを `size` バイト確保する（ホスト関数がゲストへ値を返すとき）。`Ok(None)` は確保できなかった
@@ -431,6 +622,168 @@ mod tests {
             "{e:?}"
         );
         assert!(!store.data().exports.allocating);
+    }
+
+    /// 呼ばれた順を `trace` に 10 進で積むモジュール（context_create=1・request_headers=2・log=3・delete=4）。
+    /// `proxy_on_request_headers` は context の ID を action として返し、`proxy_on_log` は context 9 でトラップする。
+    /// `$spin` は fuel を使う（fuel の区切りを試す）
+    const CHAIN_MODULE: &str = r#"(module
+      (memory (export "memory") 1)
+      (global $trace (mut i32) (i32.const 0))
+      (func $push (param $v i32)
+        (global.set $trace (i32.add (i32.mul (global.get $trace) (i32.const 10)) (local.get $v))))
+      (func $spin
+        (local $i i32)
+        (block $done
+          (loop $l
+            (br_if $done (i32.ge_u (local.get $i) (i32.const 2000)))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $l))))
+      (func (export "proxy_on_context_create") (param i32 i32)
+        (call $spin) (call $push (i32.const 1)))
+      (func (export "proxy_on_request_headers") (param $c i32) (param i32 i32) (result i32)
+        (call $spin) (call $push (i32.const 2)) (local.get $c))
+      (func (export "proxy_on_log") (param $c i32)
+        (if (i32.eq (local.get $c) (i32.const 9)) (then unreachable))
+        (call $spin) (call $push (i32.const 3)))
+      (func (export "proxy_on_delete") (param i32)
+        (call $spin) (call $push (i32.const 4)))
+      (func (export "trace") (result i32) (global.get $trace))
+      (func (export "reset") (global.set $trace (i32.const 0))))"#;
+
+    fn chain_instance(yield_interval: u64) -> (Store<HostState>, Instance) {
+        let mut cfg = wasmtime::Config::new();
+        cfg.async_support(true);
+        cfg.consume_fuel(true);
+        let engine = wasmtime::Engine::new(&cfg).unwrap();
+        let module = wasmtime::Module::new(&engine, CHAIN_MODULE).unwrap();
+        let linker = wasmtime::Linker::<HostState>::new(&engine);
+        let mut store = Store::new(
+            &engine,
+            HostState::new(HttpContext::new(1, ModuleCapabilities::default())),
+        );
+        store.set_fuel(1_000_000_000).unwrap();
+        store
+            .fuel_async_yield_interval(Some(yield_interval))
+            .unwrap();
+        let instance =
+            futures::executor::block_on(linker.instantiate_async(&mut store, &module)).unwrap();
+        (store, instance)
+    }
+
+    fn trace(store: &mut Store<HostState>, instance: Instance) -> i32 {
+        let f = instance
+            .get_typed_func::<(), i32>(&mut *store, "trace")
+            .unwrap();
+        poll_to_end(f.call_async(&mut *store, ())).0.unwrap()
+    }
+
+    const ARM: (u64, u64) = (1_000_000_000, 10);
+
+    // F-319: 段は順に 1 回のファイバーの出入りで呼ばれ、`proxy_on_request_headers` の action が返る。fuel の区切りで
+    // 止まっても続きから再開する。ホスト関数は 2 回目以降は作り直さない
+    #[test]
+    fn chain_runs_the_steps_in_order_and_resumes_after_yields() {
+        let (mut store, instance) = chain_instance(100);
+        let steps = [Step::ContextCreate(5, 1), Step::RequestHeaders(5, 3, 1)];
+        let (chain, pending) = poll_to_end(call_chain(&mut store, instance, &steps, ARM));
+        assert!(chain.error.is_none(), "{:?}", chain.error);
+        assert_eq!(chain.done, 2);
+        assert_eq!(chain.values[..2], [None, Some(5)]);
+        assert!(pending > 0, "the steps must yield on the fuel interval");
+        assert_eq!(trace(&mut store, instance), 12);
+        assert!(matches!(store.data().exports.chain, Export::Present(_)));
+
+        let steps = [Step::Log(5), Step::Delete(5)];
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, ARM));
+        assert!(chain.error.is_none());
+        assert_eq!(chain.done, 2);
+        assert_eq!(trace(&mut store, instance), 1234);
+    }
+
+    // 最初のエラーで止め、後の段は呼ばない（`done` は止まった段の番号）
+    #[test]
+    fn chain_stops_at_the_first_error() {
+        let (mut store, instance) = chain_instance(1_000_000);
+        let steps = [Step::ContextCreate(9, 1), Step::Log(9), Step::Delete(9)];
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, ARM));
+        let e = chain.error.expect("proxy_on_log traps");
+        assert!(
+            matches!(
+                e.downcast_ref::<wasmtime::Trap>(),
+                Some(wasmtime::Trap::UnreachableCodeReached)
+            ),
+            "{e:?}"
+        );
+        assert_eq!(chain.done, 1);
+        assert_eq!(trace(&mut store, instance), 1);
+    }
+
+    // エクスポートの無い段は呼ばずに飛ばす（値は `None`）
+    #[test]
+    fn chain_skips_missing_exports() {
+        let (mut store, instance) = chain_instance(1_000_000);
+        store.data_mut().exports.on_log = Export::Absent;
+        let steps = [Step::Log(5), Step::Delete(5)];
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, ARM));
+        assert!(chain.error.is_none());
+        assert_eq!(chain.done, 2);
+        assert_eq!(chain.values[..2], [None, None]);
+        assert_eq!(trace(&mut store, instance), 4);
+    }
+
+    // `Delete` の前に燃料を入れ直す（前の段で使い切っても `proxy_on_delete` は別に呼んだときと同じ上限で走る）
+    #[test]
+    fn chain_rearms_fuel_before_delete() {
+        let (mut store, instance) = chain_instance(1_000_000);
+        // 1 段が使う燃料を測り、その 1.5 倍だけ入れる: 1 段は走れるが、続けて 2 段は走れない
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &[Step::Log(5)], ARM));
+        assert!(chain.error.is_none());
+        let fuel = (1_000_000_000 - store.get_fuel().unwrap()) * 3 / 2;
+        let reset = instance
+            .get_typed_func::<(), ()>(&mut store, "reset")
+            .unwrap();
+        poll_to_end(reset.call_async(&mut store, ())).0.unwrap();
+
+        store.set_fuel(fuel).unwrap();
+        let steps = [Step::Log(5), Step::Delete(5)];
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, (fuel, 10)));
+        assert!(chain.error.is_none(), "{:?}", chain.error);
+        assert_eq!(trace(&mut store, instance), 34);
+
+        // 入れ直さなければ 2 段目で燃料が尽きる
+        store.set_fuel(1_000_000).unwrap();
+        poll_to_end(reset.call_async(&mut store, ())).0.unwrap();
+        store.set_fuel(fuel).unwrap();
+        let steps = [Step::Log(5), Step::Log(6)];
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, (fuel, 10)));
+        assert!(matches!(
+            chain
+                .error
+                .as_ref()
+                .and_then(|e| e.downcast_ref::<wasmtime::Trap>()),
+            Some(wasmtime::Trap::OutOfFuel)
+        ));
+        assert_eq!(chain.done, 1);
+    }
+
+    // 段の途中で止まっている呼び出しを捨てても、ファイバーは終わり、ストアは続けて使える
+    #[test]
+    fn dropping_a_chain_suspended_in_a_step_finishes_the_fiber() {
+        let (mut store, instance) = chain_instance(100);
+        {
+            let steps = [Step::ContextCreate(5, 1), Step::RequestHeaders(5, 3, 1)];
+            let mut f = Box::pin(call_chain(&mut store, instance, &steps, ARM));
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(std::future::Future::poll(f.as_mut(), &mut cx).is_pending());
+        }
+        // 取り出していたホスト関数は戻らない（次に作り直す）
+        assert!(!matches!(store.data().exports.chain, Export::Present(_)));
+        let steps = [Step::Log(5)];
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, ARM));
+        assert!(chain.error.is_none(), "{:?}", chain.error);
+        assert_eq!(chain.done, 1);
     }
 
     // 確保の途中で止まっている呼び出しを捨てると、wasmtime はファイバーを 1 回だけ再開して終わらせる。確保の失敗が

@@ -1,5 +1,6 @@
 //! Stream Control Host Functions
 
+use crate::wasm::exports::GuestMemory;
 use wasmtime::{Caller, Linker};
 
 // B-19: マップ直列化は SDK 互換の共通モジュールを使用
@@ -58,8 +59,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
 
             // Read body from WASM memory
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 
@@ -155,8 +156,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
          return_status_msg_ptr: i32,
          return_status_msg_size_ptr: i32|
          -> i32 {
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 

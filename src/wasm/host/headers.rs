@@ -1,5 +1,6 @@
 //! Header Map Host Functions
 
+use crate::wasm::exports::GuestMemory;
 use wasmtime::{Caller, Linker};
 
 use std::borrow::Cow;
@@ -227,8 +228,7 @@ fn is_known_map_type(map_type: i32) -> bool {
 
 /// Helper to read string from WASM memory
 fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
-    let memory = caller.get_export("memory")?;
-    let memory = memory.into_memory()?;
+    let memory = caller.guest_memory()?;
     let data = memory.data(caller);
 
     let start = ptr as u32 as usize;
@@ -243,8 +243,8 @@ fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option
 
 /// Helper to write to WASM memory
 fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> bool {
-    let memory = match caller.get_export("memory") {
-        Some(wasmtime::Extern::Memory(mem)) => mem,
+    let memory = match caller.guest_memory() {
+        Some(mem) => mem,
         _ => return false,
     };
 
@@ -301,8 +301,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
 
             // Write return values
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
             };
 
@@ -340,8 +340,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
 
             // Read serialized headers from WASM memory
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 
@@ -448,8 +448,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
 
             // Write return pointers
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
             };
 

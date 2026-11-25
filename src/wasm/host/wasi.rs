@@ -4,6 +4,7 @@
 //! reference WASI to load. These implementations are minimal stubs that
 //! allow the module to function without full WASI support.
 
+use crate::wasm::exports::GuestMemory;
 use wasmtime::{Caller, Linker};
 
 use crate::wasm::context::HostState;
@@ -22,8 +23,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
          iovs_len: i32,
          nwritten_ptr: i32|
          -> i32 {
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return 8, // EBADF - Bad file descriptor
             };
 
@@ -128,8 +129,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "wasi_snapshot_preview1",
         "fd_fdstat_get",
         |mut caller: Caller<'_, HostState>, fd: i32, stat_ptr: i32| -> i32 {
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return 8,
             };
 
@@ -174,8 +175,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "wasi_snapshot_preview1",
         "environ_sizes_get",
         |mut caller: Caller<'_, HostState>, count_ptr: i32, size_ptr: i32| -> i32 {
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return 8,
             };
 
@@ -208,8 +209,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "wasi_snapshot_preview1",
         "args_sizes_get",
         |mut caller: Caller<'_, HostState>, count_ptr: i32, size_ptr: i32| -> i32 {
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return 8,
             };
 
@@ -256,8 +257,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
          _precision: i64,
          time_ptr: i32|
          -> i32 {
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return 8,
             };
 
@@ -282,8 +283,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "wasi_snapshot_preview1",
         "random_get",
         |mut caller: Caller<'_, HostState>, buf_ptr: i32, buf_len: i32| -> i32 {
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return 8,
             };
 

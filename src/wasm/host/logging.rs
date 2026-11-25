@@ -1,5 +1,6 @@
 //! Logging Host Functions
 
+use crate::wasm::exports::GuestMemory;
 use ftlog::{debug, error, info, trace, warn};
 use std::fmt::Write as _;
 use wasmtime::{Caller, Linker};
@@ -38,8 +39,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "proxy_log",
         |mut caller: Caller<'_, HostState>, level: i32, msg_ptr: i32, msg_size: i32| -> i32 {
             // Read message from WASM memory first
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 
@@ -90,8 +91,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 .unwrap_or(0);
 
             // Write to WASM memory
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
+            let memory = match caller.guest_memory() {
+                Some(mem) => mem,
                 _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 
