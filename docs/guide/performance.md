@@ -167,8 +167,9 @@ connections go to the first N workers; accepting never stops.
 - N never goes below a quarter of the workers (at least 2).
 
 Existing HTTP/1.1 keep-alive connections follow a change: the workers that hand connections over answer the next
-response with `Connection: close`, and the client reconnects to the new set. HTTP/2 connections are not moved
-(when they cannot move, the change is undone). The number of active workers is exported as
+response with `Connection: close`, and the client reconnects to the new set. HTTP/1.1 connections that pipeline
+requests are not moved (the client has usually sent more requests that a close would drop), nor are HTTP/2
+connections (when they cannot move, the change is undone). The number of active workers is exported as
 `veil_proxy_active_workers{listener}`.
 
 #### Configuration

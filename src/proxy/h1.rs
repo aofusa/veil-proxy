@@ -158,6 +158,8 @@ pub(super) async fn handle_requests(
     let mut first_read = true;
     // B-129: 蓄積に次の要求のヘッダが揃っている（パイプライン）
     let mut pipelined_ready = false;
+    // B-500: この接続は要求をパイプラインで送ってきた（本文の無い要求の後ろに次の要求が届いていたことがある）
+    let mut pipelining_seen = false;
     // B-317: 今の要求の前に捨てた空行のバイト数
     let mut skipped_empty_lines = 0usize;
     // ネイティブハンドラの呼び出しで要求をまたいで使い回す状態（F-202）
@@ -432,16 +434,21 @@ pub(super) async fn handle_requests(
                 );
                 // F-303: 接続の集約の制御が既存の接続の移動を求めていたら、応答の後に閉じる（クライアントは張り直して
                 // 別のワーカーへ振り分けられる）。本文の無い要求で、後ろにパイプライン化された要求が届いていないときだけ
-                // （閉じると届いている要求を捨てることになる）。アップグレードは閉じない
+                // （閉じると届いている要求を捨てることになる）。アップグレードは閉じない。
+                // B-500: 要求をパイプラインで送ってくる接続は動かさない（蓄積が空でも、クライアントは応答を待たずに次の
+                // 要求を送っている途中で、閉じるとそれを失う。16 本ずつ送る負荷で動かすたびに 15 要求を失っていた）
+                pipelining_seen |= is_pipelining(content_length, is_chunked, &accumulated);
                 let client_wants_close: bool = crate::http_utils::header_has_token(
                     &headers_for_proxy,
                     b"connection",
                     b"close",
-                ) || (content_length == 0
-                    && !is_chunked
-                    && !is_upgrade_connection
-                    && accumulated.is_empty()
-                    && crate::active_workers::take_shed());
+                ) || (may_shed(
+                    content_length,
+                    is_chunked,
+                    is_upgrade_connection,
+                    pipelining_seen,
+                    &accumulated,
+                ) && crate::active_workers::take_shed());
 
                 // WebSocket Upgrade チェック: Connection: upgrade と Upgrade: websocket の両方が要る。
                 // RFC 6455 §4.1: GET・HTTP/1.1 だけ（それ以外はアップグレードせず通常の要求として扱う）
@@ -1412,6 +1419,52 @@ pub(super) async fn handle_requests(
                 return;
             }
         }
+    }
+}
+
+/// 本文の無い要求の後ろに次の要求が届いている（クライアントは要求をパイプラインで送っている。B-500）
+#[inline]
+fn is_pipelining(content_length: usize, is_chunked: bool, rest: &[u8]) -> bool {
+    content_length == 0 && !is_chunked && !rest.is_empty()
+}
+
+/// 接続の集約（F-303）のために、この要求の応答の後で閉じてよいか（`take_shed` を呼ぶ前の条件）。本文の無い要求で、
+/// 後ろに何も届いておらず、アップグレードでもなく、要求をパイプラインで送ってくる接続でもないときだけ（B-500）
+#[inline]
+fn may_shed(
+    content_length: usize,
+    is_chunked: bool,
+    is_upgrade: bool,
+    pipelining_seen: bool,
+    rest: &[u8],
+) -> bool {
+    content_length == 0 && !is_chunked && !is_upgrade && !pipelining_seen && rest.is_empty()
+}
+
+#[cfg(test)]
+mod shed_tests {
+    use super::{is_pipelining, may_shed};
+
+    /// B-500: 一度でもパイプラインで送ってきた接続は、蓄積が空のときも集約のために閉じない
+    #[test]
+    fn pipelining_connection_is_never_shed() {
+        let mut seen = false;
+        // 1 本ずつ送る接続は、本文の無い要求の後ろが空なら閉じてよい
+        seen |= is_pipelining(0, false, b"");
+        assert!(may_shed(0, false, false, seen, b""));
+        // 本文の続きが後ろにあるだけ（本文のある要求）はパイプラインではない
+        assert!(!is_pipelining(5, false, b"hello"));
+        assert!(!is_pipelining(0, true, b"5\r\nhello\r\n0\r\n\r\n"));
+        // 本文の無い要求の後ろに次の要求が届いていた
+        seen |= is_pipelining(0, false, b"GET / HTTP/1.1\r\n");
+        assert!(seen);
+        assert!(!may_shed(0, false, false, seen, b"GET / HTTP/1.1\r\n"));
+        // 後で蓄積が空になっても閉じない（クライアントは次の要求を送っている途中にある）
+        assert!(!may_shed(0, false, false, seen, b""));
+        // 本文のある要求・アップグレードは今までどおり閉じない
+        assert!(!may_shed(3, false, false, false, b""));
+        assert!(!may_shed(0, true, false, false, b""));
+        assert!(!may_shed(0, false, true, false, b""));
     }
 }
 
