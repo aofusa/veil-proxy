@@ -288,7 +288,9 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 let ptr = if bytes.is_empty() {
                     0
                 } else {
-                    match super::shared_data::allocate_wasm_memory(&mut caller, bytes.len()).await {
+                    match crate::wasm::exports::allocate_guest_memory(&mut caller, bytes.len())
+                        .await
+                    {
                         Some(p) => p,
                         None => return PROXY_RESULT_INTERNAL_FAILURE,
                     }

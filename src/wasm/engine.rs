@@ -10,6 +10,7 @@ use wasmtime::Store;
 
 use super::constants::{ACTION_CONTINUE, ACTION_PAUSE};
 use super::context::{HostState, HttpContext};
+use super::exports;
 use super::instance_pool::{InstanceSlot, PooledInstance, RequestSessions};
 use super::registry::{LoadedModule, ModuleRegistry};
 use super::types::{FilterAction, LocalResponse, WasmConfig};
@@ -403,10 +404,16 @@ impl FilterEngine {
             func.call_async(&mut *store, ()).await?;
         }
         let config_size = configuration.len() as i32;
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut *store, "proxy_on_context_create")
+        if let Some(r) = exports::call(
+            store,
+            instance,
+            |e| &mut e.on_context_create,
+            "proxy_on_context_create",
+            (root_context_id, 0),
+        )
+        .await
         {
-            func.call_async(&mut *store, (root_context_id, 0)).await?;
+            r?;
         }
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut *store, "proxy_on_vm_start")
@@ -526,16 +533,16 @@ impl FilterEngine {
             if let Err(e) = self.prepare_pooled(&mut sess).await {
                 return Err(self.fail_pooled(sess, None, module_key, e));
             }
-            if let Ok(func) = sess
-                .instance
-                .get_typed_func::<(i32, i32), ()>(&mut sess.store, "proxy_on_context_create")
+            if let Some(Err(e)) = exports::call(
+                &mut sess.store,
+                sess.instance,
+                |e| &mut e.on_context_create,
+                "proxy_on_context_create",
+                (context_id, root_context_id),
+            )
+            .await
             {
-                if let Err(e) = func
-                    .call_async(&mut sess.store, (context_id, root_context_id))
-                    .await
-                {
-                    return Err(self.fail_pooled(sess, None, module_key, e));
-                }
+                return Err(self.fail_pooled(sess, None, module_key, e));
             }
             if let (Some(r), Some(slot)) = (sessions, sess.slot.as_ref()) {
                 r.insert(module_key, slot.clone(), context_id);
@@ -548,18 +555,19 @@ impl FilterEngine {
             .await?;
         // Step 4: Create HTTP context with root as parent
         let http_context_id = 2i32; // HTTP context ID
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        if let Some(Err(e)) = exports::call(
+            &mut store,
+            instance,
+            |e| &mut e.on_context_create,
+            "proxy_on_context_create",
+            (http_context_id, root_context_id),
+        )
+        .await
         {
-            if let Err(e) = func
-                .call_async(&mut store, (http_context_id, root_context_id))
-                .await
-            {
-                return Err((
-                    e.context(FailKind("lifecycle")),
-                    Box::new(store.into_data().http_ctx),
-                ));
-            }
+            return Err((
+                e.context(FailKind("lifecycle")),
+                Box::new(store.into_data().http_ctx),
+            ));
         }
 
         Ok(Session {
@@ -582,15 +590,14 @@ impl FilterEngine {
         if pending.is_empty() {
             return Ok(());
         }
-        if let Ok(func) = sess
-            .instance
-            .get_typed_func::<i32, ()>(&mut sess.store, "proxy_on_delete")
-        {
-            for id in pending {
-                func.call_async(&mut sess.store, id).await?;
-            }
-        }
-        Ok(())
+        exports::call_each(
+            &mut sess.store,
+            sess.instance,
+            |e| &mut e.on_delete,
+            "proxy_on_delete",
+            pending,
+        )
+        .await
     }
 
     /// プールのインスタンスの準備に失敗した: インスタンスを捨てて `http_ctx` を返す
@@ -631,15 +638,18 @@ impl FilterEngine {
         let end = end_context || !sess.request_scoped;
         let mut ok = ok && sess.next_context_id < i32::MAX - 1;
         if ok && end {
-            if let Ok(func) = sess
-                .instance
-                .get_typed_func::<i32, ()>(&mut sess.store, "proxy_on_delete")
-            {
+            if let Some(func) = exports::take(
+                &mut sess.store,
+                sess.instance,
+                |e| &mut e.on_delete,
+                "proxy_on_delete",
+            ) {
                 ok = self.arm_store(&mut sess.store).is_ok()
                     && func
                         .call_async(&mut sess.store, sess.context_id)
                         .await
                         .is_ok();
+                exports::put(&mut sess.store, |e| &mut e.on_delete, func);
             }
         }
         if !ok {
@@ -787,24 +797,31 @@ impl FilterEngine {
         num_headers: i32,
         end_of_stream: bool,
     ) -> anyhow::Result<i32> {
-        let callback = sess
-            .instance
-            .get_typed_func::<(i32, i32, i32), i32>(&mut sess.store, callback_name);
-
-        let action = match callback {
-            Ok(func) => {
-                let eos = if end_of_stream { 1 } else { 0 };
-                func.call_async(&mut sess.store, (sess.context_id, num_headers, eos))
-                    .await?
-            }
-            Err(_) => 0, // Callback not exported, continue
+        let request = callback_name == "proxy_on_request_headers";
+        let pick: exports::Pick<(i32, i32, i32), i32> = if request {
+            |e| &mut e.on_request_headers
+        } else {
+            |e| &mut e.on_response_headers
+        };
+        let eos = i32::from(end_of_stream);
+        let action = match exports::call(
+            &mut sess.store,
+            sess.instance,
+            pick,
+            callback_name,
+            (sess.context_id, num_headers, eos),
+        )
+        .await
+        {
+            Some(r) => r?,
+            None => 0, // Callback not exported, continue
         };
 
         // F-48: fuel 消費量を記録（ライフサイクル + コールバック 1 実行分）。
         let consumed = self
             .fuel_limit
             .saturating_sub(sess.store.get_fuel().unwrap_or(0));
-        let phase = if callback_name == "proxy_on_request_headers" {
+        let phase = if request {
             "request_headers"
         } else {
             "response_headers"
@@ -873,21 +890,22 @@ impl FilterEngine {
                     ctx.current_http_call_token = Some(token);
                 }
 
-                if let Ok(func) = instance.get_typed_func::<(i32, i32, i32, i32, i32), ()>(
-                    &mut *store,
+                if let Some(r) = exports::call(
+                    store,
+                    instance,
+                    |e| &mut e.on_http_call_response,
                     "proxy_on_http_call_response",
-                ) {
-                    func.call_async(
-                        &mut *store,
-                        (
-                            http_context_id,
-                            token as i32,
-                            num_headers,
-                            body_size,
-                            num_trailers,
-                        ),
-                    )
-                    .await?;
+                    (
+                        http_context_id,
+                        token as i32,
+                        num_headers,
+                        body_size,
+                        num_trailers,
+                    ),
+                )
+                .await
+                {
+                    r?;
                 }
                 store.data_mut().http_ctx.current_http_call_token = None;
                 resumed = true;
@@ -1499,19 +1517,16 @@ impl FilterEngine {
 
         // Call proxy_on_request_body
         // Signature: (context_id, body_size, end_of_stream) -> action
-        let callback = sess
-            .instance
-            .get_typed_func::<(i32, i32, i32), i32>(&mut sess.store, "proxy_on_request_body");
-
-        let run = match callback {
-            Ok(func) => {
-                let body_size = body_len as i32;
-                let eos = if end_of_stream { 1 } else { 0 };
-                func.call_async(&mut sess.store, (sess.context_id, body_size, eos))
-                    .await
-            }
-            Err(_) => Ok(0), // Continue if not exported
-        };
+        let eos = i32::from(end_of_stream);
+        let run = exports::call(
+            &mut sess.store,
+            sess.instance,
+            |e| &mut e.on_request_body,
+            "proxy_on_request_body",
+            (sess.context_id, body_len as i32, eos),
+        )
+        .await
+        .unwrap_or(Ok(0)); // Continue if not exported
         crate::metrics::observe_wasm_fuel_consumed(
             &module.name,
             "request_body",
@@ -1654,19 +1669,16 @@ impl FilterEngine {
 
         // Call proxy_on_response_body
         // Signature: (context_id, body_size, end_of_stream) -> action
-        let callback = sess
-            .instance
-            .get_typed_func::<(i32, i32, i32), i32>(&mut sess.store, "proxy_on_response_body");
-
-        let run = match callback {
-            Ok(func) => {
-                let body_size = body_len as i32;
-                let eos = if end_of_stream { 1 } else { 0 };
-                func.call_async(&mut sess.store, (sess.context_id, body_size, eos))
-                    .await
-            }
-            Err(_) => Ok(0), // Continue if not exported
-        };
+        let eos = i32::from(end_of_stream);
+        let run = exports::call(
+            &mut sess.store,
+            sess.instance,
+            |e| &mut e.on_response_body,
+            "proxy_on_response_body",
+            (sess.context_id, body_len as i32, eos),
+        )
+        .await
+        .unwrap_or(Ok(0)); // Continue if not exported
         crate::metrics::observe_wasm_fuel_consumed(
             &module.name,
             "response_body",
@@ -1751,11 +1763,16 @@ impl FilterEngine {
         // Call proxy_on_log
         // Signature: (context_id) -> void
         let mut ok = true;
-        if let Ok(func) = sess
-            .instance
-            .get_typed_func::<i32, ()>(&mut sess.store, "proxy_on_log")
+        if let Some(r) = exports::call(
+            &mut sess.store,
+            sess.instance,
+            |e| &mut e.on_log,
+            "proxy_on_log",
+            sess.context_id,
+        )
+        .await
         {
-            match func.call_async(&mut sess.store, sess.context_id).await {
+            match r {
                 Ok(()) => {
                     ftlog::debug!(
                         "[wasm:{}] proxy_on_log({}) OK",
@@ -1965,17 +1982,15 @@ impl FilterEngine {
 
         // Call proxy_on_request_trailers
         // Signature: (context_id, num_trailers) -> action
-        let run = match sess
-            .instance
-            .get_typed_func::<(i32, i32), i32>(&mut sess.store, "proxy_on_request_trailers")
-        {
-            Ok(func) => {
-                let num_trailers = trailers.len() as i32;
-                func.call_async(&mut sess.store, (sess.context_id, num_trailers))
-                    .await
-            }
-            Err(_) => Ok(0),
-        };
+        let run = exports::call(
+            &mut sess.store,
+            sess.instance,
+            |e| &mut e.on_request_trailers,
+            "proxy_on_request_trailers",
+            (sess.context_id, trailers.len() as i32),
+        )
+        .await
+        .unwrap_or(Ok(0));
 
         // B-299: トラップの前のローカルレスポンスも返す
         let (ok, settled) = self.settle(module, &mut sess, run).await;
@@ -2075,17 +2090,15 @@ impl FilterEngine {
 
         // Call proxy_on_response_trailers
         // Signature: (context_id, num_trailers) -> action
-        let run = match sess
-            .instance
-            .get_typed_func::<(i32, i32), i32>(&mut sess.store, "proxy_on_response_trailers")
-        {
-            Ok(func) => {
-                let num_trailers = trailers.len() as i32;
-                func.call_async(&mut sess.store, (sess.context_id, num_trailers))
-                    .await
-            }
-            Err(_) => Ok(0),
-        };
+        let run = exports::call(
+            &mut sess.store,
+            sess.instance,
+            |e| &mut e.on_response_trailers,
+            "proxy_on_response_trailers",
+            (sess.context_id, trailers.len() as i32),
+        )
+        .await
+        .unwrap_or(Ok(0));
 
         // B-299: トラップの前のローカルレスポンスも返す
         let (ok, settled) = self.settle(module, &mut sess, run).await;

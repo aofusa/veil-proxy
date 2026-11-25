@@ -19,6 +19,7 @@ mod capabilities;
 mod constants;
 mod context;
 mod engine;
+mod exports;
 pub mod grpc_integration;
 pub(crate) mod host;
 pub mod http_executor;

@@ -241,28 +241,6 @@ fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option
     String::from_utf8(data[start..end].to_vec()).ok()
 }
 
-/// Helper to allocate memory in WASM
-///
-/// B-20: エンジンは async store（`async_support(true)` + fuel yield）で動作するため、
-/// wasm への再入呼び出しは `call_async` でなければならない（同期 `call` は
-/// "must use call_async with async stores" で panic する）。
-async fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
-    // Call proxy_on_memory_allocate if exported
-    let func = caller
-        .get_export("proxy_on_memory_allocate")
-        .or_else(|| caller.get_export("malloc"))?;
-    let func = func.into_func()?;
-    let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
-    let size = i32::try_from(size).ok()?;
-    // B-320: 0 はゲストのアロケータの失敗（以前は有効な場所として先頭からクライアントのバイトを
-    // 書き込んでいた。F49）
-    typed
-        .call_async(&mut *caller, size)
-        .await
-        .ok()
-        .filter(|&p| p != 0 || size == 0)
-}
-
 /// Helper to write to WASM memory
 fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> bool {
     let memory = match caller.get_export("memory") {
@@ -310,7 +288,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 let size = serialized.len();
 
                 // Allocate memory in WASM
-                let ptr = match allocate_wasm_memory(&mut caller, size).await {
+                let ptr = match crate::wasm::exports::allocate_guest_memory(&mut caller, size).await
+                {
                     Some(p) => p,
                     None => return PROXY_RESULT_INTERNAL_FAILURE,
                 };
@@ -461,10 +440,13 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 };
 
                 // Allocate memory and write value
-                let ptr = match allocate_wasm_memory(&mut caller, value.len()).await {
-                    Some(p) => p,
-                    None => return PROXY_RESULT_INTERNAL_FAILURE,
-                };
+                let ptr =
+                    match crate::wasm::exports::allocate_guest_memory(&mut caller, value.len())
+                        .await
+                    {
+                        Some(p) => p,
+                        None => return PROXY_RESULT_INTERNAL_FAILURE,
+                    };
 
                 if !write_to_wasm(&mut caller, ptr, &value) {
                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;

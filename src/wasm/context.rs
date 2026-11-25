@@ -548,11 +548,16 @@ impl HttpContext {
 pub struct HostState {
     /// HTTP context
     pub http_ctx: HttpContext,
+    /// インスタンスのエクスポートの関数（引いたものをインスタンスの寿命の間使い回す。F-318）
+    pub(crate) exports: super::exports::GuestExports,
 }
 
 impl HostState {
     /// Create a new host state
     pub fn new(http_ctx: HttpContext) -> Self {
-        Self { http_ctx }
+        Self {
+            http_ctx,
+            exports: Default::default(),
+        }
     }
 }
