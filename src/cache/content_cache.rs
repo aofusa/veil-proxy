@@ -234,6 +234,18 @@ impl ContentCache {
         let current_entries = self.entries.len();
         match self.entries.entry(path.to_path_buf()) {
             Entry::Occupied(mut o) => {
+                // B-496: 同じ版（大きさと更新時刻）の本体の入れ直しは、本体と圧縮結果を残して時刻と世代だけ更新する。
+                // open_file_cache が当たらない間（有効期限切れ・ルートで無効）の静的配信は要求ごとに本体を読んで
+                // ここへ来るので、無条件に圧縮結果を捨てると HTTP/2・HTTP/3 が要求ごとに圧縮し直していた。
+                // 更新時刻の分からない版（`modified: None`）は同じとみなさない（同じ大きさの書き換えを見逃す）。
+                if let Some(v) = content.version {
+                    if v.modified.is_some() && o.get().version == Some(v) {
+                        let e = o.get_mut();
+                        e.cached_at = content.cached_at;
+                        e.stamp = content.stamp;
+                        return;
+                    }
+                }
                 let old_len = o.get().len;
                 let current = self.total_bytes.load(Ordering::Relaxed);
                 let projected = current.saturating_sub(old_len).saturating_add(new_len);
@@ -615,6 +627,93 @@ mod tests {
             len,
             modified: None,
         }
+    }
+
+    /// 同じ版の本体を入れ直しても圧縮結果を残し、版が変われば捨てる（B-496）。
+    // グローバル `COMPRESSED_CACHE` を経由するため #[serial]。
+    #[test]
+    #[serial_test::serial]
+    fn reinsert_same_version_keeps_compressed_cache() {
+        let cache = ContentCache::new();
+        let path = PathBuf::from("/b496/same-version.js");
+        let cfg = test_cfg();
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let v1 = crate::cache::FileVersion {
+            len: 2,
+            modified: Some(t),
+        };
+        let mime: Arc<str> = Arc::from("text/javascript");
+        cache.insert_bytes(
+            &path,
+            Bytes::from_static(b"v1"),
+            mime.clone(),
+            &cfg,
+            None,
+            v1,
+        );
+        let calls = AtomicUsize::new(0);
+        let compress = |out: &'static [u8]| {
+            super::super::compressed::get_or_compress(
+                &path,
+                crate::config::AcceptedEncoding::Zstd,
+                3,
+                0,
+                &cfg,
+                || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    out.to_vec()
+                },
+            )
+        };
+        assert_eq!(compress(b"c1"), Bytes::from_static(b"c1"));
+
+        // 同じ版の入れ直し: 圧縮結果に当たる
+        cache.insert_bytes(
+            &path,
+            Bytes::from_static(b"v1"),
+            mime.clone(),
+            &cfg,
+            None,
+            v1,
+        );
+        assert_eq!(compress(b"recompressed"), Bytes::from_static(b"c1"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // 更新時刻が 1 ns でも違えば版が違う: 圧縮し直す
+        let v2 = crate::cache::FileVersion {
+            len: 2,
+            modified: Some(t + Duration::from_nanos(1)),
+        };
+        cache.insert_bytes(
+            &path,
+            Bytes::from_static(b"v2"),
+            mime.clone(),
+            &cfg,
+            None,
+            v2,
+        );
+        assert_eq!(compress(b"c2"), Bytes::from_static(b"c2"));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        // 更新時刻の分からない版は同じとみなさない
+        let v3 = crate::cache::FileVersion {
+            len: 2,
+            modified: None,
+        };
+        cache.insert_bytes(
+            &path,
+            Bytes::from_static(b"v3"),
+            mime.clone(),
+            &cfg,
+            None,
+            v3,
+        );
+        assert_eq!(compress(b"c3"), Bytes::from_static(b"c3"));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        cache.insert_bytes(&path, Bytes::from_static(b"v3"), mime, &cfg, None, v3);
+        assert_eq!(compress(b"c4"), Bytes::from_static(b"c4"));
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        super::super::compressed::invalidate(&path);
     }
 
     fn write_file(dir: &tempfile::TempDir, name: &str, content: &[u8]) -> PathBuf {

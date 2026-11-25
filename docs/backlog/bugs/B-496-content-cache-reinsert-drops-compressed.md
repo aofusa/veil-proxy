@@ -1,6 +1,15 @@
 # B-496: 静的コンテンツキャッシュへ同じ版の本体を入れ直すと圧縮結果のキャッシュを捨て、HTTP/2・HTTP/3 の静的配信が要求ごとに圧縮し直す
 
-**状態: 未着手（2026-11-22 起票。F-317 の HttpArena の調査で見つけた。v0.10.1・main とも同じ）**
+**状態: 完了（2026-11-25、feat/httparena-perf。2026-11-22 起票。F-317 の HttpArena の調査で見つけた。v0.10.1・main とも同じ）**
+
+## 対応（2026-11-25）
+
+- `ContentCache::try_insert` の `Occupied` で、入れる本体の版（`FileVersion`。大きさと更新時刻）が既存と同じなら、本体も圧縮結果も残して
+  `cached_at`・`stamp` だけ更新する。版が違う・更新時刻が分からない（`modified: None`）・版を持たない入れ方は今までどおり置き換えて
+  `compressed::invalidate` する（同じ大きさの書き換えを見逃さない）。
+- 試験: `cache::content_cache::tests::reinsert_same_version_keeps_compressed_cache`（同じ版の入れ直しでは圧縮しない。更新時刻が 1 ns 違えば
+  圧縮し直す。更新時刻の分からない版は毎回圧縮し直す）。圧縮結果の当たりの数はメトリクスに出していないので、HTTP/2・HTTP/3 の通しの確認は
+  aofish の計測（[F-317](../features/F-317-httparena-infra-score-plan.md) の「計測の記録」）で行った。
 
 ## 事象
 
