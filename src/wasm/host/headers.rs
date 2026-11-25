@@ -263,62 +263,62 @@ fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> b
 /// Add header functions to linker
 pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     // proxy_get_header_map_pairs
-    // B-20: wasm 側アロケータ（proxy_on_memory_allocate）へ再入するため async ホスト関数
-    linker.func_wrap_async(
+    // ゲストのアロケータ（proxy_on_memory_allocate）を今のファイバーの上で呼ぶ同期のホスト関数（F-318。`exports::allocate_guest_memory`）
+    linker.func_wrap(
         "env",
         "proxy_get_header_map_pairs",
         |mut caller: Caller<'_, HostState>,
-         (map_type, return_map_ptr, return_map_size): (i32, i32, i32)| {
-            Box::new(async move {
-                let state = caller.data();
+         map_type: i32,
+         return_map_ptr: i32,
+         return_map_size: i32|
+         -> anyhow::Result<i32> {
+            let state = caller.data();
 
-                // Check capability
-                if !check_read_capability(state, map_type) {
-                    return PROXY_RESULT_NOT_ALLOWED;
-                }
+            // Check capability
+            if !check_read_capability(state, map_type) {
+                return Ok(PROXY_RESULT_NOT_ALLOWED);
+            }
 
-                let serialized = match get_headers(state, map_type) {
-                    // B-408: 疑似ヘッダを先頭に足す
-                    Some(h) => serialize_map(&state.http_ctx, map_type, h),
-                    // F-134: 認識済みの読み取り専用型（gRPC 受信メタデータ/HTTP call
-                    // 応答）はデータ未到着なら NotFound、完全に未知の型のみ BadArgument。
-                    None if is_known_map_type(map_type) => return PROXY_RESULT_NOT_FOUND,
-                    None => return PROXY_RESULT_BAD_ARGUMENT,
-                };
-                let size = serialized.len();
+            let serialized = match get_headers(state, map_type) {
+                // B-408: 疑似ヘッダを先頭に足す
+                Some(h) => serialize_map(&state.http_ctx, map_type, h),
+                // F-134: 認識済みの読み取り専用型（gRPC 受信メタデータ/HTTP call
+                // 応答）はデータ未到着なら NotFound、完全に未知の型のみ BadArgument。
+                None if is_known_map_type(map_type) => return Ok(PROXY_RESULT_NOT_FOUND),
+                None => return Ok(PROXY_RESULT_BAD_ARGUMENT),
+            };
+            let size = serialized.len();
 
-                // Allocate memory in WASM
-                let ptr = match crate::wasm::exports::allocate_guest_memory(&mut caller, size).await
-                {
-                    Some(p) => p,
-                    None => return PROXY_RESULT_INTERNAL_FAILURE,
-                };
+            // Allocate memory in WASM
+            let ptr = match crate::wasm::exports::allocate_guest_memory(&mut caller, size)? {
+                Some(p) => p,
+                None => return Ok(PROXY_RESULT_INTERNAL_FAILURE),
+            };
 
-                // Write serialized headers
-                if !write_to_wasm(&mut caller, ptr, &serialized) {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                }
+            // Write serialized headers
+            if !write_to_wasm(&mut caller, ptr, &serialized) {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
 
-                // Write return values
-                let memory = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(mem)) => mem,
-                    _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-                };
+            // Write return values
+            let memory = match caller.get_export("memory") {
+                Some(wasmtime::Extern::Memory(mem)) => mem,
+                _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
+            };
 
-                let data = memory.data_mut(&mut caller);
+            let data = memory.data_mut(&mut caller);
 
-                let ptr_offset = return_map_ptr as u32 as usize;
-                let size_offset = return_map_size as u32 as usize;
+            let ptr_offset = return_map_ptr as u32 as usize;
+            let size_offset = return_map_size as u32 as usize;
 
-                if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                }
+            if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
 
-                data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
-                data[size_offset..size_offset + 4].copy_from_slice(&(size as i32).to_le_bytes());
+            data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+            data[size_offset..size_offset + 4].copy_from_slice(&(size as i32).to_le_bytes());
 
-                PROXY_RESULT_OK
-            })
+            Ok(PROXY_RESULT_OK)
         },
     )?;
 
@@ -391,88 +391,81 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     )?;
 
     // proxy_get_header_map_value
-    linker.func_wrap_async(
+    linker.func_wrap(
         "env",
         "proxy_get_header_map_value",
-        // B-20: wasm 側アロケータへ再入するため async ホスト関数
+        // ゲストのアロケータを今のファイバーの上で呼ぶ同期のホスト関数（F-318。`exports::allocate_guest_memory`）
         |mut caller: Caller<'_, HostState>,
-         (map_type, key_ptr, key_size, return_value_ptr, return_value_size): (
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-        )| {
-            Box::new(async move {
-                let state = caller.data();
+         map_type: i32,
+         key_ptr: i32,
+         key_size: i32,
+         return_value_ptr: i32,
+         return_value_size: i32|
+         -> anyhow::Result<i32> {
+            let state = caller.data();
 
-                // Check capability
-                if !check_read_capability(state, map_type) {
-                    return PROXY_RESULT_NOT_ALLOWED;
-                }
+            // Check capability
+            if !check_read_capability(state, map_type) {
+                return Ok(PROXY_RESULT_NOT_ALLOWED);
+            }
 
-                let key = match read_string(&mut caller, key_ptr, key_size) {
-                    Some(k) => k,
-                    None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-                };
+            let key = match read_string(&mut caller, key_ptr, key_size) {
+                Some(k) => k,
+                None => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
+            };
 
-                let state = caller.data();
-                let headers = match get_headers(state, map_type) {
-                    Some(h) => h,
-                    // F-134: 認識済みの読み取り専用型はデータ未到着なら NotFound。
-                    None if is_known_map_type(map_type) => return PROXY_RESULT_NOT_FOUND,
-                    None => return PROXY_RESULT_BAD_ARGUMENT,
-                };
+            let state = caller.data();
+            let headers = match get_headers(state, map_type) {
+                Some(h) => h,
+                // F-134: 認識済みの読み取り専用型はデータ未到着なら NotFound。
+                None if is_known_map_type(map_type) => return Ok(PROXY_RESULT_NOT_FOUND),
+                None => return Ok(PROXY_RESULT_BAD_ARGUMENT),
+            };
 
-                // B-408: 疑似ヘッダ（`:path` 等）は context の要求・応答から
-                let value = match pseudo_value(&state.http_ctx, map_type, key.as_bytes()) {
-                    Some(v) => Some(v.into_owned()),
-                    // Find header value (case-insensitive)
-                    None => headers
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(key.as_bytes()))
-                        .map(|(_, v)| v.clone()),
-                };
+            // B-408: 疑似ヘッダ（`:path` 等）は context の要求・応答から
+            let value = match pseudo_value(&state.http_ctx, map_type, key.as_bytes()) {
+                Some(v) => Some(v.into_owned()),
+                // Find header value (case-insensitive)
+                None => headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key.as_bytes()))
+                    .map(|(_, v)| v.clone()),
+            };
 
-                let value = match value {
-                    Some(v) => v,
-                    None => return PROXY_RESULT_NOT_FOUND,
-                };
+            let value = match value {
+                Some(v) => v,
+                None => return Ok(PROXY_RESULT_NOT_FOUND),
+            };
 
-                // Allocate memory and write value
-                let ptr =
-                    match crate::wasm::exports::allocate_guest_memory(&mut caller, value.len())
-                        .await
-                    {
-                        Some(p) => p,
-                        None => return PROXY_RESULT_INTERNAL_FAILURE,
-                    };
+            // Allocate memory and write value
+            let ptr = match crate::wasm::exports::allocate_guest_memory(&mut caller, value.len())? {
+                Some(p) => p,
+                None => return Ok(PROXY_RESULT_INTERNAL_FAILURE),
+            };
 
-                if !write_to_wasm(&mut caller, ptr, &value) {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                }
+            if !write_to_wasm(&mut caller, ptr, &value) {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
 
-                // Write return pointers
-                let memory = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(mem)) => mem,
-                    _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-                };
+            // Write return pointers
+            let memory = match caller.get_export("memory") {
+                Some(wasmtime::Extern::Memory(mem)) => mem,
+                _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
+            };
 
-                let data = memory.data_mut(&mut caller);
+            let data = memory.data_mut(&mut caller);
 
-                let ptr_offset = return_value_ptr as u32 as usize;
-                let size_offset = return_value_size as u32 as usize;
+            let ptr_offset = return_value_ptr as u32 as usize;
+            let size_offset = return_value_size as u32 as usize;
 
-                if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                }
+            if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
 
-                data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
-                data[size_offset..size_offset + 4]
-                    .copy_from_slice(&(value.len() as i32).to_le_bytes());
+            data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+            data[size_offset..size_offset + 4].copy_from_slice(&(value.len() as i32).to_le_bytes());
 
-                PROXY_RESULT_OK
-            })
+            Ok(PROXY_RESULT_OK)
         },
     )?;
 

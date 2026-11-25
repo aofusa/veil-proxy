@@ -280,71 +280,69 @@ fn parse_len_prefixed_path(data: &[u8]) -> Option<String> {
 /// Add properties functions to linker
 pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     // proxy_get_property
-    // B-20: wasm 側アロケータへ再入するため async ホスト関数
-    linker.func_wrap_async(
+    // ゲストのアロケータを今のファイバーの上で呼ぶ同期のホスト関数（F-318。`exports::allocate_guest_memory`）
+    linker.func_wrap(
         "env",
         "proxy_get_property",
         |mut caller: Caller<'_, HostState>,
-         (path_ptr, path_size, return_value_ptr, return_value_size): (i32, i32, i32, i32)| {
-            Box::new(async move {
-                // Read path from WASM memory（B-178: 短いパスはスタックで組み立てる）
-                let mut path = PropertyPath::new();
-                {
-                    let memory = match caller.get_export("memory") {
-                        Some(wasmtime::Extern::Memory(mem)) => mem,
-                        _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-                    };
-                    let data = memory.data(&caller);
-                    let (start, len) = (path_ptr as u32 as usize, path_size as u32 as usize);
-                    let raw = match start.checked_add(len).and_then(|end| data.get(start..end)) {
-                        Some(r) => r,
-                        None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-                    };
-                    if !parse_path_into(raw, &mut path) {
-                        return PROXY_RESULT_PARSE_FAILURE;
-                    }
-                }
-
-                let state = caller.data();
-                let value = match get_property_value(state, path.as_str()) {
-                    Some(v) => v,
-                    None => return PROXY_RESULT_NOT_FOUND,
-                };
-                let value = value.as_bytes();
-
-                // Allocate memory and write value
-                let ptr =
-                    match crate::wasm::exports::allocate_guest_memory(&mut caller, value.len())
-                        .await
-                    {
-                        Some(p) => p,
-                        None => return PROXY_RESULT_INTERNAL_FAILURE,
-                    };
-
-                if !write_to_wasm(&mut caller, ptr, value) {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                }
-
-                // Write return values
+         path_ptr: i32,
+         path_size: i32,
+         return_value_ptr: i32,
+         return_value_size: i32|
+         -> anyhow::Result<i32> {
+            // Read path from WASM memory（B-178: 短いパスはスタックで組み立てる）
+            let mut path = PropertyPath::new();
+            {
                 let memory = match caller.get_export("memory") {
                     Some(wasmtime::Extern::Memory(mem)) => mem,
-                    _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+                    _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
                 };
-
-                let data = memory.data_mut(&mut caller);
-                let ptr_offset = return_value_ptr as u32 as usize;
-                let size_offset = return_value_size as u32 as usize;
-
-                if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+                let data = memory.data(&caller);
+                let (start, len) = (path_ptr as u32 as usize, path_size as u32 as usize);
+                let raw = match start.checked_add(len).and_then(|end| data.get(start..end)) {
+                    Some(r) => r,
+                    None => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
+                };
+                if !parse_path_into(raw, &mut path) {
+                    return Ok(PROXY_RESULT_PARSE_FAILURE);
                 }
+            }
 
-                data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
-                data[size_offset..size_offset + 4]
-                    .copy_from_slice(&(value.len() as i32).to_le_bytes());
+            let state = caller.data();
+            let value = match get_property_value(state, path.as_str()) {
+                Some(v) => v,
+                None => return Ok(PROXY_RESULT_NOT_FOUND),
+            };
+            let value = value.as_bytes();
 
-                PROXY_RESULT_OK
-            })
+            // Allocate memory and write value
+            let ptr = match crate::wasm::exports::allocate_guest_memory(&mut caller, value.len())? {
+                Some(p) => p,
+                None => return Ok(PROXY_RESULT_INTERNAL_FAILURE),
+            };
+
+            if !write_to_wasm(&mut caller, ptr, value) {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
+
+            // Write return values
+            let memory = match caller.get_export("memory") {
+                Some(wasmtime::Extern::Memory(mem)) => mem,
+                _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
+            };
+
+            let data = memory.data_mut(&mut caller);
+            let ptr_offset = return_value_ptr as u32 as usize;
+            let size_offset = return_value_size as u32 as usize;
+
+            if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
+
+            data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+            data[size_offset..size_offset + 4].copy_from_slice(&(value.len() as i32).to_le_bytes());
+
+            Ok(PROXY_RESULT_OK)
         },
     )?;
 

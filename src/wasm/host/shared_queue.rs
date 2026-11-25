@@ -266,51 +266,50 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     // B-247: Proxy-Wasm ABI どおり、ゲストのアロケータ（proxy_on_memory_allocate、無ければ malloc）で
     // 確保した領域にペイロードを書き、その番地と長さを return_data_ptr / return_data_size に書く
     // （以前は return_data_ptr の番地へペイロードそのものを書き、SDK が不正なポインタから Vec を作っていた）。
-    // ゲストのアロケータへ再入するため async ホスト関数（B-20）
-    linker.func_wrap_async(
+    // ゲストのアロケータを今のファイバーの上で呼ぶ同期のホスト関数（F-318。`exports::allocate_guest_memory`）
+    linker.func_wrap(
         "env",
         "proxy_dequeue_shared_queue",
         |mut caller: Caller<'_, HostState>,
-         (queue_id, return_data_ptr, return_data_size_ptr): (i32, i32, i32)| {
-            Box::new(async move {
-                let Some(me) = queue_caller(&caller) else {
-                    return PROXY_RESULT_NOT_ALLOWED;
-                };
-                let data = match SHARED_QUEUES.write() {
-                    Ok(mut registry) => registry.dequeue(&me, queue_id as u32),
-                    Err(_) => return PROXY_RESULT_INTERNAL_FAILURE,
-                };
-                let Some(bytes) = data else {
-                    // Queue empty or not found
-                    return PROXY_RESULT_EMPTY;
-                };
+         queue_id: i32,
+         return_data_ptr: i32,
+         return_data_size_ptr: i32|
+         -> anyhow::Result<i32> {
+            let Some(me) = queue_caller(&caller) else {
+                return Ok(PROXY_RESULT_NOT_ALLOWED);
+            };
+            let data = match SHARED_QUEUES.write() {
+                Ok(mut registry) => registry.dequeue(&me, queue_id as u32),
+                Err(_) => return Ok(PROXY_RESULT_INTERNAL_FAILURE),
+            };
+            let Some(bytes) = data else {
+                // Queue empty or not found
+                return Ok(PROXY_RESULT_EMPTY);
+            };
 
-                let ptr = if bytes.is_empty() {
-                    0
-                } else {
-                    match crate::wasm::exports::allocate_guest_memory(&mut caller, bytes.len())
-                        .await
-                    {
-                        Some(p) => p,
-                        None => return PROXY_RESULT_INTERNAL_FAILURE,
-                    }
-                };
-                if !bytes.is_empty() && !write_bytes(&mut caller, ptr, &bytes) {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+            let ptr = if bytes.is_empty() {
+                0
+            } else {
+                match crate::wasm::exports::allocate_guest_memory(&mut caller, bytes.len())? {
+                    Some(p) => p,
+                    None => return Ok(PROXY_RESULT_INTERNAL_FAILURE),
                 }
-                if !write_u32(&mut caller, return_data_ptr, ptr as u32)
-                    || !write_u32(&mut caller, return_data_size_ptr, bytes.len() as u32)
-                {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                }
+            };
+            if !bytes.is_empty() && !write_bytes(&mut caller, ptr, &bytes) {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
+            if !write_u32(&mut caller, return_data_ptr, ptr as u32)
+                || !write_u32(&mut caller, return_data_size_ptr, bytes.len() as u32)
+            {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
 
-                ftlog::debug!(
-                    "WASM: proxy_dequeue_shared_queue id={} size={}",
-                    queue_id,
-                    bytes.len()
-                );
-                PROXY_RESULT_OK
-            })
+            ftlog::debug!(
+                "WASM: proxy_dequeue_shared_queue id={} size={}",
+                queue_id,
+                bytes.len()
+            );
+            Ok(PROXY_RESULT_OK)
         },
     )?;
 

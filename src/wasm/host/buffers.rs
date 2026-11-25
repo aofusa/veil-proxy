@@ -132,86 +132,52 @@ fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> b
 /// Add buffer functions to linker
 pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     // proxy_get_buffer_bytes
-    // B-20: wasm 側アロケータへ再入するため async ホスト関数
-    linker.func_wrap_async(
+    // ゲストのアロケータを今のファイバーの上で呼ぶ同期のホスト関数（F-318。`exports::allocate_guest_memory`）
+    linker.func_wrap(
         "env",
         "proxy_get_buffer_bytes",
         |mut caller: Caller<'_, HostState>,
-         (buffer_type, start, max_size, return_buffer_ptr, return_buffer_size): (
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-        )| {
-            Box::new(async move {
-                let state = caller.data();
+         buffer_type: i32,
+         start: i32,
+         max_size: i32,
+         return_buffer_ptr: i32,
+         return_buffer_size: i32|
+         -> anyhow::Result<i32> {
+            let state = caller.data();
 
-                // F-134: 未知の BufferType は capability に関わらず BadArgument
-                // （NOT_ALLOWED は capability 拒否専用の veil 拡張のため誤用しない）。
-                if !is_known_buffer_type(buffer_type) {
-                    return PROXY_RESULT_BAD_ARGUMENT;
-                }
+            // F-134: 未知の BufferType は capability に関わらず BadArgument
+            // （NOT_ALLOWED は capability 拒否専用の veil 拡張のため誤用しない）。
+            if !is_known_buffer_type(buffer_type) {
+                return Ok(PROXY_RESULT_BAD_ARGUMENT);
+            }
 
-                // Check capability
-                if !check_read_capability(state, buffer_type) {
-                    return PROXY_RESULT_NOT_ALLOWED;
-                }
+            // Check capability
+            if !check_read_capability(state, buffer_type) {
+                return Ok(PROXY_RESULT_NOT_ALLOWED);
+            }
 
-                // F-61: ボディは Bytes の参照カウント共有で取得（deep copy なし）
-                let buffer = match get_buffer(state, buffer_type) {
-                    Some(b) => b,
-                    None => return PROXY_RESULT_BAD_ARGUMENT,
-                };
+            // F-61: ボディは Bytes の参照カウント共有で取得（deep copy なし）
+            let buffer = match get_buffer(state, buffer_type) {
+                Some(b) => b,
+                None => return Ok(PROXY_RESULT_BAD_ARGUMENT),
+            };
 
-                // Calculate range
-                let start_idx = start as u32 as usize;
-                let end_idx = std::cmp::min(start_idx + max_size as u32 as usize, buffer.len());
+            // Calculate range
+            let start_idx = start as u32 as usize;
+            let end_idx = std::cmp::min(start_idx + max_size as u32 as usize, buffer.len());
 
-                if start_idx > buffer.len() {
-                    return PROXY_RESULT_BAD_ARGUMENT;
-                }
+            if start_idx > buffer.len() {
+                return Ok(PROXY_RESULT_BAD_ARGUMENT);
+            }
 
-                let slice = &buffer[start_idx..end_idx];
-                let size = slice.len();
+            let slice = &buffer[start_idx..end_idx];
+            let size = slice.len();
 
-                if size == 0 {
-                    // Write null pointer and zero size
-                    let memory = match caller.get_export("memory") {
-                        Some(wasmtime::Extern::Memory(mem)) => mem,
-                        _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-                    };
-
-                    let data = memory.data_mut(&mut caller);
-                    let ptr_offset = return_buffer_ptr as u32 as usize;
-                    let size_offset = return_buffer_size as u32 as usize;
-
-                    if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
-                        return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                    }
-
-                    data[ptr_offset..ptr_offset + 4].copy_from_slice(&0i32.to_le_bytes());
-                    data[size_offset..size_offset + 4].copy_from_slice(&0i32.to_le_bytes());
-
-                    return PROXY_RESULT_OK;
-                }
-
-                // Allocate memory in WASM
-                let ptr = match crate::wasm::exports::allocate_guest_memory(&mut caller, size).await
-                {
-                    Some(p) => p,
-                    None => return PROXY_RESULT_INTERNAL_FAILURE,
-                };
-
-                // Write buffer data
-                if !write_to_wasm(&mut caller, ptr, slice) {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                }
-
-                // Write return values
+            if size == 0 {
+                // Write null pointer and zero size
                 let memory = match caller.get_export("memory") {
                     Some(wasmtime::Extern::Memory(mem)) => mem,
-                    _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+                    _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
                 };
 
                 let data = memory.data_mut(&mut caller);
@@ -219,14 +185,44 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 let size_offset = return_buffer_size as u32 as usize;
 
                 if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+                    return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
                 }
 
-                data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
-                data[size_offset..size_offset + 4].copy_from_slice(&(size as i32).to_le_bytes());
+                data[ptr_offset..ptr_offset + 4].copy_from_slice(&0i32.to_le_bytes());
+                data[size_offset..size_offset + 4].copy_from_slice(&0i32.to_le_bytes());
 
-                PROXY_RESULT_OK
-            })
+                return Ok(PROXY_RESULT_OK);
+            }
+
+            // Allocate memory in WASM
+            let ptr = match crate::wasm::exports::allocate_guest_memory(&mut caller, size)? {
+                Some(p) => p,
+                None => return Ok(PROXY_RESULT_INTERNAL_FAILURE),
+            };
+
+            // Write buffer data
+            if !write_to_wasm(&mut caller, ptr, slice) {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
+
+            // Write return values
+            let memory = match caller.get_export("memory") {
+                Some(wasmtime::Extern::Memory(mem)) => mem,
+                _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
+            };
+
+            let data = memory.data_mut(&mut caller);
+            let ptr_offset = return_buffer_ptr as u32 as usize;
+            let size_offset = return_buffer_size as u32 as usize;
+
+            if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
+
+            data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+            data[size_offset..size_offset + 4].copy_from_slice(&(size as i32).to_le_bytes());
+
+            Ok(PROXY_RESULT_OK)
         },
     )?;
 

@@ -24,80 +24,73 @@ fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<
 /// Add shared data functions to linker
 pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     // proxy_get_shared_data
-    // B-20: wasm 側アロケータへ再入するため async ホスト関数
-    linker.func_wrap_async(
+    // ゲストのアロケータを今のファイバーの上で呼ぶ同期のホスト関数（F-318。`exports::allocate_guest_memory`）
+    linker.func_wrap(
         "env",
         "proxy_get_shared_data",
         |mut caller: Caller<'_, HostState>,
-         (key_ptr, key_size, return_value_ptr, return_value_size, return_cas): (
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-        )| {
-            Box::new(async move {
-                // Check capability
-                {
-                    let state = caller.data();
-                    if !state.http_ctx.capabilities.allow_shared_data {
-                        return PROXY_RESULT_NOT_ALLOWED;
-                    }
+         key_ptr: i32,
+         key_size: i32,
+         return_value_ptr: i32,
+         return_value_size: i32,
+         return_cas: i32|
+         -> anyhow::Result<i32> {
+            // Check capability
+            {
+                let state = caller.data();
+                if !state.http_ctx.capabilities.allow_shared_data {
+                    return Ok(PROXY_RESULT_NOT_ALLOWED);
                 }
+            }
 
-                // Read key
-                let key = match read_bytes(&mut caller, key_ptr, key_size) {
-                    Some(k) => String::from_utf8_lossy(&k).to_string(),
-                    None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-                };
+            // Read key
+            let key = match read_bytes(&mut caller, key_ptr, key_size) {
+                Some(k) => String::from_utf8_lossy(&k).to_string(),
+                None => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
+            };
 
-                // Get value from shared data（B-179: モジュールで共有する表。値は `Arc` の参照を増やすだけ）
-                let (value, cas) = match caller.data().http_ctx.shared_data.get(&key) {
-                    Some(found) => found,
-                    None => return PROXY_RESULT_NOT_FOUND,
-                };
+            // Get value from shared data（B-179: モジュールで共有する表。値は `Arc` の参照を増やすだけ）
+            let (value, cas) = match caller.data().http_ctx.shared_data.get(&key) {
+                Some(found) => found,
+                None => return Ok(PROXY_RESULT_NOT_FOUND),
+            };
 
-                // Allocate memory and write value
-                let ptr =
-                    match crate::wasm::exports::allocate_guest_memory(&mut caller, value.len())
-                        .await
-                    {
-                        Some(p) => p,
-                        None => return PROXY_RESULT_INTERNAL_FAILURE,
-                    };
+            // Allocate memory and write value
+            let ptr = match crate::wasm::exports::allocate_guest_memory(&mut caller, value.len())? {
+                Some(p) => p,
+                None => return Ok(PROXY_RESULT_INTERNAL_FAILURE),
+            };
 
-                // Write value
-                let memory = match caller.get_export("memory") {
-                    Some(wasmtime::Extern::Memory(mem)) => mem,
-                    _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-                };
+            // Write value
+            let memory = match caller.get_export("memory") {
+                Some(wasmtime::Extern::Memory(mem)) => mem,
+                _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
+            };
 
-                let data = memory.data_mut(&mut caller);
-                let value_start = ptr as u32 as usize;
-                if value_start + value.len() > data.len() {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                }
-                data[value_start..value_start + value.len()].copy_from_slice(&value);
+            let data = memory.data_mut(&mut caller);
+            let value_start = ptr as u32 as usize;
+            if value_start + value.len() > data.len() {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
+            data[value_start..value_start + value.len()].copy_from_slice(&value);
 
-                // Write return pointers
-                let ptr_offset = return_value_ptr as u32 as usize;
-                let size_offset = return_value_size as u32 as usize;
-                let cas_offset = return_cas as u32 as usize;
+            // Write return pointers
+            let ptr_offset = return_value_ptr as u32 as usize;
+            let size_offset = return_value_size as u32 as usize;
+            let cas_offset = return_cas as u32 as usize;
 
-                if ptr_offset + 4 > data.len()
-                    || size_offset + 4 > data.len()
-                    || cas_offset + 4 > data.len()
-                {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                }
+            if ptr_offset + 4 > data.len()
+                || size_offset + 4 > data.len()
+                || cas_offset + 4 > data.len()
+            {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            }
 
-                data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
-                data[size_offset..size_offset + 4]
-                    .copy_from_slice(&(value.len() as i32).to_le_bytes());
-                data[cas_offset..cas_offset + 4].copy_from_slice(&cas.to_le_bytes());
+            data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+            data[size_offset..size_offset + 4].copy_from_slice(&(value.len() as i32).to_le_bytes());
+            data[cas_offset..cas_offset + 4].copy_from_slice(&cas.to_le_bytes());
 
-                PROXY_RESULT_OK
-            })
+            Ok(PROXY_RESULT_OK)
         },
     )?;
 

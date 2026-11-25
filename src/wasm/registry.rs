@@ -42,6 +42,18 @@ pub struct LoadedModule {
 /// B-173: エポックを進める間隔（`FilterEngine` の `epoch_deadline` = 10 で 1 回のコールバックは約 1 秒まで）
 pub(crate) const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// ゲストの呼び出し 1 回が使えるスタック（wasmtime の既定と同じ）
+const MAX_WASM_STACK: usize = 512 * 1024;
+
+/// コールバックを走らせるファイバーのスタック（wasmtime の既定と同じ）。
+///
+/// F-318: ホスト関数はゲストのメモリの確保関数を同じファイバーの上で呼ぶ（`exports::allocate_guest_memory`。入れ子は
+/// 1 段だけ）。非同期のストアでは wasmtime はゲストに入るたびにスタックの上限を今のスタックポインタから
+/// `MAX_WASM_STACK` 分と測り直すので、外側と入れ子の 2 回分とホストのフレームが収まる大きさにする（足りないと、
+/// 入れ子のゲストがスタックの上限の検査より先にファイバーのガードページに届く）。
+const ASYNC_STACK_SIZE: usize = 2 * 1024 * 1024;
+const _: () = assert!(ASYNC_STACK_SIZE >= 2 * MAX_WASM_STACK + 512 * 1024);
+
 /// B-173: `engine` のエポックを `EPOCH_TICK` ごとに 1 進める専用スレッドを起こす。エンジンが捨てられたら
 /// （リロードで作り直したら）次の周期で終わる。データプレーンからは何も呼ばない。
 fn spawn_epoch_ticker(engine: &Engine) {
@@ -221,9 +233,11 @@ impl ModuleRegistry {
             config.allocation_strategy(wasmtime::InstanceAllocationStrategy::OnDemand);
         }
 
-        // 非同期サポートを有効化（async host functions のため）
+        // 非同期サポートを有効化（fuel の区切りでワーカーへ制御を返すため）
         // これにより Store::call_async などの非同期実行が可能になる
         config.async_support(true);
+        config.max_wasm_stack(MAX_WASM_STACK);
+        config.async_stack_size(ASYNC_STACK_SIZE);
 
         // fuel によるCPU消費制限（主要なタイムアウト機構）
         config.consume_fuel(true);
