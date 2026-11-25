@@ -1,6 +1,6 @@
 # F-326: reactor（epoll・kqueue・WSAPoll）の送出を周回の終わりにまとめ、相手の起床を束ねる
 
-**状態: 未着手（2026-11-26 起票。F-319 の計測から分けた。F-317 の子）**
+**状態: 未着手（2026-11-26 起票。F-319 の計測から分けた。F-317 の子。HttpArena のエントリは io_uring でビルドする形にした〈F-320 の 5〉ので、HttpArena の点には効かない。残す理由はコンテナの既定の seccomp で動かす利用者と BSD・macOS・Windows）**
 
 ## 今の状態（測った値）
 
@@ -44,8 +44,8 @@ aofish（F-317 の「計測の記録」と同じ条件。サーバは CPU 0-7・
 
 ## 期待する効果
 
-- HttpArena の veil（Proxy-Wasm）のエントリが epoll のままでも、h1 の Wasm の経路が io_uring に近づく（26 万 → 35 万 rps 前後の試算）。
-  コンテナの既定の seccomp（io_uring を拒否する）で動かす利用者にも効く。
+- reactor の h1 の Wasm の経路が io_uring に近づく（aofish で 26 万 → 35 万 rps 前後の試算）。コンテナの既定の seccomp（io_uring を
+  拒否する）で動かす利用者と、BSD・macOS・Windows に効く。HttpArena のエントリは io_uring にした（F-320 の 5）ので、その点には効かない。
 
 ## 関連
 
