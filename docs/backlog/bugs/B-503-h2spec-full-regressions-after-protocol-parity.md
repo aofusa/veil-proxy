@@ -44,7 +44,7 @@ h2c:  3.5. HTTP/2 Connection Preface
 - 単体: `proxy::detect::request_line_tests::version_after_the_target_must_be_http1`。
 - 自己完結型 E2E: `protocol_parity_tests::b503_cleartext_invalid_preface_gets_goaway`（3 つの入力に GOAWAY(PROTOCOL_ERROR) の 17 バイトが
   返って FIN で閉じる。GET・PROPFIND の HTTP/1.1 は 200）。直す前の木では HTTP/1.1 の 400 を受けて落ちる。
-- h2spec（aofish の Docker、`H2SPEC_FULL=1 H2SPEC_STRICT=1`）で TLS・h2c の full が全件通ること（結果はこの後に書く）。
+- h2spec（aofish の Docker、3c6e983a の io_uring のバイナリ、`H2SPEC_FULL=1 H2SPEC_STRICT=1`）: ゲート（generic・hpack）52/52 × 2、full（`-S` の strict の 1 件を含む）は TLS・h2c とも 147/147。h3spec は 38/49 で、11 件の不一致は B-100・B-158 で調べた既知のもの（quiche が未認証の最初の Initial に CONNECTION_CLOSE を返さない・QPACK の動的テーブルを使わない。v0.10.0 の nightly と同じ）。
 
 ## 影響
 
