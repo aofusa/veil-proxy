@@ -567,7 +567,7 @@ fn merge_http3_compression(
 }
 
 /// グローバルセキュリティ設定
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct GlobalSecurityConfig {
     /// 起動後に降格するユーザー名（非root推奨）
     #[serde(default)]
@@ -832,6 +832,14 @@ pub struct GlobalSecurityConfig {
     /// - `"unescape"`: `/`・`\` に戻してから正規化する（ルートの照合と上流へ送るパスが同じになる）
     #[serde(default)]
     pub escaped_slashes: EscapedSlashesMode,
+}
+
+impl Default for GlobalSecurityConfig {
+    /// `[security]` が無いときの値（各フィールドの serde の既定。B-495。derive の `Default` は `seccomp_mode` を空・
+    /// `sandbox_no_new_privs` 等を false にしていた）
+    fn default() -> Self {
+        super::serde_defaults()
+    }
 }
 
 /// `[performance] cpu_affinity` の値（F-310）

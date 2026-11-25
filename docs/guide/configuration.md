@@ -44,7 +44,7 @@ The following table lists default values for major configuration options:
 | `[performance]` | `keepalive_direct_read_ms` | `20` | io_uring, plaintext HTTP/1.1 keep-alive: read the next request directly for this long before waiting without a buffer (`0` = always wait first; F-205) |
 | `[performance]` | `open_file_cache_enabled` | `false` | Enable OpenFileCache |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | Cache validity (seconds) |
-| `[performance]` | `open_file_cache_max_entries` | `10000` | Max cache entries |
+| `[performance]` | `open_file_cache_max_entries` | `10000` | Max cache entries (`0` caches nothing) |
 | `[performance]` | `open_file_cache_watch` | `false` | Follow disk changes by change notification (default for routes; see [Compression & Cache](compression-cache.md#static-file-caches-follow-disk-changes)) |
 | `[static_file_cache]` | `enabled` | `false` | Enable static content cache (F-146/F-150; HTTP/2/HTTP/3, and HTTP/1.1 when kTLS is disabled) |
 | `[static_file_cache]` | `valid_duration_secs` | `60` | Cache validity (seconds) |

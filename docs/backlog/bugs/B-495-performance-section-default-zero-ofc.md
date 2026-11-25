@@ -1,6 +1,19 @@
 # B-495: `[performance]` を書かない設定で open_file_cache の有効期間・最大件数が 0 になり、ルートの open_file_cache が一度も当たらない
 
-**状態: 未着手（2026-11-22 起票。F-317 の HttpArena の調査で見つけた。v0.10.1・main とも同じ）**
+**状態: 完了（2026-11-25、feat/httparena-perf。2026-11-22 起票。F-317 の HttpArena の調査で見つけた。v0.10.1・main とも同じ）**
+
+## 対応（2026-11-25）
+
+- `src/config/mod.rs` に `serde_defaults<T>()` を足した（空の map を serde で読むので、各フィールドの `#[serde(default = "...")]` が効く）。
+  `PerformanceConfigSection` と `GlobalSecurityConfig`（`src/config/compression.rs`）の `Default` をこれで書き、derive の `Default` を外した。
+  節が無いときと、節が 1 行だけのときの値が同じになる（open_file_cache は 60 秒・10000 件）。
+- `file_cache`: `max_entries == 0` は「何もキャッシュしない」（入れない）。`evict_oldest` は上限まで確実に減らす（以前は `max_entries / 10` 件で、
+  上限が 10 未満だと 0 件しか消さず、上限を超えて増え続けた）。文書（英日の configuration.md・`examples/config.toml`）に 0 の意味と、
+  `[performance]` を書かない設定でも既定が同じことを書いた。
+- 挿入のたびの `entries.len()` はミスのときだけ通る（キャッシュに当たるようになったので要求ごとの経路には無い）。要求ごとの共有の書き込みは F-321 で扱う。
+- 試験: `config::section_default_tests`（`[performance]`・`[security]` が無いときの値が serde の既定と一致。derive の `Default` に戻すと落ちる）、
+  `cache::file_cache::tests::test_insert_with_config_small_and_zero_limits`（上限 0 は入れない。上限 5 で 20 件入れても 5 件以下で、最新が残る）。
+- 計測（aofish、HttpArena のエントリと同じ設定）は [F-317](../features/F-317-httparena-infra-score-plan.md) の「計測の記録」。
 
 ## 事象
 

@@ -42,7 +42,7 @@
 | `[performance]` | `keepalive_direct_read_ms` | `20` | io_uring・平文 HTTP/1.1 のキープアライブで、次の要求をこの時間だけ直接読みにいき、その後はバッファを持たずに待つ（`0` = 常に先に待つ。F-205） |
 | `[performance]` | `open_file_cache_enabled` | `false` | OpenFileCacheを有効化 |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | キャッシュ有効期間（秒） |
-| `[performance]` | `open_file_cache_max_entries` | `10000` | 最大キャッシュエントリ数 |
+| `[performance]` | `open_file_cache_max_entries` | `10000` | 最大キャッシュエントリ数（`0` は何もキャッシュしない） |
 | `[performance]` | `open_file_cache_watch` | `false` | ディスクの変更を通知で追従する（ルートの既定値。[圧縮・キャッシュ](compression-cache.md#静的配信のキャッシュがディスクの変更に追従する)） |
 | `[static_file_cache]` | `enabled` | `false` | 静的ファイル本体キャッシュ（F-146/F-150。HTTP/2・HTTP/3、および kTLS 無効時の HTTP/1.1）を有効化 |
 | `[static_file_cache]` | `valid_duration_secs` | `60` | キャッシュ有効期間（秒） |

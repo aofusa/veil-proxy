@@ -593,8 +593,8 @@ reuseport_balancing = "cbpf"
 # open_file_cache_valid_duration_secs = 60
 
 # OpenFileCacheの最大エントリ数（グローバルデフォルト）
-# キャッシュに保持する最大ファイル情報数
-# デフォルト: 10000
+# キャッシュに保持する最大ファイル情報数。0 は何もキャッシュしない
+# デフォルト: 10000（[performance] を書かない設定でも同じ）
 # open_file_cache_max_entries = 10000
 
 # OpenFileCacheがディスクの変更を通知で追従するか（グローバルデフォルト、F-272）

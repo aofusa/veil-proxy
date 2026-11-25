@@ -1761,8 +1761,22 @@ fn default_tcp_cork() -> bool {
     true
 }
 
+/// 設定の節が無いときの値を、各フィールドの `#[serde(default ...)]` から作る（B-495）。
+///
+/// derive の `Default` は `#[serde(default = "...")]` を見ないので、節を書かない設定（serde は型の `Default` を使う）と
+/// 節を 1 行でも書いた設定とで既定値がずれる（`[performance]` が無いと open_file_cache の有効期間・最大件数が 0 になっていた）。
+/// 節の型の `Default` はこの関数で作り、フィールドの既定を 1 か所（serde の属性）にまとめる。
+pub(crate) fn serde_defaults<T: serde::de::DeserializeOwned>() -> T {
+    use serde::de::value::{Error, MapDeserializer};
+    T::deserialize(MapDeserializer::<_, Error>::new(std::iter::empty::<(
+        &str,
+        &str,
+    )>()))
+    .expect("every field of a configuration section has a serde default")
+}
+
 /// パフォーマンス設定
-#[derive(Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone)]
 pub struct PerformanceConfigSection {
     /// SO_REUSEPORTの振り分け方式
     /// - "kernel": カーネルデフォルト（3元タプルハッシュ）
@@ -1900,6 +1914,13 @@ pub struct PerformanceConfigSection {
     pub open_file_cache_watch: bool,
 }
 
+impl Default for PerformanceConfigSection {
+    /// `[performance]` が無いときの値（各フィールドの serde の既定。B-495）
+    fn default() -> Self {
+        serde_defaults()
+    }
+}
+
 impl PerformanceConfigSection {
     /// `keepalive_direct_read_ms`（未指定は 20ms。F-205）。
     pub fn keepalive_direct_read(&self) -> Duration {
@@ -1969,6 +1990,53 @@ mod blocklist_tests {
 // ====================
 // F-200: 待ち受け設定（listen / listen_cleartext）のテスト
 // ====================
+
+#[cfg(test)]
+mod section_default_tests {
+    //! 節を書かない設定の既定値（B-495）。derive の `Default` へ戻すと、節の無い設定だけ値が 0・空になる。
+    use super::*;
+
+    #[test]
+    fn performance_section_absent_uses_documented_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        for p in [&cfg.performance, &PerformanceConfigSection::default()] {
+            assert_eq!(p.open_file_cache_valid_duration_secs, 60);
+            assert_eq!(p.open_file_cache_max_entries, 10000);
+            assert_eq!(p.manual_chunk_size, 1048576);
+            assert_eq!(p.chunk_size_mode, ChunkSizeMode::Dynamic);
+            assert!(!p.open_file_cache_enabled);
+        }
+        // 節を 1 行だけ書いた設定と同じ値になる
+        let one: Config = toml::from_str("[performance]\nhuge_pages_enabled = false\n").unwrap();
+        assert_eq!(
+            one.performance.open_file_cache_max_entries,
+            cfg.performance.open_file_cache_max_entries
+        );
+        assert_eq!(
+            one.performance.open_file_cache_valid_duration_secs,
+            cfg.performance.open_file_cache_valid_duration_secs
+        );
+    }
+
+    #[test]
+    fn security_section_absent_uses_serde_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let one: Config = toml::from_str("[security]\nenable_seccomp = false\n").unwrap();
+        for s in [
+            &cfg.security,
+            &GlobalSecurityConfig::default(),
+            &one.security,
+        ] {
+            assert_eq!(s.seccomp_mode, "disabled");
+            assert!(s.sandbox_no_new_privs);
+            assert!(s.sandbox_mount_proc && s.sandbox_mount_dev);
+            assert!(s.sandbox_unshare_mount);
+            assert!(!s.allow_security_failures);
+            assert_eq!(s.landlock_read_paths, one.security.landlock_read_paths);
+            assert!(!s.landlock_read_paths.is_empty());
+        }
+    }
+}
 
 #[cfg(test)]
 mod f200_listener_tests {

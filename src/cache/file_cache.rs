@@ -391,9 +391,12 @@ impl OpenFileCache {
 
         let info = self.fetch_file_info(path).await?;
 
-        // キャッシュが大きすぎる場合は古いエントリを削除
+        // 上限 0 は「入れない」（B-495）。キャッシュが大きすぎる場合は古いエントリを削除
+        if max_entries == 0 {
+            return Some(info);
+        }
         if self.entries.len() >= max_entries {
-            self.evict_oldest();
+            self.evict_oldest(max_entries);
         }
 
         self.entries.insert(path_key(path).into(), info.clone());
@@ -562,10 +565,11 @@ impl OpenFileCache {
         .await
     }
 
-    /// 古いエントリを削除（10%を削除）
-    fn evict_oldest(&self) {
-        let max_entries = self.max_entries.load(Ordering::Relaxed);
-        let to_remove = max_entries / 10;
+    /// 古いエントリを削除して `limit` 件未満にする（`limit` の 10% か、上限を超えた分の多い方。最低 1 件）。
+    /// 以前は全体の上限の 10% だけを消していたので、上限が 10 件未満（`limit / 10 == 0`）だと何も消さずに
+    /// 全エントリの走査と確保だけを挿入のたびに繰り返し、エントリは増え続けた（B-495）
+    fn evict_oldest(&self, limit: usize) {
+        let to_remove = (limit / 10).max(self.entries.len().saturating_sub(limit) + 1);
         let mut removed = 0;
 
         // 最も古いエントリから削除
@@ -695,9 +699,13 @@ impl OpenFileCache {
         let max_entries = config
             .and_then(|c| c.max_entries)
             .unwrap_or_else(|| OPEN_FILE_CACHE_GLOBAL_MAX_ENTRIES.load(Ordering::Relaxed));
-        let current_max_entries = self.max_entries.load(Ordering::Relaxed);
-        if self.entries.len() >= max_entries.min(current_max_entries) {
-            self.evict_oldest();
+        let limit = max_entries.min(self.max_entries.load(Ordering::Relaxed));
+        // 上限 0 は「入れない」（B-495）
+        if limit == 0 {
+            return;
+        }
+        if self.entries.len() >= limit {
+            self.evict_oldest(limit);
         }
         self.entries.insert(path_key(path).into(), info);
     }
@@ -727,10 +735,13 @@ impl OpenFileCache {
         let mut info = self.fetch_file_info(path).await?;
         info.stamp = stamp;
 
-        // ルーティングごとの最大エントリ数で判定
-        let current_max_entries = self.max_entries.load(Ordering::Relaxed);
-        if self.entries.len() >= max_entries.min(current_max_entries) {
-            self.evict_oldest();
+        // ルーティングごとの最大エントリ数で判定（上限 0 は「入れない」。B-495）
+        let limit = max_entries.min(self.max_entries.load(Ordering::Relaxed));
+        if limit == 0 {
+            return Some(info);
+        }
+        if self.entries.len() >= limit {
+            self.evict_oldest(limit);
         }
 
         self.entries.insert(path_key(path).into(), info.clone());
@@ -831,6 +842,42 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use tempfile::tempdir;
+
+    /// 上限 0 は何も入れず、上限が 10 件未満でも上限を超えない（B-495。以前は `limit / 10 == 0` 件を消して増え続けた）
+    #[test]
+    // 理由付き allow: テストコード（一時ファイルの作成に同期 FS を使う。データプレーン非経由）。
+    #[allow(clippy::disallowed_methods)]
+    fn test_insert_with_config_small_and_zero_limits() {
+        let dir = tempdir().unwrap();
+        let cache = OpenFileCache::new();
+        let info = |name: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            futures::executor::block_on(cache.fetch_file_info(&p)).unwrap()
+        };
+        let zero = OpenFileCacheConfig {
+            enabled: Some(true),
+            max_entries: Some(0),
+            ..Default::default()
+        };
+        cache.insert_with_config(&dir.path().join("z"), info("z"), Some(&zero));
+        assert_eq!(cache.len(), 0, "max_entries = 0 caches nothing");
+
+        let five = OpenFileCacheConfig {
+            enabled: Some(true),
+            max_entries: Some(5),
+            ..Default::default()
+        };
+        for i in 0..20 {
+            let name = format!("f{i}");
+            cache.insert_with_config(&dir.path().join(&name), info(&name), Some(&five));
+            assert!(cache.len() <= 5, "len {} exceeds the limit", cache.len());
+        }
+        // 最後に入れたものは残る（古い方から消す）
+        assert!(cache
+            .entries
+            .contains_key(path_key(&dir.path().join("f19"))));
+    }
 
     #[test]
     fn test_file_cache_hit() {
