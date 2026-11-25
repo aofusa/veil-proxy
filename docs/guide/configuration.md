@@ -369,7 +369,7 @@ required, and they must not use the same address (a single port no longer auto-d
 | Key | Protocols | Requires |
 |-----|-----------|----------|
 | `[server].listen` | TLS: HTTP/1.1 + HTTP/2 (ALPN). Plaintext is rejected by the TLS handshake | `[tls]` |
-| `[server].listen_cleartext` | Plaintext: HTTP/1.1 + h2c (prior knowledge), told apart by protocol detection (`MSG_PEEK`) | `listen` if `enable_secure_redirect = true`; the `http2` feature for h2c |
+| `[server].listen_cleartext` | Plaintext: HTTP/1.1 + h2c (prior knowledge), told apart by protocol detection (`MSG_PEEK`). HTTP/1.1 is a request line of the form `<method token> <target> HTTP/1.x`; bytes that are neither that nor the h2c preface get `GOAWAY(PROTOCOL_ERROR)` | `listen` if `enable_secure_redirect = true`; the `http2` feature for h2c |
 | `[http3] enabled = true` | HTTP/3 (UDP) on `listen`'s address, or on `[http3].listen` if set | `listen`, `[tls]`, the `http3` feature |
 
 `listen_cleartext` keys (all under `[server]`):

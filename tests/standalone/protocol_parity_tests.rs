@@ -643,6 +643,56 @@ url = "http://127.0.0.1:{up}"
     }
 }
 
+/// B-503: 平文のリスナーで、HTTP/1.1 の要求行（トークン SP 要求先 SP `HTTP/1.`）でも h2c のプリフェースでもないものには
+/// GOAWAY(PROTOCOL_ERROR) を返し、FIN で閉じる（RFC 9113 §3.4・B-102。h2spec 3.5/2 の `INVALID CONNECTION PREFACE`）。B-490 の後は
+/// メソッドがトークンなら HTTP/1.1 とし、400 を返していた。版の付いた拡張メソッドの要求行は HTTP/1.1 のまま
+#[test]
+fn b503_cleartext_invalid_preface_gets_goaway() {
+    use std::io::{Read, Write};
+    // length=8, type=GOAWAY, flags=0, stream=0 / last_stream_id=0, error=PROTOCOL_ERROR
+    const GOAWAY_PROTOCOL_ERROR: [u8; 17] = [0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_self_signed(dir.path());
+    let ports = Ports::alloc();
+    let config = format!(
+        r#"{listeners}
+[[route]]
+[route.conditions]
+path = "/*"
+[route.action]
+type = "Respond"
+body = "ok"
+"#,
+        listeners = listeners_toml(ports, &cert, &key),
+    );
+    let veil = spawn_config(dir.path(), ports, &config);
+    for input in [
+        &b"INVALID CONNECTION PREFACE\r\n\r\n"[..],
+        // 要求先に SP（2 つ目の SP の後ろが版でない）
+        b"GET /a b HTTP/1.1\r\nHost: x\r\n\r\n",
+        // 壊れた h2c のプリフェース
+        b"PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n",
+    ] {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", ports.clear)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(input).unwrap();
+        let mut got = Vec::new();
+        // RST で閉じられると Err（相手は GOAWAY を読めない。B-102）
+        s.read_to_end(&mut got).unwrap();
+        assert_eq!(
+            got,
+            GOAWAY_PROTOCOL_ERROR,
+            "{}\n{}",
+            String::from_utf8_lossy(input),
+            veil.log()
+        );
+    }
+    for method in ["GET", "PROPFIND"] {
+        let r = fetch(Proto::H1, ports, method, "/x", &[], b"");
+        assert_eq!(r.status, 200, "{method}\n{}", veil.log());
+    }
+}
+
 /// B-487: 応答を受け始めてから `pause` の間、フロー制御のクレジットを出さずに待ち（HTTP/2 は WINDOW_UPDATE を送らず、HTTP/3 は
 /// 読まずに MAX_STREAM_DATA を出させない）、その後で本文を全部読む。読めた本文のバイト数。Err はストリームが打ち切られた
 fn paused_download(

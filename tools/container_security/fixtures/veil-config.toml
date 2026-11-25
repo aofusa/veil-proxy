@@ -45,6 +45,12 @@ landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
 huge_pages_enabled = false
 reuseport_balancing = "cbpf"
 
+# h2spec 4.2/3 は 4,000 バイトのヘッダを 5 つ付けた約 17.5 KB の HEADERS を送って FRAME_SIZE_ERROR を待つ（相手の
+# SETTINGS_MAX_FRAME_SIZE を RFC の既定の 16384 と決め打ちしている）。veil の既定の 65536 ではこのフレームは上限の内で、
+# veil は要求ヘッダの上限で 431 を返す（B-482）。この試験では RFC の既定にして、フレームの大きさの検査を確かめる（B-503）
+[http2]
+max_frame_size = 16384
+
 [prometheus]
 enabled = true
 path = "/__metrics"

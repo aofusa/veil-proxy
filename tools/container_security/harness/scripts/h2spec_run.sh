@@ -114,9 +114,14 @@ full_ok=0
 [[ "${tls_full}" -eq 1 && "${h2c_full}" -eq 1 ]] && full_ok=1
 
 if [[ "${gate_ok}" -eq 1 ]]; then
-    if [[ "${H2SPEC_STRICT}" == "1" && "${full_ok}" -eq 0 ]]; then
-        log "h2spec: gate ok, full suite failed (H2SPEC_STRICT=1)"
-        exit 1
+    if [[ "${full_ok}" -eq 0 ]]; then
+        # 集計（lib/report.sh）が失敗に数える印。以前はゲートの「: ok」の行で passed に数えられ、nightly（H2SPEC_FULL=1）が
+        # full の失敗を 4 日見逃した（B-503）。終了コードは従来どおり（0 なら後続の段階を続ける）
+        log "FAIL h2spec: gate ok, full suite failed (tls_full=${tls_full} h2c_full=${h2c_full})"
+        if [[ "${H2SPEC_STRICT}" == "1" ]]; then
+            exit 1
+        fi
+        exit 0
     fi
     log "h2spec: ok"
     exit 0

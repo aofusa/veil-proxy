@@ -361,7 +361,7 @@ path = "/var/www/index.html"
 | キー | プロトコル | 必要なもの |
 |------|-----------|-----------|
 | `[server].listen` | TLS: HTTP/1.1 + HTTP/2（ALPN）。平文は TLS ハンドシェイクの失敗で閉じる | `[tls]` |
-| `[server].listen_cleartext` | 平文: HTTP/1.1 + h2c（prior knowledge）。プロトコル検出（`MSG_PEEK`）で判別 | `enable_secure_redirect = true` なら `listen`、h2c は `http2` feature |
+| `[server].listen_cleartext` | 平文: HTTP/1.1 + h2c（prior knowledge）。プロトコル検出（`MSG_PEEK`）で判別。HTTP/1.1 は `<メソッドのトークン> <要求先> HTTP/1.x` の形の要求行で、それでも h2c のプリフェースでもないバイト列には `GOAWAY(PROTOCOL_ERROR)` を返す | `enable_secure_redirect = true` なら `listen`、h2c は `http2` feature |
 | `[http3] enabled = true` | `listen` と同じアドレス（UDP）、`[http3].listen` があればそちらで HTTP/3 | `listen`・`[tls]`・`http3` feature |
 
 `listen_cleartext` のキー（すべて `[server]` 配下）:

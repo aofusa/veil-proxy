@@ -254,10 +254,32 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
     (ProtocolType::Unknown, Vec::new())
 }
 
-/// 覗いたバイト列が HTTP/1.1 の要求行の始まり（メソッドのトークン + SP、またはトークンだけで切れている）か（B-490）
+/// 覗いたバイト列が HTTP/1.1 の要求行の始まりか（B-490・B-503）。
+///
+/// 要求行は `メソッド（トークン） SP 要求先 SP HTTP-version`（RFC 9112 §3。要求先は SP を含まない）。覗いた範囲（最大 24 バイト）で
+/// 見えている分だけ確かめる: メソッドがトークンであること（覗いた範囲がメソッド・要求先の途中で切れていれば、そこまでで可）と、
+/// 2 つ目の SP が見えていれば、その後ろが `HTTP/1.` と食い違わないこと。B-503: 2 つ目の SP の後ろを見ずに HTTP/1.1 としていたので、
+/// h2c の不正なプリフェース（h2spec 3.5/2 の `INVALID CONNECTION PREFACE`）に HTTP/1.1 の 400 を返していた（B-102 の GOAWAY に
+/// 届かない）。`PRI * HTTP/2.0` で始まる壊れたプリフェースも、版が `HTTP/1.` でないので HTTP/2 側（GOAWAY）へ回る。
 fn looks_like_http1_request_line(data: &[u8]) -> bool {
     let method_len = data.iter().position(|&b| b == b' ').unwrap_or(data.len());
-    crate::http_utils::is_valid_header_name(&data[..method_len])
+    if !crate::http_utils::is_valid_header_name(&data[..method_len]) {
+        return false;
+    }
+    // メソッドの後ろの SP が見えていない（長い拡張メソッドの途中で切れている）
+    let Some(rest) = data.get(method_len + 1..) else {
+        return true;
+    };
+    match rest.iter().position(|&b| b == b' ') {
+        Some(target_len) => {
+            const VERSION: &[u8] = b"HTTP/1.";
+            let version = &rest[target_len + 1..];
+            let k = version.len().min(VERSION.len());
+            version[..k] == VERSION[..k]
+        }
+        // 要求先の途中で切れている（長いパス）
+        None => true,
+    }
 }
 
 /// h2c 専用リスナーで HTTP/2 プリフェース以外を受けた接続を閉じる（エラー経路のみ）。
@@ -495,6 +517,35 @@ mod request_line_tests {
             b" GET / HTTP/1.1",
             b"G\x00T / HTTP/1.1",
             b"{\"a\":1}",
+        ] {
+            assert!(!looks_like_http1_request_line(d), "{d:?}");
+        }
+    }
+
+    /// B-503: 2 つ目の SP が見えていれば、その後ろは `HTTP/1.` と食い違わない（見えている分だけ比べる）
+    #[test]
+    fn version_after_the_target_must_be_http1() {
+        for d in [
+            // 覗く 24 バイトで切れた要求行（版の途中・要求先の途中）
+            &b"GET /index.html HTTP/1.1"[..],
+            b"GET / HTTP/1.0\r\nHost: a\r",
+            b"OPTIONS * HTTP/1.1\r\nHost",
+            b"CONNECT a:443 HTTP/1.1\r\n",
+            b"GET /a/long/path/that/ex",
+            b"GET / H",
+            b"GET / HTTP/1",
+            b"POST /x ",
+        ] {
+            assert!(looks_like_http1_request_line(d), "{d:?}");
+        }
+        for d in [
+            // h2spec 3.5/2（覗いた 24 バイト）
+            &b"INVALID CONNECTION PREFA"[..],
+            // 要求先に SP を含む（2 つ目の SP の後ろが版でない）
+            b"GET /a b HTTP/1.1\r\nHost:",
+            // 壊れた h2c のプリフェース（版が HTTP/1. でない）
+            b"PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n",
+            b"GET / http/1.1\r\n",
         ] {
             assert!(!looks_like_http1_request_line(d), "{d:?}");
         }

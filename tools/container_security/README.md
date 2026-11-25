@@ -226,8 +226,8 @@ CARGO_TARGET_DIR=/tmp/veil-build-target cargo build -p veil-fuzz
 
 | 変数 | 既定 | 説明 |
 |------|------|------|
-| `H2SPEC_FULL` | `0` | `1` でフルスイート（時間増） |
-| `H2SPEC_STRICT` | `0` | 厳密モード |
+| `H2SPEC_FULL` | `0` | `1` でフルスイート（時間増）。1 件でも落ちたら h2spec の段階を失敗に数える（B-503） |
+| `H2SPEC_STRICT` | `0` | `1` で h2spec の `-S`（strict のテストケースも走らせる）。フルスイートの失敗でハーネスを終了コード 1 で止める |
 | `H2SPEC_TIMEOUT` | `30` | タイムアウト秒（ハーネスへ渡す） |
 
 ### タイムアウト・ポーリング
@@ -296,6 +296,7 @@ tools/container_security/
 - **Landlock** 有効（seccomp と併用）
 - **Prometheus** `/__metrics` 有効（SIGHUP リロード検知・CB メトリクス用）
 - **ルート `/`**: 静的ファイル（h2spec 用 200 応答）
+- **`[http2] max_frame_size = 16384`**（RFC の既定）: h2spec 4.2/3 は相手のフレームの上限を 16384 と決め打ちして約 17.5 KB の HEADERS を送る。veil の既定（65536）ではこのフレームは上限の内で 431 になるので、試験では既定に戻してフレームの大きさの検査を確かめる（B-503）
 - **ルート `/api/`**: `toxi-pool` upstream（Toxiproxy 経由）+ サーキットブレーカー
 
 Toxiproxy 起動後、`prepare_veil_test_config()` が Docker DNS ホスト名 `veil-sec-toxiproxy` を **コンテナ IP に置換** します（Landlock 下の DNS/NSS 制約回避）。

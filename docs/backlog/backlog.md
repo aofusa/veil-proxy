@@ -880,6 +880,7 @@
 | B-500 | P1 | 完了（feat/httparena-perf） | [bugs/B-500-concentrate-sheds-pipelining-connections.md](bugs/B-500-concentrate-sheds-pipelining-connections.md) | 接続の集約（F-303）が要求をパイプラインで送ってくる HTTP/1.1 の接続を動かし、クライアントが送っている途中の要求を失わせる（蓄積が空でも次の要求は送る途中にある。16 本ずつのパイプラインで張り直し 1 回につき 15 要求、aofish の io_uring で 5 秒に約 930 要求）。パイプラインを見た接続は動かさない |
 | B-501 | P1 | 完了（feat/httparena-perf f680dc43） | [bugs/B-501-arc-swap-guard-held-across-await.md](bugs/B-501-arc-swap-guard-held-across-await.md) | arc_swap の Guard を `.await` をまたいで持つと、スレッドの速いスロット（8 個）が埋まり、以後の設定の読み取りが全部、全ワーカー共有の参照カウントへの加算・減算になる。HTTP/2 の接続は接続の間、HTTP/3 は要求の終わりまで、Proxy-Wasm は各フェーズで Guard を持っていた。clippy の `await_holding_invalid_type` で検出し、要求の入口で 1 回だけ読む形にした |
 | B-502 | P1 | 修正済み（feat/httparena-perf） | [bugs/B-502-url-advisory-nightly-cargo-audit.md](bugs/B-502-url-advisory-nightly-cargo-audit.md) | main の nightly の cargo-audit・cargo-deny が `url` 2.5.8 の RUSTSEC-2026-0592（`Url::origin()` のスタックオーバーフロー）で 2026-11-22 から落ちていた。本体と `tools/tokio-compat/ecosystem` の `Cargo.lock` を 2.5.9 に（veil のバイナリには入らない。quiche の試験と試験用クレートだけ） |
+| B-503 | P2 | 修正済み（feat/httparena-perf） | [bugs/B-503-h2spec-full-regressions-after-protocol-parity.md](bugs/B-503-h2spec-full-regressions-after-protocol-parity.md) | protocol-parity の後、h2spec の full で 3 件落ちていたのを nightly が見逃していた。h2c の 3.5/2 は B-490 の判別が `INVALID CONNECTION PREFACE` を HTTP/1.1 にして 400 を返していた（要求行の 2 つ目の SP の後ろが `HTTP/1.` でなければ GOAWAY(PROTOCOL_ERROR) にした）。4.2/3 は h2spec がフレームの上限を 16384 と決め打ちするので試験の設定を RFC の既定に。full の失敗を集計が passed に数えていたのも直した |
 
 ---
 

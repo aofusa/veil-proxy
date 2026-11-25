@@ -278,13 +278,15 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   vendoring 版 quiche の差分（STREAM 詰め合わせ・予約ビット検査・rlib のみ・パケット番号を飛ばす頻度・片付けたストリームの ID を範囲で持つ）は `third_party/quiche/README.veil.md`。
 - 不正なプリフェースや拒否する接続は、未読データを残して close しない（RST になり相手は GOAWAY を読めない）。
   送信側を閉じて上限付きで読み捨ててから閉じる（B-102）。
+- 平文のリスナーの判別は、要求行の形（メソッドのトークン SP 要求先 SP `HTTP/1.`）に見えている分が合うものだけを HTTP/1.1 とし、
+  それ以外は h2c の不正なプリフェースとして GOAWAY(PROTOCOL_ERROR) で閉じる（トークン + SP だけで決めると h2spec 3.5/2 に 400 を返す。B-503）。
 - seccomp の `ALLOWED_SYSCALLS` に syscall を足すときは番号を `libc::SYS_*` で確かめ、
   `test_allowed_syscalls_match_libc_numbers` にも足す（コメントと番号のずれで x86_64 の prctl が拒否されていた。B-103）。
 - FreeBSD capability mode 下の上流接続は `connect_broker`（サンドボックス外の子プロセス）経由。本体が渡すのは
   起動時に確定した許可リストの **添字だけ**（アドレス・ホスト名・パスの文字列を受け付けるプロトコルにしない）。
   新しい接続経路を足すときは reactor の `connect*` か `connect_broker::connect_std_*` を通す（F-182）。
 - container_security の判定は「本当に走ったか」を見る。h3spec の打ち切り・testssl の常時スキップ・サニタイザの
-  起動失敗を ok と報告していた（B-100〜B-103 はすべてハーネスを直して初めて見つかった）。LeakSanitizer は
+  起動失敗・h2spec の full の失敗（B-503）を ok と報告していた（B-100〜B-103 はすべてハーネスを直して初めて見つかった）。LeakSanitizer は
   終了時にしか走らず、veil の seccomp・Landlock・特権降格があると ptrace できずに落ちる（B-116）。
 - 脆弱性の検査（grype・Trivy・cargo-audit・cargo-deny）は、直す版の無いもの・保守終了・yanked も失敗にする
   （`only-fixed`・`--ignore-unfixed` を戻さない）。直せないものは土台のイメージや依存を替えて取り除き、やむを得ず残すときは
