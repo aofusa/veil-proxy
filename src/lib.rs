@@ -291,6 +291,8 @@ pub mod simple_tls;
 /// `ktls_rustls` (the rustls fallback path when `veil_ktls` is enabled) use it, so it is
 /// always compiled regardless of `veil_ktls`.
 pub(crate) mod tls_writev;
+// F-322: HTTP/1.1 のパイプラインの応答を溜めて 1 回で送る（サーバ側の TLS ストリームが持つ）
+pub(crate) mod response_hold;
 
 #[cfg(feature = "jwt")]
 #[doc(hidden)]

@@ -173,6 +173,13 @@ pub(super) async fn handle_requests(
         // B-129: 前の要求の後ろに次の要求（パイプライン）が丸ごと届いていれば、読まずに処理する
         // （読みにいくと、もう送られてこないデータを待ち続ける）
         if !std::mem::take(&mut pipelined_ready) {
+            // F-322: 次の要求を待つ前に溜めた応答を送る（送らずに待つと、クライアントは応答を待って止まる）
+            if tls_stream.has_held() {
+                match timeout(WRITE_TIMEOUT, tls_stream.flush_held()).await {
+                    Ok(Ok(())) => {}
+                    _ => return,
+                }
+            }
             let wait_first = !first_read && accumulated.is_empty();
             first_read = false;
             // F-187: 蓄積が空＝次の要求を待っているだけ。graceful shutdown ではこの待ちを即座に
@@ -927,6 +934,9 @@ pub(super) async fn handle_requests(
                 } else {
                     BytesMut::new()
                 };
+                // F-322: 後ろに次の要求のヘッダが丸ごと届いていれば、この要求の応答は溜めてよい（次の要求の応答と
+                // まとめて 1 回で送る）。応答の後に閉じる要求は溜めない
+                tls_stream.set_hold_next(!client_wants_close && has_request_head(&pipelined));
                 let initial_body: Vec<u8> = accumulated.to_vec();
 
                 // WASMモジュールの適用
@@ -1013,8 +1023,9 @@ pub(super) async fn handle_requests(
                                         client_wants_close || is_websocket || expect_waiting,
                                     );
                                     let resp_size = response.len() as u64;
+                                    // F-322: パイプラインで次の要求が届いていれば溜める
                                     let write_result =
-                                        timeout(WRITE_TIMEOUT, tls_stream.write_all(response))
+                                        timeout(WRITE_TIMEOUT, tls_stream.write_or_hold(response))
                                             .await;
                                     if !matches!(write_result, Ok((Ok(_), _))) {
                                         return;
@@ -1050,6 +1061,8 @@ pub(super) async fn handle_requests(
                                         )
                                         .await
                                     {
+                                        // F-322: 溜めた応答を送ってから閉じる
+                                        flush_held_before_close(&mut tls_stream).await;
                                         return;
                                     }
                                     if !pipelined.is_empty() {
@@ -1216,6 +1229,13 @@ pub(super) async fn handle_requests(
 
                 // WebSocket Upgrade の場合は専用ハンドラーを使用
                 if is_websocket {
+                    // F-322: 前のパイプラインの要求の溜めた応答を、トンネル（ソケットを直接使う）より先に送る
+                    if tls_stream.has_held() {
+                        match timeout(WRITE_TIMEOUT, tls_stream.flush_held()).await {
+                            Ok(Ok(())) => {}
+                            _ => return,
+                        }
+                    }
                     // WebSocket はプロキシバックエンドでのみ（上で Proxy 以外は外した）
                     if let Backend::Proxy(upstream_group, security, _, _, _, _) = backend {
                         debug!(
@@ -1395,6 +1415,8 @@ pub(super) async fn handle_requests(
 
                         // Connection: close が要求された場合、またはエラー時は接続を閉じる
                         if should_close {
+                            // F-322: 溜めた応答を送ってから閉じる
+                            flush_held_before_close(&mut tls_stream).await;
                             return;
                         }
                         // B-129: 届いている次の要求（パイプライン）を蓄積に戻す
@@ -1695,6 +1717,14 @@ pub(super) async fn handle_backend(
         // ドレイン失敗（接続が汚染されている可能性）→ 接続を閉じる
         return Some((tls_stream, 400, 0, true));
     }
+    // F-322: 前のパイプラインの要求の溜めた応答を、ソケットへ直接書く経路（上流の中継の splice・静的配信の
+    // sendfile）より先に送る。固定応答・リダイレクト・ハンドラはストリームの書き込みを通る（溜めた分を先に送る）
+    if tls_stream.has_held() && !writes_through_stream(backend) {
+        match timeout(WRITE_TIMEOUT, tls_stream.flush_held()).await {
+            Ok(Ok(())) => {}
+            _ => return None,
+        }
+    }
     match backend {
         Backend::Proxy(upstream_group, security, compression, buffering, cache, _) => {
             // handle_proxy のフューチャは約 19KB あり、インラインで待つと handle_backend の
@@ -1869,7 +1899,8 @@ pub(super) async fn handle_backend(
             } else {
                 full.clone()
             };
-            match timeout(WRITE_TIMEOUT, tls_stream.write_all(out)).await {
+            // F-322: パイプラインで次の要求が届いていれば溜める
+            match timeout(WRITE_TIMEOUT, tls_stream.write_or_hold(out)).await {
                 Ok((Ok(_), _)) => Some((
                     tls_stream,
                     r.status,
@@ -1914,6 +1945,31 @@ pub(super) async fn handle_backend(
             ))
             .await
         }
+    }
+}
+
+/// 応答をストリームの書き込み（溜めた応答を先に送る）だけで書くバックエンドか（F-322。それ以外はソケットへ直接書く
+/// 経路を持つので、前の要求の溜めた応答を先に送る）
+#[inline]
+fn writes_through_stream(backend: &Backend) -> bool {
+    match backend {
+        Backend::Respond(_) | Backend::Redirect(..) => true,
+        #[cfg(feature = "handler")]
+        Backend::Handler(..) => true,
+        _ => false,
+    }
+}
+
+/// 蓄積の先頭に要求のヘッダが丸ごと届いている（終わりの空行がある。F-322 の溜めてよいかの判定）
+#[inline]
+fn has_request_head(buf: &[u8]) -> bool {
+    !buf.is_empty() && buf.windows(4).any(|w| w == b"\r\n\r\n")
+}
+
+/// 閉じる前に溜めた応答を送る（F-322。送れなくても閉じる）
+async fn flush_held_before_close(stream: &mut ServerTls) {
+    if stream.has_held() {
+        let _ = timeout(WRITE_TIMEOUT, stream.flush_held()).await;
     }
 }
 
@@ -2076,7 +2132,13 @@ async fn write_api_response(
             _ => None,
         };
     }
-    match timeout(WRITE_TIMEOUT, tls_stream.write_all(head)).await {
+    // F-322: 本文まで 1 つのバッファに収めた応答は、パイプラインで次の要求が届いていれば溜める
+    let written = if streaming.is_none() {
+        timeout(WRITE_TIMEOUT, tls_stream.write_or_hold(head)).await
+    } else {
+        timeout(WRITE_TIMEOUT, tls_stream.write_all(head)).await
+    };
+    match written {
         Ok((Ok(_), buf)) => crate::pool::request_buf_put(buf),
         _ => return None,
     }

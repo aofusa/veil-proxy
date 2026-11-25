@@ -354,7 +354,7 @@ fn no_wait_writer(fd: RawFd) -> FdVectoredWriter {
 }
 
 /// rustls の送信待ちの暗号文を、待たずに書けるだけ書く。
-fn write_tls_now(fd: RawFd, conn: &mut impl TlsWriteSink) -> io::Result<()> {
+pub(crate) fn write_tls_now(fd: RawFd, conn: &mut impl TlsWriteSink) -> io::Result<()> {
     while conn.sink_wants_write() {
         let mut w = no_wait_writer(fd);
         if conn.sink_write_tls(&mut w)? == 0 {
@@ -362,6 +362,18 @@ fn write_tls_now(fd: RawFd, conn: &mut impl TlsWriteSink) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// 平文（kTLS の送信ではカーネルが暗号化する）を待たずに書けるだけ書く。`Drop` で閉じる直前に、溜めた応答
+/// （F-322）を送る保険。送信バッファが一杯・相手が閉じた等で送れなければ諦める
+pub(crate) fn write_now(fd: RawFd, mut data: &[u8]) {
+    let mut w = no_wait_writer(fd);
+    while !data.is_empty() {
+        match w.write(data) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => data = &data[n..],
+        }
+    }
 }
 
 /// close_notify を積んで、待たずに送る。`Drop` で閉じる直前に呼ぶ（待てない）。送信バッファが一杯・相手が閉じた等で

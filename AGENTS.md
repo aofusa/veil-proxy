@@ -135,6 +135,9 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   `RESOLVE_CACHED`・`preadv2(RWF_NOWAIT)`。`EAGAIN`・非対応はその場で offload へ回す。ブロックし得る形で呼ばない。F-304）。
 - FreeBSD の平文 h2c は、静的コンテンツキャッシュの本体（共有メモリ。`cache::shm`）の DATA を `sendfile(2)` + `sf_hdtr`
   で送る（`Http2Connection::enable_zero_copy` は平文の h2c のリスナーだけで呼ぶ。TLS で呼ぶと平文漏洩。F-240）。
+- HTTP/1.1 のパイプラインで次の要求のヘッダが届いている間は、応答を `write_or_hold` でストリームに溜め、次の要求の無い要求の
+  応答と一緒に 1 回で送る（F-322）。ソケットへ直接書く経路（`sendfile`・`splice`・トンネル等）を足すときは、その前に `flush_held` を
+  呼ぶ（ストリームの読み書きは溜めた分を先に送るが、fd を直接使う経路は送らない）。
 - HTTP/2 の要求は、HEADERS の直後に END_STREAM 付き DATA の全量が読み取りバッファに見えていれば溜める経路で起動する（本文の
   チャネル・中継のタスクが消える。見るだけで読み進めない。分割して届いたら従来のストリーミング。F-298）。トレーラは `write_buf` に積む
   （別に `write_all` すると応答ごとに `send(2)` が 2 本になる。B-333）。

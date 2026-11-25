@@ -27,6 +27,9 @@ mod protocol_parity_tests;
 ))]
 #[path = "standalone/matrix_tests.rs"]
 mod matrix_tests;
+// F-322: HTTP/1.1 のパイプラインの応答をまとめて送る経路
+#[path = "standalone/pipeline_tests.rs"]
+mod pipeline_tests;
 
 use standalone::*;
 use std::time::Duration;

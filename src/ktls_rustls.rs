@@ -78,6 +78,8 @@ pub struct KtlsServerStream {
     sent_close_notify: bool,
     /// 応答の本文が途中で切れた: 閉じるときに close_notify を送らない（F-284。[`Self::skip_close_notify`]）
     truncated: std::cell::Cell<bool>,
+    /// HTTP/1.1 のパイプラインで溜めた応答（F-322。[`Self::write_or_hold`]）
+    held: crate::response_hold::ResponseHold,
 }
 
 impl crate::runtime::io::BufferedReadState for KtlsServerStream {
@@ -97,6 +99,79 @@ impl KtlsServerStream {
     /// 送らない）。
     pub fn skip_close_notify(&self) {
         self.truncated.set(true);
+    }
+
+    /// 今の要求の後ろに次の要求が届いているか（HTTP/1.1 のパイプライン。F-322）。届いていれば
+    /// [`Self::write_or_hold`] は応答を送らずに溜める。要求の処理が要求ごとに設定する
+    #[inline]
+    pub fn set_hold_next(&mut self, next_ready: bool) {
+        self.held.set_next_ready(next_ready);
+    }
+
+    /// 溜めた応答がある（F-322）
+    #[inline]
+    pub fn has_held(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// 応答を書く（F-322）。次の要求が届いていれば溜め（送らない）、届いていなければ溜めた分と一緒に 1 回で送る。
+    /// 溜めると上限を超える応答は、溜めた分を送ってから書く
+    pub async fn write_or_hold<T: IoBuf>(
+        &mut self,
+        buf: T,
+    ) -> crate::runtime::io::BufResult<usize, T> {
+        let n = buf.bytes_init();
+        if (self.held.next_ready() || !self.held.is_empty()) && self.held.fits(n) {
+            // SAFETY: IoBuf は read_ptr() から bytes_init() バイトが初期化済み
+            let data = unsafe { std::slice::from_raw_parts(buf.read_ptr(), n) };
+            self.held.push(data);
+            if self.held.next_ready() {
+                return (Ok(n), buf);
+            }
+            return (self.flush_held().await.map(|()| n), buf);
+        }
+        crate::runtime::io::AsyncWriteRentExt::write_all(self, buf).await
+    }
+
+    /// 溜めた応答を送る（F-322）。溜めていなければ何もしない
+    pub async fn flush_held(&mut self) -> io::Result<()> {
+        if self.held.is_empty() {
+            return Ok(());
+        }
+        let data = self.held.take();
+        let (res, data) = if self.mode == TlsMode::Rustls {
+            let res = match self.conn.as_mut() {
+                Some(conn) => match push_plaintext_server(&self.inner, conn, &data).await {
+                    Ok(()) => crate::tls_writev::flush_tls_writev(&self.inner, conn).await,
+                    Err(e) => Err(e),
+                },
+                None => Err(io::Error::other("No TLS connection")),
+            };
+            (res, data)
+        } else {
+            // 平文・kTLS（カーネルが暗号化する）
+            let (res, data) =
+                crate::runtime::io::AsyncWriteRentExt::write_all(&mut self.inner, data).await;
+            (res.map(|_| ()), data)
+        };
+        crate::response_hold::recycle(data);
+        res
+    }
+
+    /// 溜めた応答を待たずに送る（`Drop`。溜めたまま閉じる経路の保険）
+    fn flush_held_now(&mut self) {
+        let data = self.held.take();
+        let fd = self.inner.as_raw_fd();
+        match (self.mode, self.conn.as_mut()) {
+            (TlsMode::Rustls, Some(conn)) => {
+                if std::io::Write::write_all(&mut conn.writer(), &data).is_ok() {
+                    let _ = crate::tls_writev::write_tls_now(fd, conn);
+                }
+            }
+            (TlsMode::Rustls, None) => {}
+            _ => crate::tls_writev::write_now(fd, &data),
+        }
+        crate::response_hold::recycle(data);
     }
 
     /// rustls が復号済みで抱えている平文をドレインバッファへ移し、未読があれば `true`（メッシュの L4 転送。
@@ -254,6 +329,12 @@ impl KtlsServerStream {
         a: A,
         b: B,
     ) -> (io::Result<()>, A, B) {
+        if !self.held.is_empty() {
+            // F-322: 溜めた応答を先に送る
+            if let Err(e) = Box::pin(self.flush_held()).await {
+                return (Err(e), a, b);
+            }
+        }
         if self.mode == TlsMode::Plain {
             return self.inner.write_all_vectored(a, b).await;
         }
@@ -958,6 +1039,7 @@ pub async fn accept_plain(
         drained_buffer: initial_data.unwrap_or_default(),
         sent_close_notify: false,
         truncated: std::cell::Cell::new(false),
+        held: Default::default(),
     })
 }
 
@@ -1053,6 +1135,7 @@ pub async fn accept(
         drained_buffer,
         sent_close_notify: false,
         truncated: std::cell::Cell::new(false),
+        held: Default::default(),
     })
 }
 
@@ -1151,6 +1234,7 @@ pub async fn accept_with_peer_cert(
             drained_buffer,
             sent_close_notify: false,
             truncated: std::cell::Cell::new(false),
+            held: Default::default(),
         },
         peer_cert,
     ))
@@ -1251,6 +1335,12 @@ pub async fn connect(
 
 impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
     async fn read<T: IoBufMut>(&mut self, mut buf: T) -> crate::runtime::io::BufResult<usize, T> {
+        if !self.held.is_empty() {
+            // F-322: 溜めた応答を先に送る（溜めない読み書きが続いた。まれなので Box に入れてフューチャを太らせない）
+            if let Err(e) = Box::pin(self.flush_held()).await {
+                return (Err(e), buf);
+            }
+        }
         // 【Phase 2】まずドレインバッファからデータを返す
         if !self.drained_buffer.is_empty() {
             let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
@@ -1364,6 +1454,12 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
 
 impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
     async fn write<T: IoBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
+        if !self.held.is_empty() {
+            // F-322: 溜めた応答を先に送る（溜めない読み書きが続いた。まれなので Box に入れてフューチャを太らせない）
+            if let Err(e) = Box::pin(self.flush_held()).await {
+                return (Err(e), buf);
+            }
+        }
         // kTLS が有効な場合は直接 TCP に書き込み（カーネルが暗号化）
         if self.mode != TlsMode::Rustls {
             return self.inner.write(buf).await;
@@ -1420,6 +1516,8 @@ impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
 
     /// close_notify を送ってから送信側を閉じる（B-401。HTTP/2 の GOAWAY の後。読み捨ては続けられる）。
     async fn shutdown(&mut self) -> io::Result<()> {
+        // F-322: 溜めた応答を先に送る
+        Box::pin(self.flush_held()).await?;
         if self.mode == TlsMode::Plain {
             return self.inner.shutdown(std::net::Shutdown::Write);
         }
@@ -1442,6 +1540,9 @@ impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
 /// 誤りの応答の後など、どの経路で閉じても通るように `Drop` で送る。待てないので 1 回だけ試す。
 impl Drop for KtlsServerStream {
     fn drop(&mut self) {
+        if !self.held.is_empty() {
+            self.flush_held_now();
+        }
         if self.truncated.get() {
             return;
         }
