@@ -72,6 +72,14 @@ HttpArena の pipelined（`GET /pipeline` を 16 本ずつまとめて送る、4
   他の回の半分の 61 回）だけが外れ、2 巡目（235k）は f321 の 2 巡（234k・246k）の間にある（接続の集約の選ぶ本数の揺れ）。
 - pipe-wasm の io_uring の f321 の失った要求 1,936 は B-500 で 0 になった（F-317）。
 
+### 残りの費用（aofish の perf、f322、pipe-plain）
+
+- 要求の処理の本体（`handle_requests`）が約 30%、`BytesMut` の共有の参照カウント（`shared_v_clone`・`shared_v_drop`）約 7%、
+  ルートの照合・キャッシュ約 5%、`httparse` 約 4%。io_uring だけ時計（`clock_gettime`）が 6〜7%（epoll は 1%）で、その 4.8% は
+  要求の処理から: io_uring の `timeout()` はタイマーを作るときに正確な時計を読み、溜める書き込み（その場で終わる）にも払っていた。
+- `runtime::uring::timer::timeout`・`timeout_idle` を、内側の Future が最初の poll で終わらなかったときだけタイマー（`Sleep`）を作る
+  形にした（期限は最初の poll から。作った直後に poll する使い方では同じ）。reactor の `Sleep::new` は粗い時計なので変えない。
+
 ## 気を付けること
 
 - 応答の順序は要求の順のまま（同じ接続の 1 本の書き込み口なので崩れない）。100-continue（本文を待つ前に送る）は溜めない。

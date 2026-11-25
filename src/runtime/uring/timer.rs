@@ -377,13 +377,16 @@ pub fn sleep(duration: Duration) -> Sleep {
 ///
 /// タイムアウト前に Future が完了すれば `Ok(R)` を返す。
 /// タイムアウトした場合は `Err(Elapsed)` を返す。
-pub async fn timeout<F, R>(duration: Duration, future: F) -> Result<R, Elapsed>
-where
-    F: Future<Output = R>,
-{
-    futures::select_biased! {
-        result = futures::FutureExt::fuse(future) => Ok(result),
-        _ = futures::FutureExt::fuse(sleep(duration)) => Err(Elapsed),
+///
+/// タイマー（[`Sleep`]）は内側の Future が最初の poll で終わらなかったときに作る。io_uring の `Sleep::new` は
+/// 正確な時計（`clock_gettime`）を読むので、その場で終わる Future（パイプラインで溜める応答の書き込み等）に
+/// 時計とタイマーの費用を払わせない（F-322。期限は最初の poll からで、作った直後に poll する使い方では同じ）。
+pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
+    Timeout {
+        future,
+        sleep: None,
+        duration,
+        idle: false,
     }
 }
 
@@ -391,17 +394,47 @@ where
 /// 即座に `Err(Elapsed)` になる（F-187）。キープアライブで次の要求を待つ間だけ `idle = true` に
 /// する（要求の途中・応答の途中の待ちに使うと処理中の要求を打ち切る）。内側の Future が先に
 /// 完了していればそちらを返す（パイプライン化された次の要求は処理される）。
-pub async fn timeout_idle<F, R>(duration: Duration, idle: bool, future: F) -> Result<R, Elapsed>
-where
-    F: Future<Output = R>,
-{
-    let mut timer = sleep(duration);
-    timer.idle = idle;
-    // `Fuse` で包む（`Sleep` 自身の `is_terminated` は満了済みで true を返すので、そのまま渡すと
-    // select が満了した枝を飛ばして永久に待つ）。
-    futures::select_biased! {
-        result = futures::FutureExt::fuse(future) => Ok(result),
-        _ = futures::FutureExt::fuse(timer) => Err(Elapsed),
+pub fn timeout_idle<F: Future>(duration: Duration, idle: bool, future: F) -> Timeout<F> {
+    Timeout {
+        future,
+        sleep: None,
+        duration,
+        idle,
+    }
+}
+
+/// [`timeout`]・[`timeout_idle`] の Future。内側の Future を先に poll する（両方が終わっていれば内側の結果を返す）
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Timeout<F> {
+    future: F,
+    /// 内側の Future が最初に `Pending` を返したときに作る
+    sleep: Option<Sleep>,
+    duration: Duration,
+    idle: bool,
+}
+
+impl<F: Future> Future for Timeout<F> {
+    type Output = Result<F::Output, Elapsed>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: `future` だけを構造的にピン留めする（この中でも外でもムーブしない）。他のフィールドは
+        // ピン留めしない（`Sleep` は Unpin）
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: `this.future` は `self` と一緒にピン留めされている
+        let future = unsafe { Pin::new_unchecked(&mut this.future) };
+        if let Poll::Ready(r) = future.poll(cx) {
+            return Poll::Ready(Ok(r));
+        }
+        let (duration, idle) = (this.duration, this.idle);
+        let sleep = this.sleep.get_or_insert_with(|| {
+            let mut s = Sleep::new(duration);
+            s.idle = idle;
+            s
+        });
+        match Pin::new(sleep).poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(Elapsed)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -455,6 +488,32 @@ mod tests {
             let result = timeout(Duration::from_secs(5), async { 42 }).await;
             assert_eq!(result, Ok(42));
         });
+    }
+
+    /// F-322: 最初の poll で終わる Future にはタイマーを作らない（時計も読まない）。終わらない Future には作る
+    /// （io_uring を使わない）
+    #[test]
+    fn timeout_makes_no_timer_for_a_future_that_is_ready_at_once() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut ready = timeout(Duration::from_secs(30), async { 7 });
+        // SAFETY: この関数の中でムーブしない
+        let ready = unsafe { Pin::new_unchecked(&mut ready) };
+        assert_eq!(ready.poll(&mut cx), Poll::Ready(Ok(7)));
+        assert!(!has_timers(), "a ready future must not register a timer");
+
+        {
+            let mut pending = timeout(Duration::from_secs(30), std::future::pending::<()>());
+            // SAFETY: このブロックの中でムーブしない
+            let pending = unsafe { Pin::new_unchecked(&mut pending) };
+            assert_eq!(pending.poll(&mut cx), Poll::Pending);
+            assert!(has_timers(), "a pending future needs its timer");
+        }
+        assert_eq!(
+            next_deadline(),
+            None,
+            "the timer is released with the future"
+        );
     }
 
     #[test]
