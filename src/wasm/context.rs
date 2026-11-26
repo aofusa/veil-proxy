@@ -151,8 +151,8 @@ pub struct HttpContext {
     pub root_context_id: i32,
 
     // === Request ===
-    /// Request headers (binary)。ホスト関数が書き換えるときは [`Self::request_headers_mut`]・
-    /// [`Self::replace_request_headers`] を通す（本文の段は上流へ送る表を見せている）
+    /// Request headers (binary)。ホスト関数が書き換えるときは `request_headers_mut`・`replace_request_headers` を
+    /// 通す（本文の段は上流へ送る表を見せている）
     pub request_headers: Vec<(Vec<u8>, Vec<u8>)>,
     /// 本文の段で `request_headers` が上流へ送る表か（F-330。[`UpstreamRequestHeaders`]）
     pub(crate) upstream_request_headers: UpstreamRequestHeaders,

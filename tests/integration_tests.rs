@@ -1539,15 +1539,18 @@ mod f150_tls_writev_roundtrip {
         Arc::new(config)
     }
 
-    /// 送出する 3 ケース（ヘッダ + ボディ）: 54KB（TLS レコード境界をまたぐ）・3B・0B。
+    /// 送出する 4 ケース（ヘッダ + ボディ）: 54KB（TLS レコード境界をまたぐ）・3B・0B・150KB（rustls の送信バッファの
+    /// 既定の上限 64 KiB を超え、平文の一部だけが受け取られて残りを送ってから続ける）。
     fn make_cases() -> Vec<(&'static [u8], Vec<u8>)> {
         let body_54k: Vec<u8> = (0..54_000usize).map(|i| (i % 251) as u8).collect();
         let body_3b: Vec<u8> = vec![0x11, 0x22, 0x33];
         let body_0b: Vec<u8> = Vec::new();
+        let body_150k: Vec<u8> = (0..150_000usize).map(|i| (i * 7 % 253) as u8).collect();
         vec![
             (b"HDR1".as_slice(), body_54k),
             (b"HDR2".as_slice(), body_3b),
             (b"HDR3".as_slice(), body_0b),
+            (b"HDR4".as_slice(), body_150k),
         ]
     }
 

@@ -2567,11 +2567,67 @@ mod f331_request_reuse_tests {
     (i32.const 0))
 )"#;
 
-    fn engine(dir: &std::path::Path, instance_reuse: bool) -> Arc<FilterEngine> {
+    /// `proxy_get_property` を表のパス・最後の NUL・`.` で繋いだ形・長さ付きの形・許可の無いプロパティ・メモリの外の場所・
+    /// アロケータの失敗で呼び、ケースごとに戻り値を要求ヘッダ `r<ケース>`（`A` + 戻り値の 1 バイト）に、成功なら値を
+    /// `v<ケース>` に足すモジュール。アロケータは `$mode` が 1 ならメモリの終わりの 1 バイト前、2 なら 0 を返す
+    const PROPERTY_MODULE: &str = r#"(module
+  (import "env" "proxy_get_property" (func $prop (param i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_add_header_map_value"
+    (func $add (param i32 i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (global $bump (mut i32) (i32.const 4096))
+  (global $mode (mut i32) (i32.const 0))
+  (data (i32.const 0) "request\00path")
+  (data (i32.const 16) "request\00path\00")
+  (data (i32.const 32) "request.path")
+  (data (i32.const 48) "source\00address")
+  (data (i32.const 80) "\02\00\00\00\07\00\00\00request\04\00\00\00path")
+  (data (i32.const 128) "\00\00")
+  (func (export "proxy_on_memory_allocate") (param $n i32) (result i32)
+    (local $p i32)
+    (if (i32.eq (global.get $mode) (i32.const 1)) (then (return (i32.const 65535))))
+    (if (i32.eq (global.get $mode) (i32.const 2)) (then (return (i32.const 0))))
+    (local.set $p (global.get $bump))
+    (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+    (local.get $p))
+  (func (export "proxy_on_context_create") (param i32 i32))
+  (func (export "proxy_on_vm_start") (param i32 i32) (result i32) (i32.const 1))
+  (func (export "proxy_on_configure") (param i32 i32) (result i32) (i32.const 1))
+  (func $case (param $c i32) (param $path i32) (param $len i32) (param $ret i32) (param $size i32)
+    (local $rc i32)
+    (local.set $rc (call $prop (local.get $path) (local.get $len) (local.get $ret) (local.get $size)))
+    (i32.store8 (i32.const 200) (i32.const 114))
+    (i32.store8 (i32.const 201) (local.get $c))
+    (i32.store8 (i32.const 202) (i32.add (i32.const 65) (local.get $rc)))
+    (drop (call $add (i32.const 0) (i32.const 200) (i32.const 2) (i32.const 202) (i32.const 1)))
+    (if (i32.eqz (local.get $rc))
+      (then
+        (i32.store8 (i32.const 200) (i32.const 118))
+        (drop (call $add (i32.const 0) (i32.const 200) (i32.const 2)
+          (i32.load (local.get $ret)) (i32.load (local.get $size)))))))
+  (func (export "proxy_on_request_headers") (param i32 i32 i32) (result i32)
+    (call $case (i32.const 97) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
+    (call $case (i32.const 98) (i32.const 16) (i32.const 13) (i32.const 64) (i32.const 68))
+    (call $case (i32.const 99) (i32.const 32) (i32.const 12) (i32.const 64) (i32.const 68))
+    (call $case (i32.const 100) (i32.const 80) (i32.const 23) (i32.const 64) (i32.const 68))
+    (call $case (i32.const 101) (i32.const 48) (i32.const 14) (i32.const 64) (i32.const 68))
+    (call $case (i32.const 102) (i32.const 0) (i32.const 12) (i32.const 65534) (i32.const 68))
+    (call $case (i32.const 103) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const -1))
+    (call $case (i32.const 104) (i32.const 65530) (i32.const 12) (i32.const 64) (i32.const 68))
+    (call $case (i32.const 105) (i32.const 128) (i32.const 2) (i32.const 64) (i32.const 68))
+    (global.set $mode (i32.const 1))
+    (call $case (i32.const 106) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
+    (global.set $mode (i32.const 2))
+    (call $case (i32.const 107) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
+    (global.set $mode (i32.const 0))
+    (i32.const 0))
+)"#;
+
+    fn engine(dir: &std::path::Path, module: &str, instance_reuse: bool) -> Arc<FilterEngine> {
         let path = dir.join("m.wat");
         // 理由付き allow: テストのフィクスチャ作成（ホットパス外）。
         #[allow(clippy::disallowed_methods)]
-        std::fs::write(&path, MODULE).unwrap();
+        std::fs::write(&path, module).unwrap();
         let config = WasmConfig {
             enabled: true,
             defaults: Default::default(),
@@ -2626,7 +2682,7 @@ mod f331_request_reuse_tests {
         let dir = std::env::temp_dir().join(format!("veil-f331-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for reuse in [false, true] {
-            let engine = engine(&dir, reuse);
+            let engine = engine(&dir, MODULE, reuse);
             for (path, method) in [("/p?q=1", "POST"), ("/second", "PUT"), ("/p?q=1", "GET")] {
                 assert_eq!(
                     request(&engine, path, method),
@@ -2650,7 +2706,7 @@ mod f331_request_reuse_tests {
     fn request_sessions_are_reused_after_the_last_clone() {
         let dir = std::env::temp_dir().join(format!("veil-f331r-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let engine = engine(&dir, true);
+        let engine = engine(&dir, MODULE, true);
         let w = crate::wasm::worker_engine(&engine);
         crate::wasm::RequestSessions::release_free();
         let new =
@@ -2686,6 +2742,99 @@ mod f331_request_reuse_tests {
         crate::wasm::release_worker_engine();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// ログの段まで行かずに手放した要求（接続の切断等）の状態を使い回すときも、context を消す表へ積み、インスタンスの
+    /// 次の利用で `proxy_on_delete` する（`RequestSessions` の `Drop` と同じ）
+    #[test]
+    fn a_request_dropped_before_the_log_phase_is_deleted_on_the_next_use() {
+        let dir = std::env::temp_dir().join(format!("veil-f331d-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = engine(&dir, MODULE, true);
+        let w = crate::wasm::worker_engine(&engine);
+        crate::wasm::RequestSessions::release_free();
+        let new =
+            || WasmModules::for_request(Arc::new(vec![ModuleRef::from_name("m")]), Rc::clone(&w));
+        let headers = |modules: &WasmModules, path: &str| match futures::executor::block_on(
+            engine.on_request_headers_with_modules_async(
+                modules,
+                Arc::from(path),
+                Arc::from("GET"),
+                vec![],
+                Arc::from("127.0.0.1"),
+                true,
+            ),
+        ) {
+            FilterResult::Continue { headers, .. } => headers,
+            FilterResult::LocalResponse(r) => panic!("unexpected {}", r.status_code),
+        };
+        let modules = new();
+        let first: *const crate::wasm::RequestSessions = modules.sessions().unwrap();
+        headers(&modules, "/a");
+        assert_eq!(modules.sessions().unwrap().len(), 1);
+        assert_eq!(engine.pending_deletes("m"), 0);
+        drop(modules);
+        assert_eq!(engine.pending_deletes("m"), 1);
+        // 次の要求は空にした同じ状態を使い、インスタンスを使うときに前の要求の context を消す
+        let next = new();
+        assert!(std::ptr::eq(next.sessions().unwrap(), first));
+        assert_eq!(
+            headers(&next, "/b"),
+            vec![
+                (b"x-path".to_vec(), b"/b".to_vec()),
+                (b"x-method".to_vec(), b"GET".to_vec()),
+            ]
+        );
+        assert_eq!(engine.pending_deletes("m"), 0);
+        futures::executor::block_on(crate::wasm::on_request_complete_async(&next));
+        drop(next);
+        assert_eq!(engine.pending_deletes("m"), 0);
+        assert_eq!(engine.pooled_instances("m"), 1);
+        drop(w);
+        crate::wasm::RequestSessions::release_free();
+        crate::wasm::release_worker_engine();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `proxy_get_property` をホスト関数として呼ぶ: 表のパス（最後の NUL の有無）・`.` で繋いだ形・長さ付きの形は同じ値、
+    /// 許可の無いプロパティは NOT_FOUND、パス・戻り値の場所・アロケータの返す場所がメモリの外なら INVALID_MEMORY_ACCESS、
+    /// 読めないパスは PARSE_FAILURE、アロケータが 0 を返したら INTERNAL_FAILURE（使い回すモジュールとそうでないもので同じ）
+    #[test]
+    fn get_property_paths_permissions_and_bad_pointers() {
+        use crate::wasm::constants::{
+            PROXY_RESULT_INTERNAL_FAILURE as INTERNAL,
+            PROXY_RESULT_INVALID_MEMORY_ACCESS as MEMORY, PROXY_RESULT_NOT_FOUND as NOT_FOUND,
+            PROXY_RESULT_OK as OK, PROXY_RESULT_PARSE_FAILURE as PARSE,
+        };
+        let dir = std::env::temp_dir().join(format!("veil-f331p-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rc = |c: u8, code: i32| (vec![b'r', c], vec![b'A' + code as u8]);
+        let value = |c: u8| (vec![b'v', c], b"/p?q=1".to_vec());
+        let want = vec![
+            rc(b'a', OK),
+            value(b'a'),
+            rc(b'b', OK),
+            value(b'b'),
+            rc(b'c', OK),
+            value(b'c'),
+            rc(b'd', OK),
+            value(b'd'),
+            rc(b'e', NOT_FOUND),
+            rc(b'f', MEMORY),
+            rc(b'g', MEMORY),
+            rc(b'h', MEMORY),
+            rc(b'i', PARSE),
+            rc(b'j', MEMORY),
+            rc(b'k', INTERNAL),
+        ];
+        for reuse in [false, true] {
+            let engine = engine(&dir, PROPERTY_MODULE, reuse);
+            for _ in 0..2 {
+                assert_eq!(request(&engine, "/p?q=1", "GET"), want, "reuse={reuse}");
+            }
+        }
+        crate::wasm::release_worker_engine();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // F-318: プールのインスタンスの context を空へ戻すと、要求の中身は作り直したときと同じ空になり、モジュールのもの
@@ -2693,7 +2842,9 @@ mod f331_request_reuse_tests {
 mod f318_recycle_tests {
     use crate::wasm::capabilities::ModuleCapabilities;
     use crate::wasm::context::{HttpContext, RequestInfo};
-    use crate::wasm::types::LocalResponse;
+    use crate::wasm::types::{
+        HttpCallResponse, LocalResponse, Metric, MetricValue, PendingHttpCall,
+    };
     use bytes::Bytes;
     use std::sync::Arc;
 
@@ -2876,6 +3027,36 @@ mod f318_recycle_tests {
         });
         ctx.custom_properties.insert("k".into(), b"v".to_vec());
         ctx.next_metric_id = 9;
+        ctx.set_response_body(Bytes::from_static(b"resp"), true);
+        ctx.request_line_overridden = true;
+        ctx.pending_http_calls.insert(
+            3,
+            PendingHttpCall {
+                token: 3,
+                upstream: "u".to_string(),
+                timeout_ms: 10,
+                headers: vec![],
+                body: b"call".to_vec(),
+                trailers: vec![],
+            },
+        );
+        ctx.http_call_responses.insert(
+            3,
+            HttpCallResponse {
+                status_code: 200,
+                headers: vec![],
+                body: b"answer".to_vec(),
+                trailers: vec![],
+            },
+        );
+        ctx.metrics.insert(
+            8,
+            Metric {
+                name: "m".to_string(),
+                metric_type: 0,
+                value: MetricValue::Counter(1),
+            },
+        );
         ctx
     }
 
@@ -2910,6 +3091,10 @@ mod f318_recycle_tests {
             assert!(ctx.local_response.is_none());
             assert!(ctx.custom_properties.is_empty());
             assert_eq!(ctx.next_metric_id, 1);
+            assert!(ctx.response_body.is_empty() && !ctx.response_body_complete);
+            assert!(!ctx.request_line_overridden);
+            assert!(ctx.pending_http_calls.is_empty() && ctx.http_call_responses.is_empty());
+            assert!(ctx.metrics.is_empty());
             if body_phase {
                 assert!(Arc::ptr_eq(&ctx.client_ip, &ip));
                 assert_eq!(ctx.request_headers, vec![(b"h".to_vec(), b"v".to_vec())]);
@@ -2951,7 +3136,9 @@ mod f329_chained_request_tests {
     ///   からトラップする（B-299）。6 つ: 403 を返し、続くログの段で 500 を返そうとする。7 つ: 403 を返し、続く削除の段で
     ///   トラップする。8 つ: Pause（本文を待つ）。9 つ: `request.path` を `/x` に書き換えて続ける。それ以外: 続ける
     /// - 本文 1 バイト: 413 を返す。2 バイト: Pause。3 バイト: トラップ。6 バイト: 要求ヘッダ `x-b` を足し、本文を `new`
-    ///   にする。7 バイト: 413 を返してからトラップする（B-299）。それ以外: 続ける
+    ///   にする。7 バイト: 413 を返してからトラップする（B-299）。8 バイト: 要求ヘッダ `x-0` を `r` に置き換える。
+    ///   9 バイト: `x-0` を消す。10 バイト: 表を `x-s: 1` だけにする（8〜10 バイトは、変えた表が本文の段の中で見えれば本文を
+    ///   `seen`、見えなければ `miss` にする）。それ以外: 続ける
     const MODULE: &str = r#"(module
   (import "env" "proxy_send_local_response"
     (func $slr (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
@@ -2961,12 +3148,27 @@ mod f329_chained_request_tests {
     (func $setbuf (param i32 i32 i32 i32 i32) (result i32)))
   (import "env" "proxy_set_property"
     (func $setprop (param i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_replace_header_map_value"
+    (func $replace (param i32 i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_remove_header_map_value"
+    (func $remove (param i32 i32 i32) (result i32)))
+  (import "env" "proxy_set_header_map_pairs"
+    (func $set_pairs (param i32 i32 i32) (result i32)))
+  (import "env" "proxy_get_header_map_value"
+    (func $get (param i32 i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 64) "x-b")
   (data (i32.const 72) "1")
   (data (i32.const 80) "new")
   (data (i32.const 96) "request\00path")
   (data (i32.const 112) "/x")
+  (data (i32.const 128) "\01\00\00\00\03\00\00\00\01\00\00\00x-s\001\00")
+  (data (i32.const 160) "x-0")
+  (data (i32.const 168) "r")
+  (data (i32.const 176) "x-s")
+  (data (i32.const 184) "seen")
+  (data (i32.const 192) "miss")
+  (global $bump (mut i32) (i32.const 4096))
   (global $create (mut i32) (i32.const 0))
   (global $hdrs (mut i32) (i32.const 0))
   (global $body (mut i32) (i32.const 0))
@@ -2975,6 +3177,30 @@ mod f329_chained_request_tests {
   (global $trap_log (mut i32) (i32.const 0))
   (global $slr_log (mut i32) (i32.const 0))
   (global $trap_del (mut i32) (i32.const 0))
+  (func (export "proxy_on_memory_allocate") (param $n i32) (result i32)
+    (local $p i32)
+    (if (i32.gt_u (i32.add (global.get $bump) (local.get $n)) (i32.const 65536))
+      (then (global.set $bump (i32.const 4096))))
+    (local.set $p (global.get $bump))
+    (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+    (local.get $p))
+  ;; 要求ヘッダ（名前は $k から $kl バイト）の値が $want の 1 バイトか
+  (func $value_is (param $k i32) (param $kl i32) (param $want i32) (result i32)
+    (i32.store (i32.const 204) (i32.const 0))
+    (if (call $get (i32.const 0) (local.get $k) (local.get $kl) (i32.const 200) (i32.const 204))
+      (then (return (i32.const 0))))
+    (i32.and (i32.eq (i32.load (i32.const 204)) (i32.const 1))
+      (i32.eq (i32.load8_u (i32.load (i32.const 200))) (i32.load8_u (local.get $want)))))
+  ;; 要求ヘッダが無いか
+  (func $absent (param $k i32) (param $kl i32) (result i32)
+    (i32.store (i32.const 204) (i32.const 0))
+    (if (call $get (i32.const 0) (local.get $k) (local.get $kl) (i32.const 200) (i32.const 204))
+      (then (return (i32.const 1))))
+    (i32.eqz (i32.load (i32.const 204))))
+  ;; 本文を `seen`（変えた表が見えた）か `miss` にする
+  (func $mark (param $seen i32) (param $size i32)
+    (drop (call $setbuf (i32.const 0) (i32.const 0) (local.get $size)
+      (select (i32.const 184) (i32.const 192) (local.get $seen)) (i32.const 4))))
   (func $report (param $status i32)
     (i32.store8 (i32.const 0) (i32.add (i32.const 48) (global.get $create)))
     (i32.store8 (i32.const 1) (i32.add (i32.const 48) (global.get $hdrs)))
@@ -3011,6 +3237,21 @@ mod f329_chained_request_tests {
       (then
         (drop (call $add (i32.const 0) (i32.const 64) (i32.const 3) (i32.const 72) (i32.const 1)))
         (drop (call $setbuf (i32.const 0) (i32.const 0) (local.get $size) (i32.const 80) (i32.const 3)))))
+    (if (i32.eq (local.get $size) (i32.const 8))
+      (then
+        (drop (call $replace (i32.const 0) (i32.const 160) (i32.const 3) (i32.const 168) (i32.const 1)))
+        (call $mark (call $value_is (i32.const 160) (i32.const 3) (i32.const 168)) (local.get $size))))
+    (if (i32.eq (local.get $size) (i32.const 9))
+      (then
+        (drop (call $remove (i32.const 0) (i32.const 160) (i32.const 3)))
+        (call $mark (call $absent (i32.const 160) (i32.const 3)) (local.get $size))))
+    (if (i32.eq (local.get $size) (i32.const 10))
+      (then
+        (drop (call $set_pairs (i32.const 0) (i32.const 128) (i32.const 18)))
+        (call $mark
+          (i32.and (call $value_is (i32.const 176) (i32.const 3) (i32.const 72))
+            (call $absent (i32.const 160) (i32.const 3)))
+          (local.get $size))))
     (i32.eq (local.get $size) (i32.const 2)))
   (func (export "proxy_on_log") (param i32)
     (global.set $log (i32.add (global.get $log) (i32.const 1)))
@@ -3052,6 +3293,7 @@ mod f329_chained_request_tests {
                 path: path.to_string_lossy().into_owned(),
                 capabilities: ModuleCapabilities {
                     allow_send_local_response: true,
+                    allow_request_headers_read: true,
                     allow_request_headers_write: true,
                     allow_request_body_read: true,
                     allow_request_body_write: true,
@@ -3240,6 +3482,37 @@ mod f329_chained_request_tests {
         }
         assert!(!s.logged());
         log(&f, &["m"], &s);
+    }
+
+    // F-330: 本文の段でヘッダを置き換える・消す・表ごと置き換えると、本文の段の中では変えた表が見え、上流へは段の前の表が
+    // 届く（続けて呼ぶ経路と段を別に呼ぶ経路で同じ）
+    #[test]
+    fn body_phase_header_changes_are_seen_in_the_phase_but_not_upstream() {
+        let f = build(&["m"], true, None);
+        for body in [&b"replace!"[..], b"remove!!!", b"set pairs!"] {
+            let s = RequestSessions::default();
+            for sessions in [Some(&s), None] {
+                let what = format!(
+                    "{:?} chained={}",
+                    String::from_utf8_lossy(body),
+                    sessions.is_some()
+                );
+                match with_body(&f, &["m"], 2, body, sessions) {
+                    FilterResult::Continue {
+                        headers: h,
+                        body: b,
+                    } => {
+                        assert_eq!(h, headers(2), "{what}");
+                        assert_eq!(b.as_deref(), Some(&b"seen"[..]), "{what}");
+                    }
+                    FilterResult::LocalResponse(r) => {
+                        panic!("{what}: unexpected {}", r.status_code)
+                    }
+                }
+            }
+            assert!(!s.logged());
+            log(&f, &["m"], &s);
+        }
     }
 
     // B-299: ヘッダの段がローカル応答を決めてからトラップしたら、応答は返すがログの段は続けて呼ばない（インスタンスは

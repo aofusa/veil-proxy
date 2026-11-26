@@ -67,7 +67,7 @@ const RECENT_STR_MAX: usize = 256;
 /// 種類ごとにワーカーのスレッドで直前に作ったものと同じバイト列なら、その `Arc` を複製して返す（F-331。キープアライブで
 /// 同じクライアント・ホスト・パスから続く要求は、要求ごとに文字列を確保して写さない。メソッドは種類ごとに持つ）。
 /// 値はスレッドの中で作って複製するだけ（全ワーカー共有の値にすると、参照カウントへの書き込みがコアをまたぐ。F-321）。
-/// [`RECENT_STR_MAX`] より長いもの・UTF-8 でないものは持たずに作る
+/// `RECENT_STR_MAX` より長いもの・UTF-8 でないものは持たずに作る
 pub fn request_str(kind: RequestStr, bytes: &[u8], fallback: &'static str) -> Arc<str> {
     let make = || Arc::<str>::from(std::str::from_utf8(bytes).unwrap_or(fallback));
     if bytes.len() > RECENT_STR_MAX {

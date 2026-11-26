@@ -357,8 +357,9 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             dst.copy_from_slice(value);
             let ptr_offset = return_value_ptr as u32 as usize;
             let size_offset = return_value_size as u32 as usize;
-
-            if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
+            let len = data.len();
+            let fits = |offset: usize| offset.checked_add(4).is_some_and(|end| end <= len);
+            if !fits(ptr_offset) || !fits(size_offset) {
                 return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
             }
 
@@ -443,8 +444,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        get_property_value, known_property, parse_len_prefixed_path, parse_path, parse_path_into,
-        PropertyPath, PropertyValue, KNOWN_PROPERTIES,
+        get_property_value, known_property, parse_len_prefixed_into, parse_len_prefixed_path,
+        parse_path, parse_path_into, PropertyPath, PropertyValue, KNOWN_PROPERTIES,
     };
     use crate::wasm::capabilities::ModuleCapabilities;
     use crate::wasm::context::{HostState, HttpContext};
@@ -569,6 +570,40 @@ mod tests {
         ] {
             assert_eq!(known_property(raw), None, "{raw:?}");
         }
+    }
+
+    /// F-331: ヒープへ移った後も `clear` で空に戻り、次のパスはスタックのバッファで組み立てる。長さ付きの形の途中で読めなく
+    /// なったときも、組み立てかけた分（ヒープへ移ったもの）を残さずに NUL 区切りとして読み直す
+    #[test]
+    fn property_path_is_cleared_after_spilling() {
+        let mut p = PropertyPath::new();
+        p.push(&[b'x'; 200]);
+        assert!(p.heap.is_some());
+        assert_eq!(p.as_str().len(), 200);
+        p.clear();
+        assert!(p.is_empty() && p.as_str().is_empty() && p.heap.is_none());
+        for part in [&b"request"[..], b".", b"path"] {
+            p.push(part);
+        }
+        assert!(p.heap.is_none());
+        assert_eq!(p.as_str(), "request.path");
+
+        // 3 つの要素のうち 2 つ目でヒープへ移り（100 + 1 + 100 バイト）、3 つ目の長さがデータに収まらない
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&3u32.to_le_bytes());
+        bad.extend_from_slice(&100u32.to_le_bytes());
+        bad.extend_from_slice(&[b'x'; 100]);
+        bad.extend_from_slice(&100u32.to_le_bytes());
+        bad.extend_from_slice(&[b'y'; 100]);
+        bad.extend_from_slice(&127u32.to_le_bytes());
+        let mut p = PropertyPath::new();
+        assert!(!parse_len_prefixed_into(&bad, &mut p));
+        assert!(p.heap.is_some());
+        let want = format!("\u{3}.d.{}d.{}\u{7f}", "x".repeat(100), "y".repeat(100));
+        let mut p = PropertyPath::new();
+        assert!(parse_path_into(&bad, &mut p));
+        assert_eq!(p.as_str(), want);
+        assert_eq!(parse_path(&bad).as_deref(), Some(want.as_str()));
     }
 
     /// 照合した近道も権限を見る（許していないプロパティは NOT_FOUND と同じく値が無い）
