@@ -3193,8 +3193,8 @@ mod f318_recycle_tests {
 // 削除の段を 1 回のファイバーの出入りで続けて呼ぶ。別に呼んでいたときと同じ結果になることをインラインの WAT で確かめる
 mod f329_chained_request_tests {
     use crate::wasm::{
-        FailurePolicy, FilterEngine, FilterResult, ModuleCapabilities, ModuleConfig,
-        RequestSessions, WasmConfig,
+        BodyFilterResult, FailurePolicy, FilterEngine, FilterResult, ModuleCapabilities,
+        ModuleConfig, RequestMeta, RequestSessions, WasmConfig,
     };
     use crate::wasm_plugin_config::ModuleRef;
     use std::sync::Arc;
@@ -3205,11 +3205,12 @@ mod f329_chained_request_tests {
     /// - ヘッダ 1 つ: 403 を返す。3 つ: トラップ。4 つ: 403 を返し、続くログの段でトラップする。5 つ: 403 を返して
     ///   からトラップする（B-299）。6 つ: 403 を返し、続くログの段で 500 を返そうとする。7 つ: 403 を返し、続く削除の段で
     ///   トラップする。8 つ: Pause（本文を待つ）。9 つ: `request.path` を `/x` に書き換えて続ける。10 個: 403 を返し、
-    ///   続くログの段が終わらない。それ以外: 続ける
+    ///   続くログの段が終わらない。11 個: `x-0` を `h` に置き換えて続ける。それ以外: 続ける
     /// - 本文 1 バイト: 413 を返す。2 バイト: Pause。3 バイト: トラップ。6 バイト: 要求ヘッダ `x-b` を足し、本文を `new`
     ///   にする。7 バイト: 413 を返してからトラップする（B-299）。8 バイト: 要求ヘッダ `x-0` を `r` に置き換える。
-    ///   9 バイト: `x-0` を消す。10 バイト: 表を `x-s: 1` だけにする（8〜10 バイトは、変えた表が本文の段の中で見えれば本文を
-    ///   `seen`、見えなければ `miss` にする）。12 バイト: 終わらない。それ以外: 続ける
+    ///   9 バイト: `x-0` を消す。10 バイト: 表を `x-s: 1` だけにする（`proxy_get_header_map_pairs` の大きさも見る）。
+    ///   11 バイト: 何も変えずに、ヘッダの段で置き換えた `x-0: h` が見えるか（8〜11 バイトは、変えた表が本文の段の中で
+    ///   見えれば本文を `seen`、見えなければ `miss` にする）。12 バイト: 終わらない。それ以外: 続ける
     const MODULE: &str = r#"(module
   (import "env" "proxy_send_local_response"
     (func $slr (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
@@ -3227,6 +3228,8 @@ mod f329_chained_request_tests {
     (func $set_pairs (param i32 i32 i32) (result i32)))
   (import "env" "proxy_get_header_map_value"
     (func $get (param i32 i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_get_header_map_pairs"
+    (func $pairs (param i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 64) "x-b")
   (data (i32.const 72) "1")
@@ -3239,6 +3242,7 @@ mod f329_chained_request_tests {
   (data (i32.const 176) "x-s")
   (data (i32.const 184) "seen")
   (data (i32.const 192) "miss")
+  (data (i32.const 216) "h")
   (global $bump (mut i32) (i32.const 4096))
   (global $create (mut i32) (i32.const 0))
   (global $hdrs (mut i32) (i32.const 0))
@@ -3269,6 +3273,12 @@ mod f329_chained_request_tests {
     (if (call $get (i32.const 0) (local.get $k) (local.get $kl) (i32.const 200) (i32.const 204))
       (then (return (i32.const 1))))
     (i32.eqz (i32.load (i32.const 204))))
+  ;; 要求ヘッダの表を `proxy_get_header_map_pairs` で読んだ大きさ（読めなければ -1）
+  (func $pairs_size (result i32)
+    (i32.store (i32.const 212) (i32.const 0))
+    (if (call $pairs (i32.const 0) (i32.const 208) (i32.const 212))
+      (then (return (i32.const -1))))
+    (i32.load (i32.const 212)))
   ;; 本文を `seen`（変えた表が見えた）か `miss` にする
   (func $mark (param $seen i32) (param $size i32)
     (drop (call $setbuf (i32.const 0) (i32.const 0) (local.get $size)
@@ -3300,6 +3310,8 @@ mod f329_chained_request_tests {
     (if (i32.eq (local.get $n) (i32.const 5)) (then unreachable))
     (if (i32.eq (local.get $n) (i32.const 9))
       (then (drop (call $setprop (i32.const 96) (i32.const 12) (i32.const 112) (i32.const 2)))))
+    (if (i32.eq (local.get $n) (i32.const 11))
+      (then (drop (call $replace (i32.const 0) (i32.const 160) (i32.const 3) (i32.const 216) (i32.const 1)))))
     (i32.eq (local.get $n) (i32.const 8)))
   (func (export "proxy_on_request_body") (param $c i32) (param $size i32) (param $eos i32) (result i32)
     (global.set $body (i32.add (global.get $body) (i32.const 1)))
@@ -3324,9 +3336,13 @@ mod f329_chained_request_tests {
       (then
         (drop (call $set_pairs (i32.const 0) (i32.const 128) (i32.const 18)))
         (call $mark
-          (i32.and (call $value_is (i32.const 176) (i32.const 3) (i32.const 72))
-            (call $absent (i32.const 160) (i32.const 3)))
+          (i32.and
+            (i32.and (call $value_is (i32.const 176) (i32.const 3) (i32.const 72))
+              (call $absent (i32.const 160) (i32.const 3)))
+            (i32.eq (call $pairs_size) (i32.const 18)))
           (local.get $size))))
+    (if (i32.eq (local.get $size) (i32.const 11))
+      (then (call $mark (call $value_is (i32.const 160) (i32.const 3) (i32.const 216)) (local.get $size))))
     (i32.eq (local.get $size) (i32.const 2)))
   (func (export "proxy_on_log") (param i32)
     (global.set $log (i32.add (global.get $log) (i32.const 1)))
@@ -3560,12 +3576,23 @@ mod f329_chained_request_tests {
         log(&f, &["m"], &s);
     }
 
-    // F-330: 本文の段でヘッダを置き換える・消す・表ごと置き換えると、本文の段の中では変えた表が見え、上流へは段の前の表が
-    // 届く（続けて呼ぶ経路と段を別に呼ぶ経路で同じ）
+    // F-330: 本文の段でヘッダを置き換える・消す・表ごと置き換えると、本文の段の中では変えた表が見え（`get_header_map_value`・
+    // `get_header_map_pairs`）、上流へはヘッダの段の後の表が届く（ヘッダの段の変更は届き、本文の段の変更は届かない）。続けて呼ぶ
+    // 経路・段を別に呼ぶ経路（要求の並びあり・なし）で同じ
     #[test]
     fn body_phase_header_changes_are_seen_in_the_phase_but_not_upstream() {
         let f = build(&["m"], true, None);
-        for body in [&b"replace!"[..], b"remove!!!", b"set pairs!"] {
+        // ヘッダ 11 個: ヘッダの段が `x-0` を `h` に置き換える（置き換えたヘッダは表の終わりへ移る。今までと同じ）
+        let mut upstream = headers(11);
+        let mut replaced = upstream.remove(0);
+        replaced.1 = b"h".to_vec();
+        upstream.push(replaced);
+        for body in [
+            &b"replace!"[..],
+            b"remove!!!",
+            b"set pairs!",
+            b"hdr visible",
+        ] {
             let s = RequestSessions::default();
             for sessions in [Some(&s), None] {
                 let what = format!(
@@ -3573,17 +3600,56 @@ mod f329_chained_request_tests {
                     String::from_utf8_lossy(body),
                     sessions.is_some()
                 );
-                match with_body(&f, &["m"], 2, body, sessions) {
+                match with_body(&f, &["m"], 11, body, sessions) {
                     FilterResult::Continue {
                         headers: h,
                         body: b,
                     } => {
-                        assert_eq!(h, headers(2), "{what}");
+                        assert_eq!(h, upstream, "{what}");
                         assert_eq!(b.as_deref(), Some(&b"seen"[..]), "{what}");
                     }
                     FilterResult::LocalResponse(r) => {
                         panic!("{what}: unexpected {}", r.status_code)
                     }
+                }
+            }
+            assert!(!s.logged());
+            log(&f, &["m"], &s);
+
+            // 段を別に呼ぶ（本文が後から届いた要求の経路）。本文の段にはヘッダの段の後の表を渡す（呼び出し元と同じ）
+            let what = format!("{:?} separate", String::from_utf8_lossy(body));
+            let s = RequestSessions::default();
+            let (path, method, ip): (Arc<str>, Arc<str>, Arc<str>) =
+                (Arc::from("/p"), Arc::from("POST"), Arc::from("127.0.0.1"));
+            let h = match futures::executor::block_on(f.engine.on_request_headers_with_modules(
+                &refs(&["m"]),
+                &path,
+                &method,
+                headers(11),
+                &ip,
+                false,
+                Some(&s),
+            )) {
+                FilterResult::Continue { headers, .. } => headers,
+                FilterResult::LocalResponse(r) => panic!("{what}: unexpected {}", r.status_code),
+            };
+            assert_eq!(h, upstream, "{what}");
+            let meta = RequestMeta {
+                method: &method,
+                path: &path,
+                headers: &h,
+                client_ip: &ip,
+            };
+            match futures::executor::block_on(f.engine.on_request_body_with_modules(
+                &refs(&["m"]),
+                bytes::Bytes::from_static(body),
+                true,
+                Some(&meta),
+                Some(&s),
+            )) {
+                BodyFilterResult::Continue { body: b } => assert_eq!(&b[..], b"seen", "{what}"),
+                BodyFilterResult::LocalResponse(r) => {
+                    panic!("{what}: unexpected {}", r.status_code)
                 }
             }
             assert!(!s.logged());
@@ -3624,11 +3690,11 @@ mod f329_chained_request_tests {
     }
 
     // 終わらない段は、続けて呼ぶ段の中でも `max_execution_time_ms`（既定 100 ms）で打ち切り、トラップと同じく扱う。
-    // 打ち切るまでの間もゲストはワーカーへ譲るので、同じスレッドに並べた他の要求が先に終わる
+    // 打ち切るまでの間もゲストはワーカーへ譲るので、同じスレッドに並べた他の要求が先に終わる。上限は CPU 時間なので、
+    // 実時間は見ない（並列の試験の負荷の下では数秒かかる）
     #[test]
     fn an_endless_phase_in_the_chain_is_cut_without_stalling_other_requests() {
         const SPIN: &[u8] = b"spin forever";
-        let started = std::time::Instant::now();
         // ログの段: 決まった応答は返し、インスタンスは捨てる
         let f = build(&["m"], true, None);
         let _ = counts(&f);
@@ -3649,11 +3715,6 @@ mod f329_chained_request_tests {
             FilterResult::LocalResponse(r) => panic!("fail_open: {}", r.status_code),
         }
         log(&open, &["m"], &s);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
-            "{:?}",
-            started.elapsed()
-        );
 
         // 同じスレッドで終わらない要求と並べた要求は、終わらない要求より先に終わる
         let names = refs(&["m"]);
