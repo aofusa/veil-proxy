@@ -42,13 +42,19 @@ pub struct Args {
     pub pin: Vec<usize>,
     pub tsv: bool,
     pub label: String,
+    /// HTTP/1.1 request templates sent as they are (`--raw a,b,c`, like gcannon). Each connection keeps one template
+    /// and moves to the next one when it is opened again, so the connections are spread evenly over the templates.
+    pub raw: Vec<Vec<u8>>,
+    /// Requests per connection before it is closed (with a reset, like gcannon) and opened again (`-r`, 0 = keep-alive).
+    pub reqs_per_conn: usize,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: veil-load --target HOST:PORT --path /x [--path /y ...] [-c CONNS] [-t THREADS] [-d SECS]\n\
          \x20      [--warmup SECS] [--rate REQ_PER_SEC] [--mode h1|h2|grpc] [--streams N] [--pipeline N]\n\
-         \x20      [--header 'K: V' ...] [--method M] [--body-file F] [--pin 2,3] [--tsv] [--label NAME]"
+         \x20      [--header 'K: V' ...] [--method M] [--body-file F] [--pin 2,3] [--tsv] [--label NAME]\n\
+         \x20      [--raw REQ_FILE,REQ_FILE,...] [-r REQS_PER_CONN]   (h1 only; --raw replaces --path)"
     );
     std::process::exit(2)
 }
@@ -85,6 +91,8 @@ fn parse_args() -> Args {
         pin: Vec::new(),
         tsv: false,
         label: String::new(),
+        raw: Vec::new(),
+        reqs_per_conn: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -117,10 +125,21 @@ fn parse_args() -> Args {
             "--pin" => a.pin = parse_cpus(&val()),
             "--tsv" => a.tsv = true,
             "--label" => a.label = val(),
+            "--raw" => {
+                for f in val().split(',').filter(|f| !f.is_empty()) {
+                    a.raw.push(std::fs::read(f).expect("raw request file"));
+                }
+            }
+            "-r" | "--reqs-per-conn" => a.reqs_per_conn = val().parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }
     }
-    if a.target.is_empty() || a.paths.is_empty() {
+    if a.target.is_empty() || (a.paths.is_empty() && a.raw.is_empty()) {
+        usage();
+    }
+    // gcannon も `--rate` と `-r` を一緒に使えない。`--raw` と `-r` は HTTP/1.1 だけ
+    let h1_only = !a.raw.is_empty() || a.reqs_per_conn > 0;
+    if (a.reqs_per_conn > 0 && a.rate > 0.0) || (h1_only && a.mode != Mode::H1) {
         usage();
     }
     a.host_header = a.target.clone();

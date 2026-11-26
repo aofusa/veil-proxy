@@ -1,6 +1,6 @@
 # F-328: Proxy-Wasm の経路の計測の準備（HttpArena と同じ要求の混ぜ方・張り直し・分類つきのプロファイル）
 
-**状態: 未着手（[F-327](F-327-proxy-wasm-path-cost.md) の子。最初に行う）**
+**状態: 進行中（[F-327](F-327-proxy-wasm-path-cost.md) の子。最初に行う。1 は済み）**
 
 ## 現状
 
@@ -16,9 +16,12 @@
 1. `veil-load` に、gcannon と同じ「要求のひな形を順に回す」（`--raw a.raw,b.raw,c.raw`）と N 要求ごとの張り直し（`-r N`）を足す。
    ひな形は HttpArena の `requests/get.raw`（60 B、`GET /baseline11?a=13&b=42`）・`post_cl.raw`（82 B、`Content-Length: 2`・本文 `20`）・
    `post_chunked.raw`（101 B、`2\r\n20\r\n0\r\n\r\n`）をそのまま使う（`scripts/lib/tools/gcannon.sh` の baseline・limited-conn の引数。
-   手元の写しは `docs/artifacts/benchmark/work/HttpArena/requests/`）。回し方は gcannon に合わせる: gcannon の文書は「接続は張り直すときに
-   ひな形を順に替える」（`-r` が無い baseline は接続ごとにひな形が決まったまま）としているが、ソースの行までは確かめていない（ans-04 の 7）。
-   実装の前に gcannon のソース（`MDA2AV/gcannon`。HttpArena の `docker/gcannon.Dockerfile` が取ってくる）で、最初の割り当てと接続の中で替えるかを確かめる。
+   手元の写しは `docs/artifacts/benchmark/work/HttpArena/requests/`）。回し方は gcannon に合わせる。gcannon のソース（`MDA2AV/gcannon` の
+   `src/worker.c`。HttpArena の `docker/gcannon.Dockerfile` が取ってくる）で確かめた: 最初の接続でひな形を `(conn_offset + conn_idx) % n` で
+   割り当て（接続の数で均等）、接続を張り直すたびに次のひな形へ移る（接続の中では替えない）。`-r N` は N 要求を送って N 応答を受け取ったら
+   閉じて張り直し、そのソケットは `SO_LINGER` 0（RST で閉じる）。
+   **済み（2026-11-26）**: `veil-load` の `--raw`・`-r`（`tools/perf/veil-load/src/h1.rs`。`--rate` と `-r`、h2 と `--raw` は一緒に使えない）。
+   手元の試験用のサーバで、`-r 10` は 1 接続あたり約 10 要求・3 種が均等・エラー 0 を確かめた。
 2. 分類つきのプロファイルの手順（`perf report --no-children --sort dso,sym` の全シンボルを、veil の Proxy-Wasm の層・wasmtime の出入り・
    ランタイム呼び出し・ホスト関数・ゲスト等に分けて µs/要求にする）を `tools/perf/` に置くか、計測の記録の手順に書く
    （aofish の `perf` は `cpu-clock:u` のみ）。

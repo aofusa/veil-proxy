@@ -16,16 +16,22 @@ struct Conn {
     skip: usize,
     /// In a chunked body.
     chunked: bool,
-    /// Rotation over the request templates.
+    /// Rotation over the request templates (with `--raw`: the template of this connection).
     next: usize,
     status_ok: bool,
     /// Bytes of a partly written request.
     pending: Vec<u8>,
     /// A response said `Connection: close`: send nothing more and open the connection again when the server closes it.
     closing: bool,
+    /// Requests sent and responses received on this connection (`-r`).
+    sent: usize,
+    recv: usize,
 }
 
 fn build_requests(a: &Args) -> Vec<Vec<u8>> {
+    if !a.raw.is_empty() {
+        return a.raw.clone();
+    }
     a.paths
         .iter()
         .map(|p| {
@@ -128,6 +134,44 @@ fn skip_chunked(b: &[u8]) -> Option<usize> {
     }
 }
 
+/// Opens a connection. With `-r` it closes with a reset (`SO_LINGER` 0), like gcannon, so the reopened connections
+/// do not pile up in `TIME_WAIT`.
+fn open(addr: &std::net::SocketAddr, a: &Args) -> std::io::Result<RawFd> {
+    let fd = connect_nb(addr)?;
+    if a.reqs_per_conn > 0 {
+        let lg = libc::linger { l_onoff: 1, l_linger: 0 };
+        // SAFETY: fd は開いたソケット、lg は有効な値
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&lg as *const libc::linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+    }
+    Ok(fd)
+}
+
+/// Sends the next request of the connection. Returns false when `-r` allows no more requests on it.
+fn issue(c: &mut Conn, reqs: &[Vec<u8>], a: &Args, at: u64, rep: &mut Report) -> bool {
+    if a.reqs_per_conn > 0 && c.sent >= a.reqs_per_conn {
+        return false;
+    }
+    let r = &reqs[c.next];
+    // `--raw` の接続はひな形を 1 つに固定する（gcannon と同じ。張り直すときに次へ移る）
+    if a.raw.is_empty() {
+        c.next = (c.next + 1) % reqs.len();
+    }
+    c.sent += 1;
+    c.inflight.push_back(at);
+    if !write_all(c, r) {
+        rep.errors += 1;
+    }
+    true
+}
+
 fn write_all(c: &mut Conn, r: &[u8]) -> bool {
     if !c.pending.is_empty() {
         c.pending.extend_from_slice(r);
@@ -163,7 +207,7 @@ pub fn run(
     let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     let mut conns: Vec<Conn> = Vec::with_capacity(nconns);
     for i in 0..nconns {
-        let fd = match connect_nb(&addr) {
+        let fd = match open(&addr, a) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("connect: {}", e);
@@ -188,6 +232,8 @@ pub fn run(
             status_ok: true,
             pending: Vec::new(),
             closing: false,
+            sent: 0,
+            recv: 0,
         });
     }
     let fixed = a.rate > 0.0;
@@ -201,14 +247,10 @@ pub fn run(
     if fixed {
         free.extend(0..conns.len());
     } else {
-        for i in 0..conns.len() {
+        for c in conns.iter_mut() {
             for _ in 0..depth {
-                let c = &mut conns[i];
-                let r = &reqs[c.next];
-                c.next = (c.next + 1) % reqs.len();
-                c.inflight.push_back(now_ns(base));
-                if !write_all(c, r) {
-                    rep.errors += 1;
+                if !issue(c, &reqs, a, now_ns(base), &mut rep) {
+                    break;
                 }
             }
         }
@@ -226,13 +268,8 @@ pub fn run(
                 if lag > rep.max_lag_ns {
                     rep.max_lag_ns = lag;
                 }
-                let c = &mut conns[i];
-                let r = &reqs[c.next];
-                c.next = (c.next + 1) % reqs.len();
-                c.inflight.push_back(due);
-                if !write_all(c, r) {
-                    rep.errors += 1;
-                }
+                // 固定レートは `-r` と一緒に使えない（引数の検査）ので必ず送る
+                issue(&mut conns[i], &reqs, a, due, &mut rep);
             }
         }
         let wait_ns = if fixed && !free.is_empty() {
@@ -268,7 +305,8 @@ pub fn run(
                     break;
                 }
             }
-            // 応答を切り出す
+            // 応答を切り出す（`-r` の上限まで受け取ったら、張り直しへ回す）
+            let mut reopen = false;
             let mut off = 0;
             loop {
                 if c.skip > 0 {
@@ -311,19 +349,18 @@ pub fn run(
                         rep.non2xx += 1;
                     }
                 }
-                if c.closing {
+                c.recv += 1;
+                if a.reqs_per_conn > 0 && c.recv >= a.reqs_per_conn && c.inflight.is_empty() {
+                    // gcannon と同じく、上限の数の応答を受け取ったら閉じて張り直す
+                    reopen = true;
+                } else if c.closing {
                     // 閉じられる接続には送らない（張り直してから送る）
                 } else if fixed {
                     if c.inflight.is_empty() {
                         free.push_back(idx);
                     }
                 } else {
-                    let r = &reqs[c.next];
-                    c.next = (c.next + 1) % reqs.len();
-                    c.inflight.push_back(now_ns(base));
-                    if !write_all(c, r) {
-                        rep.errors += 1;
-                    }
+                    issue(c, &reqs, a, now_ns(base), &mut rep);
                 }
                 if off == c.len {
                     break;
@@ -333,8 +370,8 @@ pub fn run(
                 c.buf.copy_within(off..c.len, 0);
                 c.len -= off;
             }
-            if eof {
-                // 応答の届かなかった要求は失敗。`Connection: close` の後の正しい切断なら 0 件
+            if eof || reopen {
+                // 応答の届かなかった要求は失敗。`Connection: close` の後の正しい切断・`-r` の張り直しなら 0 件
                 rep.errors += c.inflight.len() as u64;
                 let mut ev = libc::epoll_event { events: 0, u64: 0 };
                 // SAFETY: 閉じた接続を外して閉じる
@@ -343,7 +380,7 @@ pub fn run(
                     libc::close(c.fd);
                 }
                 c.fd = -1;
-                match connect_nb(&addr) {
+                match open(&addr, a) {
                     Ok(fd) => {
                         c.fd = fd;
                         c.len = 0;
@@ -352,6 +389,11 @@ pub fn run(
                         c.chunked = false;
                         c.pending.clear();
                         c.closing = false;
+                        c.sent = 0;
+                        c.recv = 0;
+                        if !a.raw.is_empty() {
+                            c.next = (c.next + 1) % reqs.len();
+                        }
                         let mut ev = libc::epoll_event {
                             events: libc::EPOLLIN as u32,
                             u64: idx as u64,
@@ -365,11 +407,8 @@ pub fn run(
                             free.push_back(idx);
                         } else {
                             for _ in 0..depth {
-                                let r = &reqs[c.next];
-                                c.next = (c.next + 1) % reqs.len();
-                                c.inflight.push_back(now_ns(base));
-                                if !write_all(c, r) {
-                                    rep.errors += 1;
+                                if !issue(c, &reqs, a, now_ns(base), &mut rep) {
+                                    break;
                                 }
                             }
                         }

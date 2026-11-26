@@ -377,7 +377,7 @@ API ライブラリの経路（ハンドラ・圧縮・gRPC・Python）を、Doc
 
 | 部品 | 役割 |
 |---|---|
-| `veil-load/` | 負荷ツール。HTTP/1.1・h2c・gRPC、閉ループと固定レート（予定時刻から測るので Coordinated Omission を含む）、CPU の固定、1 行の `key=value` か `--tsv` |
+| `veil-load/` | 負荷ツール。HTTP/1.1・h2c・gRPC、閉ループと固定レート（予定時刻から測るので Coordinated Omission を含む）、CPU の固定、1 行の `key=value` か `--tsv`。HTTP/1.1 は HttpArena の gcannon と同じ回し方もできる: `--raw a.raw,b.raw,...`（要求のひな形をそのまま送る。接続ごとにひな形を 1 つに固定し、接続を張り直すたびに次のひな形へ移る）、`-r N`（N 要求ごとに RST で閉じて張り直す。`--rate` とは一緒に使えない） |
 | `api-app/` | HttpArena の `veil-api` と同じ形のハンドラ（`/baseline11`・`/json/{count}`・unary gRPC）の API サーバ |
 | `api_ab.py` | シナリオを交互に回して TSV と中央値の表を出すドライバ |
 | `syscall_count/` | 1 要求あたりのシステムコール数を数える LD_PRELOAD の小片（`--syscalls`。futex は数えない） |
