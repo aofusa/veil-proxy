@@ -773,11 +773,13 @@ mod plaintext_pair_tests {
         let (mut records, mut at) = (0, 0);
         while at + 5 <= wire.len() {
             records += usize::from(wire[at] == 23);
-            at += 5 + usize::from(u16::from_be_bytes([wire[at + 3], wire[at + 4]]));
+            let end = at + 5 + usize::from(u16::from_be_bytes([wire[at + 3], wire[at + 4]]));
+            // 受信の平文の上限（16 KiB）を超えないよう、記録ごとに渡して平文を取り出す（B-86）
+            read_tls_all(client, &wire[at..end]).unwrap();
+            let _ = client.reader().read_to_end(got);
+            at = end;
         }
         assert_eq!(at, wire.len());
-        read_tls_all(client, &wire).unwrap();
-        let _ = client.reader().read_to_end(got);
         records
     }
 
@@ -810,6 +812,86 @@ mod plaintext_pair_tests {
             assert_eq!(deliver(&mut server, &mut client, &mut got), 1);
             assert_eq!(got, HEAD);
         }
+    }
+
+    /// 受理した長さの分だけ先頭から外す（`a` を使い切るまで `b` は減らない。どの境目でも）
+    #[test]
+    fn advance_pair_handles_every_boundary() {
+        let (a0, b0): (&[u8], &[u8]) = (b"abc", b"defg");
+        for n in 0..=9 {
+            let (mut a, mut b) = (a0, b0);
+            advance_pair(&mut a, &mut b, n);
+            let want: (&[u8], &[u8]) = if n <= a0.len() {
+                (&a0[n..], b0)
+            } else {
+                (b"", &b0[(n - a0.len()).min(b0.len())..])
+            };
+            assert_eq!((a, b), want, "n={n}");
+        }
+        for (a0, b0, n) in [(&b""[..], &b"xy"[..], 1), (b"xy", b"", 5), (b"", b"", 0)] {
+            let (mut a, mut b) = (a0, b0);
+            advance_pair(&mut a, &mut b, n);
+            assert_eq!(
+                [a, b].concat(),
+                [a0, b0].concat()[n.min(a0.len() + b0.len())..]
+            );
+        }
+    }
+
+    /// 両方が空なら何も積まない
+    #[test]
+    fn an_empty_pair_writes_nothing() {
+        let (mut client, mut server) = established();
+        assert_eq!(write_plaintext_pair(&mut server, b"", b"").unwrap(), 0);
+        let mut got = Vec::new();
+        assert_eq!(deliver(&mut server, &mut client, &mut got), 0);
+        assert!(got.is_empty());
+    }
+
+    /// 16 KiB を超える組は記録の上限でだけ分かれる（要素の境目では分けない。別々に積むと 1 つ多い）
+    #[test]
+    fn a_pair_larger_than_a_record_is_split_by_size_only() {
+        let body = vec![b'z'; 20_000];
+        let want = [HEAD, &body[..]].concat();
+        let (mut client, mut server) = established();
+        assert_eq!(
+            write_plaintext_pair(&mut server, HEAD, &body).unwrap(),
+            want.len()
+        );
+        let mut got = Vec::new();
+        assert_eq!(deliver(&mut server, &mut client, &mut got), 2);
+        assert_eq!(got, want);
+
+        let (mut client, mut server) = established();
+        server.writer().write_all(HEAD).unwrap();
+        server.writer().write_all(&body).unwrap();
+        let mut got = Vec::new();
+        assert_eq!(deliver(&mut server, &mut client, &mut got), 3);
+        assert_eq!(got, want);
+    }
+
+    /// 送信のバッファが一杯なら何も受理せず（`push_plaintext_pair_server` は吐き出してから積み直す）、吐き出した後は
+    /// 続きから受理する
+    #[test]
+    fn a_full_buffer_accepts_nothing_until_flushed() {
+        let body = vec![b'y'; 30_000];
+        let want = [HEAD, &body[..]].concat();
+        let (mut client, mut server) = established();
+        server.set_buffer_limit(Some(4096));
+        let (mut a, mut b) = (HEAD, &body[..]);
+        let n = write_plaintext_pair(&mut server, a, b).unwrap();
+        assert!(n > 0 && n < want.len(), "{n}");
+        advance_pair(&mut a, &mut b, n);
+        assert_eq!(write_plaintext_pair(&mut server, a, b).unwrap(), 0);
+        let mut got = Vec::new();
+        deliver(&mut server, &mut client, &mut got);
+        while !a.is_empty() || !b.is_empty() {
+            let n = write_plaintext_pair(&mut server, a, b).unwrap();
+            assert!(n > 0);
+            advance_pair(&mut a, &mut b, n);
+            deliver(&mut server, &mut client, &mut got);
+        }
+        assert_eq!(got, want);
     }
 
     /// 送信のバッファの上限で一部だけ受理されても、受理した分を外して積み直せば全部が順に届く（`write_all_vectored` の

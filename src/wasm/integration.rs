@@ -58,12 +58,21 @@ thread_local! {
         const { std::cell::RefCell::new([const { None }; RECENT_SLOTS]) };
 }
 
+/// [`request_str`] がスレッドに持つ文字列の長さの上限（長いものは持たない。要求の後まで持ち続けず、持っている短いものを
+/// 追い出さない）
+const RECENT_STR_MAX: usize = 256;
+
 /// ゲストに見せる要求の文字列（`bytes` が UTF-8 でなければ `fallback`）。
 ///
 /// 種類ごとにワーカーのスレッドで直前に作ったものと同じバイト列なら、その `Arc` を複製して返す（F-331。キープアライブで
 /// 同じクライアント・ホスト・パスから続く要求は、要求ごとに文字列を確保して写さない。メソッドは種類ごとに持つ）。
-/// 値はスレッドの中で作って複製するだけ（全ワーカー共有の値にすると、参照カウントへの書き込みがコアをまたぐ。F-321）
+/// 値はスレッドの中で作って複製するだけ（全ワーカー共有の値にすると、参照カウントへの書き込みがコアをまたぐ。F-321）。
+/// [`RECENT_STR_MAX`] より長いもの・UTF-8 でないものは持たずに作る
 pub fn request_str(kind: RequestStr, bytes: &[u8], fallback: &'static str) -> Arc<str> {
+    let make = || Arc::<str>::from(std::str::from_utf8(bytes).unwrap_or(fallback));
+    if bytes.len() > RECENT_STR_MAX {
+        return make();
+    }
     let slot = match kind {
         RequestStr::Path => 0,
         RequestStr::ClientIp => 1,
@@ -79,7 +88,6 @@ pub fn request_str(kind: RequestStr, bytes: &[u8], fallback: &'static str) -> Ar
             _ => 10,
         },
     };
-    let make = || Arc::<str>::from(std::str::from_utf8(bytes).unwrap_or(fallback));
     RECENT_STRS
         .try_with(|r| {
             let mut r = r.borrow_mut();
@@ -88,7 +96,10 @@ pub fn request_str(kind: RequestStr, bytes: &[u8], fallback: &'static str) -> Ar
                     return Arc::clone(s);
                 }
             }
-            let s = make();
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                return Arc::from(fallback);
+            };
+            let s = Arc::<str>::from(text);
             r[slot] = Some(Arc::clone(&s));
             s
         })
@@ -413,28 +424,76 @@ mod request_str_tests {
         // 種類ごとに別（同じバイト列でも）
         let ip = request_str(RequestStr::ClientIp, b"/a?x=2", "");
         assert!(!Arc::ptr_eq(&ip, &c));
-        // メソッドは種類ごとに持つ（交互に来ても作り直さない）
-        let get = request_str(RequestStr::Method, b"GET", "GET");
-        let post = request_str(RequestStr::Method, b"POST", "GET");
+        // 空のバイト列も持つ
+        let e = request_str(RequestStr::Authority, b"", "");
         assert!(Arc::ptr_eq(
-            &get,
-            &request_str(RequestStr::Method, b"GET", "GET")
+            &e,
+            &request_str(RequestStr::Authority, b"", "")
         ));
-        assert!(Arc::ptr_eq(
-            &post,
-            &request_str(RequestStr::Method, b"POST", "GET")
-        ));
-        let m1 = request_str(RequestStr::Method, b"PROPFIND", "GET");
-        let m2 = request_str(RequestStr::Method, b"MKCOL", "GET");
-        assert_eq!((&*m1, &*m2), ("PROPFIND", "MKCOL"));
-        // UTF-8 でないバイト列は `fallback`（同じ値でも使い回さない）
-        let bad = request_str(RequestStr::Authority, b"\xff\xfe", "");
-        assert_eq!(&*bad, "");
-        assert_eq!(&*request_str(RequestStr::Authority, b"\xff\xfe", "x"), "x");
         release_request_strs();
         assert!(!Arc::ptr_eq(
             &a,
             &request_str(RequestStr::Path, b"/a?x=1", "/")
         ));
+    }
+
+    /// メソッドは種類ごとに持つ（交互に来ても作り直さない）。それ以外のメソッドは 1 つの枠を分け合う
+    #[test]
+    fn methods_have_their_own_slots() {
+        release_request_strs();
+        let names: [&[u8]; 7] = [
+            b"GET", b"POST", b"HEAD", b"PUT", b"DELETE", b"PATCH", b"OPTIONS",
+        ];
+        let first: Vec<_> = names
+            .iter()
+            .map(|m| request_str(RequestStr::Method, m, "GET"))
+            .collect();
+        for (m, a) in names.iter().zip(&first) {
+            let again = request_str(RequestStr::Method, m, "GET");
+            assert!(Arc::ptr_eq(a, &again), "{m:?}");
+            assert_eq!(again.as_bytes(), *m);
+        }
+        let p1 = request_str(RequestStr::Method, b"PROPFIND", "GET");
+        assert!(Arc::ptr_eq(
+            &p1,
+            &request_str(RequestStr::Method, b"PROPFIND", "GET")
+        ));
+        let m = request_str(RequestStr::Method, b"MKCOL", "GET");
+        assert_eq!(&*m, "MKCOL");
+        let p2 = request_str(RequestStr::Method, b"PROPFIND", "GET");
+        assert!(!Arc::ptr_eq(&p1, &p2));
+        assert_eq!(&*p2, "PROPFIND");
+        // それ以外のメソッドは決まったメソッドの枠を追い出さない
+        assert!(Arc::ptr_eq(
+            &first[0],
+            &request_str(RequestStr::Method, b"GET", "GET")
+        ));
+        release_request_strs();
+    }
+
+    /// UTF-8 でないもの・長いものは持たない（持っている文字列を追い出さない）
+    #[test]
+    fn invalid_or_long_bytes_do_not_evict() {
+        release_request_strs();
+        let hot = request_str(RequestStr::Path, b"/json", "/");
+        let bad = request_str(RequestStr::Path, b"/\xff\xfe", "/");
+        assert_eq!(&*bad, "/");
+        assert_eq!(&*request_str(RequestStr::Authority, b"\xff", "x"), "x");
+        let long = vec![b'a'; super::RECENT_STR_MAX + 1];
+        let l1 = request_str(RequestStr::Path, &long, "/");
+        let l2 = request_str(RequestStr::Path, &long, "/");
+        assert_eq!(l1.len(), long.len());
+        assert!(!Arc::ptr_eq(&l1, &l2));
+        let bad_long = [&long[..], b"\xff"].concat();
+        assert_eq!(&*request_str(RequestStr::Path, &bad_long, "/"), "/");
+        assert!(Arc::ptr_eq(
+            &hot,
+            &request_str(RequestStr::Path, b"/json", "/")
+        ));
+        // 上限ちょうどは持つ
+        let edge = vec![b'b'; super::RECENT_STR_MAX];
+        let e1 = request_str(RequestStr::Path, &edge, "/");
+        assert!(Arc::ptr_eq(&e1, &request_str(RequestStr::Path, &edge, "/")));
+        release_request_strs();
     }
 }

@@ -980,9 +980,6 @@ impl H3BufferedTask {
         #[cfg(feature = "wasm")]
         if let (Some(backend_modules), Some(engine)) = (backend.modules_arc(), wasm_engine) {
             {
-                let path_str = std::str::from_utf8(path).unwrap_or("/");
-                let method_str = std::str::from_utf8(method).unwrap_or("GET");
-
                 // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）。エンジンは入口で決めた
                 // ワーカーの写し（設定を読み直さない。B-501）
                 let modules_to_apply = crate::wasm_plugin_config::WasmModules::for_request(
@@ -1007,8 +1004,8 @@ impl H3BufferedTask {
                         .map(|h| (h.name().to_vec(), h.value().to_vec()))
                         .collect();
 
-                    let path_arc = request_str(RequestStr::Path, path_str.as_bytes(), "/");
-                    let method_arc = request_str(RequestStr::Method, method_str.as_bytes(), "GET");
+                    let path_arc = request_str(RequestStr::Path, path, "/");
+                    let method_arc = request_str(RequestStr::Method, method, "GET");
                     let ip_arc =
                         request_str(RequestStr::ClientIp, self.client_ip.as_str().as_bytes(), "");
                     // F-329: 本文は全量がある（バッファの経路）。本文を受けるモジュールがあり、要求のトレーラが無ければ

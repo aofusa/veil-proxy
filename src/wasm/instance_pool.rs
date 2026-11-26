@@ -476,6 +476,35 @@ mod tests {
         assert!(FREE_SESSIONS.with(|f| f.borrow().is_empty()));
     }
 
+    /// 使い終わった要求の状態はスレッドに上限までしか持たないが、上限を超えた分も片付けはする。捨てたインスタンスの
+    /// context は消す予定に積まない（F-331）
+    #[test]
+    fn the_free_list_is_bounded_and_dead_slots_are_not_queued() {
+        RequestSessions::release_free();
+        let cfg: Arc<[u8]> = Arc::from(&b""[..]);
+        let live = InstanceSlot::new_in_use(cfg.clone());
+        let dead = InstanceSlot::new_in_use(cfg);
+        dead.discard();
+        let all: Vec<_> = (0..FREE_SESSIONS_MAX + 1)
+            .map(|i| {
+                let s = RequestSessions::take();
+                s.insert(1, live.clone(), i as i32 + 1);
+                s.insert(2, dead.clone(), 1000);
+                s
+            })
+            .collect();
+        for s in all {
+            RequestSessions::give_back(s);
+        }
+        assert_eq!(FREE_SESSIONS.with(|f| f.borrow().len()), FREE_SESSIONS_MAX);
+        let mut ids = live.take_pending_deletes();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=FREE_SESSIONS_MAX as i32 + 1).collect::<Vec<_>>());
+        assert!(dead.take_pending_deletes().is_empty());
+        assert!(FREE_SESSIONS.with(|f| f.borrow().iter().all(|s| s.len() == 0)));
+        RequestSessions::release_free();
+    }
+
     #[test]
     fn removed_session_is_not_queued() {
         let cfg: Arc<[u8]> = Arc::from(&b""[..]);

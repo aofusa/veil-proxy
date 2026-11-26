@@ -2513,6 +2513,181 @@ mod b408_pseudo_header_phase_tests {
     }
 }
 
+// F-331: 要求ごとの状態の使い回しと、プールの新しい context の `proxy_on_context_create` から見える要求の行
+mod f331_request_reuse_tests {
+    use crate::wasm::{FilterEngine, FilterResult, ModuleCapabilities, ModuleConfig, WasmConfig};
+    use crate::wasm_plugin_config::{ModuleRef, WasmModules};
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    /// `proxy_on_context_create`（http context）で `request.path`・`request.method` を読み、要求ヘッダの段でそれを
+    /// 要求ヘッダ `x-path`・`x-method` として足すモジュール（読めなければ足さない）
+    const MODULE: &str = r#"(module
+  (import "env" "proxy_get_property" (func $prop (param i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_add_header_map_value"
+    (func $add (param i32 i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (global $bump (mut i32) (i32.const 4096))
+  (global $path (mut i32) (i32.const 0))
+  (global $path_len (mut i32) (i32.const -1))
+  (global $method (mut i32) (i32.const 0))
+  (global $method_len (mut i32) (i32.const -1))
+  (data (i32.const 0) "request\00path")
+  (data (i32.const 16) "request\00method")
+  (data (i32.const 32) "x-path")
+  (data (i32.const 48) "x-method")
+  (func (export "proxy_on_memory_allocate") (param $n i32) (result i32)
+    (local $p i32)
+    (local.set $p (global.get $bump))
+    (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+    (local.get $p))
+  (func (export "proxy_on_context_create") (param $id i32) (param $parent i32)
+    (if (i32.eqz (local.get $parent)) (then (return)))
+    (global.set $path_len (i32.const -1))
+    (global.set $method_len (i32.const -1))
+    (if (i32.eqz (call $prop (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68)))
+      (then
+        (global.set $path (i32.load (i32.const 64)))
+        (global.set $path_len (i32.load (i32.const 68)))))
+    (if (i32.eqz (call $prop (i32.const 16) (i32.const 14) (i32.const 64) (i32.const 68)))
+      (then
+        (global.set $method (i32.load (i32.const 64)))
+        (global.set $method_len (i32.load (i32.const 68))))))
+  (func (export "proxy_on_vm_start") (param i32 i32) (result i32) (i32.const 1))
+  (func (export "proxy_on_configure") (param i32 i32) (result i32) (i32.const 1))
+  (func (export "proxy_on_request_headers") (param i32 i32 i32) (result i32)
+    (if (i32.ge_s (global.get $path_len) (i32.const 0))
+      (then (drop (call $add (i32.const 0) (i32.const 32) (i32.const 6)
+        (global.get $path) (global.get $path_len)))))
+    (if (i32.ge_s (global.get $method_len) (i32.const 0))
+      (then (drop (call $add (i32.const 0) (i32.const 48) (i32.const 8)
+        (global.get $method) (global.get $method_len)))))
+    (global.set $path_len (i32.const -1))
+    (global.set $method_len (i32.const -1))
+    (i32.const 0))
+)"#;
+
+    fn engine(dir: &std::path::Path, instance_reuse: bool) -> Arc<FilterEngine> {
+        let path = dir.join("m.wat");
+        // 理由付き allow: テストのフィクスチャ作成（ホットパス外）。
+        #[allow(clippy::disallowed_methods)]
+        std::fs::write(&path, MODULE).unwrap();
+        let config = WasmConfig {
+            enabled: true,
+            defaults: Default::default(),
+            modules: vec![ModuleConfig {
+                name: "m".to_string(),
+                path: path.to_string_lossy().into_owned(),
+                capabilities: ModuleCapabilities {
+                    allow_request_headers_read: true,
+                    allow_request_headers_write: true,
+                    allowed_properties: vec!["request.*".to_string()],
+                    ..Default::default()
+                },
+                instance_reuse,
+                ..Default::default()
+            }],
+            interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            metering: Default::default(),
+        };
+        let engine = FilterEngine::new(&config).unwrap();
+        engine.validate().unwrap();
+        Arc::new(engine)
+    }
+
+    /// 1 つの要求を要求ヘッダの段まで通し、モジュールが足したヘッダを返す
+    fn request(engine: &Arc<FilterEngine>, path: &str, method: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let modules = WasmModules::for_request(
+            Arc::new(vec![ModuleRef::from_name("m")]),
+            crate::wasm::worker_engine(engine),
+        );
+        let r = futures::executor::block_on(engine.on_request_headers_with_modules_async(
+            &modules,
+            Arc::from(path),
+            Arc::from(method),
+            vec![],
+            Arc::from("127.0.0.1"),
+            true,
+        ));
+        futures::executor::block_on(crate::wasm::on_request_complete_async(&modules));
+        match r {
+            FilterResult::Continue { headers, .. } => headers,
+            FilterResult::LocalResponse(r) => panic!("unexpected {}", r.status_code),
+        }
+    }
+
+    /// プールの新しい context（`proxy_on_context_create` を要求ヘッダの段と続けて呼ぶ）にも、使い回さないモジュールにも、
+    /// その要求のメソッドとパスが見える（前の要求の値は見えない）
+    #[test]
+    fn context_create_sees_the_request_line() {
+        let dir = std::env::temp_dir().join(format!("veil-f331-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for reuse in [false, true] {
+            let engine = engine(&dir, reuse);
+            for (path, method) in [("/p?q=1", "POST"), ("/second", "PUT"), ("/p?q=1", "GET")] {
+                assert_eq!(
+                    request(&engine, path, method),
+                    vec![
+                        (b"x-path".to_vec(), path.as_bytes().to_vec()),
+                        (b"x-method".to_vec(), method.as_bytes().to_vec()),
+                    ],
+                    "reuse={reuse} {method} {path}"
+                );
+            }
+            if reuse {
+                assert_eq!(engine.pooled_instances("m"), 1);
+            }
+        }
+        crate::wasm::release_worker_engine();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 要求の並びの複製が残っているうちは要求ごとの状態を使い回さず、最後の複製を手放したときに空にして次の要求に使う
+    #[test]
+    fn request_sessions_are_reused_after_the_last_clone() {
+        let dir = std::env::temp_dir().join(format!("veil-f331r-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = engine(&dir, true);
+        let w = crate::wasm::worker_engine(&engine);
+        crate::wasm::RequestSessions::release_free();
+        let new =
+            || WasmModules::for_request(Arc::new(vec![ModuleRef::from_name("m")]), Rc::clone(&w));
+        let modules = new();
+        let first: *const crate::wasm::RequestSessions = modules.sessions().unwrap();
+        modules.sessions().unwrap().set_logged();
+        modules
+            .sessions()
+            .unwrap()
+            .set_request_line(&Arc::from("GET"), &Arc::from("/a"));
+        let clone = modules.clone();
+        drop(modules);
+        // 複製がある: 状態はそのまま、次の要求は別の状態
+        assert!(clone.sessions().unwrap().logged());
+        let other = new();
+        assert!(!std::ptr::eq(other.sessions().unwrap(), first));
+        drop(other);
+        drop(clone);
+        // 最後の複製を手放した: 空にして使い回す（後に返したものから）
+        let next = new();
+        let s = next.sessions().unwrap();
+        assert!(std::ptr::eq(s, first));
+        assert!(!s.logged() && s.request_line().is_none() && s.request_info().is_none());
+        assert_eq!(s.len(), 0);
+        drop(next);
+        // モジュールの無い並びは状態を持たない
+        assert!(WasmModules::for_request(Arc::new(vec![]), Rc::clone(&w))
+            .sessions()
+            .is_none());
+        drop(w);
+        crate::wasm::RequestSessions::release_free();
+        crate::wasm::release_worker_engine();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 // F-318: プールのインスタンスの context を空へ戻すと、要求の中身は作り直したときと同じ空になり、モジュールのもの
 // （同じ `Arc`）は残る
 mod f318_recycle_tests {
