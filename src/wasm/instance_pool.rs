@@ -241,6 +241,12 @@ impl InstancePool {
         self.with_local(|slots| slots.iter().filter(|s| !s.is_dead()).count())
     }
 
+    /// 使い回しのインスタンスを作り直した回数（`fail_reload`。テスト用）
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
     /// このスレッドのインスタンスに溜まっている、消す予定の context の数（テスト用）
     #[cfg(test)]
     pub(crate) fn pending_deletes(&self) -> usize {

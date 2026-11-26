@@ -444,6 +444,11 @@ fn enter_step(caller: &mut Caller<'_, HostState>, step: Step) -> Enter {
             };
             exports.chain_io.local = Some(local);
             if present(&exports.on_log).is_none() {
+                // 続く削除の段にもログの段と同じ見え方を渡す（別に呼んでいたときは応答の後の 1 回の呼び出しで、
+                // ログ・削除とも要求の属性だけが見えた）。どちらも無ければ context を作り直さない
+                if present(&exports.on_delete).is_some() {
+                    ctx.enter_log();
+                }
                 return Enter::Pass;
             }
             ctx.enter_log();
@@ -1193,12 +1198,28 @@ mod tests {
         assert!(!ctx.request_body_modified && ctx.request_body.is_empty());
         assert_eq!(&*ctx.client_ip, "192.0.2.1");
 
+        // ログの段が無くても、削除の段はログの段と同じ見え方（要求の属性だけ）で呼ぶ
         store.data_mut().http_ctx.local_response = Some(local(401));
         let steps = [Step::LogLocal(5), Step::Delete(5)];
         let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm(), None));
         assert!(chain.error.is_none());
         assert_eq!(chain.done, 2);
         assert_eq!(chain.local.map(|l| l.status_code), Some(401));
+        assert_eq!(trace(&mut store, instance), 24);
+        assert!(store.data().http_ctx.client_ip.is_empty());
+
+        // ログ・削除とも無ければ context を作り直さない
+        store.data_mut().exports.on_delete = Export::Absent;
+        {
+            let ctx = &mut store.data_mut().http_ctx;
+            ctx.client_ip = std::sync::Arc::from("192.0.2.1");
+            ctx.local_response = Some(local(402));
+        }
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm(), None));
+        assert!(chain.error.is_none());
+        assert_eq!(chain.done, 2);
+        assert_eq!(chain.local.map(|l| l.status_code), Some(402));
+        // 何も呼んでいない（記録は前のまま）
         assert_eq!(trace(&mut store, instance), 24);
         assert_eq!(&*store.data().http_ctx.client_ip, "192.0.2.1");
     }

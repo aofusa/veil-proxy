@@ -2887,6 +2887,13 @@ mod b186_overflow_tests {
         assert!(body_in_hand(&mut b, 0, true, true, 4).is_none());
         let mut b = b"zz\r\nhello\r\n0\r\n\r\n".to_vec();
         assert!(body_in_hand(&mut b, 0, true, true, 100).is_none());
+        // 本文の後ろのバイト（呼び出し元が次の要求として切り出していなければ、全量とみなさない）
+        let mut b = b"hello!".to_vec();
+        assert!(body_in_hand(&mut b, 5, false, false, 100).is_none());
+        assert_eq!(b, b"hello!");
+        let mut b = b"5\r\nhello\r\n0\r\n\r\nGET".to_vec();
+        assert!(body_in_hand(&mut b, 0, true, true, 100).is_none());
+        assert_eq!(b, b"5\r\nhello\r\n0\r\n\r\nGET");
     }
 
     #[test]

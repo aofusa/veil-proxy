@@ -2633,9 +2633,10 @@ mod f329_chained_request_tests {
     /// 書くモジュール。要求ヘッダの段はヘッダの数で、要求本文の段は本文の長さで振る舞いを変える:
     ///
     /// - ヘッダ 1 つ: 403 を返す。3 つ: トラップ。4 つ: 403 を返し、続くログの段でトラップする。5 つ: 403 を返して
-    ///   からトラップする（B-299）。それ以外: 続ける
+    ///   からトラップする（B-299）。6 つ: 403 を返し、続くログの段で 500 を返そうとする。7 つ: 403 を返し、続く削除の段で
+    ///   トラップする。8 つ: Pause（本文を待つ）。9 つ: `request.path` を `/x` に書き換えて続ける。それ以外: 続ける
     /// - 本文 1 バイト: 413 を返す。2 バイト: Pause。3 バイト: トラップ。6 バイト: 要求ヘッダ `x-b` を足し、本文を `new`
-    ///   にする。それ以外: 続ける
+    ///   にする。7 バイト: 413 を返してからトラップする（B-299）。それ以外: 続ける
     const MODULE: &str = r#"(module
   (import "env" "proxy_send_local_response"
     (func $slr (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
@@ -2643,16 +2644,22 @@ mod f329_chained_request_tests {
     (func $add (param i32 i32 i32 i32 i32) (result i32)))
   (import "env" "proxy_set_buffer_bytes"
     (func $setbuf (param i32 i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_set_property"
+    (func $setprop (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 64) "x-b")
   (data (i32.const 72) "1")
   (data (i32.const 80) "new")
+  (data (i32.const 96) "request\00path")
+  (data (i32.const 112) "/x")
   (global $create (mut i32) (i32.const 0))
   (global $hdrs (mut i32) (i32.const 0))
   (global $body (mut i32) (i32.const 0))
   (global $log (mut i32) (i32.const 0))
   (global $del (mut i32) (i32.const 0))
   (global $trap_log (mut i32) (i32.const 0))
+  (global $slr_log (mut i32) (i32.const 0))
+  (global $trap_del (mut i32) (i32.const 0))
   (func $report (param $status i32)
     (i32.store8 (i32.const 0) (i32.add (i32.const 48) (global.get $create)))
     (i32.store8 (i32.const 1) (i32.add (i32.const 48) (global.get $hdrs)))
@@ -2669,15 +2676,22 @@ mod f329_chained_request_tests {
     (global.set $hdrs (i32.add (global.get $hdrs) (i32.const 1)))
     (if (i32.eq (local.get $n) (i32.const 3)) (then unreachable))
     (if (i32.eq (local.get $n) (i32.const 4)) (then (global.set $trap_log (i32.const 1))))
-    (if (i32.or (i32.eq (local.get $n) (i32.const 1))
-          (i32.or (i32.eq (local.get $n) (i32.const 4)) (i32.eq (local.get $n) (i32.const 5))))
+    (if (i32.eq (local.get $n) (i32.const 6)) (then (global.set $slr_log (i32.const 1))))
+    (if (i32.eq (local.get $n) (i32.const 7)) (then (global.set $trap_del (i32.const 1))))
+    (if (i32.or (i32.or (i32.eq (local.get $n) (i32.const 1)) (i32.eq (local.get $n) (i32.const 4)))
+          (i32.or (i32.eq (local.get $n) (i32.const 5))
+            (i32.or (i32.eq (local.get $n) (i32.const 6)) (i32.eq (local.get $n) (i32.const 7)))))
       (then (call $report (i32.const 403))))
     (if (i32.eq (local.get $n) (i32.const 5)) (then unreachable))
-    (i32.const 0))
+    (if (i32.eq (local.get $n) (i32.const 9))
+      (then (drop (call $setprop (i32.const 96) (i32.const 12) (i32.const 112) (i32.const 2)))))
+    (i32.eq (local.get $n) (i32.const 8)))
   (func (export "proxy_on_request_body") (param $c i32) (param $size i32) (param $eos i32) (result i32)
     (global.set $body (i32.add (global.get $body) (i32.const 1)))
     (if (i32.eq (local.get $size) (i32.const 3)) (then unreachable))
-    (if (i32.eq (local.get $size) (i32.const 1)) (then (call $report (i32.const 413))))
+    (if (i32.or (i32.eq (local.get $size) (i32.const 1)) (i32.eq (local.get $size) (i32.const 7)))
+      (then (call $report (i32.const 413))))
+    (if (i32.eq (local.get $size) (i32.const 7)) (then unreachable))
     (if (i32.eq (local.get $size) (i32.const 6))
       (then
         (drop (call $add (i32.const 0) (i32.const 64) (i32.const 3) (i32.const 72) (i32.const 1)))
@@ -2685,9 +2699,11 @@ mod f329_chained_request_tests {
     (i32.eq (local.get $size) (i32.const 2)))
   (func (export "proxy_on_log") (param i32)
     (global.set $log (i32.add (global.get $log) (i32.const 1)))
+    (if (global.get $slr_log) (then (global.set $slr_log (i32.const 0)) (call $report (i32.const 500))))
     (if (global.get $trap_log) (then (global.set $trap_log (i32.const 0)) unreachable)))
   (func (export "proxy_on_delete") (param i32)
-    (global.set $del (i32.add (global.get $del) (i32.const 1))))
+    (global.set $del (i32.add (global.get $del) (i32.const 1)))
+    (if (global.get $trap_del) (then (global.set $trap_del (i32.const 0)) unreachable)))
 )"#;
 
     struct Fixture {
@@ -2724,6 +2740,7 @@ mod f329_chained_request_tests {
                     allow_request_headers_write: true,
                     allow_request_body_read: true,
                     allow_request_body_write: true,
+                    allow_property_write: true,
                     ..Default::default()
                 },
                 instance_reuse: reuse,
@@ -2974,5 +2991,130 @@ mod f329_chained_request_tests {
             FilterResult::Continue { body, .. } => assert_eq!(body.as_deref(), Some(&b"hello"[..])),
             FilterResult::LocalResponse(r) => panic!("unexpected {}", r.status_code),
         }
+    }
+
+    fn continued_body(r: FilterResult) -> Option<bytes::Bytes> {
+        match r {
+            FilterResult::Continue { body, .. } => body,
+            FilterResult::LocalResponse(r) => panic!("unexpected {}", r.status_code),
+        }
+    }
+
+    // ログの段の `proxy_send_local_response` は送る応答を変えない（別に呼んでいたときは応答を書いた後で、捨てられていた）
+    #[test]
+    fn log_phase_cannot_change_the_local_response() {
+        let f = build(&["m"], true, None);
+        let s = RequestSessions::default();
+        let r = with_body(&f, &["m"], 6, b"xxxx", Some(&s));
+        assert_eq!(status(&r), Some(403));
+        assert!(s.logged());
+        assert_eq!(f.engine.pooled_instances("m"), 1);
+    }
+
+    // 削除の段のトラップ: 決まった応答は返し、インスタンスは捨てる。`on_failure` は呼ばない（`fail_reload` でも作り直さない）
+    #[test]
+    fn delete_trap_still_sends_the_local_response_and_discards_the_instance() {
+        let f = build(&["m"], true, Some(FailurePolicy::FailReload));
+        let _ = counts(&f);
+        let s = RequestSessions::default();
+        assert_eq!(
+            status(&with_body(&f, &["m"], 7, b"xxxx", Some(&s))),
+            Some(403)
+        );
+        assert!(s.logged());
+        assert_eq!(f.engine.pooled_instances("m"), 0);
+        assert_eq!(f.engine.pool_generation("m"), 0);
+    }
+
+    // B-299 の本文の段: 本文の段がローカル応答を決めてからトラップしたら、応答は返し、ログの段は応答の後に新しい
+    // インスタンスで呼ぶ（ヘッダの段と同じ）
+    #[test]
+    fn body_phase_local_response_before_a_trap_is_logged_after_the_response() {
+        let f = build(&["m"], true, None);
+        let _ = counts(&f);
+        let s = RequestSessions::default();
+        assert_eq!(
+            status(&with_body(&f, &["m"], 2, b"xxxxxxx", Some(&s))),
+            Some(413)
+        );
+        assert!(!s.logged());
+        assert_eq!(f.engine.pooled_instances("m"), 0);
+        log(&f, &["m"], &s);
+        // ログの段は新しいインスタンスで 1 回（その後の `counts` の要求の分は数えない）
+        let now = counts(&f);
+        assert_eq!(now[3], 1, "{now:?}");
+    }
+
+    // `fail_reload`: 要求の段（ヘッダ・本文）の失敗はインスタンスを作り直す。ログ・削除の段の失敗は作り直さない（`on_failure`
+    // を呼ばない。今までと同じ）
+    #[test]
+    fn fail_reload_reloads_on_request_phase_failures_only() {
+        let f = build(&["m"], true, Some(FailurePolicy::FailReload));
+        let generation = |f: &Fixture| f.engine.pool_generation("m");
+        let s = RequestSessions::default();
+        assert_eq!(
+            status(&with_body(&f, &["m"], 3, b"xxxx", Some(&s))),
+            Some(503)
+        );
+        assert_eq!(generation(&f), 1);
+        log(&f, &["m"], &s);
+        let s = RequestSessions::default();
+        assert_eq!(
+            status(&with_body(&f, &["m"], 2, b"xxx", Some(&s))),
+            Some(503)
+        );
+        assert_eq!(generation(&f), 2);
+        log(&f, &["m"], &s);
+        let s = RequestSessions::default();
+        assert_eq!(
+            status(&with_body(&f, &["m"], 4, b"xxxx", Some(&s))),
+            Some(403)
+        );
+        assert!(s.logged());
+        assert_eq!(generation(&f), 2);
+    }
+
+    // `fail_open` でヘッダの段がトラップしたら、本文の段は新しいインスタンスで別に呼ぶ（今までと同じ）
+    #[test]
+    fn fail_open_header_trap_runs_the_body_phase_separately() {
+        let f = build(&["m"], true, Some(FailurePolicy::FailOpen));
+        let s = RequestSessions::default();
+        let body = continued_body(with_body(&f, &["m"], 3, b"hello", Some(&s)));
+        assert_eq!(body.as_deref(), Some(&b"hello"[..]));
+        assert!(!s.logged());
+        log(&f, &["m"], &s);
+        // 新しいインスタンスで本文の段が 1 回、ログ・削除が 1 回
+        let now = counts(&f);
+        assert_eq!((now[1], now[2], now[3], now[4]), (1, 1, 1, 1), "{now:?}");
+    }
+
+    // ヘッダの段が本文を待つ Pause を返したら、本文の段を続けて呼ぶ（別に呼んでいたときも本文の段へ進んだ）
+    #[test]
+    fn header_pause_waiting_for_the_body_continues_to_the_body_phase() {
+        let f = build(&["m"], true, None);
+        let base = counts(&f);
+        let s = RequestSessions::default();
+        let body = continued_body(with_body(&f, &["m"], 8, b"hello", Some(&s)));
+        assert_eq!(body.as_deref(), Some(&b"hello"[..]));
+        log(&f, &["m"], &s);
+        let now = counts(&f);
+        assert_eq!(now[2] - base[2], 1, "{base:?} {now:?}");
+        assert_eq!(f.engine.pooled_instances("m"), 1);
+    }
+
+    // ゲストが `request.path` を書き換えたら続けて呼ばず、本文の段は別に呼ぶ（その段の要求の行は元に戻る。今までと同じ）
+    #[test]
+    fn request_line_override_falls_back_to_separate_calls() {
+        let f = build(&["m"], true, None);
+        let base = counts(&f);
+        let s = RequestSessions::default();
+        let body = continued_body(with_body(&f, &["m"], 9, b"hello", Some(&s)));
+        assert_eq!(body.as_deref(), Some(&b"hello"[..]));
+        assert!(!s.logged());
+        log(&f, &["m"], &s);
+        let now = counts(&f);
+        assert_eq!(now[2] - base[2], 1, "{base:?} {now:?}");
+        assert_eq!(now[3] - base[3], 2, "{base:?} {now:?}");
+        assert_eq!(f.engine.pooled_instances("m"), 1);
     }
 }

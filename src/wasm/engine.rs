@@ -1884,6 +1884,15 @@ impl FilterEngine {
             .unwrap_or(0)
     }
 
+    /// テスト用: モジュールの使い回しのインスタンスを作り直した回数（`fail_reload`）
+    #[cfg(test)]
+    pub(crate) fn pool_generation(&self, name: &str) -> u64 {
+        self.registry
+            .get_module(name)
+            .map(|m| m.pool.generation())
+            .unwrap_or(0)
+    }
+
     /// テスト用: 次にインスタンスを使うときに `proxy_on_delete` する context の数（B-177）
     #[cfg(test)]
     pub(crate) fn pending_deletes(&self, name: &str) -> usize {
