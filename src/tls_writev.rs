@@ -587,6 +587,34 @@ mod tests {
     }
 }
 
+/// rustls の送信平文バッファへ `a` と `b` を続けて積み、受理したバイト数を返す（`write_all_vectored` の下請け。F-330）。
+///
+/// 2 つを 1 回の `write_vectored` で渡す。rustls は続いた平文として TLS の記録に分けるので、ヘッダと 16 KiB までの本文は
+/// 1 つの記録になる（別々に `write` すると記録が 2 つになり、記録ごとの暗号化と送るバイトが増える。こちらで 1 つのバッファへ
+/// 写してまとめるより安い）。片方が空なら `write`（rustls は要素が 2 つ以上の `write_vectored` で要素の表を確保する）。
+/// 送信のバッファの上限で一部だけ受理したら、受理した分を [`advance_pair`] で外して呼び直す
+pub(crate) fn write_plaintext_pair(
+    conn: &mut rustls::ServerConnection,
+    a: &[u8],
+    b: &[u8],
+) -> io::Result<usize> {
+    let mut wr = conn.writer();
+    if b.is_empty() {
+        wr.write(a)
+    } else if a.is_empty() {
+        wr.write(b)
+    } else {
+        wr.write_vectored(&[IoSlice::new(a), IoSlice::new(b)])
+    }
+}
+
+/// [`write_plaintext_pair`] が受理した `n` バイトを `a`・`b` の先頭から外す
+pub(crate) fn advance_pair(a: &mut &[u8], b: &mut &[u8], n: usize) {
+    let from_a = n.min(a.len());
+    *a = &a[from_a..];
+    *b = &b[(n - from_a).min(b.len())..];
+}
+
 /// 受信した暗号文 `data` を**全量** rustls へ投入し、レコードを処理する（B-90）。
 ///
 /// rustls の `read_tls` は 1 回の呼び出しで最大 4KB（deframer の `READ_SIZE`）しか
@@ -707,6 +735,102 @@ mod read_tls_all_tests {
             n,
             wire.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod plaintext_pair_tests {
+    use super::read_tls_all_tests::pair_until_client_finished;
+    use super::{advance_pair, read_tls_all, write_plaintext_pair};
+    use std::io::{Read as _, Write as _};
+
+    /// ハンドシェイクを終わらせ、サーバの送る残り（TLS 1.3 のチケット）もクライアントへ渡す
+    fn established() -> (rustls::ClientConnection, rustls::ServerConnection) {
+        let (mut client, mut server) = pair_until_client_finished();
+        let mut wire = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut wire).unwrap();
+        }
+        read_tls_all(&mut server, &wire).unwrap();
+        let mut wire = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut wire).unwrap();
+        }
+        read_tls_all(&mut client, &wire).unwrap();
+        (client, server)
+    }
+
+    /// サーバの送る暗号文をクライアントへ渡し、アプリケーションデータの記録の数と届いた平文を返す
+    fn deliver(
+        server: &mut rustls::ServerConnection,
+        client: &mut rustls::ClientConnection,
+        got: &mut Vec<u8>,
+    ) -> usize {
+        let mut wire = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut wire).unwrap();
+        }
+        let (mut records, mut at) = (0, 0);
+        while at + 5 <= wire.len() {
+            records += usize::from(wire[at] == 23);
+            at += 5 + usize::from(u16::from_be_bytes([wire[at + 3], wire[at + 4]]));
+        }
+        assert_eq!(at, wire.len());
+        read_tls_all(client, &wire).unwrap();
+        let _ = client.reader().read_to_end(got);
+        records
+    }
+
+    const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 8000\r\n\r\n";
+
+    /// ヘッダと本文を 1 回で積むと 1 つの記録になる（別々に積むと 2 つ）。届く平文は同じ
+    #[test]
+    fn a_pair_is_one_record() {
+        let body = vec![b'x'; 8000];
+        let want = [HEAD, &body[..]].concat();
+        let (mut client, mut server) = established();
+        let n = write_plaintext_pair(&mut server, HEAD, &body).unwrap();
+        assert_eq!(n, want.len());
+        let mut got = Vec::new();
+        assert_eq!(deliver(&mut server, &mut client, &mut got), 1);
+        assert_eq!(got, want);
+
+        let (mut client, mut server) = established();
+        server.writer().write_all(HEAD).unwrap();
+        server.writer().write_all(&body).unwrap();
+        let mut got = Vec::new();
+        assert_eq!(deliver(&mut server, &mut client, &mut got), 2);
+        assert_eq!(got, want);
+
+        // 片方が空
+        for (a, b) in [(HEAD, &b""[..]), (&b""[..], HEAD)] {
+            let (mut client, mut server) = established();
+            assert_eq!(write_plaintext_pair(&mut server, a, b).unwrap(), HEAD.len());
+            let mut got = Vec::new();
+            assert_eq!(deliver(&mut server, &mut client, &mut got), 1);
+            assert_eq!(got, HEAD);
+        }
+    }
+
+    /// 送信のバッファの上限で一部だけ受理されても、受理した分を外して積み直せば全部が順に届く（`write_all_vectored` の
+    /// ループと同じ）
+    #[test]
+    fn partial_acceptance_resumes_where_it_stopped() {
+        let body: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        let want = [HEAD, &body[..]].concat();
+        for limit in [10, HEAD.len(), HEAD.len() + 1, 4096, 20_000] {
+            let (mut client, mut server) = established();
+            server.set_buffer_limit(Some(limit));
+            let (mut a, mut b) = (HEAD, &body[..]);
+            let mut got = Vec::new();
+            while !a.is_empty() || !b.is_empty() {
+                let n = write_plaintext_pair(&mut server, a, b).unwrap();
+                assert!(n > 0, "limit {limit}");
+                advance_pair(&mut a, &mut b, n);
+                deliver(&mut server, &mut client, &mut got);
+            }
+            assert_eq!(got, want, "limit {limit}");
+        }
     }
 }
 

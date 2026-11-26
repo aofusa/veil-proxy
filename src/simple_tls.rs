@@ -72,13 +72,21 @@ fn raw_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
 async fn push_plaintext_server(
     stream: &TcpStream,
     conn: &mut ServerConnection,
-    mut slice: &[u8],
+    slice: &[u8],
 ) -> io::Result<()> {
-    while !slice.is_empty() {
-        let accepted = {
-            let mut wr = conn.writer();
-            std::io::Write::write(&mut wr, slice)?
-        };
+    push_plaintext_pair_server(stream, conn, slice, &[]).await
+}
+
+/// rustls の送信平文バッファへ `a` と `b` を続けて積む（`write_all_vectored`。部分受理は [`push_plaintext_server`] と同じ）。
+/// 2 つは 1 つの TLS の記録にまとまる（[`crate::tls_writev::write_plaintext_pair`]。F-330）
+async fn push_plaintext_pair_server(
+    stream: &TcpStream,
+    conn: &mut ServerConnection,
+    mut a: &[u8],
+    mut b: &[u8],
+) -> io::Result<()> {
+    while !a.is_empty() || !b.is_empty() {
+        let accepted = crate::tls_writev::write_plaintext_pair(conn, a, b)?;
         if accepted == 0 {
             // 送信キューが上限に達していて 1 バイトも受理されなかった。キューを
             // 吐き出して空けてから再試行する。吐き出すものが無いのに 0 受理なら
@@ -92,8 +100,8 @@ async fn push_plaintext_server(
             crate::tls_writev::flush_tls_writev(stream, conn).await?;
             continue;
         }
-        slice = &slice[accepted..];
-        if !slice.is_empty() {
+        crate::tls_writev::advance_pair(&mut a, &mut b, accepted);
+        if !a.is_empty() || !b.is_empty() {
             crate::tls_writev::flush_tls_writev(stream, conn).await?;
         }
     }
@@ -369,14 +377,14 @@ impl SimpleTlsServerStream {
         };
 
         let a_slice = unsafe { std::slice::from_raw_parts(a.read_ptr(), a.bytes_init()) };
-        if let Err(e) = push_plaintext_server(&self.inner, conn, a_slice).await {
+        let b_slice: &[u8] = if b.bytes_init() > 0 {
+            unsafe { std::slice::from_raw_parts(b.read_ptr(), b.bytes_init()) }
+        } else {
+            &[]
+        };
+        // ヘッダと本文を 1 つの TLS の記録にまとめる（F-330）
+        if let Err(e) = push_plaintext_pair_server(&self.inner, conn, a_slice, b_slice).await {
             return (Err(e), a, b);
-        }
-        if b.bytes_init() > 0 {
-            let b_slice = unsafe { std::slice::from_raw_parts(b.read_ptr(), b.bytes_init()) };
-            if let Err(e) = push_plaintext_server(&self.inner, conn, b_slice).await {
-                return (Err(e), a, b);
-            }
         }
         if let Err(e) = crate::tls_writev::flush_tls_writev(&self.inner, conn).await {
             return (Err(e), a, b);
