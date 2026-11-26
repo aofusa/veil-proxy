@@ -9,7 +9,7 @@
   IP 制限を書いたルートでは要求ごとに確保と解析が走る（ホットパスの規則に反する）。
 - HTTP/2 の要求は、経路の解決に渡すヘッダを要求ごとに `Vec<(&[u8], &[u8])>` へ集める（`src/proxy/h2.rs` の `h2_dispatch`・
   `h2_serve_streaming`。`h2_route_streaming_plan` は `Bytes` の組の `Vec` も作る）。HTTP/1.1 は 16 個までスタックの配列
-  （`proxy::h1::parse_request_head`）。
+  （`proxy::h1::handle_requests` の `raw_buf`）。
 
 ## 案
 
