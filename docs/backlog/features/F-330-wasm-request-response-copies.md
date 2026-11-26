@@ -69,6 +69,37 @@
   40 KiB の閉じる応答と HEAD・204・本文の無い 404、溜めてから大きな本文の応答で一緒に送る、溜めない書き方）、`status_line_and_supplied_length`、
   `abi.rs` の `deserialize_matches_the_previous_implementation`、`stream.rs` の `local_response_tests`。
 
+## レビュー（Gemini、`docs/artifacts/proxy-wasm-perf/gemini/ans-08-review-F-330.md`）への対応
+
+must-fix は無し（送るバイト列・パイプラインの送出の順・HTTP/3 の移動・`cfg` は正しいと確かめた）。
+
+- 4-1（should-fix）: `pairs_hint` が組の数をデータの長さ / 8 まで信じて確保していた（10 MiB のゲストのメモリで約 60 MiB を確保して
+  捨てられる。前の `deserialize_headers` も表の長さの検査を通る組の数ならまとめて確保していた）。組ごとに 10 バイト（サイズテーブル
+  8・NUL 2）が収まらない組の数は 0、収まっても 64 までにした。壊れた表のローカル応答のヘッダは確保したものを持ち続けずに空の
+  `Vec` を返す。
+- 7-1（should-fix）: 長さの桁あふれ・最後の NUL の境界・壊れた組の前で止まること・`pairs_hint` の上限・CR だけ・名前の NUL・
+  LF だけの値・ASCII でない名前の試験を足した。
+- 2-1（nit）: ヘッダの見積もりを固定の 256 バイトからモジュールのヘッダの長さの上限（`wasm_local_head_bound`）にした（kTLS の
+  大きな本文・大きなヘッダの応答でバッファを伸ばし直さない）。
+- 7-2（nit）: 小さな応答を 2 つ溜めて 3 つめと送る・溜める指定のまま大きな本文の応答・本文を持たないステータスの大きな本文・
+  プールのバッファ（1 KiB・4 KiB）を超えるヘッダの試験を足した。rustls の経路は E2E（json-tls と同じ大きさの応答）で確かめる。
+
+## 確保の回数（2026-11-26、手元、`--features full,alloc-stats`、`veil_alloc_allocs_total` の差 / 要求数）
+
+フィルタは HttpArena の ABI の版。前（`320f2e49`）→ 後（`0c7e174b`）、2 巡とも同じ値。
+
+| 負荷 | 確保 / 要求 | 確保したバイト / 要求 |
+|---|---|---|
+| h1 GET（`get.raw`） | 17.0 → 16.0 | 3,790 → 3,697 |
+| h1 POST（Content-Length） | 26.0 → 25.0 | 4,096 → 3,998 |
+| h1 POST（chunked） | 27.0 → 26.0 | 4,133 → 4,033 |
+| h1 `/json/50`（8.4 KB の本文） | 17.0 → 16.0 | 20,520 → 12,052 |
+| h2c `/baseline2` | 21.07 → 21.07 | 4,841 → 4,843 |
+
+HTTP/2 は前から本文を写していない（ヘッダの取り出しと検査を 1 回にしても、前の `collect` は同じ確保を使い回していたので回数は
+同じ）。HTTP/3 は応答ごとに本文の写しが 1 つ減る（手元で測っていない。ゲストから写した `Vec` は長さと容量が同じなので `Bytes::from`
+は確保しない）。
+
 ## 関連
 
 - [F-327](F-327-proxy-wasm-path-cost.md)（親）・[F-319](F-319-wasm-per-request-fixed-cost.md)・F-202（ハンドラの応答の書き方）・F-322・B-188・B-499・F-62

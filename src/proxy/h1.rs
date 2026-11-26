@@ -2452,10 +2452,11 @@ pub(super) async fn write_wasm_local_response_h1(
         resp.body.len()
     };
     let one_buffer = body_len <= API_INLINE_BODY_MAX || stream.is_ktls_enabled();
+    let head_len = wasm_local_head_bound(resp);
     let mut out = if body_len <= API_INLINE_BODY_MAX || !one_buffer {
-        crate::pool::request_buf_get(API_HEAD_ESTIMATE + if one_buffer { body_len } else { 0 })
+        crate::pool::request_buf_get(head_len + if one_buffer { body_len } else { 0 })
     } else {
-        Vec::with_capacity(API_HEAD_ESTIMATE + body_len)
+        Vec::with_capacity(head_len + body_len)
     };
     write_wasm_local_head_h1(&mut out, resp, close);
     let size = (out.len() + body_len) as u64;
@@ -2497,10 +2498,19 @@ pub(super) fn wasm_local_response_h1(
     } else {
         resp.body.len()
     };
-    let mut out = Vec::with_capacity(API_HEAD_ESTIMATE + body_len);
+    let mut out = Vec::with_capacity(wasm_local_head_bound(resp) + body_len);
     write_wasm_local_head_h1(&mut out, resp, close);
     out.extend_from_slice(&resp.body[..body_len]);
     out
+}
+
+/// [`write_wasm_local_head_h1`] が書く長さの上限（バッファを選んで伸ばさないため。ステータス行・`Connection: close`・
+/// `Content-Length`・空行は 128 バイトに収まる〈理由句は 31 バイトまで〉）
+#[cfg(feature = "wasm")]
+fn wasm_local_head_bound(resp: &crate::wasm::LocalResponse) -> usize {
+    resp.headers
+        .iter()
+        .fold(128, |n, (k, v)| n + k.len() + v.len() + 4)
 }
 
 /// 本文を持たないステータス（1xx・204・304。B-188）
@@ -2608,7 +2618,7 @@ pub(super) fn no_wasm_modules() -> crate::wasm_plugin_config::WasmModules {
 #[cfg(any(feature = "handler", feature = "wasm"))]
 pub(super) const API_INLINE_BODY_MAX: usize = 3 * 1024;
 /// ステータス行と既定のヘッダの見積もり（プールのバッファの選択に使う）。
-#[cfg(any(feature = "handler", feature = "wasm"))]
+#[cfg(feature = "handler")]
 pub(super) const API_HEAD_ESTIMATE: usize = 256;
 
 /// ハンドラのストリーミング応答を HTTP/1.1 の chunked で書く（F-197）。トレーラは最後のチャンクの後に
@@ -2986,33 +2996,82 @@ mod b186_overflow_tests {
         if !runtime_available() {
             return;
         }
-        let local = |status: u16, len: usize| crate::wasm::LocalResponse {
+        // `extra` 個の 200 バイトのヘッダを足す（ヘッダの見積もりを超える応答）
+        let with_headers = |status: u16, len: usize, extra: usize| crate::wasm::LocalResponse {
             status_code: status,
-            headers: vec![(b"content-type".to_vec(), b"text/plain".to_vec())],
+            headers: std::iter::once((b"content-type".to_vec(), b"text/plain".to_vec()))
+                .chain((0..extra).map(|i| (format!("x-h{i}").into_bytes(), vec![b'v'; 200])))
+                .collect(),
             body: (0..len).map(|i| b'a' + (i % 26) as u8).collect(),
         };
+        let local = move |status: u16, len: usize| with_headers(status, len, 0);
         let expected = wasm_local_response_h1;
         let limit = Duration::from_secs(5);
         crate::runtime::block_on(async move {
-            for (status, len, head, close) in [
-                (200, 2, false, false),
-                (200, API_INLINE_BODY_MAX, false, false),
-                (200, API_INLINE_BODY_MAX + 1, false, false),
-                (200, 40 * 1024, false, true),
-                (200, 40 * 1024, true, false),
-                (204, 10, false, false),
-                (404, 0, false, false),
+            for (status, len, extra, head, close) in [
+                (200, 2, 0, false, false),
+                (200, API_INLINE_BODY_MAX, 0, false, false),
+                (200, API_INLINE_BODY_MAX + 1, 0, false, false),
+                (200, 40 * 1024, 0, false, true),
+                (200, 40 * 1024, 0, true, false),
+                (204, 10, 0, false, false),
+                (204, 10 * 1024, 0, false, false),
+                (304, 10 * 1024, 0, false, true),
+                (404, 0, 0, false, false),
+                // ヘッダがプールのバッファ（1 KiB・4 KiB）より大きい
+                (200, 2, 2, false, false),
+                (200, 2, 8, false, false),
+                (200, API_INLINE_BODY_MAX, 30, false, false),
+                (200, 40 * 1024, 8, false, true),
             ] {
                 let (s, c) = pair();
                 let mut tls = server(s).await;
-                let mut r = local(status, len);
+                let mut r = with_headers(status, len, extra);
                 let want = expected(&r, head, close);
                 let (size, ok) =
                     write_wasm_local_response_h1(&mut tls, &mut r, head, close, true, limit).await;
-                assert!(ok);
-                assert_eq!(size as usize, want.len(), "{status} {len} {head} {close}");
-                assert_eq!(received(&c), want, "{status} {len} {head} {close}");
+                let case = format!("{status} {len} {extra} {head} {close}");
+                assert!(ok, "{case}");
+                assert_eq!(size as usize, want.len(), "{case}");
+                assert_eq!(received(&c), want, "{case}");
             }
+            // 小さな応答を 2 つ溜めて、次の要求の無い 3 つめと一緒に送る
+            let (s, c) = pair();
+            let mut tls = server(s).await;
+            let mut want = Vec::new();
+            for (n, hold_next) in [(3, true), (4, true), (5, false)] {
+                tls.set_hold_next(hold_next);
+                let mut r = local(200, n);
+                want.extend_from_slice(&expected(&r, false, false));
+                assert!(
+                    write_wasm_local_response_h1(&mut tls, &mut r, false, false, true, limit)
+                        .await
+                        .1
+                );
+                if hold_next {
+                    assert!(received(&c).is_empty());
+                }
+            }
+            assert_eq!(received(&c), want);
+            // 次の要求が届いていても、大きな本文の応答は溜めずに溜めた分と一緒に送る
+            let (s, c) = pair();
+            let mut tls = server(s).await;
+            tls.set_hold_next(true);
+            let mut small = local(200, 5);
+            let mut large = local(200, 10 * 1024);
+            let want = [
+                expected(&small, false, false),
+                expected(&large, false, false),
+            ]
+            .concat();
+            for r in [&mut small, &mut large] {
+                assert!(
+                    write_wasm_local_response_h1(&mut tls, r, false, false, true, limit)
+                        .await
+                        .1
+                );
+            }
+            assert_eq!(received(&c), want);
             // パイプラインで次の要求が届いていれば溜め、次の応答の前に送る（大きな本文の応答は溜めた分を先に送る。F-322）
             let (s, c) = pair();
             let mut tls = server(s).await;

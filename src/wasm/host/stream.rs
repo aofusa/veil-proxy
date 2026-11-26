@@ -212,7 +212,7 @@ fn local_response_headers(data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         }
     });
     if !complete {
-        headers.clear();
+        return Vec::new();
     }
     headers
 }
@@ -231,12 +231,19 @@ mod local_response_tests {
             (Vec::new(), b"v".to_vec()),
             (b"x-nul".to_vec(), b"a\0b".to_vec()),
             (b"Content-Type".to_vec(), b"text/plain".to_vec()),
+            (b"x-cr".to_vec(), b"a\rb".to_vec()),
+            (b"x-lf".to_vec(), b"a\nb".to_vec()),
+            (b"bad\rname".to_vec(), b"v".to_vec()),
+            (b"bad\0name".to_vec(), b"v".to_vec()),
+            // ASCII でないバイトはそのまま（小文字にするのは ASCII だけ）
+            (b"X-\xC3\x84b".to_vec(), b"\xC3\x84".to_vec()),
         ]);
         assert_eq!(
             local_response_headers(&map),
             vec![
                 (b"x-blocked".to_vec(), b"1".to_vec()),
                 (b"content-type".to_vec(), b"text/plain".to_vec()),
+                (b"x-\xC3\x84b".to_vec(), b"\xC3\x84".to_vec()),
             ]
         );
     }
@@ -252,5 +259,10 @@ mod local_response_tests {
         assert!(local_response_headers(&map).is_empty());
         assert!(local_response_headers(&[1, 0]).is_empty());
         assert!(local_response_headers(&[]).is_empty());
+        // 収まらない組の数（確保もしない）
+        let mut big = vec![0u8; 1 << 16];
+        big[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let none = local_response_headers(&big);
+        assert!(none.is_empty() && none.capacity() == 0);
     }
 }

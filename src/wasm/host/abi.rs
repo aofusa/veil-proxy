@@ -56,11 +56,22 @@ pub(crate) fn deserialize_headers(data: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>
     .then_some(headers)
 }
 
-/// 表の組の数（確保の見込み）。データの長さで抑える（組ごとにサイズテーブルの 8 バイトが要る）
+/// 表の組の数（確保の見込み）。組ごとにサイズテーブルの 8 バイトと名前・値の NUL の 2 バイトが要るので、それが収まらない
+/// 組の数は壊れた表（0）。見込みは [`PAIRS_HINT_MAX`] で抑える（ゲストが書いた組の数でホストのメモリをまとめて確保しない。
+/// それより多い表は `push` が伸ばす）
 pub(crate) fn pairs_hint(data: &[u8]) -> usize {
-    data.first_chunk::<4>()
-        .map_or(0, |n| (u32::from_le_bytes(*n) as usize).min(data.len() / 8))
+    let Some(n) = data.first_chunk::<4>() else {
+        return 0;
+    };
+    let n = u32::from_le_bytes(*n) as usize;
+    if n > data.len().saturating_sub(4) / 10 {
+        return 0;
+    }
+    n.min(PAIRS_HINT_MAX)
 }
+
+/// [`pairs_hint`] の上限
+const PAIRS_HINT_MAX: usize = 64;
 
 /// Proxy-Wasm ABI 形式のヘッダマップの名前と値を、写さずに順に `f` へ渡す（F-330。取り出しと検査を 1 回の走査で行う
 /// 呼び出し元のため）。データが壊れていれば、その組の前で止めて `false`（それまでの組は渡している）
@@ -136,6 +147,64 @@ mod tests {
         assert_eq!(deserialize_headers(&bytes), Some(Vec::new()));
         // SDK は空マップを空バイト列で送ることがある
         assert_eq!(deserialize_headers(&[]), Some(Vec::new()));
+    }
+
+    /// 1 組の表（名前と値の長さを書き換えられる）
+    fn one_pair(key_len: u32, val_len: u32, rest: &[u8]) -> Vec<u8> {
+        let mut b = 1u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&key_len.to_le_bytes());
+        b.extend_from_slice(&val_len.to_le_bytes());
+        b.extend_from_slice(rest);
+        b
+    }
+
+    /// 長さの桁あふれ・最後の NUL の境界
+    #[test]
+    fn lengths_at_the_edges_are_rejected_without_overflow() {
+        assert_eq!(deserialize_headers(&one_pair(u32::MAX, 0, b"k\0v\0")), None);
+        assert_eq!(deserialize_headers(&one_pair(1, u32::MAX, b"k\0v\0")), None);
+        assert_eq!(
+            deserialize_headers(&one_pair(1, 1, b"k\0v\0")),
+            Some(vec![(b"k".to_vec(), b"v".to_vec())])
+        );
+        // 値の後の NUL が無い（値はデータの終わりまで）
+        assert_eq!(deserialize_headers(&one_pair(1, 1, b"k\0v")), None);
+        // 名前の後の NUL しか無い
+        assert_eq!(deserialize_headers(&one_pair(1, 0, b"k\0")), None);
+        assert_eq!(
+            deserialize_headers(&one_pair(1, 0, b"k\0\0")),
+            Some(vec![(b"k".to_vec(), Vec::new())])
+        );
+    }
+
+    /// 壊れた組の前までは渡して `false`
+    #[test]
+    fn visit_stops_before_a_broken_pair() {
+        let mut b = serialize_headers(&[
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+        ]);
+        b.truncate(b.len() - 1);
+        let mut seen = Vec::new();
+        assert!(!visit_headers(&b, |k, v| seen.push((k.to_vec(), v.to_vec()))));
+        assert_eq!(seen, vec![(b"a".to_vec(), b"1".to_vec())]);
+    }
+
+    /// ゲストが書いた組の数でまとめて確保しない（収まらない組の数は 0、収まっても上限まで）
+    #[test]
+    fn pairs_hint_is_bounded_by_the_data_and_a_cap() {
+        let mut big = vec![0u8; 1 << 20];
+        let fits = (big.len() as u32 - 4) / 10;
+        big[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(pairs_hint(&big), 0);
+        big[..4].copy_from_slice(&(fits + 1).to_le_bytes());
+        assert_eq!(pairs_hint(&big), 0);
+        big[..4].copy_from_slice(&fits.to_le_bytes());
+        assert_eq!(pairs_hint(&big), PAIRS_HINT_MAX);
+        let two = serialize_headers(&[(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), Vec::new())]);
+        assert_eq!(pairs_hint(&two), 2);
+        assert_eq!(pairs_hint(&[]), 0);
+        assert_eq!(pairs_hint(&[5, 0, 0]), 0);
     }
 
     /// 不正データ（サイズテーブル超過・過大 num_pairs）で panic せず None を返すこと
