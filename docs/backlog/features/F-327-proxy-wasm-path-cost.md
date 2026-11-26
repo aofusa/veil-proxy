@@ -80,14 +80,13 @@
 
 ## 分担（Claude Code と Gemini）
 
-- 計画のレビュー（`docs/artifacts/proxy-wasm-perf/gemini/ans-04-design-review.md`）の指摘は全部チケットへ入れた（扱いは
-  `gemini/notes-04-disposition.md`）。
-
 - Claude Code: コードの変更・ビルド・試験・aofish の計測・チケットの更新・コミット。
 - Gemini（同じ tmux のセッションの別の枠）: 調査・文書の読解・各コミットのコードレビュー（読むだけ。ビルド・試験・git の状態の変更はしない）。
   やり取りは `docs/artifacts/proxy-wasm-perf/gemini/`（依頼 `req-NN-*.md` と回答 `ans-NN-*.md`。決まりは同じ場所の `README.md`）。
 - 子チケットごとに、着手の前に Gemini に設計の確認を、コミットの後に差分のレビュー（ホットパスの規則・ABI の意味・`cfg(feature)`・
   `unsafe`・試験の漏れ）を頼み、指摘は直すか理由を書いて退ける。
+- 計画のレビュー（`docs/artifacts/proxy-wasm-perf/gemini/ans-04-design-review.md`）の指摘は全部チケットへ入れた（扱いは
+  `gemini/notes-04-disposition.md`）。
 
 ## 計測（全子チケット共通）
 

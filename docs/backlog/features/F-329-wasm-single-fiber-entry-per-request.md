@@ -65,11 +65,13 @@
 ## 意味の変化と危険
 
 - `proxy_on_log` が、応答をソケットへ書き終える前（応答が決まった直後）に走る。ログの段から見える応答のステータス・ヘッダは決まっているが、
-  書き込みの失敗と書き込みにかかった時間は見えない。Envoy もローカル応答では、応答を接続のバッファへ符号化した後、同じイベントループの周回の
-  ストリームの終わり（`ConnectionManagerImpl::doEndStream` → `filter_manager_.log(DownstreamEnd)`）でアクセスログ（`proxy_on_log`）を呼び、
-  その後の遅延破棄で `proxy_on_delete` を呼ぶ。ソケットへの送出は待たない（ans-04 の 1。Envoy の `source/common/http/conn_manager_impl.cc`・
-  `filter_manager.cc`・`source/extensions/common/wasm/context.cc`）。違いは veil が符号化の前に呼ぶこと。ガイド（`docs/guide/` の Proxy-Wasm の章、
-  英日）に書く。
+  書き込みの失敗と書き込みにかかった時間は見えない。Envoy の HTTP/1.1・HTTP/2 は、応答をコーデックへ符号化し終えたストリームの終わり
+  （`ConnectionManagerImpl::doEndStream` → `doDeferredStreamDestroy`）で `stream.log(AccessLogType::DownstreamEnd)`（→ `proxy_on_log`）、
+  `stream.filter_manager_.destroyFilters()`（→ `onDestroy` → `proxy_on_done`・`proxy_on_delete`）、`dispatcher_->deferredDelete(..)` の順に
+  同期で呼び、ソケットへの送出を待たない（待つのはコーデックの完了〈`canDestroyStream`〉だけ。2026-11-26 に `source/common/http/conn_manager_impl.cc`
+  を読んで確かめた。`onDestroy` から先は ans-04 の読解）。違いは veil が符号化の前に呼ぶこと。**HTTP/3 は違う**: Envoy は
+  `doDeferredStreamDestroy` でログを呼ばず `deferHeadersAndTrailers()` で後へ回す（送った分の ACK を待つ仕組みと見ている。未確認）。veil の
+  HTTP/3 は送出の前に呼ぶことになる。ガイド（`docs/guide/` の Proxy-Wasm の章、英日）に書く。
 - 今はローカル応答の要求のログの段の `response.code` が 0 で応答ヘッダも空（`set_response` は応答ヘッダの段でしか呼ばれない。`engine.rs:1234`）。
   1 で直る。ただし外部呼び出し（`dispatch_http_call`）の応答で決まったローカル応答は今の経路のままなので 0 のまま（範囲外。ans-04 の 6-6）。
 - 今は応答の書き込みに失敗すると HTTP/1.1 は `proxy_on_log` を呼ばずに戻る（context は後の要求の `take_pending_deletes` で消す）。

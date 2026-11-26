@@ -26,8 +26,9 @@
    HTTP/3 は `Bytes::from(resp.body)` にする。本文のゲストのメモリからの最初の写し（`src/wasm/host/stream.rs` の `to_vec()`）は残るが、
    これを 1 回だけの写しにする（プロトコルの側で写し直さない。HTTP/1.1 でヘッダと同じバッファへ写す形にするなら最初の写しをそこへ直接）。
 2. json-tls の TLS の分類が Proxy-Wasm の版だけ +0.93 µs/要求 重い（`docs/artifacts/proxy-wasm-perf/profile-2026-11-26.md`。暗号化の本体は同じ）。
-   ローカル応答を 1 つの `Vec` で書く今の形と、ネイティブの `write_api_response`（ヘッダと本文を分けて `write_all_vectored`）の違いで
-   説明できるかを 1 の前後で確かめる。
+   ローカル応答を毎回確保する `Vec` に `write_fmt` で書く今の形（`wasm_local_response_h1`）と、ネイティブの `write_api_response`（プールの
+   バッファにヘッダを書き、3 KiB 以下の本文は同じバッファへ続けて `write_or_hold`、超える本文は `write_all_vectored`）の違いで説明できるかを
+   1 の前後で確かめる。
 3. POST: 本文の全量が読み取りバッファにあれば写さずに切り出す（`Bytes`）。[F-329](F-329-wasm-single-fiber-entry-per-request.md) の 3
    （本文の全量があるときヘッダと本文の段を 1 回で呼ぶ）が通る要求は、本文の段のヘッダ・文字列の作り直しがそもそも無くなるので、
    ここで扱うのは本文を分割して受ける要求の側（ヘッダの段のヘッダ・文字列を要求の並び〈`RequestSessions`〉に持たせる等）と、
