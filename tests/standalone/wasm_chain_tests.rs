@@ -386,8 +386,15 @@ max_chunked_body_size = 1024
     };
     let chunked = "POST /a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
                    Transfer-Encoding: chunked\r\n\r\n";
+    // HTTP/1.1 と h2c は同じインスタンス（平文のワーカー）なので、h2c の最初の読み取りも HTTP/1.1 の最後の作成の数より大きい
+    let mut clear_creates = 0;
     for proto in all_protos() {
-        let before = settled(proto, ports, &veil, &mut 0, 1);
+        let min_creates = if proto == Proto::H2c {
+            clear_creates + 1
+        } else {
+            1
+        };
+        let before = settled(proto, ports, &veil, &mut 0, min_creates);
         let mut resent = 0;
         // 要求の数、本文の段の数（本文の全量で 1 回）、本文の段が受けた大きさの合計
         let (mut requests, mut bodies, mut bytes) = (0, 0, 0);
@@ -445,15 +452,10 @@ max_chunked_body_size = 1024
         // `before` の後の要求と、`after` の `/stats`（送り直した分を含む）
         let created = requests + resent + 1;
         assert_eq!(
-            (
-                after.creates - before.creates,
-                after.bodies - before.bodies,
-                after.body_bytes - before.body_bytes,
-                after.early,
-            ),
-            (created, bodies, bytes, 0),
-            "{proto:?}: (creates, request bodies, body bytes, body seen in the headers phase) \
-             {before:?} -> {after:?}\n{}",
+            (after.since(&before), after.early),
+            ((created, created, bodies, bytes, created, created), 0),
+            "{proto:?}: ((creates, headers, request bodies, body bytes, logs, deletes), \
+             body seen in the headers phase) {before:?} -> {after:?}\n{}",
             veil.log()
         );
 
@@ -480,7 +482,15 @@ max_chunked_body_size = 1024
         // 413（HTTP/1.1 は本文を読む前の検査、HTTP/2・HTTP/3 は本文を溜めてからの検査）
         let before = after;
         let mut resent = 0;
-        let r = fetch(proto, ports, "POST", "/a", &[], &[b'x'; 2048]);
+        // HTTP/1.1 はヘッダと本文を 1 回で書く（本文を読む前に 413 を返して閉じるので、分けて書くと 2 回目の書き込みが
+        // 負荷の下で閉じた後になり得る）
+        let r = if proto == Proto::H1 {
+            let head = "POST /a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+                        Content-Length: 2048\r\n\r\n";
+            h1_raw(ports.clear, head, &[b'x'; 2048], false)
+        } else {
+            fetch(proto, ports, "POST", "/a", &[], &[b'x'; 2048])
+        };
         assert_eq!(r.status, 413, "{proto:?} over the limit\n{}", veil.log());
         let after = settled(proto, ports, &veil, &mut resent, before.creates + 1);
         assert_eq!(
@@ -525,6 +535,7 @@ max_chunked_body_size = 1024
                 );
                 before = after;
             }
+            clear_creates = before.creates;
             continue;
         }
 

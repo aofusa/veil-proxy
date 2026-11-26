@@ -2569,7 +2569,8 @@ mod f331_request_reuse_tests {
 
     /// `proxy_get_property` を表のパス・最後の NUL・`.` で繋いだ形・長さ付きの形・許可の無いプロパティ・メモリの外の場所・
     /// アロケータの失敗で呼び、ケースごとに戻り値を要求ヘッダ `r<ケース>`（`A` + 戻り値の 1 バイト）に、成功なら値を
-    /// `v<ケース>` に足すモジュール。アロケータは `$mode` が 1 ならメモリの終わりの 1 バイト前、2 なら 0 を返す
+    /// `v<ケース>` に足すモジュール。アロケータは `$mode` が 1 ならメモリの終わりの 1 バイト前、2 なら 0、3 なら値
+    /// （6 バイト）がメモリの終わりちょうどで終わる場所、4 ならその 1 バイト先、5 なら -1 を返す
     const PROPERTY_MODULE: &str = r#"(module
   (import "env" "proxy_get_property" (func $prop (param i32 i32 i32 i32) (result i32)))
   (import "env" "proxy_add_header_map_value"
@@ -2626,8 +2627,8 @@ mod f331_request_reuse_tests {
                  (i64.eq (i64.load (i32.const 64)) (i64.const 0x5a5a5a5a5a5a5a5a)))))
     (drop (call $add (i32.const 0) (i32.const 200) (i32.const 2) (i32.const 202) (i32.const 1))))
   (func (export "proxy_on_request_headers") (param i32 i32 i32) (result i32)
-    ;; メモリの終わりちょうどで終わるパス（65524..65536 の "request\00path"）。アロケータが終わりを返す場合（v）が
-    ;; 値で上書きするので、要求ごとに書き直す
+    ;; メモリの終わりちょうどで終わるパス（65524..65536 の "request\00path"）。戻り値の場所がメモリの終わりの場合（q）と
+    ;; アロケータが終わりを返す場合（v）が上書きするので、要求ごとに書き直す
     (i64.store (i32.const 65524) (i64.const 0x0074736575716572))
     (i32.store (i32.const 65532) (i32.const 0x68746170))
     (call $case (i32.const 97) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
@@ -2654,17 +2655,18 @@ mod f331_request_reuse_tests {
     ;; 戻り値の場所と長さの場所が同じ（どちらも書けるので OK。値は見ない）
     (call $report (i32.const 117)
       (call $prop (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 64)))
+    ;; アロケータがメモリの外を返す場合（j・w・x）も、値の行き先と戻り値の場所に書かない
     (global.set $mode (i32.const 1))
-    (call $case (i32.const 106) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
+    (call $intact (i32.const 106) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
     (global.set $mode (i32.const 2))
     (call $case (i32.const 107) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
     ;; アロケータの返す場所: 値がメモリの終わりちょうどで終わる・1 バイト先・-1
     (global.set $mode (i32.const 3))
     (call $case (i32.const 118) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
     (global.set $mode (i32.const 4))
-    (call $case (i32.const 119) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
+    (call $intact (i32.const 119) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
     (global.set $mode (i32.const 5))
-    (call $case (i32.const 120) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
+    (call $intact (i32.const 120) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
     (global.set $mode (i32.const 0))
     (i32.const 0))
 )"#;
@@ -2890,11 +2892,14 @@ mod f331_request_reuse_tests {
             intact(b't'),
             rc(b'u', OK),
             rc(b'j', MEMORY),
+            intact(b'j'),
             rc(b'k', INTERNAL),
             rc(b'v', OK),
             value(b'v'),
             rc(b'w', MEMORY),
+            intact(b'w'),
             rc(b'x', MEMORY),
+            intact(b'x'),
         ];
         for reuse in [false, true] {
             let engine = engine(&dir, PROPERTY_MODULE, reuse);
