@@ -1,7 +1,8 @@
-# F-333: ゲストの小さな `memory.copy`・`memory.fill` を wasmtime の側で速くする（要判断。どのフィルタにも効く）
+# F-333: ゲストの小さな `memory.copy`・`memory.fill` を wasmtime の側で速くする（見送り）
 
-**状態: 保留（[F-327](F-327-proxy-wasm-path-cost.md) の子。wasmtime の手直しが要るので [F-335](F-335-wasmtime-fiber-entry-cost.md) と一緒に利用者が判断する。
-HttpArena のエントリはフィルタを bulk-memory 無しでビルドすれば足りる〈[F-334](F-334-httparena-filter-and-guide.md)〉）**
+**状態: 見送り（2026-11-26、利用者の判断。[F-327](F-327-proxy-wasm-path-cost.md) の子。wasm のランタイムはセキュリティ上デリケートなので、
+wasmtime に手直し・独自の拡張を入れない。HttpArena のエントリはフィルタを bulk-memory 無しでビルドする〈[F-334](F-334-httparena-filter-and-guide.md)。
+測った値は json-tls −2.2 µs/要求〉。下は判断の記録）**
 
 ## 現状
 

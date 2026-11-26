@@ -24,7 +24,7 @@
    （aofish の `perf` は `cpu-clock:u` のみ）。
 3. 共有の行の競合の兆候: ワーカーを 1・2・4・8 本にして、ワーカーあたりの負荷を揃えたときの 1 要求の費用が増えないかを見る
    （HttpArena はサーバに 64 スレッド。aofish は 8 本までしか見られない。wasmtime はファイバーごとに全ワーカー共有のエンジンの `Arc` を
-   複製して捨てる〈[F-335](F-335-wasmtime-fiber-entry-cost.md)〉）。2026-11-26 の予備の計測（`docs/artifacts/proxy-wasm-perf/profile-2026-11-26.md`
+   複製して捨てる〈[F-335](F-335-wasmtime-fiber-entry-cost.md) の調べ。F-335 は見送り〉）。2026-11-26 の予備の計測（`docs/artifacts/proxy-wasm-perf/profile-2026-11-26.md`
    の「ワーカーの数」）では、aofish はコアを増やすとクロックが下がって全分類が均等に伸び、Wasm に固有の上乗せは 4 ワーカーで約 0.07 µs
    （ファイバーの出入り）。SMT の兄弟と分け合うと Proxy-Wasm の版の方が大きく伸びる（×1.33 と ×1.09）。
 4. 負荷の形を HttpArena に寄せる: json-tls は同じ `json-tls-rotate.lua`、HTTP/2 は HttpArena の `-c 256 -m 100` でも測る（aofish の既定は

@@ -1,50 +1,38 @@
-# F-332: wasmtime の設定と cargo の機能を Proxy-Wasm の経路に合わせて見直す
+# F-332: wasmtime の設定と cargo の機能を Proxy-Wasm の経路に合わせて見直す（見送り）
 
-**状態: 未着手（[F-327](F-327-proxy-wasm-path-cost.md) の子。測って効いたものだけ入れる）**
+**状態: 見送り（2026-11-26、利用者の判断。[F-327](F-327-proxy-wasm-path-cost.md) の子。拡張性を性能より優先する方針により、veil の wasmtime の
+cargo の機能と設定は変えない）**
 
-## 現状
+## 見送りの理由
 
-- Linux は crates.io の wasmtime 36.0.21。cargo の機能は `async`・`gc`・`gc-drc`・`gc-null`・`wat`・`parallel-compilation`・`cranelift`・
-  `pooling-allocator`・`demangle`・`addr2line`・`coredump`・`debug-builtins`・`runtime`・`component-model`・`threads`・`stack-switching`・`std`・
-  `pulley`（`Cargo.toml:793`。BSD の vendoring 版も同じ）。veil の `src/wasm/` は component・共有メモリ・コアダンプ・GC の参照・
-  スタックの切り替えを使っていない。
-- エンジンの設定（`src/wasm/registry.rs` の `create_engine`）はプーリングアロケータ、`async_support`、`epoch_interruption`、`cranelift_opt_level(Speed)`、
-  スタックの大きさのみ。`table_lazy_init` 等は既定。
-- ans-01（Gemini）の指摘: ホスト関数の呼び出しごとの `Caller::with` が GC のルートの範囲（`gc_roots().enter_lifo_scope()`）を出入りする、
-  `table_lazy_init`（既定 true）で SDK の `Box<dyn HttpContext>` の `call_indirect` ごとに初期化の検査が入る。
-- ans-02（`docs/artifacts/proxy-wasm-perf/gemini/ans-02-wasmtime.md` の 5。`Caller::with` の GC の範囲はソースで確かめた）:
-  - `gc`・`gc-drc`・`gc-null`: ホスト関数の呼び出しごと（`run_chain` も）に `Caller::with` が GC のルートの範囲に出入りし
-    （`wasmtime-36.0.21/src/runtime/func.rs` の `enter_lifo_scope`・`exit_gc_lifo_scope`。無効なら何もしない）、`TypedFunc::call_raw` が
-    `AutoAssertNoGc` を 2 回作る。エンジンは GC の収集器（DRC）を作り、ストアとプールに GC のヒープの場所を持つ。veil は GC の参照を使わない。
-  - `coredump`: トラップの準備（`CallThreadState`）ごとに 1 語の写しが増えるだけ。
-  - `component-model`・`threads`・`stack-switching`・`debug-builtins`: 呼び出しごとの費用は無い（`stack-switching` を外してもスタックの鎖の
-    保存と復元は消えない）。ストアとプールの構造が大きくなる・バイナリの大きさ。
-  - `addr2line`・`demangle`: トラップのときのバックトレースの表示だけ。`wat`: 試験とテキストのモジュールの読み込みが使う。
-  - `table_lazy_init`（既定 true）: `call_indirect` ごとの初期化の検査。h1・json-tls の主な費用ではない。
+- 利用者の方針（2026-11-26）: Proxy-Wasm は拡張性を大事にする。Envoy の Proxy-Wasm で動くフィルタ・Rust の Proxy-Wasm の SDK で書いたフィルタが
+  そのまま動くことを重視し、今できることができなくなるのは避ける。veil 本体の機能は減らさない。HttpArena 向けの最適化はフィルタ（拡張の側）で
+  行う（[F-334](F-334-httparena-filter-and-guide.md)）。
+- 1 要求の費用に効くのは `gc`・`gc-drc`・`gc-null` だけで（ans-02 の見込みは他と合わせて −0.05〜0.15 µs/要求、試算で 10〜15 点）、外すと
+  Wasm 2.0 の `externref` を使うモジュールが読めなくなる。他の機能は外しても 1 要求の費用は変わらない（ans-02 の 5）。
 
-## 改修内容（候補。測ってから決める）
+## 機能ごとの調べ（記録）
 
-1. `gc`・`gc-drc`・`gc-null`・`coredump`・`component-model`・`threads`・`stack-switching`・`debug-builtins` を外して測る（ans-02 の見込みは
-   −0.05〜0.15 µs/要求）。`gc` を外すと GC の型（`externref`・`anyref` 等）を使うモジュールは読めなくなる（Rust・TinyGo・C++ の Proxy-Wasm の
-   SDK は使わない。`gc` 無しのとき wasmtime は `WasmFeatures::GC_TYPES` を閉じるだけで〈`wasmtime-36.0.21/src/config.rs`〉、これは `externref`・`anyref` 等を止め、`funcref` は止めない〈`wasmparser-0.236.1/src/features.rs`〉。reference-types の複数のテーブルも読める）。
-   外すなら利用者の確認を得て、ガイドに書く。`addr2line`・`demangle`・`wat` は残す。
-2. `instance_reuse` のときの `table_lazy_init(false)`。
-3. その他、1 要求の費用に効く `Config` の項目（ans-02 の結果から）。
+wasmtime 36.0.21 の既定の Wasm の機能（`src/config.rs` の `features()`）は Wasm 2.0 に multi-memory・relaxed-simd・tail-call・extended-const・
+memory64 を足したもので、`GC_TYPES`・`THREADS`・`COMPONENT_MODEL` は cargo の機能があるときだけ有効になる。veil の `create_engine`
+（`src/wasm/registry.rs`）は Wasm の機能を上書きしていない。
 
-## 危険
+| cargo の機能 | 今できること | 外したときに失うもの | 1 要求の費用（ans-02 の 5） |
+|---|---|---|---|
+| `gc`・`gc-drc`・`gc-null` | `GC_TYPES`。Wasm 2.0（reference-types）の `externref` 等を使うモジュールが読める（GC の提案〈struct・array〉自体は `wasm_gc` が既定で無効なので今も読めない） | `externref` を使うモジュール（Proxy-Wasm の SDK は使わないが、他の言語・道具の出力に含まれ得る） | ホスト関数ごとの GC のルートの範囲の出入り（`Caller::with`）、呼び出しごとの `AutoAssertNoGc` 2 回 |
+| `threads` | `THREADS`。アトミック命令・共有メモリを使うモジュールが検証を通る（共有メモリはプーリングアロケータが拒む〈`memory_pool.rs:333`〉ので、プールを切った設定でだけ動く） | アトミック命令・共有メモリを使うモジュール | なし |
+| `component-model` | `COMPONENT_MODEL`。veil は今コンポーネントを読まない | 将来コンポーネントのフィルタを扱う余地 | なし（ストアの構造が大きくなるだけ） |
+| `stack-switching` | 今も使えない（`wasm_stack_switching` が既定で無効） | なし | なし（スタックの鎖の保存と復元は 36 では外しても消えない） |
+| `coredump` | トラップのときのコアダンプ（veil は今使っていない） | 障害の解析の手段 | トラップの準備ごとに 1 語の写し |
+| `debug-builtins`・`addr2line`・`demangle` | ネイティブのデバッガへの登録、トラップのバックトレースの表示 | 障害の解析の手段 | なし |
+| `wat` | テキスト形式（`.wat`）のモジュールを読める（`Module::new`）。試験も使う | `.wat` のフィルタ・試験 | なし |
 
-- AOT のキャッシュ（`.cwasm`）の名前はモジュールのハッシュだけで、エンジンの設定を含まない（`src/wasm/registry.rs` の `aot_cache_path`）。
-  設定の違う `.cwasm` は wasmtime の検査で読めずに作り直して上書きするので、A/B は 2 つのビルドでキャッシュの場所を分ける。版を上げた後の
-  最初の起動は作り直しになる（名前に設定のハッシュを混ぜるかは、このチケットで決める）。
-- BSD・aarch64 向けの vendoring 版（`veil-proxy-wasmtime`、`third_party/wasmtime`、Pulley）でも同じ機能の組でビルドでき動くこと
-  （`full-freebsd`・`full-openbsd`・`full-netbsd` のビルド）。
-- 外した機能を使うモジュールの読み込みが分かりやすいエラーで失敗すること。
-
-## 受け入れ条件
-
-- 入れたものそれぞれに aofish の交互 A/B（同じビルドの中の切り替えができないものは 3 巡）。
-- Proxy-Wasm の E2E（試験のモジュール全部が読める）、BSD 向けのクロスビルドが通る。
+- 機能を変えない設定の候補だった `table_lazy_init(false)`（`call_indirect` ごとの初期化の検査を無くす）も入れない。効果は小さく（ans-02 の 5-2。
+  h1・json-tls の主な費用ではない）、エンジン全体の設定なので、インスタンスを使い回さないモジュールの作成が重くなる。
+- HttpArena のエントリだけ機能を減らした veil を使う案も採らない（エントリで動く veil の機能が減る。効果も小さい）。
+- 線形メモリの読み書きの境界の検査は、今の設定（4 GiB の予約・32 MiB のガード。既定のまま）ですでに省かれている（ans-02 の 6）。
+  フィルタの `put_i64` に見える検査は、ゲストの Rust のスライスの検査（フィルタの側。[F-334](F-334-httparena-filter-and-guide.md)）。
 
 ## 関連
 
-- [F-327](F-327-proxy-wasm-path-cost.md)（親）・B-55（vendoring 版）・`docs/artifacts/proxy-wasm-perf/gemini/ans-01-host-path.md` の候補 3・`ans-02-wasmtime.md`
+- [F-327](F-327-proxy-wasm-path-cost.md)（親）・B-55（vendoring 版）・`docs/artifacts/proxy-wasm-perf/gemini/ans-01-host-path.md` の候補 3・`ans-02-wasmtime.md` の 5・6
