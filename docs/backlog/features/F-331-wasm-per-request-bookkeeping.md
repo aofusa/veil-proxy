@@ -32,15 +32,20 @@ ans-01 が挙げたもの（2026-11-26 にコードで確かめた）:
 1. 確保: 段ごとの `Box::pin`（B-240 の意図〈Wasm の無い経路の future を太らせない〉を保つ形で）、`RequestSessions` と `SessionEntry` の
    要求ごとの確保。
 2. 検索と作り直し: モジュールの名前の検索を、ワーカーの写し（`WasmModules`・`WorkerEngine`）に解決済みの添字で持つ（エンジンの世代と結ぶ）。
-   `wants_request_body` 等は借りるだけにする。`set_request_line` は要求ごとに 1 回、クエリは使うときに切り出す。`recycle` は触ったものだけ戻す。
+   `wants_request_body` 等は借りるだけにする（この 1 箇所は [F-329](F-329-wasm-single-fiber-entry-per-request.md) の前に先に直す）。
+   要求ごとの `from_utf8`（`src/proxy/h1.rs`・`h2.rs` の `host`・`path`・`method`。POST は本文の段でもう一度）を 1 回にする。
+   `src/http3_server/request_task.rs` の `modules_to_apply.clone()`（全ワーカー共有の `Arc` なら共有の行への書き込み）を確かめて減らす。`set_request_line` は要求ごとに 1 回、クエリは使うときに切り出す。`recycle` は触ったものだけ戻す。
 3. ホスト関数: `proxy_get_property` の標準のプロパティ（NUL 区切りの `request\0path` 等）をバイト列のまま照合する近道、許可の判定を
    ロードのときに作る表で引く（`*`・`request.*`・カスタムのプロパティは今の判定に落とす）、`guest_memory()` と `data_mut()` を 1 回にまとめる。
-4. その他: `settle` の空の保留の近道、時刻の読み取りを `request_start_instant()` へ、`metering::arm` の省略（前の段が 1 エポック未満のときだけ）。
+4. その他: `settle` の空の保留の近道、時刻の読み取りを `request_start_instant()` へ。`proxy_on_delete` の前の `metering::arm` は省かない
+   （前の段が上限の近くまで走っても削除の段を走らせて context を漏らさないための安全弁。ans-04 の 5-1）。
 
 ## 危険
 
 - 許可のプロパティの判定を表にするときに権限を広げない（今の判定との一致を単体試験で網羅する）。
-- リロード（B-404・F-293）で古いエンジンの添字・インスタンスを使わない。
+- リロード（B-404・F-293）で古いエンジンの添字・インスタンスを使わない（添字はエンジンの同一性〈`Arc::ptr_eq`〉か世代と結ぶ）。
+- `Box::pin` を減らすときに Wasm の無い経路の future を太らせない（B-240。`-Zprint-type-sizes` で確かめる）。
+- `RequestSessions` を使い回すなら F-329 の「ログ済み」を戻す。
 
 ## 受け入れ条件
 

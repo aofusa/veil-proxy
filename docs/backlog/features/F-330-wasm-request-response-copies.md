@@ -23,18 +23,25 @@
 
 1. ローカル応答の組み立て: ヘッダの取り出しと検査（CR・LF・NUL の除去・小文字化）を 1 回の走査にし、HTTP/1.1 はプールのバッファへ
    ヘッダを書いて（数字は `itoa` 等）、大きい本文は `write_all_vectored`・小さい本文は同じバッファへ続けて `write_or_hold` で送る。
-   HTTP/3 は `Bytes::from(resp.body)` にする。
-2. POST: 本文の全量が読み取りバッファにあれば写さずに切り出す（`Bytes`）。[F-329](F-329-wasm-single-fiber-entry-per-request.md) の 3
+   HTTP/3 は `Bytes::from(resp.body)` にする。本文のゲストのメモリからの最初の写し（`src/wasm/host/stream.rs` の `to_vec()`）は残るが、
+   これを 1 回だけの写しにする（プロトコルの側で写し直さない。HTTP/1.1 でヘッダと同じバッファへ写す形にするなら最初の写しをそこへ直接）。
+2. json-tls の TLS の分類が Proxy-Wasm の版だけ +0.93 µs/要求 重い（`docs/artifacts/proxy-wasm-perf/profile-2026-11-26.md`。暗号化の本体は同じ）。
+   ローカル応答を 1 つの `Vec` で書く今の形と、ネイティブの `write_api_response`（ヘッダと本文を分けて `write_all_vectored`）の違いで
+   説明できるかを 1 の前後で確かめる。
+3. POST: 本文の全量が読み取りバッファにあれば写さずに切り出す（`Bytes`）。[F-329](F-329-wasm-single-fiber-entry-per-request.md) の 3
    （本文の全量があるときヘッダと本文の段を 1 回で呼ぶ）が通る要求は、本文の段のヘッダ・文字列の作り直しがそもそも無くなるので、
    ここで扱うのは本文を分割して受ける要求の側（ヘッダの段のヘッダ・文字列を要求の並び〈`RequestSessions`〉に持たせる等）と、
    本文の段のローカル応答の `write_or_hold`。
-3. 1・2 の後で、ヘッダの段の写し（F-319 で見送ったもの）を測り直し、全段で 1 つの表現（要求の読み取りバッファを指す `Bytes` の組等）に
+4. 1〜3 の後で、ヘッダの段の写し（F-319 で見送ったもの）を測り直し、全段で 1 つの表現（要求の読み取りバッファを指す `Bytes` の組等）に
    できるか判断する。
 
 ## 危険
 
-- ローカル応答のヘッダの検査（CR・LF・NUL）・`Connection: close`（B-499）・HEAD/204/304 の本文の抑止（B-188）・Content-Length の補い（F-62）・
-  パイプラインの溜めと送出の順（F-322 の `flush_held`）を保つ。
+- ローカル応答のヘッダの検査（CR・LF・NUL の除去・空のヘッダ名の拒否・小文字化。B-318）・`Connection: close`（B-499）・HEAD/204/304 の
+  本文の抑止（B-188）・Content-Length の補い（F-62）・パイプラインの溜めと送出の順（F-322 の `flush_held`）を保つ。
+- `write_all_vectored` は io_uring・epoll・kqueue・WSAPoll の全バックエンドと kTLS・rustls・平文で確かめる。
+- 本文の段のローカル応答を `write_or_hold` にするとき、閉じる経路（`client_wants_close`・エラー）で溜めた応答を送ってから閉じる
+  （送らずに閉じるとパイプラインの前の応答が消える）。
 
 ## 受け入れ条件
 

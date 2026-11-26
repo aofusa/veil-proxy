@@ -27,7 +27,8 @@
 
 1. フィルタ（エントリの側。veil のクレートの外。提出の前にエントリへ入れる）: `put_i64` をインライン化し、出力の `Vec` の空き容量へ直接
    2 桁ずつの表で書く（ゼロ埋めと写しを無くす。ループの回数が半分になればエポックの検査も半分）、要求ごとの確保を減らす（固定の引数は
-   静的に）、bulk-memory 無しでビルドする（[F-333](F-333-wasm-bulk-memory-libcalls.md)）。
+   静的に）、bulk-memory 無しでビルドする（`RUSTFLAGS='-C target-feature=-bulk-memory,-bulk-memory-opt'`。エントリの Dockerfile。
+   測った値は json-tls −2.2 µs。根拠は [F-333](F-333-wasm-bulk-memory-libcalls.md) の「ゲストの側の試し」）。
    `active` は分岐の中でそれぞれ `extend_from_slice` する。`write_body` は 1 行の最大長を先に確保し、手元のカーソルで書いて最後に長さを置く。
    POST はヘッダの段で読んだ値を文脈に持ち、本文の段でパスを引き直さない。`set_http_context` を使う。
    ans-03 の見込み（推測）: bulk-memory 無し −2.0〜2.7（測った値は −2.2）、`put_i64` −0.9〜1.2、カーソル書き −0.25〜0.45（いずれも json-tls）、
@@ -35,12 +36,15 @@
 2. SDK を使わずに Proxy-Wasm の ABI を直接実装する案（固定のプロパティのパスとヘッダを定数のバイト列に、文脈の表と `Box<dyn>` と要求ごとの
    確保を無くす）は、ans-03 の見込みで h1・h2 −0.35〜0.45 µs/要求。「Proxy-Wasm を見せる」エントリとして公式の SDK を使う方が説明しやすい
    ので、1 の後で測った差を示して利用者が決める。
-3. ガイド（`docs/guide/` の Proxy-Wasm の章、英日）に、フィルタを書く人向けの性能の注意を足す: `instance_reuse`、コールバックごとの確保、
-   bulk-memory と小さな写し、64 ビットの定数の割り算、`get_property` の戻り値の確保（ans-03 の結果から選ぶ）。
+3. ガイド（`docs/guide/` の Proxy-Wasm の章、英日）に、フィルタを書く人向けの性能の注意を足す（ans-03 の 5-2 から選ぶ）: `instance_reuse`、
+   bulk-memory と小さな写し（Rust・TinyGo・Clang の既定。Rust は上のフラグ、Clang は `-mno-bulk-memory -mno-bulk-memory-opt`）、長さの違う
+   定数を 1 つの写しに畳まない書き方、コールバックごとの確保と `get_property` の戻り値の確保・前の段で読んだ値を持ち越す、ループの反復の
+   回数とエポックの検査（小さな関数のインライン化）。
 
 ## 受け入れ条件
 
-- aofish の交互 A/B で json-tls のゲストの時間が 1.0 µs 以上、h1 GET が 0.2 µs 以上下がる。
+- aofish の交互 A/B で、SDK のまま（1）で json-tls の 1 要求のユーザー時間が 3.0 µs 以上（bulk-memory 無しのビルドを含む）、POST が 0.2 µs 以上
+  下がる。h1 GET の 0.2 µs 以上は SDK を外す場合（2）の条件にする（SDK のままの見込みは 0.05〜0.10 µs）。
 - エントリの `validate.sh` が全件通る（`docs/artifacts/benchmark/` の手順。F-320 と同じ 72 件）。
 - ガイドの英日を同じ変更で更新する。
 

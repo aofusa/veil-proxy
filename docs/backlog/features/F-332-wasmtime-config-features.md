@@ -26,15 +26,18 @@
 
 1. `gc`・`gc-drc`・`gc-null`・`coredump`・`component-model`・`threads`・`stack-switching`・`debug-builtins` を外して測る（ans-02 の見込みは
    −0.05〜0.15 µs/要求）。`gc` を外すと GC の型（`externref`・`anyref` 等）を使うモジュールは読めなくなる（Rust・TinyGo・C++ の Proxy-Wasm の
-   SDK は使わない。reference-types の `funcref`・複数のテーブルは `gc` 無しでも読める〈着手のときに試験のモジュールで確かめる〉）。
+   SDK は使わない。`gc` 無しのとき wasmtime は `WasmFeatures::GC_TYPES` を閉じるだけで〈`wasmtime-36.0.21/src/config.rs`〉、これは `externref`・`anyref` 等を止め、`funcref` は止めない〈`wasmparser-0.236.1/src/features.rs`〉。reference-types の複数のテーブルも読める）。
    外すなら利用者の確認を得て、ガイドに書く。`addr2line`・`demangle`・`wat` は残す。
 2. `instance_reuse` のときの `table_lazy_init(false)`。
 3. その他、1 要求の費用に効く `Config` の項目（ans-02 の結果から）。
 
 ## 危険
 
-- AOT のキャッシュ（`.cwasm`）は設定が変わると使えない（キャッシュの鍵に設定が入っているか確かめる）。
-- BSD（vendoring 版・Pulley）でも同じ機能の組で通ること（`full-freebsd` 等のビルド）。
+- AOT のキャッシュ（`.cwasm`）の名前はモジュールのハッシュだけで、エンジンの設定を含まない（`src/wasm/registry.rs` の `aot_cache_path`）。
+  設定の違う `.cwasm` は wasmtime の検査で読めずに作り直して上書きするので、A/B は 2 つのビルドでキャッシュの場所を分ける。版を上げた後の
+  最初の起動は作り直しになる（名前に設定のハッシュを混ぜるかは、このチケットで決める）。
+- BSD・aarch64 向けの vendoring 版（`veil-proxy-wasmtime`、`third_party/wasmtime`、Pulley）でも同じ機能の組でビルドでき動くこと
+  （`full-freebsd`・`full-openbsd`・`full-netbsd` のビルド）。
 - 外した機能を使うモジュールの読み込みが分かりやすいエラーで失敗すること。
 
 ## 受け入れ条件

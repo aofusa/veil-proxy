@@ -26,7 +26,16 @@
 | D. wasmtime 38 以降へ上げる | ans-02 によると 38.0.0 で `setjmp`・`longjmp` が無くなり、トラップの準備が軽くなる（`wasmtime_setjmp` 0.47%・入れ子の `catch_traps` 0.87% の大部分） | h1 −0.10〜0.20 µs/要求 | BSD 向けの vendoring 版（B-55 等の手直し）も上げる必要がある。38 以降のセキュリティの修正の確認、`max_execution_time_ms`・取り消しの試験。版の番号・PR の番号は Gemini の報告（未確認） |
 | E. 上流への提案 | A の手直しを上流へ（issue・PR は人が出す） | — | 時間がかかる |
 
-[F-329](F-329-wasm-single-fiber-entry-per-request.md)（1 要求 1 回の出入り）の後に残る差と、上の見込みで利用者が判断する。
+D は A・B・C と独立に選べる（組み合わせられる）。[F-329](F-329-wasm-single-fiber-entry-per-request.md)（1 要求 1 回の出入り）の後に残る差と、
+上の見込みで利用者が判断する。
+
+## 危険
+
+- C: サンドボックス（Landlock・seccomp・Capsicum・pledge）を掛けた後に `.cwasm` を読む経路（リロード。B-404）との順序、64 ワーカーで
+  プーリングアロケータの予約を分けたときの偏りと枯渇。
+- A: `tls::raw::replace` の `inline(never)`（`wasmtime-36.0.21/src/runtime/vm/traphandlers.rs`）は外さない（LLVM がスレッドローカルの番地を
+  ファイバーの切り替えをまたいで使い回す未定義動作になる。ans-04 の 5-1）。
+- B: 止めたままのファイバーを捨てるときは 1 回の再開で必ず終える。駆動のループの中のゲストがトラップしたらインスタンスごと捨てる。
 
 ## 受け入れ条件
 

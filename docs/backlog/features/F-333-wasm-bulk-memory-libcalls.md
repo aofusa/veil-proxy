@@ -1,6 +1,7 @@
-# F-333: ゲストの `memory.copy`・`memory.fill` がランタイム呼び出しになる費用を減らす
+# F-333: ゲストの小さな `memory.copy`・`memory.fill` を wasmtime の側で速くする（要判断。どのフィルタにも効く）
 
-**状態: 未着手（[F-327](F-327-proxy-wasm-path-cost.md) の子。やり方は調査と試しの後で決める）**
+**状態: 保留（[F-327](F-327-proxy-wasm-path-cost.md) の子。wasmtime の手直しが要るので [F-335](F-335-wasmtime-fiber-entry-cost.md) と一緒に利用者が判断する。
+HttpArena のエントリはフィルタを bulk-memory 無しでビルドすれば足りる〈[F-334](F-334-httparena-filter-and-guide.md)〉）**
 
 ## 現状
 
@@ -11,13 +12,12 @@
   展開せず、ランタイムの関数を呼ぶ（トラップの準備・境界の検査・memmove）と見ている。Rust 1.87 以降の `wasm32-wasip1` は bulk-memory が
   既定で有効。どのフィルタにも起きる（Rust の SDK で書いた、本文を組み立てるフィルタ）。
 
-## 改修案（ans-02・ans-03 と試しの結果で選ぶ）
+## 改修案
 
-1. ホストの側: 小さな `memory.copy`・`memory.fill` をゲストの機械語の中で展開する（境界を検査して数バイトずつ写し、大きいものだけランタイムへ）。
-   wasmtime の新しい版にあれば上げる、無ければ wasmtime の手直し（[F-335](F-335-wasmtime-fiber-entry-cost.md) と同じ判断）。どのフィルタにも効く。
-2. ゲストの側: フィルタを `-C target-feature=-bulk-memory` でビルドする（std・wasi-libc の `memcpy` の扱い、`-Zbuild-std` の要否を確かめる）。
-   エントリだけに効く。フィルタを書く人向けの注意としてガイドに書く（[F-334](F-334-httparena-filter-and-guide.md)）。
-3. ホストの側: ランタイム呼び出しの経路そのものを軽くする（wasmtime の手直し）。
+- 下の「wasmtime の側」の (A)（ランタイムの側だけ）か (B)（Cranelift での展開）。どちらも wasmtime の手直しで、Linux でも vendoring 版を使う
+  判断（[F-335](F-335-wasmtime-fiber-entry-cost.md) の案 A と同じ）が要る。
+- ゲストの側の対処（bulk-memory 無しのビルド）はエントリとガイドの話なので [F-334](F-334-httparena-filter-and-guide.md) で行う。下の「ゲストの側の試し」は
+  その根拠と、(A)・(B) の価値を見積もる比較の材料。
 
 ### wasmtime の側（ans-02 の 1。下ろし方はソースで確かめた）
 
@@ -29,7 +29,7 @@
   約 50〜100 行、見込み −1.0〜1.8 µs（json-tls）。(B) Cranelift で小さい写しをゲストの機械語に展開（書く前に両方の範囲を検査し、範囲外なら
   1 バイトも書かずにトラップ、重なりは `memmove` の意味）約 150〜300 行、見込み −2.0〜2.6 µs。
 
-### 2 の試し（2026-11-26、調査。エントリのファイルは変えていない）
+### ゲストの側の試し（2026-11-26、調査。エントリのファイルは変えていない）
 
 - Rust 1.99.1 の `wasm32-wasip1` は `bulk-memory` が既定で有効（`rustc --print cfg`）。既定のビルドのフィルタは `memory.copy` 43 箇所
   （`put_i64`・`on_http_request_headers`〈`write_body` を含む〉・`sum`・SDK の `serialize_map`・`serialize_property_path`・`finish_grow` 等）。
@@ -47,14 +47,19 @@
   | h1 GET | 6.95 + 9.06 | 6.97 + 9.34（差なし。外れ値の 1 回を除く） |
 
   ランタイム呼び出しの 2.94 µs のうち約 2.2 µs が消える。残りは小さな写しのゲストの中のループと、32 バイトを超える写しのランタイム呼び出し。
-- したがってエントリは 2 で足りる（このチケットでは 2 をエントリのビルドに入れ、ガイドに書く。[F-334](F-334-httparena-filter-and-guide.md) と一緒に）。
-  1・3（wasmtime の手直し）は「どのフィルタにも効く」ことの価値（Rust の SDK で本文を組み立てるフィルタは既定で同じ費用を払う）と、
-  Linux でも wasmtime を vendoring して手直しを持ち越す費用で決める（[F-335](F-335-wasmtime-fiber-entry-cost.md) と一緒に利用者が判断）。
+- したがってエントリはゲストの側で足りる。(A)・(B) は「どのフィルタにも効く」ことの価値（Rust・TinyGo・Clang の既定のビルドで本文を組み立てる
+  フィルタは同じ費用を払う）と、Linux でも wasmtime を vendoring して手直しを持ち越す費用で決める。
+
+## 危険
+
+- (B) は bulk-memory の仕様（範囲外なら 1 バイトも書かずにトラップ・重なりは `memmove` の意味）を守る。Pulley（BSD の一部）でも同じ結果。
+- wasmtime のセキュリティの修正を手直しの上へ持ち越す費用。
 
 ## 受け入れ条件
 
-- json-tls の 1 要求のユーザー時間が 2.5 µs 以上下がる（どの案でも）。大きな写し（数 KB 以上）が遅くならない。
-- 1 を選ぶ場合は wasmtime の手直しの範囲・保守の方法を利用者が判断してから。
+- 既定のビルド（bulk-memory あり）のフィルタで json-tls の 1 要求のユーザー時間が (A) で 1.0 µs 以上、(B) で 2.0 µs 以上下がる。
+  大きな写し（数 KB 以上）が遅くならない。範囲外・重なりの試験（wasmtime の spec の試験を含む）が通る。
+- 着手は wasmtime の手直しの範囲・保守の方法を利用者が判断してから。
 
 ## 関連
 
