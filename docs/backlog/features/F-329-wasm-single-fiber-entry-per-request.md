@@ -158,8 +158,8 @@
   トラップ・本文を待つ Pause・`request.path` の書き換え、`body_in_hand` の本文の後ろのバイト）。
 - 試験: `exports.rs`（本文の段の見え方・飛ばす・止める・エクスポートの無い段・書き換えた要求の行・ログの段のトラップ・本文の段の前の
   燃料の入れ直し）、`tests.rs` の `f329_chained_request_tests`（段の回数・ローカル応答のログが 1 回・本文の段の Pause とトラップの
-  `failure_policy`・B-299・ログの段のトラップ・本文の書き換えと本文の段のヘッダ・続けて呼ばない経路）、`metering.rs`（上限を入れると
-  専用スレッドを起こす）、`h1.rs`（`body_in_hand` の境界）。
+  `failure_policy`・B-299・ログの段のトラップ・本文の書き換えと本文の段のヘッダ・終わらない段の打ち切り・続けて呼ばない経路）、
+  `metering.rs`（上限を入れると専用スレッドを起こす）、`h1.rs`（`body_in_hand` の境界）。
 
 ## 交互 A/B（aofish、`~/hp/bench.py`、3 巡の中央値、1 要求のユーザー + システムの CPU µs）
 
@@ -192,7 +192,10 @@ json-tls（wrk）の ABI の版は 3 巡のうち 1 巡に wrk のソケット�
   削除だけ。main からの動きで F-329 の前後で同じ。[B-504](../bugs/B-504-h1-body-error-skips-wasm-on-log.md) に起票）。
 - ログ・削除の段のトラップ（応答は届き、二重に呼ばない）・本文の段の Pause（503、B-300）・`failure_policy`・B-299 は、エンジンを直接
   呼ぶ単体の試験（`tests.rs` の `f329_chained_request_tests`）で確かめた（E2E のモジュールはトラップで捨てられると数え直しになるため）。
-  `max_execution_time_ms` が段ごとに効くことは `metering.rs` の単体の試験と、既存の自己完結型 E2E（`max_execution_time_ms = 50`）。
+  終わらない段（ログの段・本文の段）は、続けて呼ぶ段の中でも `max_execution_time_ms` で打ち切られ、トラップと同じく扱われ、打ち切るまで
+  ワーカーへ譲るので同じスレッドに並べた他の要求が先に終わる（`an_endless_phase_in_the_chain_is_cut_without_stalling_other_requests`）。
+  上限を入れるたびに専用スレッドを起こすことは `metering.rs` の単体の試験、fuel を使い切るフィルタの 503 と `fail_open` は既存の E2E
+  （`test_wasm_timeout`）。
 - 線形メモリ: 上の E2E で、作った context の数と `proxy_on_delete` の数が全プロトコルで一致する（SDK の文脈の表はこれで消える）。aofish の
   持続負荷（1 回に数百万要求）のプロファイル（[F-334](F-334-httparena-filter-and-guide.md)、SDK の版）の minor fault は h1 GET 0.0000・
   POST 0.0001・json-tls 0.0008 /要求で、要求ごとに確保しない ABI の版（0.0000・0.0001・0.0006）と同じ程度。ゲストの線形メモリは要求ごとに

@@ -3134,11 +3134,12 @@ mod f329_chained_request_tests {
     ///
     /// - ヘッダ 1 つ: 403 を返す。3 つ: トラップ。4 つ: 403 を返し、続くログの段でトラップする。5 つ: 403 を返して
     ///   からトラップする（B-299）。6 つ: 403 を返し、続くログの段で 500 を返そうとする。7 つ: 403 を返し、続く削除の段で
-    ///   トラップする。8 つ: Pause（本文を待つ）。9 つ: `request.path` を `/x` に書き換えて続ける。それ以外: 続ける
+    ///   トラップする。8 つ: Pause（本文を待つ）。9 つ: `request.path` を `/x` に書き換えて続ける。10 個: 403 を返し、
+    ///   続くログの段が終わらない。それ以外: 続ける
     /// - 本文 1 バイト: 413 を返す。2 バイト: Pause。3 バイト: トラップ。6 バイト: 要求ヘッダ `x-b` を足し、本文を `new`
     ///   にする。7 バイト: 413 を返してからトラップする（B-299）。8 バイト: 要求ヘッダ `x-0` を `r` に置き換える。
     ///   9 バイト: `x-0` を消す。10 バイト: 表を `x-s: 1` だけにする（8〜10 バイトは、変えた表が本文の段の中で見えれば本文を
-    ///   `seen`、見えなければ `miss` にする）。それ以外: 続ける
+    ///   `seen`、見えなければ `miss` にする）。12 バイト: 終わらない。それ以外: 続ける
     const MODULE: &str = r#"(module
   (import "env" "proxy_send_local_response"
     (func $slr (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
@@ -3177,6 +3178,7 @@ mod f329_chained_request_tests {
   (global $trap_log (mut i32) (i32.const 0))
   (global $slr_log (mut i32) (i32.const 0))
   (global $trap_del (mut i32) (i32.const 0))
+  (global $spin_log (mut i32) (i32.const 0))
   (func (export "proxy_on_memory_allocate") (param $n i32) (result i32)
     (local $p i32)
     (if (i32.gt_u (i32.add (global.get $bump) (local.get $n)) (i32.const 65536))
@@ -3219,9 +3221,11 @@ mod f329_chained_request_tests {
     (if (i32.eq (local.get $n) (i32.const 4)) (then (global.set $trap_log (i32.const 1))))
     (if (i32.eq (local.get $n) (i32.const 6)) (then (global.set $slr_log (i32.const 1))))
     (if (i32.eq (local.get $n) (i32.const 7)) (then (global.set $trap_del (i32.const 1))))
+    (if (i32.eq (local.get $n) (i32.const 10)) (then (global.set $spin_log (i32.const 1))))
     (if (i32.or (i32.or (i32.eq (local.get $n) (i32.const 1)) (i32.eq (local.get $n) (i32.const 4)))
           (i32.or (i32.eq (local.get $n) (i32.const 5))
-            (i32.or (i32.eq (local.get $n) (i32.const 6)) (i32.eq (local.get $n) (i32.const 7)))))
+            (i32.or (i32.eq (local.get $n) (i32.const 6))
+              (i32.or (i32.eq (local.get $n) (i32.const 7)) (i32.eq (local.get $n) (i32.const 10))))))
       (then (call $report (i32.const 403))))
     (if (i32.eq (local.get $n) (i32.const 5)) (then unreachable))
     (if (i32.eq (local.get $n) (i32.const 9))
@@ -3230,6 +3234,7 @@ mod f329_chained_request_tests {
   (func (export "proxy_on_request_body") (param $c i32) (param $size i32) (param $eos i32) (result i32)
     (global.set $body (i32.add (global.get $body) (i32.const 1)))
     (if (i32.eq (local.get $size) (i32.const 3)) (then unreachable))
+    (if (i32.eq (local.get $size) (i32.const 12)) (then (loop $spin (br $spin))))
     (if (i32.or (i32.eq (local.get $size) (i32.const 1)) (i32.eq (local.get $size) (i32.const 7)))
       (then (call $report (i32.const 413))))
     (if (i32.eq (local.get $size) (i32.const 7)) (then unreachable))
@@ -3256,7 +3261,8 @@ mod f329_chained_request_tests {
   (func (export "proxy_on_log") (param i32)
     (global.set $log (i32.add (global.get $log) (i32.const 1)))
     (if (global.get $slr_log) (then (global.set $slr_log (i32.const 0)) (call $report (i32.const 500))))
-    (if (global.get $trap_log) (then (global.set $trap_log (i32.const 0)) unreachable)))
+    (if (global.get $trap_log) (then (global.set $trap_log (i32.const 0)) unreachable))
+    (if (global.get $spin_log) (then (loop $spin (br $spin)))))
   (func (export "proxy_on_delete") (param i32)
     (global.set $del (i32.add (global.get $del) (i32.const 1)))
     (if (global.get $trap_del) (then (global.set $trap_del (i32.const 0)) unreachable)))
@@ -3545,6 +3551,78 @@ mod f329_chained_request_tests {
         // 次の要求は新しいインスタンス（回数は 0 から）
         let now = counts(&f);
         assert_eq!((now[1], now[2], now[3]), (1, 0, 0), "{now:?}");
+    }
+
+    // 終わらない段は、続けて呼ぶ段の中でも `max_execution_time_ms`（既定 100 ms）で打ち切り、トラップと同じく扱う。
+    // 打ち切るまでの間もゲストはワーカーへ譲るので、同じスレッドに並べた他の要求が先に終わる
+    #[test]
+    fn an_endless_phase_in_the_chain_is_cut_without_stalling_other_requests() {
+        const SPIN: &[u8] = b"spin forever";
+        let started = std::time::Instant::now();
+        // ログの段: 決まった応答は返し、インスタンスは捨てる
+        let f = build(&["m"], true, None);
+        let _ = counts(&f);
+        let s = RequestSessions::default();
+        let r = with_body(&f, &["m"], 10, b"xxxx", Some(&s));
+        assert_eq!(status(&r), Some(403));
+        assert!(s.logged());
+        assert_eq!(f.engine.pooled_instances("m"), 0);
+        // 本文の段: `failure_policy` に従う
+        let s = RequestSessions::default();
+        assert_eq!(status(&with_body(&f, &["m"], 2, SPIN, Some(&s))), Some(503));
+        assert!(!s.logged());
+        log(&f, &["m"], &s);
+        let open = build(&["m"], true, Some(FailurePolicy::FailOpen));
+        let s = RequestSessions::default();
+        match with_body(&open, &["m"], 2, SPIN, Some(&s)) {
+            FilterResult::Continue { body, .. } => assert_eq!(body.as_deref(), Some(SPIN)),
+            FilterResult::LocalResponse(r) => panic!("fail_open: {}", r.status_code),
+        }
+        log(&open, &["m"], &s);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // 同じスレッドで終わらない要求と並べた要求は、終わらない要求より先に終わる
+        let names = refs(&["m"]);
+        let (path, method, ip): (Arc<str>, Arc<str>, Arc<str>) =
+            (Arc::from("/p"), Arc::from("POST"), Arc::from("127.0.0.1"));
+        let (s1, s2) = (RequestSessions::default(), RequestSessions::default());
+        let spin = f.engine.on_request_with_body(
+            &names,
+            &path,
+            &method,
+            headers(2),
+            &ip,
+            bytes::Bytes::from_static(SPIN),
+            Some(&s1),
+        );
+        let other = f.engine.on_request_with_body(
+            &names,
+            &path,
+            &method,
+            headers(2),
+            &ip,
+            bytes::Bytes::from_static(b"hello"),
+            Some(&s2),
+        );
+        futures::executor::block_on(async {
+            let spin = std::pin::pin!(spin);
+            let other = std::pin::pin!(other);
+            match futures::future::select(spin, other).await {
+                futures::future::Either::Right((r, spin)) => {
+                    assert_eq!(status(&r), None, "the other request continues");
+                    assert_eq!(status(&spin.await), Some(503));
+                }
+                futures::future::Either::Left((r, _)) => {
+                    panic!("the endless request finished first: {:?}", status(&r))
+                }
+            }
+        });
+        log(&f, &["m"], &s1);
+        log(&f, &["m"], &s2);
     }
 
     // 続けて呼ばない経路（2 つ以上のモジュール・使い回さないモジュール・要求の並びが無い）は今までどおり段ごとに呼ぶ。
