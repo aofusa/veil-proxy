@@ -73,8 +73,9 @@ use self::buffered::*;
 // プロキシのキャッシュの引き当て（HTTP/1.1・HTTP/2・HTTP/3 で共有。F-257）
 pub(crate) mod cache_lookup;
 mod compress;
-// HTTP/3 のバッファ経路がキャッシュへ置くかを決める（Wasm で書き換える本文は置かない。F-257）
-#[cfg(feature = "wasm")]
+// HTTP/3 のバッファ経路がキャッシュへ置くかを決める（Wasm で書き換える本文は置かない。F-257）。使うのは HTTP/3 だけ
+// （http3 の無いビルドで未使用の警告にならないよう同じ cfg を付ける）
+#[cfg(all(feature = "wasm", feature = "http3"))]
 pub(crate) use self::compress::wasm_wants_response_body;
 use self::compress::*;
 #[cfg(veil_ktls)]
