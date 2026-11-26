@@ -126,6 +126,27 @@ h3 は本文の写しが減って −0.1〜−0.15 µs。2 の「json-tls の TL
 記録だった（ネイティブのハンドラの `write_all_vectored` が 2 つ）ので、記録の数では説明できない（ネイティブのハンドラの側が記録 1 つ分
 軽くなった）。
 
+### 同じバイナリの A/B（2026-11-26、[F-327](F-327-proxy-wasm-path-cost.md) の確かめ）
+
+F-327 の確かめで、veil-api（ネイティブのハンドラ）の json-tls が `422c4721` のビルドから遅くなっていた（aofish の二分〈`apibis`、epoll の
+veil-api、3 巡〉で 1 要求の CPU 22.2 µs 前後 → 24.1 µs、rps −6〜−9%。ユーザー空間の命令数は −600/要求、サイクル数は +4,750/要求〈IPC
+1.80 → 1.60〉。`istat-api`）。命令が減ってサイクルが増えるので、`write_plaintext_pair` の積み方を環境変数で切り替える一時的なビルド
+（B-339 の方法。`docs/artifacts/proxy-wasm-perf/tools/pairmode.patch`）で、同じバイナリの中で比べた（aofish、5 巡の中央値、1 要求の
+CPU µs。wrk の時計の戻りでエラーの出た巡〈B-357〉は除く。`pm`）。
+
+| 負荷 | 記録 1 つ（`write_vectored`。今） | 記録 2 つ（2 回の `write`。前） | 1 つのバッファへ写して `write` |
+|---|---|---|---|
+| veil-api（epoll）の json-tls | 22.79 | 22.17（rps +4.7%） | 23.03 |
+| veil-api（epoll）の static-tls | 29.29 | 31.55（rps −13.4%） | 29.62 |
+| Proxy-Wasm（io_uring・SDK を使わないフィルタ）の json-tls | 17.60 | 18.10（rps −3.7%） | 17.61 |
+| Proxy-Wasm の static-tls | 27.54 | 29.86（rps −12.2%） | 30.66 |
+
+記録 1 つのままにする。記録 2 つが軽いのは veil-api の json-tls（−0.62 µs）だけで、static-tls はどちらの版でも 2 µs 以上重く、Proxy-Wasm
+の版（HttpArena へ出す方）の json-tls も記録 1 つが軽い。写してからまとめても軽くならない。1 要求のユーザー空間の命令数・サイクル数
+（`istat-pm`、3 巡）も同じ向きで、記録 2 つは命令数がどれも増え（json-tls +540〜590、static-tls +1,300）、サイクル数が減るのは veil-api の
+json-tls（−970、−2.2%）だけ。二分のサイクル数の差（+4,750）のうち記録の積み方の分は約 1,000 で、残りはビルドごとのコードの配置の差
+（B-339。同じバイナリの記録 1 つは 1 要求の CPU 22.79 µs）。
+
 ## 3（追加、2026-11-26）: 本文の段のヘッダの写し
 
 ヘッダと本文の段を続けて呼ぶ経路（[F-329](F-329-wasm-single-fiber-entry-per-request.md)）で、本文の段の context に要求ヘッダの表の写しを
