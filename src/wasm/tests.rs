@@ -2587,38 +2587,84 @@ mod f331_request_reuse_tests {
     (local $p i32)
     (if (i32.eq (global.get $mode) (i32.const 1)) (then (return (i32.const 65535))))
     (if (i32.eq (global.get $mode) (i32.const 2)) (then (return (i32.const 0))))
+    (if (i32.eq (global.get $mode) (i32.const 3)) (then (return (i32.const 65530))))
+    (if (i32.eq (global.get $mode) (i32.const 4)) (then (return (i32.const 65531))))
+    (if (i32.eq (global.get $mode) (i32.const 5)) (then (return (i32.const -1))))
     (local.set $p (global.get $bump))
     (global.set $bump (i32.add (global.get $bump) (local.get $n)))
     (local.get $p))
   (func (export "proxy_on_context_create") (param i32 i32))
   (func (export "proxy_on_vm_start") (param i32 i32) (result i32) (i32.const 1))
   (func (export "proxy_on_configure") (param i32 i32) (result i32) (i32.const 1))
-  (func $case (param $c i32) (param $path i32) (param $len i32) (param $ret i32) (param $size i32)
-    (local $rc i32)
-    (local.set $rc (call $prop (local.get $path) (local.get $len) (local.get $ret) (local.get $size)))
+  (func $report (param $c i32) (param $rc i32)
     (i32.store8 (i32.const 200) (i32.const 114))
     (i32.store8 (i32.const 201) (local.get $c))
     (i32.store8 (i32.const 202) (i32.add (i32.const 65) (local.get $rc)))
-    (drop (call $add (i32.const 0) (i32.const 200) (i32.const 2) (i32.const 202) (i32.const 1)))
+    (drop (call $add (i32.const 0) (i32.const 200) (i32.const 2) (i32.const 202) (i32.const 1))))
+  (func $case (param $c i32) (param $path i32) (param $len i32) (param $ret i32) (param $size i32)
+    (local $rc i32)
+    (local.set $rc (call $prop (local.get $path) (local.get $len) (local.get $ret) (local.get $size)))
+    (call $report (local.get $c) (local.get $rc))
     (if (i32.eqz (local.get $rc))
       (then
         (i32.store8 (i32.const 200) (i32.const 118))
         (drop (call $add (i32.const 0) (i32.const 200) (i32.const 2)
           (i32.load (local.get $ret)) (i32.load (local.get $size)))))))
+  ;; 失敗する呼び出しがゲストのメモリを変えないこと: 値の行き先（アロケータの次の場所）と戻り値の場所（64..72）に
+  ;; 印を置いて呼び、残っていれば `i<c>: 1`
+  (func $intact (param $c i32) (param $path i32) (param $len i32) (param $ret i32) (param $size i32)
+    (local $b i32)
+    (local.set $b (global.get $bump))
+    (i64.store (local.get $b) (i64.const 0x5a5a5a5a5a5a5a5a))
+    (i64.store (i32.const 64) (i64.const 0x5a5a5a5a5a5a5a5a))
+    (call $case (local.get $c) (local.get $path) (local.get $len) (local.get $ret) (local.get $size))
+    (i32.store8 (i32.const 200) (i32.const 105))
+    (i32.store8 (i32.const 201) (local.get $c))
+    (i32.store8 (i32.const 202)
+      (i32.add (i32.const 48)
+        (i32.and (i64.eq (i64.load (local.get $b)) (i64.const 0x5a5a5a5a5a5a5a5a))
+                 (i64.eq (i64.load (i32.const 64)) (i64.const 0x5a5a5a5a5a5a5a5a)))))
+    (drop (call $add (i32.const 0) (i32.const 200) (i32.const 2) (i32.const 202) (i32.const 1))))
   (func (export "proxy_on_request_headers") (param i32 i32 i32) (result i32)
+    ;; メモリの終わりちょうどで終わるパス（65524..65536 の "request\00path"）。アロケータが終わりを返す場合（v）が
+    ;; 値で上書きするので、要求ごとに書き直す
+    (i64.store (i32.const 65524) (i64.const 0x0074736575716572))
+    (i32.store (i32.const 65532) (i32.const 0x68746170))
     (call $case (i32.const 97) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
     (call $case (i32.const 98) (i32.const 16) (i32.const 13) (i32.const 64) (i32.const 68))
     (call $case (i32.const 99) (i32.const 32) (i32.const 12) (i32.const 64) (i32.const 68))
     (call $case (i32.const 100) (i32.const 80) (i32.const 23) (i32.const 64) (i32.const 68))
     (call $case (i32.const 101) (i32.const 48) (i32.const 14) (i32.const 64) (i32.const 68))
-    (call $case (i32.const 102) (i32.const 0) (i32.const 12) (i32.const 65534) (i32.const 68))
-    (call $case (i32.const 103) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const -1))
+    (call $intact (i32.const 102) (i32.const 0) (i32.const 12) (i32.const 65534) (i32.const 68))
+    (call $intact (i32.const 103) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const -1))
     (call $case (i32.const 104) (i32.const 65530) (i32.const 12) (i32.const 64) (i32.const 68))
     (call $case (i32.const 105) (i32.const 128) (i32.const 2) (i32.const 64) (i32.const 68))
+    ;; 長さ 0 のパス（先頭・メモリの終わりちょうど・その先）
+    (call $case (i32.const 108) (i32.const 0) (i32.const 0) (i32.const 64) (i32.const 68))
+    (call $case (i32.const 109) (i32.const 65536) (i32.const 0) (i32.const 64) (i32.const 68))
+    (call $case (i32.const 110) (i32.const 65537) (i32.const 0) (i32.const 64) (i32.const 68))
+    ;; メモリの終わりちょうど・1 バイト先: パス（o・p）と戻り値の場所（q・r）
+    (call $case (i32.const 111) (i32.const 65524) (i32.const 12) (i32.const 64) (i32.const 68))
+    (call $case (i32.const 112) (i32.const 65525) (i32.const 12) (i32.const 64) (i32.const 68))
+    (call $case (i32.const 113) (i32.const 0) (i32.const 12) (i32.const 65532) (i32.const 68))
+    (call $intact (i32.const 114) (i32.const 0) (i32.const 12) (i32.const 65533) (i32.const 68))
+    ;; f・g と逆の側
+    (call $intact (i32.const 115) (i32.const 0) (i32.const 12) (i32.const -1) (i32.const 68))
+    (call $intact (i32.const 116) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 65534))
+    ;; 戻り値の場所と長さの場所が同じ（どちらも書けるので OK。値は見ない）
+    (call $report (i32.const 117)
+      (call $prop (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 64)))
     (global.set $mode (i32.const 1))
     (call $case (i32.const 106) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
     (global.set $mode (i32.const 2))
     (call $case (i32.const 107) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
+    ;; アロケータの返す場所: 値がメモリの終わりちょうどで終わる・1 バイト先・-1
+    (global.set $mode (i32.const 3))
+    (call $case (i32.const 118) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
+    (global.set $mode (i32.const 4))
+    (call $case (i32.const 119) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
+    (global.set $mode (i32.const 5))
+    (call $case (i32.const 120) (i32.const 0) (i32.const 12) (i32.const 64) (i32.const 68))
     (global.set $mode (i32.const 0))
     (i32.const 0))
 )"#;
@@ -2796,8 +2842,9 @@ mod f331_request_reuse_tests {
     }
 
     /// `proxy_get_property` をホスト関数として呼ぶ: 表のパス（最後の NUL の有無）・`.` で繋いだ形・長さ付きの形は同じ値、
-    /// 許可の無いプロパティは NOT_FOUND、パス・戻り値の場所・アロケータの返す場所がメモリの外なら INVALID_MEMORY_ACCESS、
-    /// 読めないパスは PARSE_FAILURE、アロケータが 0 を返したら INTERNAL_FAILURE（使い回すモジュールとそうでないもので同じ）
+    /// 許可の無いプロパティは NOT_FOUND、パス・戻り値の場所・アロケータの返す場所がメモリの外なら INVALID_MEMORY_ACCESS
+    /// （メモリの終わりちょうどまでは OK。失敗した呼び出しは値も場所も書かない）、読めないパス（長さ 0 を含む）は
+    /// PARSE_FAILURE、アロケータが 0 を返したら INTERNAL_FAILURE（使い回すモジュールとそうでないもので同じ）
     #[test]
     fn get_property_paths_permissions_and_bad_pointers() {
         use crate::wasm::constants::{
@@ -2809,6 +2856,8 @@ mod f331_request_reuse_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let rc = |c: u8, code: i32| (vec![b'r', c], vec![b'A' + code as u8]);
         let value = |c: u8| (vec![b'v', c], b"/p?q=1".to_vec());
+        // 失敗した呼び出しの後もゲストのメモリ（値の行き先・戻り値の場所）が変わっていない
+        let intact = |c: u8| (vec![b'i', c], b"1".to_vec());
         let want = vec![
             rc(b'a', OK),
             value(b'a'),
@@ -2820,11 +2869,32 @@ mod f331_request_reuse_tests {
             value(b'd'),
             rc(b'e', NOT_FOUND),
             rc(b'f', MEMORY),
+            intact(b'f'),
             rc(b'g', MEMORY),
+            intact(b'g'),
             rc(b'h', MEMORY),
             rc(b'i', PARSE),
+            rc(b'l', PARSE),
+            rc(b'm', PARSE),
+            rc(b'n', MEMORY),
+            rc(b'o', OK),
+            value(b'o'),
+            rc(b'p', MEMORY),
+            rc(b'q', OK),
+            value(b'q'),
+            rc(b'r', MEMORY),
+            intact(b'r'),
+            rc(b's', MEMORY),
+            intact(b's'),
+            rc(b't', MEMORY),
+            intact(b't'),
+            rc(b'u', OK),
             rc(b'j', MEMORY),
             rc(b'k', INTERNAL),
+            rc(b'v', OK),
+            value(b'v'),
+            rc(b'w', MEMORY),
+            rc(b'x', MEMORY),
         ];
         for reuse in [false, true] {
             let engine = engine(&dir, PROPERTY_MODULE, reuse);

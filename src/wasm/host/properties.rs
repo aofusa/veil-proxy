@@ -341,28 +341,23 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 None => return Ok(PROXY_RESULT_INTERNAL_FAILURE),
             };
 
-            // 値と、その場所・長さを書く（ゲストのアロケータを呼んだ後なのでメモリを引き直す）
+            // 値と、その場所・長さを書く（ゲストのアロケータを呼んだ後なのでメモリを引き直す）。3 つの場所を全部
+            // 確かめてから書く（どれかが外れていればゲストのメモリを変えない。以前は値を書いてから場所を見ていた）
             let memory = match caller.guest_memory() {
                 Some(mem) => mem,
                 _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
             };
             let data = memory.data_mut(&mut caller);
+            let len = data.len();
+            let fits =
+                |offset: usize, n: usize| offset.checked_add(n).is_some_and(|end| end <= len);
             let start = ptr as u32 as usize;
-            let Some(dst) = start
-                .checked_add(value.len())
-                .and_then(|end| data.get_mut(start..end))
-            else {
-                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
-            };
-            dst.copy_from_slice(value);
             let ptr_offset = return_value_ptr as u32 as usize;
             let size_offset = return_value_size as u32 as usize;
-            let len = data.len();
-            let fits = |offset: usize| offset.checked_add(4).is_some_and(|end| end <= len);
-            if !fits(ptr_offset) || !fits(size_offset) {
+            if !fits(start, value.len()) || !fits(ptr_offset, 4) || !fits(size_offset, 4) {
                 return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
             }
-
+            data[start..start + value.len()].copy_from_slice(value);
             data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
             data[size_offset..size_offset + 4].copy_from_slice(&(value.len() as i32).to_le_bytes());
 
