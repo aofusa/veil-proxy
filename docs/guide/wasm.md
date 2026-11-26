@@ -503,15 +503,16 @@ filter's own code. What helps:
   HTTP context. With one module on the route, a request's callbacks run in as few entries into the module as possible
   (see [Reusing the VM Context](#reusing-the-vm-context-instance_reuse)).
 - **Export only the callbacks you use.** veil does not call a callback the module does not export. A filter that keeps
-  no state per request needs no `proxy_on_context_create`, `proxy_on_log` or `proxy_on_done`; export `proxy_on_delete`
-  only to drop state kept per context.
+  no state per request needs no `proxy_on_context_create` or `proxy_on_log` (nor `proxy_on_done`, which veil does not
+  call but other hosts do); export `proxy_on_delete` only to drop state kept per context.
 - **Read a value once and keep it in the HTTP context.** Reading a property or a header again in a later phase is
   another host call and another copy into the guest. What a later phase can see also differs between hosts: Envoy, for
   example, no longer shows the request headers (nor properties such as `request.path`) to the body phase once the
   headers phase has returned `Continue`, so a filter that needs them there has to keep them.
 - **Do not allocate in every callback.** The Rust SDK allocates for each property path, header list and returned
   value. Keep buffers in the instance (a global or a thread-local) and reuse them: with `instance_reuse` the module's
-  memory stays between requests.
+  memory stays between requests. Use such buffers only for work within one callback: one instance holds the HTTP
+  contexts of several requests at once, so keep a value that a later phase needs in the HTTP context.
 - **Build without bulk memory.** Since Rust 1.87 the wasm32 targets enable bulk memory, and LLVM then turns
   variable-length copies (each small `extend_from_slice`) into `memory.copy`, which wasmtime runs as a call into the
   runtime whatever the size. Built with `-C target-feature=-bulk-memory,-bulk-memory-opt` (in `.cargo/config.toml`

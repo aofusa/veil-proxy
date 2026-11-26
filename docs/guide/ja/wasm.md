@@ -480,13 +480,15 @@ cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
   モジュールが 1 つなら、要求のコールバックをできるだけ少ない回数のモジュールへの出入りで呼ぶ
   （[VM の文脈の使い回し](#vm-の文脈の使い回しinstance_reuse)）。
 - **使うコールバックだけをエクスポートする。** veil はモジュールがエクスポートしないコールバックを呼ばない。要求ごとの状態を
-  持たないフィルタに `proxy_on_context_create`・`proxy_on_log`・`proxy_on_done` は要らない。`proxy_on_delete` は context ごとに
-  持つ状態を消すときだけ。
+  持たないフィルタに `proxy_on_context_create`・`proxy_on_log` は要らない（`proxy_on_done` も。veil は呼ばないが、他のホストは
+  呼ぶ）。`proxy_on_delete` は context ごとに持つ状態を消すときだけ。
 - **値は 1 回読んで HTTP context に持つ。** 後の段でプロパティやヘッダを読み直すと、ホストの呼び出しとゲストへの写しが 1 回ずつ
   増える。後の段から見える値はホストでも違う: たとえば Envoy は、ヘッダの段が `Continue` を返すと、本文の段に要求ヘッダ
   （と `request.path` 等のプロパティ）を見せない。本文の段で要るフィルタは持っておく。
 - **コールバックごとに確保しない。** Rust の SDK はプロパティのパス・ヘッダの表・ホストが返す値ごとに確保する。バッファは
   インスタンスに（グローバル・スレッドローカルで）持って使い回す（`instance_reuse` ではモジュールのメモリは要求をまたいで残る）。
+  使い回すバッファは 1 回のコールバックの中の作業だけに使う（1 つのインスタンスに複数の要求の HTTP context が同時に住むので、
+  後の段で使う値は HTTP context に持つ）。
 - **bulk memory 無しでビルドする。** Rust 1.87 から wasm32 のターゲットは bulk memory が有効で、LLVM は長さが可変の写し
   （小さな `extend_from_slice` ごと）を `memory.copy` にする。wasmtime は大きさに関わらずランタイムの呼び出しとして実行する。
   `-C target-feature=-bulk-memory,-bulk-memory-opt`（`.cargo/config.toml` の `[target.wasm32-wasip1] rustflags`）でビルドすると、
