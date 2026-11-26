@@ -491,6 +491,41 @@ cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
 # Add configuration to config.toml
 ```
 
+#### 6. Performance Tips
+
+For a filter that answers small requests, the entries into the module and the host calls often cost more than the
+filter's own code. What helps:
+
+- **`instance_reuse = true`.** The module is instantiated and configured once per worker; a request only creates an
+  HTTP context. With one module on the route, a request's callbacks run in as few entries into the module as possible
+  (see [Reusing the VM Context](#reusing-the-vm-context-instance_reuse)).
+- **Export only the callbacks you use.** veil does not call a callback the module does not export. A filter that keeps
+  no state per request needs no `proxy_on_context_create`, `proxy_on_log` or `proxy_on_done`; export `proxy_on_delete`
+  only to drop state kept per context.
+- **Read a value once and keep it in the HTTP context.** Reading a property or a header again in a later phase is
+  another host call and another copy into the guest. What a later phase can see also differs between hosts: Envoy, for
+  example, no longer shows the request headers (nor properties such as `request.path`) to the body phase once the
+  headers phase has returned `Continue`, so a filter that needs them there has to keep them.
+- **Do not allocate in every callback.** The Rust SDK allocates for each property path, header list and returned
+  value. Keep buffers in the instance (a global or a thread-local) and reuse them: with `instance_reuse` the module's
+  memory stays between requests.
+- **Build without bulk memory.** Since Rust 1.87 the wasm32 targets enable bulk memory, and LLVM then turns
+  variable-length copies (each small `extend_from_slice`) into `memory.copy`, which wasmtime runs as a call into the
+  runtime whatever the size. Built with `-C target-feature=-bulk-memory,-bulk-memory-opt` (in `.cargo/config.toml`
+  under `[target.wasm32-wasip1] rustflags`), the copies call wasi-libc's `memcpy`, which copies up to 32 bytes inside
+  the guest (larger copies still use `memory.copy`). With C and Clang, use `-mno-bulk-memory -mno-bulk-memory-opt`.
+  rustc reports `bulk-memory-opt` as an unknown feature with a warning; the flag still takes effect.
+- **Keep copies at a fixed size.** LLVM may merge fixed-size copies of different sizes in two branches
+  (`if a { copy 16 bytes } else { copy 23 bytes }`) into one copy of a variable length, which becomes a `memcpy` call.
+  Write each branch's copy on its own (for example as 8-byte loads and stores), and check the result with
+  `wasm-objdump -d` or `wasm-tools print`.
+- **Run fewer loop iterations.** With `metering = "clock"` every function entry and loop back-edge checks the epoch;
+  with `"fuel"` every block counts fuel. Compare words instead of bytes, write two digits per step, and let small
+  helpers be inlined.
+- **Move one-time work out of line.** Parsing a configuration or a data file on the first request makes the callback
+  that does it larger. Put it in a function of its own (`#[cold] #[inline(never)]` in Rust) so the request path stays
+  small.
+
 ### External Service Integration (HTTP Calls)
 
 Use Proxy-Wasm's `dispatch_http_call` to call external HTTP services (e.g., Webdis for Redis).

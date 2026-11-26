@@ -468,6 +468,35 @@ cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
 # config.tomlに設定を追加
 ```
 
+#### 6. 性能のための注意
+
+小さな要求に答えるフィルタでは、フィルタ自身のコードより、モジュールへの出入りとホストの関数の呼び出しの方が費用が
+大きいことが多い。効くもの:
+
+- **`instance_reuse = true`。** インスタンスの作成と設定はワーカーごとに 1 回で、要求ごとは HTTP context を作るだけ。ルートの
+  モジュールが 1 つなら、要求のコールバックをできるだけ少ない回数のモジュールへの出入りで呼ぶ
+  （[VM の文脈の使い回し](#vm-の文脈の使い回しinstance_reuse)）。
+- **使うコールバックだけをエクスポートする。** veil はモジュールがエクスポートしないコールバックを呼ばない。要求ごとの状態を
+  持たないフィルタに `proxy_on_context_create`・`proxy_on_log`・`proxy_on_done` は要らない。`proxy_on_delete` は context ごとに
+  持つ状態を消すときだけ。
+- **値は 1 回読んで HTTP context に持つ。** 後の段でプロパティやヘッダを読み直すと、ホストの呼び出しとゲストへの写しが 1 回ずつ
+  増える。後の段から見える値はホストでも違う: たとえば Envoy は、ヘッダの段が `Continue` を返すと、本文の段に要求ヘッダ
+  （と `request.path` 等のプロパティ）を見せない。本文の段で要るフィルタは持っておく。
+- **コールバックごとに確保しない。** Rust の SDK はプロパティのパス・ヘッダの表・ホストが返す値ごとに確保する。バッファは
+  インスタンスに（グローバル・スレッドローカルで）持って使い回す（`instance_reuse` ではモジュールのメモリは要求をまたいで残る）。
+- **bulk memory 無しでビルドする。** Rust 1.87 から wasm32 のターゲットは bulk memory が有効で、LLVM は長さが可変の写し
+  （小さな `extend_from_slice` ごと）を `memory.copy` にする。wasmtime は大きさに関わらずランタイムの呼び出しとして実行する。
+  `-C target-feature=-bulk-memory,-bulk-memory-opt`（`.cargo/config.toml` の `[target.wasm32-wasip1] rustflags`）でビルドすると、
+  写しは wasi-libc の `memcpy` を呼び、32 バイトまではゲストの中で写す（それより大きい写しは `memory.copy` のまま）。C（Clang）は
+  `-mno-bulk-memory -mno-bulk-memory-opt`。rustc は `bulk-memory-opt` を知らない機能として警告するが、フラグは効く。
+- **写しの大きさを固定に保つ。** 2 つの分岐の大きさの違う固定の写し（`if a { 16 バイト写す } else { 23 バイト写す }`）は、
+  LLVM が長さが可変の 1 つの写しにまとめて `memcpy` の呼び出しにすることがある。分岐ごとに別に書き（8 バイトずつの読み書き等）、
+  `wasm-objdump -d`・`wasm-tools print` で確かめる。
+- **ループの回数を減らす。** `metering = "clock"` では関数の入口とループの後ろ向きの分岐のたびにエポックを確かめ、`"fuel"` では
+  ブロックごとに燃料を数える。バイトではなくワードで比べる、1 回に 2 桁ずつ書く、小さな関数はインライン化させる。
+- **1 回だけの仕事は別の関数へ。** 最初の要求で設定やデータのファイルを解析するコードは、それを持つコールバックを大きくする。
+  別の関数（Rust は `#[cold] #[inline(never)]`）に分けて、要求の経路を小さく保つ。
+
 ### 外部サービス連携（HTTP呼び出し）
 
 Proxy-Wasmの`dispatch_http_call`を使用して外部HTTPサービス（Redis用Webdis等）を呼び出せます。
