@@ -2340,20 +2340,25 @@ pub(super) async fn h2_dispatch(
                     Some(data),
                     false,
                 );
+                // B-504: 応答ヘッダの段のローカル応答も、関数の最後のログの段を通す（以前はここで返して
+                // `proxy_on_log` を呼ばなかった）
                 #[cfg(feature = "wasm")]
-                let header_store = match apply_h2_wasm_response_headers(
-                    &wasm_modules_to_apply,
-                    status,
-                    built_headers,
-                )
-                .await
                 {
-                    Ok(h) => h,
-                    Err(local) => return h2_emit_head_local(resp_tx, notify, local).await,
-                };
+                    match apply_h2_wasm_response_headers(
+                        &wasm_modules_to_apply,
+                        status,
+                        built_headers,
+                    )
+                    .await
+                    {
+                        Ok(h) => h2_emit_full(resp_tx, notify, status, h, response_body).await,
+                        Err(local) => h2_emit_head_local(resp_tx, notify, local).await,
+                    }
+                }
                 #[cfg(not(feature = "wasm"))]
-                let header_store = built_headers;
-                h2_emit_full(resp_tx, notify, status, header_store, response_body).await
+                {
+                    h2_emit_full(resp_tx, notify, status, built_headers, response_body).await
+                }
             }
         }
         Backend::SendFile(

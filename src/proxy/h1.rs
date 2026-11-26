@@ -887,6 +887,9 @@ pub(super) async fn handle_requests(
                                     )
                                     .await;
                                     if !written {
+                                        // B-504: 応答を書けずに閉じる要求もログの段を呼ぶ（Envoy と同じ）
+                                        crate::wasm::on_request_complete_async(&modules_to_apply)
+                                            .await;
                                         return;
                                     }
                                     log_access(
@@ -976,6 +979,8 @@ pub(super) async fn handle_requests(
                                 )
                                 .await;
                                 if let Err(_) | Ok((Err(_), _)) = write_result {
+                                    // B-504: ヘッダの段を呼んだ要求は、閉じるときもログの段を呼ぶ
+                                    crate::wasm::on_request_complete_async(&modules_to_apply).await;
                                     return;
                                 }
                             }
@@ -999,6 +1004,10 @@ pub(super) async fn handle_requests(
                                     let _ =
                                         timeout(WRITE_TIMEOUT, tls_stream.write_all(err.to_vec()))
                                             .await;
+                                    // B-504: 本文のエラー（上限の 413・壊れた chunked・本文の読み取りの
+                                    // タイムアウトの 400）で終える要求もログの段を呼ぶ（以前は呼ばず、context は
+                                    // 次の利用で消すだけだった）。読み捨ての前に呼ぶ（読み捨ては相手が送り終えるまで待つ）
+                                    crate::wasm::on_request_complete_async(&modules_to_apply).await;
                                     // 未読の本文を残して閉じると RST で応答が届かないことがある（B-102）
                                     lingering_drain_before_close(&mut tls_stream).await;
                                     return;
@@ -1049,6 +1058,9 @@ pub(super) async fn handle_requests(
                                     )
                                     .await;
                                     if !written {
+                                        // B-504: 応答を書けずに閉じる要求もログの段を呼ぶ
+                                        crate::wasm::on_request_complete_async(&modules_to_apply)
+                                            .await;
                                         return;
                                     }
                                     log_access(
@@ -1095,7 +1107,12 @@ pub(super) async fn handle_requests(
                     if tls_stream.has_held() {
                         match timeout(WRITE_TIMEOUT, tls_stream.flush_held()).await {
                             Ok(Ok(())) => {}
-                            _ => return,
+                            _ => {
+                                // B-504: ヘッダの段を呼んだ要求は、閉じるときもログの段を呼ぶ
+                                #[cfg(feature = "wasm")]
+                                crate::wasm::on_request_complete_async(&modules_to_apply).await;
+                                return;
+                            }
                         }
                     }
                     // WebSocket はプロキシバックエンドでのみ（上で Proxy 以外は外した）
@@ -1124,6 +1141,9 @@ pub(super) async fn handle_requests(
                                 );
                                 let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
                                 let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                                // B-504: 502 で終える要求もログの段を呼ぶ（上流を選んだ後の 502・504 と同じ）
+                                #[cfg(feature = "wasm")]
+                                crate::wasm::on_request_complete_async(&modules_to_apply).await;
                                 return;
                             }
                         };
@@ -1162,13 +1182,10 @@ pub(super) async fn handle_requests(
                                 client_ip,
                                 "",
                             );
-
-                            // WASMライフサイクルコールバック: リクエスト完了
-                            #[cfg(feature = "wasm")]
-                            {
-                                crate::wasm::on_request_complete_async(&modules_to_apply).await;
-                            }
                         }
+                        // WASMライフサイクルコールバック: リクエスト完了（B-504: 応答を書けなかった要求も）
+                        #[cfg(feature = "wasm")]
+                        crate::wasm::on_request_complete_async(&modules_to_apply).await;
                         // WebSocket 接続終了後は HTTP 接続も終了
                         return;
                     }
@@ -1271,6 +1288,9 @@ pub(super) async fn handle_requests(
                         // Keep-Alive: ループを継続して次のリクエストを待機
                     }
                     None => {
+                        // B-504: 応答を書けずに閉じる要求もログの段を呼ぶ（Envoy と同じ）
+                        #[cfg(feature = "wasm")]
+                        crate::wasm::on_request_complete_async(&modules_to_apply).await;
                         return;
                     }
                 }

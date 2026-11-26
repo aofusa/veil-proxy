@@ -344,6 +344,9 @@ pub(crate) async fn serve(
         );
         crate::logging::log_throttled!(error, "No healthy upstream servers for WebSocket");
         let r = out.error(502, b"Bad Gateway").await;
+        // B-504: 要求ヘッダの段を呼んだ要求は、502 で終えるときもログの段を呼ぶ
+        #[cfg(feature = "wasm")]
+        crate::wasm::on_request_complete_async(&wasm.modules).await;
         return (r.0, r.1, 0);
     };
     server.acquire();

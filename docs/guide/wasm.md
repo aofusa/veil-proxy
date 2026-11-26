@@ -208,8 +208,11 @@ later requests: each request only creates an HTTP context (`proxy_on_context_cre
 and `proxy_on_delete` runs when the request is done. This is the same lifetime as Envoy. All phases of a request
 (request headers, request body, response headers, response body and `on_log`) use the same HTTP context, so
 state the filter keeps in its HTTP context carries over from one phase to the next. One instance holds the
-HTTP contexts of several requests at once, as an Envoy worker's VM does. If a request ends before `on_log`
-(for example the client disconnects), its context is deleted the next time the instance is used. The filter's
+HTTP contexts of several requests at once, as an Envoy worker's VM does. `on_log` runs for every request whose
+request phases have run, also when veil ends the request with its own error response (such as `413` for a chunked body
+over the limit, `400` for a malformed, incomplete or timed-out body, or `502` when a WebSocket upgrade finds no healthy
+upstream) or cannot write the response. If the request is abandoned before `on_log` instead (for example the client
+resets an HTTP/2 or HTTP/3 stream), its context is deleted the next time the instance is used. The filter's
 global variables and root-context state persist across requests. An instance that traps or returns an error
 is discarded and the next request gets a new one; later phases of the requests whose contexts lived in it
 run in a new HTTP context (the filter still runs, but state kept in the old context is lost). Each worker keeps

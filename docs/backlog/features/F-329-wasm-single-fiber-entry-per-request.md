@@ -186,10 +186,12 @@ json-tls（wrk）の ABI の版は 3 巡のうち 1 巡に wrk のソケット�
   json-tls −3.81 µs（0.4 以上）、h3 −0.38 µs（0.25 以上）。SDK の版は h3 が −0.23 µs で、ほかは満たした。epoll でも全負荷で下がった。
 - E2E（`tests/standalone/wasm_chain_tests.rs`、自己完結型 E2E。平文の HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3、io_uring と epoll）:
   `proxy_on_context_create`・`proxy_on_request_headers`・`proxy_on_log`・`proxy_on_delete` が要求ごとに 1 回ずつで、本文の段は本文のある
-  要求ごとに 1 回（受け取った本文の長さも数える）。GET・POST・chunked・空の chunked・`Expect: 100-continue`（HTTP/1.1）、HTTP/2・HTTP/3 の
-  トレーラ付きの POST（段ごとの経路）。ヘッダの段の間に本文が見えないこと。上限を超える本文は 413: HTTP/2・HTTP/3 は本文を溜めてから
-  ヘッダの段を呼ぶのでモジュールを呼ばない。HTTP/1.1 の chunked はヘッダの段の後に返し、ログの段を呼ばない（context は次の利用で
-  削除だけ。main からの動きで F-329 の前後で同じ。[B-504](../bugs/B-504-h1-body-error-skips-wasm-on-log.md) に起票）。
+  要求ごとに 1 回（受け取った本文の長さも数える）。GET・POST・chunked・空の chunked（HTTP/1.1 はヘッダと本文を 1 回で書き、続けて
+  呼ぶ経路を通す）・`Expect: 100-continue`（HTTP/1.1。本文はヘッダの段の後に届く）、HTTP/2・HTTP/3 のトレーラ付きの POST（段ごとの
+  経路。本文の段に全量を `end_of_stream` 付きで渡すので、本文の段が答える）。ヘッダの段の間に本文が見えないこと。Content-Length で
+  上限を超える本文は、どのプロトコルでもモジュールを呼ばずに 413。HTTP/1.1 の上限を超える chunked（413）・`100 Continue` の後に届く
+  壊れた chunked（400）と、全プロトコルのメモリのファイルの応答ヘッダの段のローカル応答は、ログの段まで 1 回ずつ呼ぶ（この E2E で
+  見つけた [B-504](../bugs/B-504-h1-body-error-skips-wasm-on-log.md)。main からの動きで、同じブランチで直した）。
 - ログ・削除の段のトラップ（応答は届き、二重に呼ばない）・本文の段の Pause（503、B-300）・`failure_policy`・B-299 は、エンジンを直接
   呼ぶ単体の試験（`tests.rs` の `f329_chained_request_tests`）で確かめた（E2E のモジュールはトラップで捨てられると数え直しになるため）。
   終わらない段（ログの段・本文の段）は、続けて呼ぶ段の中でも `max_execution_time_ms` で打ち切られ、トラップと同じく扱われ、打ち切るまで
