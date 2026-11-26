@@ -13,16 +13,29 @@
   プロファイル（h1 GET）で wasmtime の出入りは 0.80 µs/要求（2 回分）、後始末の段の veil の段取りは約 0.3 µs。
 - 後始末の段（`on_request_complete_async`）は応答をソケットへ書いた後に走る。
 
-## 改修内容
+## 設計
 
-1. ローカル応答の要求: 連続呼び出しの中で `proxy_send_local_response` が呼ばれ、保留中の外部呼び出し（`dispatch_http_call`・gRPC）が無ければ、
-   同じ連続呼び出しの中で続けて `proxy_on_log`・`proxy_on_delete` を呼ぶ。応答はその後で書く。2 回目の出入りと段取りが丸ごと消える。
-   `proxy_on_log` の前に `http_ctx.response_status` 等をローカル応答の値にする（今は 0）。
-2. POST: 本文の全量がヘッダの段の時点で手元にあれば（HTTP/1.1 は読み取りバッファに Content-Length 分・chunked は終端まで、
-   HTTP/2 は F-298 の END_STREAM 付き DATA、HTTP/3 は同じ束の本文）、`proxy_on_request_headers` が `Continue` を返したら同じ連続呼び出しで
-   `proxy_on_request_body` を呼び、ローカル応答なら 1 のとおり後始末まで続ける。全量が無いときは今のまま。
-3. 複数のモジュールのルート: Envoy と同じく全モジュールのヘッダの段の後に本文の段を呼ぶ順を守る（2 は単一モジュールに限る）。ローカル応答を
-   返したモジュールより後のモジュール（ヘッダの段を呼んでいないもの）の扱いは今の挙動（作成・ログ・削除）を保つ。
+1. **連続呼び出しに条件つきの続きを足す**（`src/wasm/exports.rs`）
+   - `Step::RequestBody(context_id, body_size, end_of_stream)` を足し、`MAX_STEPS` を 5 にする（作成・ヘッダ・本文・ログ・削除）。
+   - `run_chain` は本文の段を、前のヘッダの段の戻り値が Continue（0）か本文を待つ Pause（1。`allow_request_body_read` のとき）で、
+     ローカル応答が無く、保留の外部呼び出し（`pending_http_calls`・gRPC）が無いときだけ呼ぶ。満たさなければそこで止め、
+     今の非同期の経路（`settle` の外部呼び出しのインラインの解決・本文の段の別呼び出し）に任せる。
+   - 終わりの段（呼び出し元が許したときだけ）: 段の後にローカル応答が決まっていて保留の外部呼び出しが無ければ、ログの段の
+     `response.code` をローカル応答の値にし、`proxy_on_log`・（燃料と締切を入れ直して）`proxy_on_delete` を続けて呼び、
+     `Chain` に「終えた」と返す。
+2. **エンジン**（`src/wasm/engine.rs`）: 効く並び（`resolve_effective_modules`）がモジュール 1 つで、`instance_reuse` で、要求の並び
+   （`RequestSessions`）があるときだけ終わりの段を許す。終えたら `release_session(.., end = true)` で context を消し、`RequestSessions` に
+   「ログ済み」（`Cell<bool>`）を立てる。`on_log_with_modules` は「ログ済み」なら何もしない（全プロトコルの後始末の呼び出し元
+   〈`on_request_complete_async`〉は変えない）。
+3. **本文の全量が手元にある POST**: 新しい入口（`on_request_with_body_async`、仮）が作成・ヘッダ（`end_of_stream = false`）・本文
+   （`end_of_stream = true`）・ログ・削除を 1 回で呼び、`FilterResult::Continue { headers, body: Some(..) }`（今の型の `body`）か
+   ローカル応答を返す。プロトコルの側は次のときだけ使い、後の本文の段を飛ばす:
+   - 全量がある: HTTP/1.1 は Content-Length 分が最初の読み取りにある、chunked は終端が見えていて読み取り無しで復号できる。
+     HTTP/2 は F-298 の溜める経路、HTTP/3 は `take_first_body` で全量。
+   - 本文の上限（`limit`）以下で、本文の段が要る（`wants_request_body`）。上限超過の 413・`Expect: 100-continue`・分割して届く本文は今の経路。
+4. **複数のモジュールのルート**: 変えない（モジュールをまたぐ `proxy_on_log` の順〈Envoy はフィルタの順〉を保つため）。
+5. ゲストから見える呼び出しの順と引数は今と同じ（作成 → ヘッダ〈`end_of_stream = false`〉→ 本文〈全量、`end_of_stream = true`〉→ ログ → 削除）。
+   変わるのは `proxy_on_log` の時機だけ（下）。
 
 ## 意味の変化と危険
 
@@ -34,6 +47,10 @@
   1 でローカル応答の値を入れるので、ここは直る。
 - `proxy_on_log`・`proxy_on_delete` がトラップしても、決まったローカル応答は返し（B-299）、インスタンスは捨てる。
 - 段ごとの CPU の上限（`max_execution_time_ms`、`Window::Callback`）と協調的な譲り（エポック）は今の連続呼び出しと同じに保つ。
+- 今は応答の書き込みに失敗すると HTTP/1.1 は `proxy_on_log` を呼ばずに戻る（context は後の要求の `take_pending_deletes` で消す）。
+  1 の後は書き込みの成否に関わらず `proxy_on_log` が走る（Envoy はストリームの破棄でアクセスログを呼ぶ）。
+- 2 の判定（全量がある・上限以下）を誤ると、今は 413 を返す要求の本文をゲストへ渡す。判定は今の本文の読み取り
+  （`read_full_request_body`）と同じ関数で行う。
 
 ## 受け入れ条件
 

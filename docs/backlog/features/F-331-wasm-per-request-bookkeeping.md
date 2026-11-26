@@ -18,9 +18,14 @@
   （`src/wasm/host/properties.rs`）。許すプロパティの判定は `Vec<String>` の線形走査。
 - `request_path` 等が要求ごとの `Arc<str>`（`arcinner_layout_for_value_layout` 0.20%）。
 
-ans-01 が挙げたもの（着手のときにコードで確かめる）: 要求ごとの `Rc<RequestSessions>` と `Vec<SessionEntry>` の確保、`InstancePool::with_local`
-の `retain`（共有の `alive.strong_count()`・`generation` を毎回読む）、`settle` が保留の無いときも `resolve_pending_http_calls_inline` を通る、
-HTTP/1.1 のローカル応答の経路の `Instant::now()`（アクセスログ・メトリクスが無効でも）、`Delete` の前の `metering::arm`。
+ans-01 が挙げたもの（2026-11-26 にコードで確かめた）:
+
+- 要求ごとの `Rc<RequestSessions>`（`WasmModules::for_request`）と `Vec<SessionEntry>` の確保。
+- `InstancePool::with_local` が要求ごとにスレッドの表を `retain`（全ワーカー共有の `alive` の強参照数を読む）し、`generation` を読む。
+  読むだけで共有の行へは書かないので、優先度は低い。
+- `settle`: HttpArena のフィルタはローカル応答の後に Pause を返すので、毎回 `resolve_pending_http_calls_inline` の future を作って空の保留を
+  確かめる（[F-329](F-329-wasm-single-fiber-entry-per-request.md) の後はローカル応答で終えた連続呼び出しでは通らない）。
+- HTTP/1.1 のローカル応答の経路の `Instant::now()`（`h1.rs` のローカル応答の 2 箇所。アクセスログが無効でも読む）、`Delete` の前の `metering::arm`。
 
 ## 改修内容
 
