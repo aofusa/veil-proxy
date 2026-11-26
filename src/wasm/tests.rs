@@ -3790,6 +3790,34 @@ mod f329_chained_request_tests {
         }
     }
 
+    // B-504: ログの段は 1 要求に 1 回。同じ要求でまた `on_log` を呼んでも `proxy_on_log` を 2 回呼ばない（呼ぶ箇所が
+    // 増えたので、2 回呼ぶ経路を作っても context を作り直して呼ばない）
+    #[test]
+    fn the_log_phase_runs_once_per_request() {
+        let f = build(&["m"], true, None);
+        let before = counts(&f);
+        let s = RequestSessions::default();
+        let r = futures::executor::block_on(f.engine.on_request_headers_with_modules(
+            &refs(&["m"]),
+            &Arc::from("/p"),
+            &Arc::from("GET"),
+            headers(2),
+            &Arc::from("127.0.0.1"),
+            true,
+            Some(&s),
+        ));
+        assert_eq!(status(&r), None);
+        assert!(!s.logged());
+        log(&f, &["m"], &s);
+        assert!(s.logged());
+        log(&f, &["m"], &s);
+        let after = counts(&f);
+        // この要求（作成・ヘッダ・ログ・削除が 1 回ずつ）と、回数を読む要求の分（`before` の要求のログ・削除、`after` の
+        // 要求の作成・ヘッダ）
+        let d: Vec<u8> = after.iter().zip(&before).map(|(a, b)| a - b).collect();
+        assert_eq!(d, [2, 2, 0, 2, 2]);
+    }
+
     fn continued_body(r: FilterResult) -> Option<bytes::Bytes> {
         match r {
             FilterResult::Continue { body, .. } => body,

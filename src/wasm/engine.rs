@@ -2173,9 +2173,13 @@ impl FilterEngine {
         modules: &[ModuleRef],
         sessions: Option<&RequestSessions>,
     ) {
-        // F-329: ローカル応答の要求は要求の段の続きで `proxy_on_log`・`proxy_on_delete` を呼んだ
+        // F-329: ローカル応答の要求は要求の段の続きで `proxy_on_log`・`proxy_on_delete` を呼んだ。B-504: ログの段は
+        // 1 要求に 1 回（呼ぶ箇所が増えたので、同じ要求でまた呼ばれても `proxy_on_log` を 2 回呼ばない）
         if sessions.is_some_and(RequestSessions::logged) {
             return;
+        }
+        if let Some(s) = sessions {
+            s.set_logged();
         }
         let resolved = resolve_effective_modules(&self.registry, modules);
 

@@ -265,8 +265,7 @@ pub struct RequestSessions {
     request_info: std::cell::OnceCell<super::RequestInfo>,
     /// 要求のメソッドとパス（B-408。要求ヘッダの段が置き、要求を持たない応答の段・`on_log` の context へ写す）
     request_line: std::cell::OnceCell<(Arc<str>, Arc<str>)>,
-    /// ローカル応答の要求の `proxy_on_log`・`proxy_on_delete` を要求の段の続きで呼んだ（F-329。応答の後の `on_log` は
-    /// 何もしない）
+    /// ログの段を呼んだ（ローカル応答の要求の要求の段の続き〈F-329〉か `on_log`。後の `on_log` は何もしない。B-504）
     logged: std::cell::Cell<bool>,
 }
 
@@ -359,12 +358,12 @@ impl RequestSessions {
         self.request_line.get()
     }
 
-    /// 要求の段の続きで `proxy_on_log` を呼んだ（F-329）
+    /// ログの段を呼んだ（F-329・B-504）
     pub(crate) fn set_logged(&self) {
         self.logged.set(true);
     }
 
-    /// 要求の段の続きで `proxy_on_log` を呼んだか（F-329。応答の後の `on_log` を飛ばす）
+    /// ログの段を呼んだか（F-329・B-504。後の `on_log` を飛ばす）
     pub fn logged(&self) -> bool {
         self.logged.get()
     }
