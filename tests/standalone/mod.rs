@@ -214,6 +214,13 @@ pub fn connect_local(port: u16, timeout: Duration) -> std::io::Result<TcpStream>
     }
 }
 
+/// Proxy-Wasm のモジュールを読む veil の起動を待つ上限。debug ビルドの veil は wasm を最適化していない Cranelift で
+/// コンパイルするので、`tests/fixtures/wasm/baseline_filter.wasm` は 1 本で 5〜7 秒、同時に 3 本で 22 秒かかった（4 CPU で
+/// 負荷 4〜5。リリースビルドは 0.2 秒）。試験は並列に走るので 30 秒では足りないことがある（2026-11-26 に b186・b188・b189 が
+/// 起動待ちで落ちた）
+#[cfg(feature = "wasm")]
+pub const WASM_STARTUP: Duration = Duration::from_secs(120);
+
 /// `port` に接続できるようになるまで待つ。
 pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     wait_until(timeout, || {

@@ -315,11 +315,7 @@ url = "http://127.0.0.1:{up}/"
     let cfg_path = dir.path().join("config.toml");
     std::fs::write(&cfg_path, config("", None)).unwrap();
     let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
-    assert!(
-        wait_for_port(port, Duration::from_secs(30)),
-        "{}",
-        veil.log()
-    );
+    assert!(wait_for_port(port, WASM_STARTUP), "{}", veil.log());
     assert!(
         filtered(),
         "filter did not run at startup; log:\n{}",
@@ -3649,8 +3645,7 @@ url = "http://127.0.0.1:{echo}"
     std::fs::write(&cfg_path, config).unwrap();
     let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
     assert!(
-        wait_for_port(port, Duration::from_secs(30))
-            && wait_for_port(tls_port, Duration::from_secs(30)),
+        wait_for_port(port, WASM_STARTUP) && wait_for_port(tls_port, Duration::from_secs(30)),
         "{}",
         veil.log()
     );
@@ -3956,11 +3951,7 @@ url = "http://127.0.0.1:{echo}"
     let cfg_path = dir.join("config.toml");
     std::fs::write(&cfg_path, config).unwrap();
     let veil = VeilProcess::spawn(&cfg_path, &[], &[]);
-    assert!(
-        wait_for_port(port, Duration::from_secs(30)),
-        "{}",
-        veil.log()
-    );
+    assert!(wait_for_port(port, WASM_STARTUP), "{}", veil.log());
     (veil, port)
 }
 
