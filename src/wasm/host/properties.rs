@@ -102,25 +102,6 @@ pub(crate) fn get_property_value(state: &HostState, path: &str) -> Option<Proper
     }
 }
 
-/// Helper to write to WASM memory
-fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> bool {
-    let memory = match caller.guest_memory() {
-        Some(mem) => mem,
-        _ => return false,
-    };
-
-    let mem_data = memory.data_mut(caller);
-    let start = ptr as u32 as usize;
-    let end = start + data.len();
-
-    if end > mem_data.len() {
-        return false;
-    }
-
-    mem_data[start..end].copy_from_slice(data);
-    true
-}
-
 /// Helper to read string from WASM memory
 fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
     let memory = caller.guest_memory()?;
@@ -168,7 +149,13 @@ impl PropertyPath {
     }
 
     fn is_empty(&self) -> bool {
-        self.as_str().is_empty()
+        self.len == 0 && self.heap.as_ref().is_none_or(String::is_empty)
+    }
+
+    /// 空にする（バッファを 0 で埋め直さない。F-331）
+    fn clear(&mut self) {
+        self.len = 0;
+        self.heap = None;
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -180,12 +167,38 @@ impl PropertyPath {
     }
 }
 
+/// よく使うプロパティの、ゲストが渡す形（SDK の NUL 区切り）と `.` で繋いだ名前（F-331: [`parse_path_into`] で組み立てずに
+/// バイト列のまま照合する。どれも長さ付きの形としては読めない〈先頭 4 バイトの要素の数がデータに収まらない〉ので、
+/// [`parse_path_into`] と同じ名前になる）
+const KNOWN_PROPERTIES: [(&[u8], &str); 11] = [
+    (b"request\0path", "request.path"),
+    (b"request\0url_path", "request.url_path"),
+    (b"request\0method", "request.method"),
+    (b"request\0host", "request.host"),
+    (b"request\0scheme", "request.scheme"),
+    (b"request\0protocol", "request.protocol"),
+    (b"request\0query", "request.query"),
+    (b"source\0address", "source.address"),
+    (b"response\0code", "response.code"),
+    (b"plugin_name", "plugin_name"),
+    (b"plugin_root_id", "plugin_root_id"),
+];
+
+/// ゲストの渡したパスがよく使うプロパティ（[`KNOWN_PROPERTIES`]。最後の NUL 1 つは無視する）ならその名前
+fn known_property(raw: &[u8]) -> Option<&'static str> {
+    let raw = raw.strip_suffix(b"\0").unwrap_or(raw);
+    KNOWN_PROPERTIES
+        .iter()
+        .find(|(k, _)| *k == raw)
+        .map(|&(_, name)| name)
+}
+
 /// [`parse_path`] の確保しない版。読めたら true
 pub(crate) fn parse_path_into(data: &[u8], out: &mut PropertyPath) -> bool {
     if parse_len_prefixed_into(data, out) {
         return true;
     }
-    *out = PropertyPath::new();
+    out.clear();
     for part in data.split(|&b| b == 0).filter(|p| !p.is_empty()) {
         if !out.is_empty() {
             out.push(b".");
@@ -290,9 +303,10 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
          return_value_ptr: i32,
          return_value_size: i32|
          -> anyhow::Result<i32> {
-            // Read path from WASM memory（B-178: 短いパスはスタックで組み立てる）
-            let mut path = PropertyPath::new();
-            {
+            // Read path from WASM memory（B-178: 短いパスはスタックで組み立てる。F-331: よく使うプロパティは組み立てずに
+            // 照合する）
+            let mut parsed = None;
+            let known = {
                 let memory = match caller.guest_memory() {
                     Some(mem) => mem,
                     _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
@@ -303,13 +317,19 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     Some(r) => r,
                     None => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
                 };
-                if !parse_path_into(raw, &mut path) {
-                    return Ok(PROXY_RESULT_PARSE_FAILURE);
+                let known = known_property(raw);
+                if known.is_none() {
+                    let path = parsed.insert(PropertyPath::new());
+                    if !parse_path_into(raw, path) {
+                        return Ok(PROXY_RESULT_PARSE_FAILURE);
+                    }
                 }
-            }
+                known
+            };
+            let path = known.unwrap_or_else(|| parsed.as_ref().map_or("", PropertyPath::as_str));
 
-            let state = caller.data();
-            let value = match get_property_value(state, path.as_str()) {
+            // 権限は get_property_value が見る
+            let value = match get_property_value(caller.data(), path) {
                 Some(v) => v,
                 None => return Ok(PROXY_RESULT_NOT_FOUND),
             };
@@ -321,17 +341,20 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 None => return Ok(PROXY_RESULT_INTERNAL_FAILURE),
             };
 
-            if !write_to_wasm(&mut caller, ptr, value) {
-                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
-            }
-
-            // Write return values
+            // 値と、その場所・長さを書く（ゲストのアロケータを呼んだ後なのでメモリを引き直す）
             let memory = match caller.guest_memory() {
                 Some(mem) => mem,
                 _ => return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS),
             };
-
             let data = memory.data_mut(&mut caller);
+            let start = ptr as u32 as usize;
+            let Some(dst) = start
+                .checked_add(value.len())
+                .and_then(|end| data.get_mut(start..end))
+            else {
+                return Ok(PROXY_RESULT_INVALID_MEMORY_ACCESS);
+            };
+            dst.copy_from_slice(value);
             let ptr_offset = return_value_ptr as u32 as usize;
             let size_offset = return_value_size as u32 as usize;
 
@@ -420,8 +443,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        get_property_value, parse_len_prefixed_path, parse_path, parse_path_into, PropertyPath,
-        PropertyValue,
+        get_property_value, known_property, parse_len_prefixed_path, parse_path, parse_path_into,
+        PropertyPath, PropertyValue, KNOWN_PROPERTIES,
     };
     use crate::wasm::capabilities::ModuleCapabilities;
     use crate::wasm::context::{HostState, HttpContext};
@@ -523,6 +546,48 @@ mod tests {
             let ok = parse_path_into(c, &mut p);
             assert_eq!(ok.then(|| p.as_str().to_string()), parse_path(c), "{:?}", c);
         }
+    }
+
+    /// F-331: よく使うプロパティの照合は [`parse_path_into`] と同じ名前になる（最後の NUL も同じ）。照合しない形は今までどおり
+    #[test]
+    fn known_properties_match_the_parsed_names() {
+        for (raw, name) in KNOWN_PROPERTIES {
+            for raw in [raw.to_vec(), [raw, b"\0"].concat()] {
+                let mut p = PropertyPath::new();
+                assert!(parse_path_into(&raw, &mut p), "{raw:?}");
+                assert_eq!(p.as_str(), name);
+                assert_eq!(known_property(&raw), Some(name));
+            }
+        }
+        for raw in [
+            &b"request\0path\0\0"[..],
+            b"\0request\0path",
+            b"request.path",
+            b"request\0pat",
+            b"plugin_data\0dataset",
+            b"",
+        ] {
+            assert_eq!(known_property(raw), None, "{raw:?}");
+        }
+    }
+
+    /// 照合した近道も権限を見る（許していないプロパティは NOT_FOUND と同じく値が無い）
+    #[test]
+    fn known_properties_still_need_permission() {
+        let caps = ModuleCapabilities {
+            allowed_properties: vec!["request.method".to_string()],
+            ..Default::default()
+        };
+        let mut st = HostState::new(HttpContext::new(1, caps));
+        st.http_ctx
+            .set_request_line(Arc::from("GET"), Arc::from("/p"));
+        let path = known_property(b"request\0path").unwrap();
+        assert!(get_property_value(&st, path).is_none());
+        let method = known_property(b"request\0method").unwrap();
+        assert_eq!(
+            get_property_value(&st, method).map(|v| v.as_bytes().to_vec()),
+            Some(b"GET".to_vec())
+        );
     }
 
     #[test]

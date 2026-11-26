@@ -121,6 +121,17 @@ pub struct RequestInfo {
     pub protocol: &'static str,
 }
 
+/// [`HttpContext::reset_values`] で残すもの（モジュールのものはいつも残す）
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// 何も残さない（要求の終わり。[`HttpContext::recycle`]）
+    Nothing,
+    /// context の ID・要求の属性・メソッドとパス（[`HttpContext::enter_log`]）
+    RequestLine,
+    /// それとクライアントの IP（[`HttpContext::enter_request_body`]）
+    RequestLineAndClient,
+}
+
 /// HTTP context for a single request
 pub struct HttpContext {
     // === Context IDs ===
@@ -399,8 +410,17 @@ impl HttpContext {
     /// 残して、[`Self::for_module`] で作ったときと同じ空の状態へ戻す（F-318）。
     ///
     /// プールのインスタンスの context を要求ごとに作り直すと、モジュールの `Arc` を全部複製し直して捨てる（全ワーカーが
-    /// 同じ行へ書く）。全フィールドを列挙する（足したフィールドを戻し忘れたらコンパイルで分かる）。
+    /// 同じ行へ書く）。
     pub(crate) fn recycle(&mut self) {
+        self.reset_values(Keep::Nothing);
+    }
+
+    /// モジュールのものと `keep` のものを残して空の状態へ戻す（[`Self::recycle`]・[`Self::enter_log`]・
+    /// [`Self::enter_request_body`]）。全フィールドを列挙する（足したフィールドを戻し忘れたらコンパイルで分かる）。
+    ///
+    /// F-331: 残すものは触らない（以前は要求の段の値を残すときも、メソッド・パスを空の文字列と入れ替えてから全部を戻し、
+    /// 元へ戻していた。入れ替えのたびに参照カウントの加算・減算になる）。空の文字列はもう空なら置き直さない
+    fn reset_values(&mut self, keep: Keep) {
         let HttpContext {
             context_id,
             root_context_id,
@@ -457,22 +477,31 @@ impl HttpContext {
             #[cfg(feature = "grpc")]
             grpc_receive_trailing_metadata,
         } = self;
-        *context_id = 1;
-        *root_context_id = 0;
+        let clear_str = |s: &mut Arc<str>| {
+            if !s.is_empty() {
+                *s = local_empty_str();
+            }
+        };
+        if keep == Keep::Nothing {
+            *context_id = 1;
+            *root_context_id = 0;
+            clear_str(request_path);
+            clear_str(request_method);
+            request_query.clear();
+            *request_info = None;
+        }
+        if keep != Keep::RequestLineAndClient {
+            clear_str(client_ip);
+        }
         request_headers.clear();
         *request_body = BodyBuffer::empty();
         request_trailers.clear();
-        *request_path = local_empty_str();
-        *request_method = local_empty_str();
-        request_query.clear();
-        *request_info = None;
         *request_body_complete = false;
         *response_status = 0;
         response_headers.clear();
         *response_body = BodyBuffer::empty();
         response_trailers.clear();
         *response_body_complete = false;
-        *client_ip = local_empty_str();
         *request_headers_modified = false;
         *request_body_modified = false;
         *request_line_overridden = false;
@@ -623,39 +652,21 @@ impl HttpContext {
         !self.pending_http_calls.is_empty()
     }
 
-    /// 要求の段の値（ヘッダ・本文・トレーラ・クライアントの IP・ゲストが置いたプロパティ・メトリクス・ローカル応答等）を
-    /// 消し、context の ID・要求の属性・メソッドとパス（[`HttpContext::set_request_line`]）だけを残す（F-329）。段を別に
-    /// 呼んでいたときの、段の間の `recycle` とセッションが入れ直す要求の属性（`set_request_attrs`）の後と同じ状態
-    fn keep_request_line_only(&mut self) {
-        let info = self.request_info.take();
-        let path = std::mem::replace(&mut self.request_path, local_empty_str());
-        let method = std::mem::replace(&mut self.request_method, local_empty_str());
-        let query = std::mem::take(&mut self.request_query);
-        let (context_id, root_context_id) = (self.context_id, self.root_context_id);
-        self.recycle();
-        self.context_id = context_id;
-        self.root_context_id = root_context_id;
-        self.request_info = info;
-        self.request_path = path;
-        self.request_method = method;
-        self.request_query = query;
-    }
-
     /// 要求ヘッダの段に続けて呼ぶ要求本文の段の context にする（F-329）。本文の段を別に呼んでいたときと同じ見え方:
     /// ヘッダの段で置いた値は消し、要求の属性・メソッド・パス・クライアントの IP を残して、`headers`（ヘッダの段の後の
     /// ヘッダ）と全量の本文を置く
     pub(crate) fn enter_request_body(&mut self, headers: Vec<(Vec<u8>, Vec<u8>)>, body: Bytes) {
-        let client_ip = std::mem::replace(&mut self.client_ip, local_empty_str());
-        self.keep_request_line_only();
-        self.client_ip = client_ip;
+        self.reset_values(Keep::RequestLineAndClient);
         self.request_headers = headers;
         self.set_request_body(body, true);
     }
 
     /// ローカル応答の要求の `proxy_on_log` の前に、context を応答の後に別に呼んでいたログの段と同じ見え方にする（F-329）。
-    /// 見えるのは要求の属性とメソッド・パスだけ（応答のステータスも別に呼んでいたときと同じく 0）
+    /// 要求の段の値（ヘッダ・本文・トレーラ・クライアントの IP・ゲストが置いたプロパティ・メトリクス・ローカル応答等）を
+    /// 消し、context の ID・要求の属性・メソッドとパス（[`HttpContext::set_request_line`]）だけを残す（応答のステータスも
+    /// 別に呼んでいたときと同じく 0。段の間の `recycle` とセッションが入れ直す要求の属性〈`set_request_attrs`〉の後と同じ）
     pub(crate) fn enter_log(&mut self) {
-        self.keep_request_line_only();
+        self.reset_values(Keep::RequestLine);
     }
 
     /// Get next gRPC call ID

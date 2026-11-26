@@ -2617,6 +2617,90 @@ mod f318_recycle_tests {
         assert!(Arc::ptr_eq(&ctx.capabilities, &caps));
         assert!(Arc::ptr_eq(&ctx.shared_data, &shared));
     }
+
+    /// 要求の段の値を持つ context（[`enter_log_and_enter_request_body_keep_only_the_request_line`]）
+    fn with_request_values() -> HttpContext {
+        let mut ctx = HttpContext::new(1, ModuleCapabilities::default());
+        ctx.context_id = 7;
+        ctx.root_context_id = 1;
+        ctx.set_request(
+            Arc::from("POST"),
+            Arc::from("/p?q=1"),
+            vec![(b"a".to_vec(), b"1".to_vec())],
+            Arc::from("10.0.0.1"),
+        );
+        ctx.request_info = Some(RequestInfo {
+            authority: Arc::from("h.example"),
+            scheme: "https",
+            protocol: "HTTP/2",
+        });
+        ctx.set_request_body(Bytes::from_static(b"body"), true);
+        ctx.request_trailers = vec![(b"t".to_vec(), b"1".to_vec())];
+        ctx.set_response(503, vec![(b"b".to_vec(), b"2".to_vec())]);
+        ctx.request_headers_modified = true;
+        ctx.local_response = Some(LocalResponse {
+            status_code: 403,
+            headers: vec![],
+            body: b"no".to_vec(),
+        });
+        ctx.custom_properties.insert("k".into(), b"v".to_vec());
+        ctx.next_metric_id = 9;
+        ctx
+    }
+
+    /// F-331: ログの段・本文の段の context は、要求の段の値を消して要求の行（と本文の段はクライアントの IP）だけを残す
+    /// （残すものは入れ替えずにそのまま）
+    #[test]
+    fn enter_log_and_enter_request_body_keep_only_the_request_line() {
+        for body_phase in [false, true] {
+            let mut ctx = with_request_values();
+            let (path, method, ip) = (
+                ctx.request_path.clone(),
+                ctx.request_method.clone(),
+                ctx.client_ip.clone(),
+            );
+            if body_phase {
+                ctx.enter_request_body(
+                    vec![(b"h".to_vec(), b"v".to_vec())],
+                    Bytes::from_static(b"xy"),
+                );
+            } else {
+                ctx.enter_log();
+            }
+            assert_eq!((ctx.context_id, ctx.root_context_id), (7, 1));
+            assert!(Arc::ptr_eq(&ctx.request_path, &path));
+            assert!(Arc::ptr_eq(&ctx.request_method, &method));
+            assert_eq!(ctx.request_query, "q=1");
+            assert_eq!(&*ctx.request_info.as_ref().unwrap().authority, "h.example");
+            assert!(ctx.request_trailers.is_empty());
+            assert_eq!(ctx.response_status, 0);
+            assert!(ctx.response_headers.is_empty());
+            assert!(!ctx.request_headers_modified);
+            assert!(ctx.local_response.is_none());
+            assert!(ctx.custom_properties.is_empty());
+            assert_eq!(ctx.next_metric_id, 1);
+            if body_phase {
+                assert!(Arc::ptr_eq(&ctx.client_ip, &ip));
+                assert_eq!(ctx.request_headers, vec![(b"h".to_vec(), b"v".to_vec())]);
+                assert_eq!(ctx.request_body.as_slice(), b"xy");
+                assert!(ctx.request_body_complete);
+            } else {
+                assert_eq!(&*ctx.client_ip, "");
+                assert!(ctx.request_headers.is_empty());
+                assert!(ctx.request_body.is_empty());
+                assert!(!ctx.request_body_complete);
+            }
+            // 要求の終わりには要求の行も消す
+            ctx.recycle();
+            assert_eq!((ctx.context_id, ctx.root_context_id), (1, 0));
+            assert_eq!(
+                (&*ctx.request_path, &*ctx.request_method, &*ctx.client_ip),
+                ("", "", "")
+            );
+            assert_eq!(ctx.request_query, "");
+            assert!(ctx.request_info.is_none() && ctx.request_headers.is_empty());
+        }
+    }
 }
 
 // F-329: 1 モジュールの `instance_reuse` のルートは、要求ヘッダ・本文（全量が手元にあるとき）・ローカル応答のログと
