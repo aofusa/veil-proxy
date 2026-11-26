@@ -219,7 +219,7 @@ impl WasmModules {
     ) -> Self {
         let any = !modules.is_empty();
         Self {
-            sessions: any.then(|| std::rc::Rc::new(crate::wasm::RequestSessions::default())),
+            sessions: any.then(crate::wasm::RequestSessions::take),
             engine: any.then_some(engine),
             modules,
         }
@@ -250,6 +250,16 @@ impl WasmModules {
     pub fn set_request_info(&self, info: crate::wasm::RequestInfo) {
         if let Some(s) = &self.sessions {
             s.set_request_info(info);
+        }
+    }
+}
+
+/// 要求の終わりに要求ごとの状態を次の要求に使い回す（最後の参照のとき。F-331）
+#[cfg(feature = "wasm")]
+impl Drop for WasmModules {
+    fn drop(&mut self) {
+        if let Some(s) = self.sessions.take() {
+            crate::wasm::RequestSessions::give_back(s);
         }
     }
 }

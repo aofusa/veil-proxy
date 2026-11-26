@@ -122,7 +122,9 @@ pub struct ModuleRegistry {
     /// Wasmtime engine
     engine: Engine,
     /// Loaded modules
-    modules: std::collections::HashMap<String, Arc<LoadedModule>>,
+    /// 要求の段ごとに名前で引く（F-331: 鍵は設定のモジュール名なので、SipHash でなくルートキャッシュ等と同じ乱数シード付きの
+    /// foldhash）
+    modules: std::collections::HashMap<String, Arc<LoadedModule>, foldhash::quality::RandomState>,
     /// エンジンが Pulley インタープリタ向け（`Config::target("pulleyNN")`）かどうか。
     /// AOT サイドカーキャッシュのファイル名をネイティブ JIT 版と分けるために使う
     /// （F-135。Pulley と Cranelift のキャッシュはバイナリ非互換）。
@@ -148,7 +150,7 @@ impl ModuleRegistry {
         let reuse_modules = config.modules.iter().filter(|m| m.instance_reuse).count();
         let mut registry = Self {
             engine,
-            modules: std::collections::HashMap::new(),
+            modules: std::collections::HashMap::default(),
             pulley,
             pool_per_thread: super::instance_pool::per_thread_capacity(
                 config.defaults.pooling.total_memories,

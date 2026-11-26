@@ -2025,8 +2025,8 @@ pub(super) async fn h2_dispatch(
             break 'modules crate::wasm::empty_wasm_modules();
         };
         {
-            let path_str = std::str::from_utf8(path).unwrap_or("/");
-            let method_str = std::str::from_utf8(method).unwrap_or("GET");
+            // F-331: 要求の文字列はスレッドで直前に作ったものと同じなら作り直さない
+            use crate::wasm::{request_str, RequestStr};
             let modules_to_apply = crate::wasm_plugin_config::WasmModules::for_request(
                 backend_modules.clone(),
                 engine,
@@ -2034,7 +2034,7 @@ pub(super) async fn h2_dispatch(
             if let Some(wasm_engine) = modules_to_apply.engine() {
                 // B-408: ゲストに見せる `:authority`・`:scheme`・プロトコル（疑似ヘッダはホストが context から作る）
                 modules_to_apply.set_request_info(crate::wasm::RequestInfo {
-                    authority: Arc::from(std::str::from_utf8(&ctx.authority).unwrap_or("")),
+                    authority: request_str(RequestStr::Authority, &ctx.authority, ""),
                     scheme: h2_wasm_scheme(&ctx.headers),
                     protocol: "HTTP/2",
                 });
@@ -2057,10 +2057,10 @@ pub(super) async fn h2_dispatch(
                     wasm_engine
                         .on_request_with_body_async(
                             &modules_to_apply,
-                            Arc::from(path_str),
-                            Arc::from(method_str),
+                            request_str(RequestStr::Path, path, "/"),
+                            request_str(RequestStr::Method, method, "GET"),
                             headers_vec,
-                            Arc::from(client_ip),
+                            request_str(RequestStr::ClientIp, client_ip.as_bytes(), ""),
                             ctx.body.clone(),
                         )
                         .await
@@ -2068,10 +2068,10 @@ pub(super) async fn h2_dispatch(
                     wasm_engine
                         .on_request_headers_with_modules_async(
                             &modules_to_apply,
-                            Arc::from(path_str),
-                            Arc::from(method_str),
+                            request_str(RequestStr::Path, path, "/"),
+                            request_str(RequestStr::Method, method, "GET"),
                             headers_vec,
-                            Arc::from(client_ip),
+                            request_str(RequestStr::ClientIp, client_ip.as_bytes(), ""),
                             ctx.body.is_empty(),
                         )
                         .await
@@ -2130,9 +2130,10 @@ pub(super) async fn h2_dispatch(
     } else if !ctx.body.is_empty() && !wasm_modules_to_apply.is_empty() {
         if let Some(wasm_engine) = wasm_modules_to_apply.engine() {
             if wasm_engine.wants_request_body(&wasm_modules_to_apply) {
-                let method_arc: Arc<str> = Arc::from(std::str::from_utf8(method).unwrap_or("GET"));
-                let path_arc: Arc<str> = Arc::from(std::str::from_utf8(path).unwrap_or("/"));
-                let ip_arc: Arc<str> = Arc::from(client_ip);
+                use crate::wasm::{request_str, RequestStr};
+                let method_arc = request_str(RequestStr::Method, method, "GET");
+                let path_arc = request_str(RequestStr::Path, path, "/");
+                let ip_arc = request_str(RequestStr::ClientIp, client_ip.as_bytes(), "");
                 let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = wasm_request_headers_override
                     .as_ref()
                     .unwrap_or(&ctx.headers)

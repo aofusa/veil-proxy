@@ -661,12 +661,18 @@ impl FilterEngine {
 
     /// B-408: 要求の属性（`:authority`・`:scheme`・プロトコル）は要求のどの段でもゲストに見せる。応答の段・`on_log` の
     /// context には要求が無いので、要求ヘッダの段と同じメソッドとパスも見せる（`:path`・`request.path` 等）
-    fn set_request_attrs(http_ctx: &mut HttpContext, sessions: Option<&RequestSessions>) {
+    ///
+    /// `with_line = false` は呼び出し元がゲストを呼ぶ前にメソッドとパスを置く（要求ヘッダの段。F-331: 2 回置かない）
+    fn set_request_attrs(
+        http_ctx: &mut HttpContext,
+        sessions: Option<&RequestSessions>,
+        with_line: bool,
+    ) {
         if let Some(s) = sessions {
             if http_ctx.request_info.is_none() {
                 http_ctx.request_info = s.request_info().cloned();
             }
-            if http_ctx.request_method.is_empty() {
+            if with_line && http_ctx.request_method.is_empty() {
                 if let Some((method, path)) = s.request_line() {
                     http_ctx.set_request_line(method.clone(), path.clone());
                 }
@@ -690,7 +696,7 @@ impl FilterEngine {
         configuration: &Arc<[u8]>,
         sessions: Option<&RequestSessions>,
     ) -> anyhow::Result<Session> {
-        self.open_session_with(module, configuration, sessions, false)
+        self.open_session_with(module, configuration, sessions, false, false)
             .await
     }
 
@@ -703,16 +709,31 @@ impl FilterEngine {
         configuration: &Arc<[u8]>,
         sessions: Option<&RequestSessions>,
     ) -> anyhow::Result<Session> {
-        self.open_session_with(module, configuration, sessions, true)
+        self.open_session_with(module, configuration, sessions, true, false)
             .await
     }
 
+    /// 要求ヘッダの段の [`Self::open_session_deferred`]。呼び出し元が返った直後（ゲストを呼ぶ前）に要求のメソッドとパスを
+    /// 置くので、プールの新しい context には置かない（F-331。作る段を後で呼ぶので、`proxy_on_context_create` にも見える）
+    async fn open_session_for_request(
+        &self,
+        module: &LoadedModule,
+        configuration: &Arc<[u8]>,
+        sessions: Option<&RequestSessions>,
+    ) -> anyhow::Result<Session> {
+        self.open_session_with(module, configuration, sessions, true, true)
+            .await
+    }
+
+    /// `line_by_caller`: 作る段を後で呼ぶプールの新しい context に要求のメソッドとパスを置かない
+    /// （[`Self::open_session_for_request`]）
     async fn open_session_with(
         &self,
         module: &LoadedModule,
         configuration: &Arc<[u8]>,
         sessions: Option<&RequestSessions>,
         defer_create: bool,
+        line_by_caller: bool,
     ) -> anyhow::Result<Session> {
         let root_context_id = 1i32;
         if module.instance_reuse {
@@ -724,7 +745,11 @@ impl FilterEngine {
                 match slot.acquire().await {
                     Some(p) => {
                         let mut sess = Session::pooled(p, slot, context_id, true);
-                        Self::set_request_attrs(&mut sess.store.data_mut().http_ctx, sessions);
+                        Self::set_request_attrs(
+                            &mut sess.store.data_mut().http_ctx,
+                            sessions,
+                            true,
+                        );
                         if let Err(e) = self.prepare_pooled(&mut sess).await {
                             return Err(self.fail_pooled(sess, sessions, module_key, e));
                         }
@@ -766,7 +791,11 @@ impl FilterEngine {
             let context_id = p.next_context_id;
             let mut sess = Session::pooled(p, slot, context_id, sessions.is_some());
             sess.next_context_id = context_id.saturating_add(1);
-            Self::set_request_attrs(&mut sess.store.data_mut().http_ctx, sessions);
+            Self::set_request_attrs(
+                &mut sess.store.data_mut().http_ctx,
+                sessions,
+                !(defer_create && line_by_caller),
+            );
             if let Err(e) = self.prepare_pooled(&mut sess).await {
                 return Err(self.fail_pooled(sess, None, module_key, e));
             }
@@ -798,7 +827,7 @@ impl FilterEngine {
             )
             .await
             .map_err(|(e, _)| e)?;
-        Self::set_request_attrs(&mut store.data_mut().http_ctx, sessions);
+        Self::set_request_attrs(&mut store.data_mut().http_ctx, sessions, true);
         // Step 4: Create HTTP context with root as parent
         let http_context_id = 2i32; // HTTP context ID
         if let Some(Err(e)) = exports::call(
@@ -1273,7 +1302,7 @@ impl FilterEngine {
         let num_headers = headers.len() as i32;
 
         let mut sess = match self
-            .open_session_deferred(module, configuration, sessions)
+            .open_session_for_request(module, configuration, sessions)
             .await
         {
             Ok(s) => s,
@@ -1334,7 +1363,7 @@ impl FilterEngine {
     ) -> (Vec<(Vec<u8>, Vec<u8>)>, RequestStep) {
         let num_headers = headers.len() as i32;
         let mut sess = match self
-            .open_session_deferred(module, configuration, Some(sessions))
+            .open_session_for_request(module, configuration, Some(sessions))
             .await
         {
             Ok(s) => s,

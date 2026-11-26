@@ -36,6 +36,70 @@ pub fn empty_wasm_modules() -> crate::wasm_plugin_config::WasmModules {
     crate::wasm_plugin_config::WasmModules::shared(EMPTY.with(Arc::clone))
 }
 
+/// ゲストに見せる要求の文字列の種類（[`request_str`]。F-331）
+#[derive(Clone, Copy)]
+pub enum RequestStr {
+    /// パス（クエリ文字列を含む）
+    Path,
+    /// クライアントの IP アドレス
+    ClientIp,
+    /// `:authority`（`Host`）
+    Authority,
+    /// メソッド
+    Method,
+}
+
+/// [`RECENT_STRS`] の枠: パス・クライアントの IP・`:authority`・よく使うメソッド 7 つとそれ以外のメソッド
+const RECENT_SLOTS: usize = 3 + 8;
+
+thread_local! {
+    /// ワーカーのスレッドで直前に作った要求の文字列（F-331。[`request_str`]）
+    static RECENT_STRS: std::cell::RefCell<[Option<Arc<str>>; RECENT_SLOTS]> =
+        const { std::cell::RefCell::new([const { None }; RECENT_SLOTS]) };
+}
+
+/// ゲストに見せる要求の文字列（`bytes` が UTF-8 でなければ `fallback`）。
+///
+/// 種類ごとにワーカーのスレッドで直前に作ったものと同じバイト列なら、その `Arc` を複製して返す（F-331。キープアライブで
+/// 同じクライアント・ホスト・パスから続く要求は、要求ごとに文字列を確保して写さない。メソッドは種類ごとに持つ）。
+/// 値はスレッドの中で作って複製するだけ（全ワーカー共有の値にすると、参照カウントへの書き込みがコアをまたぐ。F-321）
+pub fn request_str(kind: RequestStr, bytes: &[u8], fallback: &'static str) -> Arc<str> {
+    let slot = match kind {
+        RequestStr::Path => 0,
+        RequestStr::ClientIp => 1,
+        RequestStr::Authority => 2,
+        RequestStr::Method => match bytes {
+            b"GET" => 3,
+            b"POST" => 4,
+            b"HEAD" => 5,
+            b"PUT" => 6,
+            b"DELETE" => 7,
+            b"PATCH" => 8,
+            b"OPTIONS" => 9,
+            _ => 10,
+        },
+    };
+    let make = || Arc::<str>::from(std::str::from_utf8(bytes).unwrap_or(fallback));
+    RECENT_STRS
+        .try_with(|r| {
+            let mut r = r.borrow_mut();
+            if let Some(s) = &r[slot] {
+                if s.as_bytes() == bytes {
+                    return Arc::clone(s);
+                }
+            }
+            let s = make();
+            r[slot] = Some(Arc::clone(&s));
+            s
+        })
+        .unwrap_or_else(|_| make())
+}
+
+/// 要求の文字列のスレッドの持ち分を手放す（ワーカーのスレッドの終わり）
+fn release_request_strs() {
+    let _ = RECENT_STRS.try_with(|r| std::mem::take(&mut *r.borrow_mut()));
+}
+
 /// 要求の終わり（`on_log`）。`instance_reuse` のモジュールはここで要求の http context を消す（B-177）。
 /// エンジンは要求の並びが持つもの（要求の入口で置いた。B-501）
 pub async fn on_request_complete_async(modules: &crate::wasm_plugin_config::WasmModules) {
@@ -92,6 +156,9 @@ pub fn release_worker_engine() {
         let old = c.borrow_mut().take();
         drop(old);
     });
+    // 使い回す要求の状態・要求の文字列も同じ時点で手放す（F-331）
+    super::RequestSessions::release_free();
+    release_request_strs();
 }
 
 /// ワーカーのエンジンの写しが `current`（今の設定のエンジン）でなければ手放す（ワーカーのアイドル点で呼ぶ。
@@ -325,5 +392,49 @@ mod integration_tests {
 
         assert_eq!(config.module_name, "rate_limiter");
         assert_eq!(config.period_ms, 1000);
+    }
+}
+
+#[cfg(test)]
+mod request_str_tests {
+    use super::{release_request_strs, request_str, RequestStr};
+    use std::sync::Arc;
+
+    /// 同じバイト列なら同じ `Arc`、違えば作り直す。UTF-8 でなければ `fallback`（F-331）
+    #[test]
+    fn request_strs_are_reused_only_for_the_same_bytes() {
+        release_request_strs();
+        let a = request_str(RequestStr::Path, b"/a?x=1", "/");
+        let b = request_str(RequestStr::Path, b"/a?x=1", "/");
+        assert!(Arc::ptr_eq(&a, &b));
+        let c = request_str(RequestStr::Path, b"/a?x=2", "/");
+        assert_eq!(&*c, "/a?x=2");
+        assert!(!Arc::ptr_eq(&a, &c));
+        // 種類ごとに別（同じバイト列でも）
+        let ip = request_str(RequestStr::ClientIp, b"/a?x=2", "");
+        assert!(!Arc::ptr_eq(&ip, &c));
+        // メソッドは種類ごとに持つ（交互に来ても作り直さない）
+        let get = request_str(RequestStr::Method, b"GET", "GET");
+        let post = request_str(RequestStr::Method, b"POST", "GET");
+        assert!(Arc::ptr_eq(
+            &get,
+            &request_str(RequestStr::Method, b"GET", "GET")
+        ));
+        assert!(Arc::ptr_eq(
+            &post,
+            &request_str(RequestStr::Method, b"POST", "GET")
+        ));
+        let m1 = request_str(RequestStr::Method, b"PROPFIND", "GET");
+        let m2 = request_str(RequestStr::Method, b"MKCOL", "GET");
+        assert_eq!((&*m1, &*m2), ("PROPFIND", "MKCOL"));
+        // UTF-8 でないバイト列は `fallback`（同じ値でも使い回さない）
+        let bad = request_str(RequestStr::Authority, b"\xff\xfe", "");
+        assert_eq!(&*bad, "");
+        assert_eq!(&*request_str(RequestStr::Authority, b"\xff\xfe", "x"), "x");
+        release_request_strs();
+        assert!(!Arc::ptr_eq(
+            &a,
+            &request_str(RequestStr::Path, b"/a?x=1", "/")
+        ));
     }
 }

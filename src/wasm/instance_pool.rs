@@ -277,7 +277,68 @@ pub(crate) struct SessionEntry {
     pub(crate) context_id: i32,
 }
 
+thread_local! {
+    /// 使い終わった要求の状態（F-331。要求ごとに `Rc` と表を確保し直さない）
+    static FREE_SESSIONS: RefCell<Vec<Rc<RequestSessions>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// スレッドに持っておく使い終わった要求の状態の数の上限
+const FREE_SESSIONS_MAX: usize = 64;
+
 impl RequestSessions {
+    /// 要求の状態を 1 つ（使い終わったものがあれば使い回す。F-331）
+    pub(crate) fn take() -> Rc<Self> {
+        FREE_SESSIONS
+            .try_with(|f| f.borrow_mut().pop())
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// 要求の状態を手放す（F-331）。最後の参照なら要求の終わりの片付け（[`Drop`] と同じ）をして空にし、次の要求に
+    /// 使い回す。ほかに参照があれば数を減らすだけ（最後の参照を手放すところで使い回す）
+    pub(crate) fn give_back(mut rc: Rc<Self>) {
+        let Some(s) = Rc::get_mut(&mut rc) else {
+            return;
+        };
+        s.reset();
+        let _ = FREE_SESSIONS.try_with(move |f| {
+            let mut f = f.borrow_mut();
+            if f.len() < FREE_SESSIONS_MAX {
+                f.push(rc);
+            }
+        });
+    }
+
+    /// 使い終わった要求の状態を手放す（ワーカーのスレッドの終わり。B-118 と同じく、スレッドローカルの破棄より前に）
+    pub(crate) fn release_free() {
+        let _ = FREE_SESSIONS.try_with(|f| std::mem::take(&mut *f.borrow_mut()));
+    }
+
+    /// 要求の終わりの片付けをして、[`Default`] と同じ空の状態へ戻す。全フィールドを列挙する（足したフィールドを戻し
+    /// 忘れたらコンパイルで分かる。前の要求の値を次の要求に見せない）
+    fn reset(&mut self) {
+        let RequestSessions {
+            entries,
+            request_info,
+            request_line,
+            logged,
+        } = self;
+        Self::finish(entries.get_mut());
+        *request_info = std::cell::OnceCell::new();
+        *request_line = std::cell::OnceCell::new();
+        logged.set(false);
+    }
+
+    /// 要求の終わり: `proxy_on_delete` していない context は、インスタンスを次に使うときに消す
+    fn finish(entries: &mut Vec<SessionEntry>) {
+        for e in entries.drain(..) {
+            if !e.slot.is_dead() {
+                e.slot.pending_delete.borrow_mut().push(e.context_id);
+            }
+        }
+    }
+
     /// 要求の属性を置く（B-408。2 回目以降は無視する）
     pub fn set_request_info(&self, info: super::RequestInfo) {
         let _ = self.request_info.set(info);
@@ -343,11 +404,7 @@ impl RequestSessions {
 
 impl Drop for RequestSessions {
     fn drop(&mut self) {
-        for e in self.entries.get_mut().drain(..) {
-            if !e.slot.is_dead() {
-                e.slot.pending_delete.borrow_mut().push(e.context_id);
-            }
-        }
+        Self::finish(self.entries.get_mut());
     }
 }
 
@@ -382,6 +439,41 @@ mod tests {
         assert_eq!(live.take_pending_deletes(), vec![7]);
         assert!(live.take_pending_deletes().is_empty());
         assert!(dead.pending_delete.borrow().is_empty());
+    }
+
+    /// 使い回す要求の状態は、前の要求の context の片付けを済ませ、前の要求の値を持たない（F-331）
+    #[test]
+    fn given_back_sessions_are_reset_and_reused() {
+        RequestSessions::release_free();
+        let cfg: Arc<[u8]> = Arc::from(&b""[..]);
+        let slot = InstanceSlot::new_in_use(cfg.clone());
+        let s = RequestSessions::take();
+        s.insert(1, slot.clone(), 9);
+        s.set_request_info(crate::wasm::RequestInfo {
+            authority: Arc::from("a.example"),
+            scheme: "https",
+            protocol: "HTTP/1.1",
+        });
+        s.set_request_line(&Arc::from("POST"), &Arc::from("/p"));
+        s.set_logged();
+        let addr = Rc::as_ptr(&s);
+        // ほかに参照があるうちは使い回さない
+        let other = Rc::clone(&s);
+        RequestSessions::give_back(s);
+        assert!(slot.take_pending_deletes().is_empty());
+        RequestSessions::give_back(other);
+        assert_eq!(slot.take_pending_deletes(), vec![9]);
+        let s = RequestSessions::take();
+        assert_eq!(Rc::as_ptr(&s), addr);
+        assert_eq!(s.len(), 0);
+        assert!(s.request_info().is_none() && s.request_line().is_none() && !s.logged());
+        // 次の要求の値は置ける
+        s.set_request_line(&Arc::from("GET"), &Arc::from("/g"));
+        assert_eq!(&*s.request_line().unwrap().1, "/g");
+        RequestSessions::give_back(s);
+        assert_eq!(FREE_SESSIONS.with(|f| f.borrow().len()), 1);
+        RequestSessions::release_free();
+        assert!(FREE_SESSIONS.with(|f| f.borrow().is_empty()));
     }
 
     #[test]

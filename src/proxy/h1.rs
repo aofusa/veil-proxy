@@ -769,8 +769,10 @@ pub(super) async fn handle_requests(
                     headers_for_proxy
                 } else {
                     // B-408: ゲストに見せる `:authority`・`:scheme`・プロトコル（要求のすべての段で使う）
+                    // F-331: 要求の文字列はスレッドで直前に作ったものと同じなら作り直さない
+                    use crate::wasm::{request_str, RequestStr};
                     modules_to_apply.set_request_info(crate::wasm::RequestInfo {
-                        authority: Arc::from(std::str::from_utf8(&host_bytes).unwrap_or("")),
+                        authority: request_str(RequestStr::Authority, &host_bytes, ""),
                         scheme: if tls_stream.is_plain() {
                             "http"
                         } else {
@@ -780,8 +782,6 @@ pub(super) async fn handle_requests(
                     });
                     if let Some(wasm_engine) = modules_to_apply.engine() {
                         // routes内で指定されたmodulesを優先
-                        let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
-                        let method_str = std::str::from_utf8(&method_bytes).unwrap_or("GET");
 
                         // モジュールを実行
                         if !modules_to_apply.is_empty() {
@@ -818,10 +818,14 @@ pub(super) async fn handle_requests(
                                     wasm_engine
                                         .on_request_with_body_async(
                                             &modules_to_apply,
-                                            Arc::from(path_str),
-                                            Arc::from(method_str),
+                                            request_str(RequestStr::Path, &path_bytes, "/"),
+                                            request_str(RequestStr::Method, &method_bytes, "GET"),
                                             headers_vec,
-                                            Arc::from(client_ip),
+                                            request_str(
+                                                RequestStr::ClientIp,
+                                                client_ip.as_bytes(),
+                                                "",
+                                            ),
                                             body,
                                         )
                                         .await
@@ -830,10 +834,14 @@ pub(super) async fn handle_requests(
                                     wasm_engine
                                         .on_request_headers_with_modules_async(
                                             &modules_to_apply,
-                                            Arc::from(path_str),
-                                            Arc::from(method_str),
+                                            request_str(RequestStr::Path, &path_bytes, "/"),
+                                            request_str(RequestStr::Method, &method_bytes, "GET"),
                                             headers_vec,
-                                            Arc::from(client_ip),
+                                            request_str(
+                                                RequestStr::ClientIp,
+                                                client_ip.as_bytes(),
+                                                "",
+                                            ),
                                             // end_of_stream。B-320: WebSocket は本文の段を走らせないので、本文を待つ
                                             // Pause を決めずに通さないよう、本文が無いものとして渡す（F57）
                                             (content_length == 0 && !is_chunked) || is_websocket,
@@ -859,8 +867,8 @@ pub(super) async fn handle_requests(
                                 }
                                 crate::wasm::FilterResult::LocalResponse(mut resp) => {
                                     // ローカルレスポンスを返送。F-271: 本文を読み切れたら接続を続ける
-                                    // （以前は毎回閉じていた）
-                                    let start_instant = Instant::now();
+                                    // （以前は毎回閉じていた）。F-331: アクセスログ・メトリクスが無ければ時刻を読まない
+                                    let start_instant = crate::logging::request_start_instant();
                                     // B-189: chunked + `Expect: 100-continue` で本文がまだ届いていなければ、
                                     // クライアントは 100 Continue を待っている（読み捨てを待つと止まる）ので閉じる
                                     let expect_waiting = is_chunked
@@ -996,11 +1004,11 @@ pub(super) async fn handle_requests(
                                     return;
                                 }
                             };
-                            let method_arc: Arc<str> =
-                                Arc::from(std::str::from_utf8(&method_bytes).unwrap_or("GET"));
-                            let path_arc: Arc<str> =
-                                Arc::from(std::str::from_utf8(&path_bytes).unwrap_or("/"));
-                            let ip_arc: Arc<str> = Arc::from(client_ip);
+                            use crate::wasm::{request_str, RequestStr};
+                            let method_arc = request_str(RequestStr::Method, &method_bytes, "GET");
+                            let path_arc = request_str(RequestStr::Path, &path_bytes, "/");
+                            let ip_arc =
+                                request_str(RequestStr::ClientIp, client_ip.as_bytes(), "");
                             let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers_for_proxy
                                 .iter()
                                 .map(|(k, v)| (k.to_vec(), v.to_vec()))
@@ -1028,7 +1036,7 @@ pub(super) async fn handle_requests(
                                 crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
                                     mut resp,
                                 ) => {
-                                    let start_instant = Instant::now();
+                                    let start_instant = crate::logging::request_start_instant();
                                     // F-330: ヘッダの段のローカル応答と同じく、パイプラインで次の要求が届いていれば
                                     // 溜める（F-322）
                                     let (resp_size, written) = write_wasm_local_response_h1(

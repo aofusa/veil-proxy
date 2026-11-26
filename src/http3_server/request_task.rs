@@ -992,10 +992,10 @@ impl H3BufferedTask {
 
                 if let Some(wasm_engine) = modules_to_apply.engine() {
                     // B-408: ゲストに見せる `:authority`・`:scheme`・プロトコル
+                    // F-331: 要求の文字列はスレッドで直前に作ったものと同じなら作り直さない
+                    use crate::wasm::{request_str, RequestStr};
                     modules_to_apply.set_request_info(crate::wasm::RequestInfo {
-                        authority: std::sync::Arc::from(
-                            std::str::from_utf8(authority).unwrap_or(""),
-                        ),
+                        authority: request_str(RequestStr::Authority, authority, ""),
                         scheme: "https",
                         protocol: "HTTP/3",
                     });
@@ -1007,9 +1007,10 @@ impl H3BufferedTask {
                         .map(|h| (h.name().to_vec(), h.value().to_vec()))
                         .collect();
 
-                    let path_arc: std::sync::Arc<str> = std::sync::Arc::from(path_str);
-                    let method_arc: std::sync::Arc<str> = std::sync::Arc::from(method_str);
-                    let ip_arc: std::sync::Arc<str> = std::sync::Arc::from(self.client_ip.as_str());
+                    let path_arc = request_str(RequestStr::Path, path_str.as_bytes(), "/");
+                    let method_arc = request_str(RequestStr::Method, method_str.as_bytes(), "GET");
+                    let ip_arc =
+                        request_str(RequestStr::ClientIp, self.client_ip.as_str().as_bytes(), "");
                     // F-329: 本文は全量がある（バッファの経路）。本文を受けるモジュールがあり、要求のトレーラが無ければ
                     // （トレーラの段は本文の段の後）、ヘッダと本文の段を一度に呼ぶ（1 モジュールのルートは 1 回の
                     // ファイバーの出入り）。呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
