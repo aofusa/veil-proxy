@@ -35,6 +35,11 @@ mod pipeline_tests;
 #[path = "standalone/accept_burst_tests.rs"]
 mod accept_burst_tests;
 
+// F-329: Proxy-Wasm のコールバックが要求ごとに 1 回ずつ（続けて呼ぶ経路・段ごとに呼ぶ経路、全プロトコル）
+#[cfg(feature = "wasm")]
+#[path = "standalone/wasm_chain_tests.rs"]
+mod wasm_chain_tests;
+
 use standalone::*;
 use std::time::Duration;
 

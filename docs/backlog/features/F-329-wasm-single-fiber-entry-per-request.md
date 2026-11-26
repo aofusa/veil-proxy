@@ -1,7 +1,7 @@
 # F-329: ローカル応答の要求を 1 回のファイバーの出入りで終える（GET 2 → 1 回、POST 3 → 1 回）
 
-**状態: 実装済み（feat/proxy-wasm-perf。段階 1・段階 2 とも、HTTP/1.1・HTTP/2・HTTP/3 のすべてで。2026-11-26 利用者の決定）。
-計測は下の「実装」の A/B**
+**状態: 完了（2026-11-26、feat/proxy-wasm-perf。段階 1・段階 2 とも、HTTP/1.1・HTTP/2・HTTP/3 のすべてで。2026-11-26 利用者の決定。
+計測と受け入れ条件の確かめは下の「交互 A/B」・「受け入れ条件の確かめ」）**
 
 ## 現状
 
@@ -160,6 +160,45 @@
   燃料の入れ直し）、`tests.rs` の `f329_chained_request_tests`（段の回数・ローカル応答のログが 1 回・本文の段の Pause とトラップの
   `failure_policy`・B-299・ログの段のトラップ・本文の書き換えと本文の段のヘッダ・続けて呼ばない経路）、`metering.rs`（上限を入れると
   専用スレッドを起こす）、`h1.rs`（`body_in_hand` の境界）。
+
+## 交互 A/B（aofish、`~/hp/bench.py`、3 巡の中央値、1 要求のユーザー + システムの CPU µs）
+
+`p0` = 47a6e284（F-329 の前）→ `f329` = 2ac41b26。同じジョブで交互に回した。フィルタは HttpArena のエントリのもの（ABI を直接実装した
+版・Rust の SDK の版。[F-334](F-334-httparena-filter-and-guide.md) の最初の版）。
+
+| 負荷 | io_uring・ABI | io_uring・SDK | epoll・ABI |
+|---|---|---|---|
+| h1 GET（`h1-wasm`） | 15.29 → 14.31 | 16.78 → 15.37 | 22.89 → 21.09 |
+| h1 GET（HttpArena の混ぜ方、`h1-arena`） | 18.34 → 16.45 | 19.28 → 17.28 | 31.87 → 26.51 |
+| h1 GET（`h1-arena`、10 要求ごとに張り直す） | 28.64 → 23.87 | 29.55 → 25.05 | 39.88 → 34.89 |
+| h1 POST（Content-Length） | 19.98 → 16.61 | 20.00 → 17.62 | 34.43 → 26.73 |
+| h1 POST（chunked） | 20.26 → 17.49 | 21.55 → 18.19 | 35.09 → 28.50 |
+| json-tls | 25.69 → 21.88 | 27.62 → 25.26 | 22.89 → 21.50 |
+| h2 | 6.38 → 5.67 | 7.01 → 6.50 | 6.40 → 5.74 |
+| h3 | 7.31 → 6.93 | 7.65 → 7.42 | 6.99 → 6.60 |
+
+json-tls（wrk）の ABI の版は 3 巡のうち 1 巡に wrk のソケットのエラーが 259〜494 件出た（両方の版。中央値の巡はどれも 0）。
+
+## 受け入れ条件の確かめ
+
+- 性能: 受け入れ条件はユーザー時間で書いたが、測ったのはユーザー + システム（F-329 はユーザー空間のファイバーの出入りを減らすもので、
+  システム時間は変えない）。io_uring・ABI の版で POST −3.37・chunked −2.77 µs（段階 1・2 を合わせて 1.0 以上）、h1 GET −0.98・h2 −0.71・
+  json-tls −3.81 µs（0.4 以上）、h3 −0.38 µs（0.25 以上）。SDK の版は h3 が −0.23 µs で、ほかは満たした。epoll でも全負荷で下がった。
+- E2E（`tests/standalone/wasm_chain_tests.rs`、自己完結型 E2E。平文の HTTP/1.1・h2c・TLS の HTTP/2・HTTP/3、io_uring と epoll）:
+  `proxy_on_context_create`・`proxy_on_request_headers`・`proxy_on_log`・`proxy_on_delete` が要求ごとに 1 回ずつで、本文の段は本文のある
+  要求ごとに 1 回（受け取った本文の長さも数える）。GET・POST・chunked・空の chunked・`Expect: 100-continue`（HTTP/1.1）、HTTP/2・HTTP/3 の
+  トレーラ付きの POST（段ごとの経路）。ヘッダの段の間に本文が見えないこと。上限を超える本文は 413: HTTP/2・HTTP/3 は本文を溜めてから
+  ヘッダの段を呼ぶのでモジュールを呼ばない。HTTP/1.1 の chunked はヘッダの段の後に返し、ログの段を呼ばない（context は次の利用で
+  削除だけ。main からの動きで F-329 の前後で同じ。[B-504](../bugs/B-504-h1-body-error-skips-wasm-on-log.md) に起票）。
+- ログ・削除の段のトラップ（応答は届き、二重に呼ばない）・本文の段の Pause（503、B-300）・`failure_policy`・B-299 は、エンジンを直接
+  呼ぶ単体の試験（`tests.rs` の `f329_chained_request_tests`）で確かめた（E2E のモジュールはトラップで捨てられると数え直しになるため）。
+  `max_execution_time_ms` が段ごとに効くことは `metering.rs` の単体の試験と、既存の自己完結型 E2E（`max_execution_time_ms = 50`）。
+- 線形メモリ: 上の E2E で、作った context の数と `proxy_on_delete` の数が全プロトコルで一致する（SDK の文脈の表はこれで消える）。aofish の
+  持続負荷（1 回に数百万要求）のプロファイル（[F-334](F-334-httparena-filter-and-guide.md)、SDK の版）の minor fault は h1 GET 0.0000・
+  POST 0.0001・json-tls 0.0008 /要求で、要求ごとに確保しない ABI の版（0.0000・0.0001・0.0006）と同じ程度。ゲストの線形メモリは要求ごとに
+  伸びていない（1 要求 16 バイト残すだけでも 0.004 /要求になる）。
+- 複数のモジュールのルートの段の順は既存の E2E（`./tests/e2e_setup.sh test`、io_uring と epoll）で確かめた。
+- `proxy_on_log` から応答のステータスとヘッダを見せることは [F-336](F-336-wasm-on-log-response-values.md) へ分けた（上の「実装」）。
 
 ## 関連
 
