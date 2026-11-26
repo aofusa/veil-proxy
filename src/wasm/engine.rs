@@ -1465,8 +1465,17 @@ impl FilterEngine {
                     Ok(BodyModuleResult::Continue { modified_body })
                 }
             };
-            // 上流へ送るのは本文の段の前のヘッダ（本文の段に見せた写しは捨てる）
-            let headers = chain.upstream_headers.take().unwrap_or_default();
+            // 上流へ送るのは本文の段の前のヘッダ（本文の段の書き換えは届かない。F-330: 段を呼んだときは context から
+            // 取り出す）
+            let headers = match chain.upstream_headers.take() {
+                Some(h) => h,
+                None => sess
+                    .store
+                    .data_mut()
+                    .http_ctx
+                    .take_upstream_request_headers()
+                    .unwrap_or_default(),
+            };
             (headers, RequestStep::Body(result))
         } else {
             let result = match settled {

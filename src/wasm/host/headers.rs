@@ -136,7 +136,8 @@ fn get_headers(state: &HostState, map_type: i32) -> Option<&Vec<(Vec<u8>, Vec<u8
 /// Get mutable headers by map type
 fn get_headers_mut(state: &mut HostState, map_type: i32) -> Option<&mut Vec<(Vec<u8>, Vec<u8>)>> {
     match map_type {
-        HTTP_REQUEST_HEADERS => Some(&mut state.http_ctx.request_headers),
+        // F-330: 本文の段で上流へ送る表を見せているなら、書き換える前に取っておく
+        HTTP_REQUEST_HEADERS => Some(state.http_ctx.request_headers_mut()),
         HTTP_REQUEST_TRAILERS => Some(&mut state.http_ctx.request_trailers),
         HTTP_RESPONSE_HEADERS => Some(&mut state.http_ctx.response_headers),
         HTTP_RESPONSE_TRAILERS => Some(&mut state.http_ctx.response_trailers),
@@ -376,7 +377,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             let state = caller.data_mut();
             match map_type {
                 HTTP_REQUEST_HEADERS => {
-                    state.http_ctx.request_headers = headers;
+                    state.http_ctx.replace_request_headers(headers);
                     state.http_ctx.request_headers_modified = true;
                 }
                 HTTP_RESPONSE_HEADERS => {

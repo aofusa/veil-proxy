@@ -2618,6 +2618,62 @@ mod f318_recycle_tests {
         assert!(Arc::ptr_eq(&ctx.shared_data, &shared));
     }
 
+    /// F-330: 本文の段は上流へ送る要求ヘッダの表を写さずに見せ、ゲストが最初に書き換える前の表を上流へ送る
+    #[test]
+    fn body_phase_headers_are_copied_only_when_written() {
+        let original = vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+        ];
+        let fresh = || HttpContext::new(1, ModuleCapabilities::default());
+        // 書き換えなければ同じ表（写さない）
+        let mut ctx = fresh();
+        let h = original.clone();
+        let ptr = h.as_ptr();
+        ctx.enter_request_body(h, Bytes::from_static(b"x"));
+        let up = ctx.take_upstream_request_headers().unwrap();
+        assert_eq!((up.as_ptr(), &up), (ptr, &original));
+        assert!(ctx.take_upstream_request_headers().is_none());
+        // 足す・消す: 最初の書き換えの前の表（2 回目の書き換えでは取り直さない）
+        let mut ctx = fresh();
+        ctx.enter_request_body(original.clone(), Bytes::new());
+        ctx.request_headers_mut()
+            .push((b"c".to_vec(), b"3".to_vec()));
+        ctx.request_headers_mut().retain(|(k, _)| k != b"a");
+        assert_eq!(
+            ctx.request_headers,
+            vec![
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec())
+            ]
+        );
+        assert_eq!(ctx.take_upstream_request_headers(), Some(original.clone()));
+        // 置き換える: 写さずに前の表
+        let mut ctx = fresh();
+        let h = original.clone();
+        let ptr = h.as_ptr();
+        ctx.enter_request_body(h, Bytes::new());
+        ctx.replace_request_headers(vec![(b"z".to_vec(), b"9".to_vec())]);
+        ctx.replace_request_headers(Vec::new());
+        let up = ctx.take_upstream_request_headers().unwrap();
+        assert_eq!((up.as_ptr(), &up), (ptr, &original));
+        // 本文の段の外の書き換えは取っておかない（ヘッダの段の書き換えは上流へ届く）
+        let mut ctx = fresh();
+        ctx.request_headers = original.clone();
+        ctx.request_headers_mut()
+            .push((b"c".to_vec(), b"3".to_vec()));
+        ctx.replace_request_headers(Vec::new());
+        assert!(ctx.take_upstream_request_headers().is_none());
+        // 段の片付けで消す
+        for end in [HttpContext::enter_log, HttpContext::recycle] {
+            let mut ctx = fresh();
+            ctx.enter_request_body(original.clone(), Bytes::new());
+            ctx.request_headers_mut().clear();
+            end(&mut ctx);
+            assert!(ctx.take_upstream_request_headers().is_none());
+        }
+    }
+
     /// 要求の段の値を持つ context（[`enter_log_and_enter_request_body_keep_only_the_request_line`]）
     fn with_request_values() -> HttpContext {
         let mut ctx = HttpContext::new(1, ModuleCapabilities::default());

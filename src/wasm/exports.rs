@@ -80,8 +80,8 @@ pub(crate) enum Step {
     /// `proxy_on_request_headers(context_id, num_headers, end_of_stream)`
     RequestHeaders(i32, i32, i32),
     /// `proxy_on_request_body(context_id, body_size, 1)`（本文の全量。F-329）。要求がまだ続く（ローカル応答が決まって
-    /// おらず、保留の外部呼び出しが無い）ときだけ呼ぶ。呼ぶ前に、燃料と締切を入れ直し、上流へ送る要求ヘッダを
-    /// [`Chain::upstream_headers`] へ移してその写しを context に置き（本文の段のヘッダの書き換えは上流へ届かない）、
+    /// おらず、保留の外部呼び出しが無い）ときだけ呼ぶ。呼ぶ前に、燃料と締切を入れ直し、上流へ送る要求ヘッダを context に
+    /// 置き（F-330: 写さない。本文の段のヘッダの書き換えは上流へ届かない。`HttpContext::enter_request_body`）、
     /// [`call_chain`] に預けた本文を置く（ヘッダの段からは本文が見えない）。別の呼び出しで呼んでいたときと同じ
     RequestBody(i32, i32),
     /// `proxy_on_log(context_id)`
@@ -108,7 +108,8 @@ pub(crate) struct Chain {
     /// 段を終えた時点で、最後に上限を入れてから使った燃料（`fuel` のときだけ。段の燃料のメトリクス）
     pub(crate) fuel: [Option<u64>; MAX_STEPS],
     pub(crate) error: Option<anyhow::Error>,
-    /// `RequestBody` の段に入ったときの、上流へ送る要求ヘッダ（ヘッダの段の後のもの）
+    /// `RequestBody` の段をエクスポートが無くて呼ばずに終えたときの、上流へ送る要求ヘッダ（ヘッダの段の後のもの）。
+    /// 段を呼んだときは context にある（F-330。`HttpContext::take_upstream_request_headers`）
     pub(crate) upstream_headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     /// `LogLocal` の段に入ったときの、決まっていたローカル応答
     pub(crate) local: Option<LocalResponse>,
@@ -430,10 +431,10 @@ fn enter_step(caller: &mut Caller<'_, HostState>, step: Step) -> Enter {
                 return Enter::Pass;
             }
             let body = exports.chain_io.body.take().unwrap_or_default();
-            // 本文の段には写しを見せる（別に呼んでいたときの `to_vec()` と同じ。本文の段でのヘッダの書き換えは上流へ
-            // 届かない）
-            ctx.enter_request_body(headers.clone(), body);
-            exports.chain_io.upstream_headers = Some(headers);
+            // 本文の段の見え方は別に呼んでいたときの写し（`to_vec()`）と同じ（本文の段でのヘッダの書き換えは上流へ届かない）。
+            // F-330: 写さずに置き、ゲストが書き換えるときだけ前の表を取っておく。上流へ送る表は呼び出し元が段の後で
+            // context から取り出す（`HttpContext::take_upstream_request_headers`）
+            ctx.enter_request_body(headers, body);
             Enter::Run
         }
         Step::LogLocal(_) => {
@@ -1009,7 +1010,7 @@ mod tests {
     }
 
     // F-329: 本文の段は預けた本文を全量（end_of_stream = 1）で見る。context はヘッダの段で置いた値を消して本文の段を別に
-    // 呼んでいたときと同じ見え方にし（ヘッダは写し）、上流へ送るヘッダ（ヘッダの段の後）は別に返す
+    // 呼んでいたときと同じ見え方にし、上流へ送るヘッダ（ヘッダの段の後）は context から取り出す（F-330: 写さない）
     #[test]
     fn chain_body_step_sees_the_body_like_a_separate_call() {
         let (mut store, instance) = chain_instance(100);
@@ -1030,18 +1031,19 @@ mod tests {
         assert_eq!(chain.values[..2], [Some(5), Some(31)]);
         assert!(chain.completed(0) && chain.completed(1) && chain.entered(1));
         assert!(chain.fuel[0].is_some_and(|f| f > 0) && chain.fuel[1].is_some_and(|f| f > 0));
-        assert_eq!(
-            chain.upstream_headers,
-            Some(vec![(b"a".to_vec(), b"1".to_vec())])
-        );
+        assert!(chain.upstream_headers.is_none());
         assert!(chain.local.is_none());
         assert_eq!(trace(&mut store, instance), 25);
-        let ctx = &store.data().http_ctx;
+        let ctx = &mut store.data_mut().http_ctx;
         assert_eq!(ctx.request_body.as_slice(), b"abc");
         assert!(ctx.request_body_complete);
         assert_eq!(ctx.request_headers, vec![(b"a".to_vec(), b"1".to_vec())]);
         assert!(!ctx.request_headers_modified && ctx.custom_properties.is_empty());
         assert_eq!(&*ctx.client_ip, "192.0.2.1");
+        assert_eq!(
+            ctx.take_upstream_request_headers(),
+            Some(vec![(b"a".to_vec(), b"1".to_vec())])
+        );
         assert_eq!(ctx.context_id, 1);
     }
 

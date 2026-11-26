@@ -121,6 +121,16 @@ pub struct RequestInfo {
     pub protocol: &'static str,
 }
 
+/// 本文の段の要求ヘッダの表と、上流へ送る表（F-330: 本文の段に写さずに見せる）
+pub(crate) enum UpstreamRequestHeaders {
+    /// 上流へ送る表は context の外にある（本文の段の外）
+    Elsewhere,
+    /// context の `request_headers` が上流へ送る表そのもの（本文の段で、ゲストはまだ書き換えていない）
+    InContext,
+    /// ゲストが本文の段で最初に書き換える前の表（上流へはこちらを送る。本文の段の書き換えは上流へ届かない）
+    Saved(Vec<(Vec<u8>, Vec<u8>)>),
+}
+
 /// [`HttpContext::reset_values`] で残すもの（モジュールのものはいつも残す）
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Keep {
@@ -141,8 +151,11 @@ pub struct HttpContext {
     pub root_context_id: i32,
 
     // === Request ===
-    /// Request headers (binary)
+    /// Request headers (binary)。ホスト関数が書き換えるときは [`Self::request_headers_mut`]・
+    /// [`Self::replace_request_headers`] を通す（本文の段は上流へ送る表を見せている）
     pub request_headers: Vec<(Vec<u8>, Vec<u8>)>,
+    /// 本文の段で `request_headers` が上流へ送る表か（F-330。[`UpstreamRequestHeaders`]）
+    pub(crate) upstream_request_headers: UpstreamRequestHeaders,
     /// Request body（F-61: CoW バッファ。共有 Bytes で受け取り書き換え時のみ所有化）
     pub request_body: BodyBuffer,
     /// Request trailers (binary)
@@ -352,6 +365,7 @@ impl HttpContext {
             context_id,
             root_context_id: 0,
             request_headers: Vec::new(),
+            upstream_request_headers: UpstreamRequestHeaders::Elsewhere,
             request_body: BodyBuffer::empty(),
             request_trailers: Vec::new(),
             request_path: empty_str(),
@@ -425,6 +439,7 @@ impl HttpContext {
             context_id,
             root_context_id,
             request_headers,
+            upstream_request_headers,
             request_body,
             request_trailers,
             request_path,
@@ -494,6 +509,7 @@ impl HttpContext {
             clear_str(client_ip);
         }
         request_headers.clear();
+        *upstream_request_headers = UpstreamRequestHeaders::Elsewhere;
         *request_body = BodyBuffer::empty();
         request_trailers.clear();
         *request_body_complete = false;
@@ -654,11 +670,51 @@ impl HttpContext {
 
     /// 要求ヘッダの段に続けて呼ぶ要求本文の段の context にする（F-329）。本文の段を別に呼んでいたときと同じ見え方:
     /// ヘッダの段で置いた値は消し、要求の属性・メソッド・パス・クライアントの IP を残して、`headers`（ヘッダの段の後の
-    /// ヘッダ）と全量の本文を置く
+    /// ヘッダ。上流へ送るもの）と全量の本文を置く。
+    ///
+    /// F-330: `headers` は写さずに置く。ゲストが本文の段で書き換えるときは、最初の書き換えの前の表を取っておき、上流へは
+    /// それを送る（本文の段のヘッダの書き換えは上流へ届かない。[`Self::take_upstream_request_headers`]）
     pub(crate) fn enter_request_body(&mut self, headers: Vec<(Vec<u8>, Vec<u8>)>, body: Bytes) {
         self.reset_values(Keep::RequestLineAndClient);
         self.request_headers = headers;
+        self.upstream_request_headers = UpstreamRequestHeaders::InContext;
         self.set_request_body(body, true);
+    }
+
+    /// ゲストが書き換える要求ヘッダの表（F-330: 本文の段で上流へ送る表を見せているなら、書き換える前に取っておく）
+    pub(crate) fn request_headers_mut(&mut self) -> &mut Vec<(Vec<u8>, Vec<u8>)> {
+        if matches!(
+            self.upstream_request_headers,
+            UpstreamRequestHeaders::InContext
+        ) {
+            self.upstream_request_headers =
+                UpstreamRequestHeaders::Saved(self.request_headers.clone());
+        }
+        &mut self.request_headers
+    }
+
+    /// ゲストが要求ヘッダの表を置き換える（F-330: 本文の段で上流へ送る表を見せているなら、写さずに前の表を取っておく）
+    pub(crate) fn replace_request_headers(&mut self, headers: Vec<(Vec<u8>, Vec<u8>)>) {
+        let old = std::mem::replace(&mut self.request_headers, headers);
+        if matches!(
+            self.upstream_request_headers,
+            UpstreamRequestHeaders::InContext
+        ) {
+            self.upstream_request_headers = UpstreamRequestHeaders::Saved(old);
+        }
+    }
+
+    /// 本文の段を呼んだ要求の、上流へ送る要求ヘッダ（F-330。本文の段で書き換えられていれば書き換える前の表、そうでなければ
+    /// context の表を取り出す）。本文の段を呼んでいなければ `None`
+    pub(crate) fn take_upstream_request_headers(&mut self) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        match std::mem::replace(
+            &mut self.upstream_request_headers,
+            UpstreamRequestHeaders::Elsewhere,
+        ) {
+            UpstreamRequestHeaders::Elsewhere => None,
+            UpstreamRequestHeaders::InContext => Some(std::mem::take(&mut self.request_headers)),
+            UpstreamRequestHeaders::Saved(h) => Some(h),
+        }
     }
 
     /// ローカル応答の要求の `proxy_on_log` の前に、context を応答の後に別に呼んでいたログの段と同じ見え方にする（F-329）。
