@@ -1042,6 +1042,8 @@ impl H3BufferedTask {
 
                     match wasm_result {
                         crate::wasm::FilterResult::LocalResponse(resp) => {
+                            // F-330: 本文は写さずに渡す
+                            let body_len = resp.body.len();
                             self.send_response(
                                 resp.status_code,
                                 &resp
@@ -1049,7 +1051,7 @@ impl H3BufferedTask {
                                     .iter()
                                     .map(|(k, v)| (k.as_slice(), v.as_slice()))
                                     .collect::<Vec<_>>(),
-                                Some(Bytes::copy_from_slice(&resp.body)),
+                                Some(Bytes::from(resp.body)),
                             )
                             .await?;
                             let user_agent_slice: &[u8] = if user_agent.is_empty() {
@@ -1064,7 +1066,7 @@ impl H3BufferedTask {
                                 user_agent_slice,
                                 request_body.len() as u64,
                                 resp.status_code,
-                                resp.body.len() as u64,
+                                body_len as u64,
                                 start_time,
                                 self.client_ip.as_str(),
                                 "",
@@ -1110,6 +1112,8 @@ impl H3BufferedTask {
                                     crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
                                         resp,
                                     ) => {
+                                        // F-330: 本文は写さずに渡す
+                                        let body_len = resp.body.len();
                                         self.send_response(
                                             resp.status_code,
                                             &resp
@@ -1117,7 +1121,7 @@ impl H3BufferedTask {
                                                 .iter()
                                                 .map(|(k, v)| (k.as_slice(), v.as_slice()))
                                                 .collect::<Vec<_>>(),
-                                            Some(Bytes::copy_from_slice(&resp.body)),
+                                            Some(Bytes::from(resp.body)),
                                         )
                                         .await?;
                                         let user_agent_slice: &[u8] = if user_agent.is_empty() {
@@ -1132,7 +1136,7 @@ impl H3BufferedTask {
                                             user_agent_slice,
                                             request_body.len() as u64,
                                             resp.status_code,
-                                            resp.body.len() as u64,
+                                            body_len as u64,
                                             start_time,
                                             self.client_ip.as_str(),
                                             "",
@@ -1159,6 +1163,8 @@ impl H3BufferedTask {
                                     ))
                                     .await
                                 {
+                                    // F-330: 本文は写さずに渡す
+                                    let body_len = resp.body.len();
                                     self.send_response(
                                         resp.status_code,
                                         &resp
@@ -1166,7 +1172,7 @@ impl H3BufferedTask {
                                             .iter()
                                             .map(|(k, v)| (k.as_slice(), v.as_slice()))
                                             .collect::<Vec<_>>(),
-                                        Some(Bytes::copy_from_slice(&resp.body)),
+                                        Some(Bytes::from(resp.body)),
                                     )
                                     .await?;
                                     let user_agent_slice: &[u8] = if user_agent.is_empty() {
@@ -1181,7 +1187,7 @@ impl H3BufferedTask {
                                         user_agent_slice,
                                         request_body.len() as u64,
                                         resp.status_code,
-                                        resp.body.len() as u64,
+                                        body_len as u64,
                                         start_time,
                                         self.client_ip.as_str(),
                                         "",
@@ -1794,13 +1800,15 @@ impl H3BufferedTask {
                                     .iter()
                                     .map(|(k, v)| (k.as_slice(), v.as_slice()))
                                     .collect();
+                                // F-330: 本文は写さずに渡す
+                                let body_len = resp.body.len();
                                 self.send_response(
                                     resp.status_code,
                                     &resp_headers,
-                                    Some(Bytes::copy_from_slice(&resp.body)),
+                                    Some(Bytes::from(resp.body)),
                                 )
                                 .await?;
-                                return Ok((resp.status_code, resp.body.len()));
+                                return Ok((resp.status_code, body_len));
                             }
                         }
                     }
@@ -1848,13 +1856,15 @@ impl H3BufferedTask {
                                             .iter()
                                             .map(|(k, v)| (k.as_slice(), v.as_slice()))
                                             .collect();
+                                        // F-330: 本文は写さずに渡す
+                                        let body_len = resp.body.len();
                                         self.send_response(
                                             resp.status_code,
                                             &resp_headers,
-                                            Some(Bytes::copy_from_slice(&resp.body)),
+                                            Some(Bytes::from(resp.body)),
                                         )
                                         .await?;
-                                        return Ok((resp.status_code, resp.body.len()));
+                                        return Ok((resp.status_code, body_len));
                                     }
                                 }
                             }
@@ -2282,13 +2292,15 @@ impl H3BufferedTask {
                         .iter()
                         .map(|(k, v)| (k.as_slice(), v.as_slice()))
                         .collect();
+                    // F-330: 本文は写さずに渡す
+                    let body_len = resp.body.len();
                     self.send_response(
                         resp.status_code,
                         &resp_headers,
-                        Some(Bytes::copy_from_slice(&resp.body)),
+                        Some(Bytes::from(resp.body)),
                     )
                     .await?;
-                    return Ok((resp.status_code, resp.body.len()));
+                    return Ok((resp.status_code, body_len));
                 }
             };
             headers = store

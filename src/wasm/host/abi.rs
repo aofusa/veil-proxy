@@ -49,49 +49,58 @@ where
 
 /// Proxy-Wasm ABI 形式のヘッダマップを復元する（不正データは None）
 pub(crate) fn deserialize_headers(data: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-    if data.is_empty() {
-        return Some(Vec::new());
-    }
-    if data.len() < 4 {
-        return None;
-    }
+    let mut headers = Vec::with_capacity(pairs_hint(data));
+    visit_headers(data, |key, value| {
+        headers.push((key.to_vec(), value.to_vec()))
+    })
+    .then_some(headers)
+}
 
-    let num_pairs = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+/// 表の組の数（確保の見込み）。データの長さで抑える（組ごとにサイズテーブルの 8 バイトが要る）
+pub(crate) fn pairs_hint(data: &[u8]) -> usize {
+    data.first_chunk::<4>()
+        .map_or(0, |n| (u32::from_le_bytes(*n) as usize).min(data.len() / 8))
+}
+
+/// Proxy-Wasm ABI 形式のヘッダマップの名前と値を、写さずに順に `f` へ渡す（F-330。取り出しと検査を 1 回の走査で行う
+/// 呼び出し元のため）。データが壊れていれば、その組の前で止めて `false`（それまでの組は渡している）
+pub(crate) fn visit_headers(data: &[u8], mut f: impl FnMut(&[u8], &[u8])) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    let Some(num_pairs) = data.first_chunk::<4>() else {
+        return false;
+    };
+    let num_pairs = u32::from_le_bytes(*num_pairs) as usize;
 
     // サイズテーブルの範囲チェック
-    let table_end = 4usize.checked_add(num_pairs.checked_mul(8)?)?;
-    if table_end > data.len() {
-        return None;
-    }
+    let Some(table_end) = num_pairs
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(4))
+        .filter(|&end| end <= data.len())
+    else {
+        return false;
+    };
 
-    let mut headers = Vec::with_capacity(num_pairs);
+    let size = |at: usize| {
+        u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) as usize
+    };
     let mut pos = table_end;
-
     for n in 0..num_pairs {
         let s = 4 + n * 8;
-        let key_len = u32::from_le_bytes(data[s..s + 4].try_into().ok()?) as usize;
-        let val_len = u32::from_le_bytes(data[s + 4..s + 8].try_into().ok()?) as usize;
-
-        let key_end = pos.checked_add(key_len)?;
-        // key の後の NUL
-        if key_end >= data.len() {
-            return None;
-        }
-        let key = data[pos..key_end].to_vec();
+        // key・value の後の NUL（最終要素の NUL は data 長ちょうどまで）
+        let Some(key_end) = pos.checked_add(size(s)).filter(|&end| end < data.len()) else {
+            return false;
+        };
+        let key = &data[pos..key_end];
         pos = key_end + 1;
-
-        let val_end = pos.checked_add(val_len)?;
-        // value の後の NUL（最終要素の NUL は data 長ちょうどまで）
-        if val_end >= data.len() {
-            return None;
-        }
-        let value = data[pos..val_end].to_vec();
+        let Some(val_end) = pos.checked_add(size(s + 4)).filter(|&end| end < data.len()) else {
+            return false;
+        };
+        f(key, &data[pos..val_end]);
         pos = val_end + 1;
-
-        headers.push((key, value));
     }
-
-    Some(headers)
+    true
 }
 
 #[cfg(test)]
@@ -149,5 +158,77 @@ mod tests {
         bad3.extend_from_slice(&0u32.to_le_bytes());
         bad3.extend_from_slice(b"short\0\0");
         assert_eq!(deserialize_headers(&bad3), None);
+    }
+
+    /// 書き直す前の実装（F-330。`visit_headers` の上に作り直した `deserialize_headers` と比べる）
+    fn reference(data: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        if data.is_empty() {
+            return Some(Vec::new());
+        }
+        if data.len() < 4 {
+            return None;
+        }
+        let num_pairs = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+        let table_end = 4usize.checked_add(num_pairs.checked_mul(8)?)?;
+        if table_end > data.len() {
+            return None;
+        }
+        let mut headers = Vec::with_capacity(num_pairs);
+        let mut pos = table_end;
+        for n in 0..num_pairs {
+            let s = 4 + n * 8;
+            let key_len = u32::from_le_bytes(data[s..s + 4].try_into().ok()?) as usize;
+            let val_len = u32::from_le_bytes(data[s + 4..s + 8].try_into().ok()?) as usize;
+            let key_end = pos.checked_add(key_len)?;
+            if key_end >= data.len() {
+                return None;
+            }
+            let key = data[pos..key_end].to_vec();
+            pos = key_end + 1;
+            let val_end = pos.checked_add(val_len)?;
+            if val_end >= data.len() {
+                return None;
+            }
+            let value = data[pos..val_end].to_vec();
+            pos = val_end + 1;
+            headers.push((key, value));
+        }
+        Some(headers)
+    }
+
+    /// 書き直した復元は、正しい表・壊れた表（切り詰め・長さの書き換え・乱数）のどれでも前の実装と同じ結果
+    #[test]
+    fn deserialize_matches_the_previous_implementation() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..4000 {
+            let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..next() % 5)
+                .map(|_| {
+                    let k = (0..next() % 6).map(|_| next() as u8).collect();
+                    let v = (0..next() % 6).map(|_| next() as u8).collect();
+                    (k, v)
+                })
+                .collect();
+            let mut bytes = serialize_headers(&pairs);
+            match round % 4 {
+                0 => {}
+                1 => bytes.truncate((next() as usize) % (bytes.len() + 1)),
+                2 if bytes.len() > 4 => {
+                    // 長さ（組の数かサイズテーブル）の 1 バイトを書き換える
+                    let i = (next() as usize) % bytes.len().min(4 + pairs.len() * 8);
+                    bytes[i] = next() as u8;
+                }
+                _ => bytes = (0..next() % 40).map(|_| (next() % 4) as u8).collect(),
+            }
+            assert_eq!(deserialize_headers(&bytes), reference(&bytes), "{bytes:?}");
+            if round % 4 == 0 {
+                assert_eq!(deserialize_headers(&bytes).as_ref(), Some(&pairs));
+            }
+        }
     }
 }

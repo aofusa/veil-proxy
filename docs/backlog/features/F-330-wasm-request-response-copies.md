@@ -1,6 +1,6 @@
 # F-330: Proxy-Wasm の経路の要求と応答の写しを減らす（ヘッダ・本文・ローカル応答の組み立て）
 
-**状態: 未着手（[F-327](F-327-proxy-wasm-path-cost.md) の子）**
+**状態: 進行中（[F-327](F-327-proxy-wasm-path-cost.md) の子。1・3 の一部を実装。計測待ち）**
 
 ## 現状
 
@@ -48,6 +48,26 @@
 
 - aofish の交互 A/B で json-tls・POST・h3 の 1 要求のユーザー時間が下がる。`alloc-stats` のビルドで 1 要求の確保の回数を前後で記録する。
 - 上の危険の各挙動の E2E が通る（既存 + 足りなければ足す）。
+
+## 実装（2026-11-26）
+
+- 1（ヘッダ）: `src/wasm/host/abi.rs` に `visit_headers`（直列化した表の名前と値を写さずに順に渡す。壊れた表は `false`）を足し、
+  `deserialize_headers` をその上に作り直した（前の実装と乱数の表・切り詰め・長さの書き換えで同じ結果になることを試験で確かめる）。
+  `proxy_send_local_response` は `local_response_headers` で取り出しと検査（CR・LF・NUL・空の名前を捨て、名前を小文字に）を 1 回の
+  走査で行う（捨てる組は写さない。壊れた表は今までどおりヘッダ無し）。
+- 1（HTTP/1.1）: `write_wasm_local_response_h1`（`src/proxy/h1.rs`）。ステータス行とヘッダは要求バッファのプールのバッファへ `itoa` で
+  書き（`write_fmt` と要求ごとの `Vec` を無くす）、3 KiB 以下の本文は同じバッファへ続けて `write_or_hold`（ハンドラの応答と同じ上限。
+  `API_INLINE_BODY_MAX`）、超える本文は `resp` から移して `write_all_vectored`（平文は `writev` 1 回、rustls は 2 つを積んで 1 回の
+  `flush_tls_writev`）。kTLS の `write_all_vectored` はヘッダと本文を別に送る（送信が 2 回になる）ので、kTLS は今までどおり 1 つの
+  バッファにまとめる。ヘッダの段・本文の段のローカル応答、応答本文の段（`buffered.rs`・`forward.rs`）の 4 箇所。応答ヘッダの段
+  （B-300、`sendfile.rs` の `write_h1_wasm_local`）はストリームの型を問わないまれな経路なので、同じバイト列を 1 つのバッファで書く
+  （`wasm_local_response_h1`）。送るバイト列は今と同じ（ステータス行・ヘッダの順・`Connection: close`・Content-Length の補い・HEAD と
+  1xx・204・304 の本文の抑止）。
+- 1（HTTP/3）: ローカル応答の本文を `Bytes::from(resp.body)` で移す（6 箇所。ゲストから写した `Vec` は長さと容量が同じなので確保も無い）。
+- 3: 本文の段のローカル応答も `write_or_hold`（パイプラインで次の要求が届いていれば溜める。F-322）にし、閉じる前に溜めた応答を送る。
+- 試験: `h1.rs` の `wasm_local_response_sends_the_same_bytes_on_every_path`（ソケットの組で、小さな本文・3 KiB ちょうど・超える本文・
+  40 KiB の閉じる応答と HEAD・204・本文の無い 404、溜めてから大きな本文の応答で一緒に送る、溜めない書き方）、`status_line_and_supplied_length`、
+  `abi.rs` の `deserialize_matches_the_previous_implementation`、`stream.rs` の `local_response_tests`。
 
 ## 関連
 

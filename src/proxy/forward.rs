@@ -1346,10 +1346,16 @@ pub(super) async fn proxy_h2c(
         let body = std::mem::take(&mut response.body);
         match super::compress::wasm_filter_response_body(wasm_modules, body).await {
             Ok(b) => response.body = b,
-            Err(local) => {
-                let out = super::h1::wasm_local_response_h1(&local, false, client_wants_close);
-                let len = out.len() as u64;
-                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(out)).await;
+            Err(mut local) => {
+                let (len, _) = super::h1::write_wasm_local_response_h1(
+                    &mut client_stream,
+                    &mut local,
+                    false,
+                    client_wants_close,
+                    false,
+                    WRITE_TIMEOUT,
+                )
+                .await;
                 return Some((client_stream, local.status_code, len, client_wants_close));
             }
         }

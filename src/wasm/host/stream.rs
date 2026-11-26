@@ -4,7 +4,7 @@ use crate::wasm::exports::GuestMemory;
 use wasmtime::{Caller, Linker};
 
 // B-19: マップ直列化は SDK 互換の共通モジュールを使用
-use super::abi::deserialize_headers;
+use super::abi::{pairs_hint, visit_headers};
 use crate::wasm::constants::*;
 use crate::wasm::context::HostState;
 use crate::wasm::types::LocalResponse;
@@ -85,13 +85,10 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 if end > data.len() {
                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                 }
-                deserialize_headers(&data[start..end]).unwrap_or_default()
+                local_response_headers(&data[start..end])
             } else {
                 Vec::new()
             };
-            // モジュールの返すヘッダはそのままクライアントへ書かれる。名前は小文字にし（HTTP/2・HTTP/3 は大文字を
-            // PROTOCOL_ERROR にする）、CR・LF・NUL を含むもの・空の名前は捨てる（HTTP/1.1 のヘッダの注入を防ぐ）
-            let headers = sanitize_local_response_headers(headers);
             // 範囲外のステータスは 500（u16 への切り詰めで 0 や別の値にしない）
             let status_code = if (100..=599).contains(&status_code) {
                 status_code as u16
@@ -202,31 +199,58 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `proxy_send_local_response` のヘッダを、どのプロトコルでもそのまま書ける形にする
-fn sanitize_local_response_headers(headers: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<(Vec<u8>, Vec<u8>)> {
+/// `proxy_send_local_response` のヘッダ（直列化した表）を、どのプロトコルでもそのまま書ける形で取り出す。モジュールの返す
+/// ヘッダはそのままクライアントへ書かれるので、名前は小文字にし（HTTP/2・HTTP/3 は大文字を PROTOCOL_ERROR にする）、
+/// CR・LF・NUL を含むもの・空の名前は捨てる（HTTP/1.1 のヘッダの注入を防ぐ）。表が壊れていれば空（今までと同じ）。
+/// ゲストのメモリから 1 回の走査で取り出し、捨てる組は写さない（F-330）
+fn local_response_headers(data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let bad = |b: &u8| matches!(*b, b'\r' | b'\n' | 0);
+    let mut headers = Vec::with_capacity(pairs_hint(data));
+    let complete = visit_headers(data, |name, value| {
+        if !name.is_empty() && !name.iter().any(bad) && !value.iter().any(bad) {
+            headers.push((name.to_ascii_lowercase(), value.to_vec()));
+        }
+    });
+    if !complete {
+        headers.clear();
+    }
     headers
-        .into_iter()
-        .filter(|(n, v)| !n.is_empty() && !n.iter().any(bad) && !v.iter().any(bad))
-        .map(|(mut n, v)| {
-            n.make_ascii_lowercase();
-            (n, v)
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod local_response_tests {
-    use super::sanitize_local_response_headers;
+    use super::local_response_headers;
+    use crate::wasm::host::abi::serialize_headers;
 
     #[test]
     fn local_response_headers_are_lowercased_and_injection_free() {
-        let out = sanitize_local_response_headers(vec![
+        let map = serialize_headers(&[
             (b"X-Blocked".to_vec(), b"1".to_vec()),
             (b"x-evil".to_vec(), b"a\r\nset-cookie: x".to_vec()),
             (b"bad\nname".to_vec(), b"v".to_vec()),
             (Vec::new(), b"v".to_vec()),
+            (b"x-nul".to_vec(), b"a\0b".to_vec()),
+            (b"Content-Type".to_vec(), b"text/plain".to_vec()),
         ]);
-        assert_eq!(out, vec![(b"x-blocked".to_vec(), b"1".to_vec())]);
+        assert_eq!(
+            local_response_headers(&map),
+            vec![
+                (b"x-blocked".to_vec(), b"1".to_vec()),
+                (b"content-type".to_vec(), b"text/plain".to_vec()),
+            ]
+        );
+    }
+
+    // 壊れた表はヘッダ無し（途中まで読めた組も使わない。今までと同じ）
+    #[test]
+    fn a_broken_map_gives_no_headers() {
+        let mut map = serialize_headers(&[
+            (b"x-a".to_vec(), b"1".to_vec()),
+            (b"x-b".to_vec(), b"2".to_vec()),
+        ]);
+        map.truncate(map.len() - 2);
+        assert!(local_response_headers(&map).is_empty());
+        assert!(local_response_headers(&[1, 0]).is_empty());
+        assert!(local_response_headers(&[]).is_empty());
     }
 }

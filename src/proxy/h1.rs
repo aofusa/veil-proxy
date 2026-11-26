@@ -857,7 +857,7 @@ pub(super) async fn handle_requests(
                                         .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
                                         .collect()
                                 }
-                                crate::wasm::FilterResult::LocalResponse(resp) => {
+                                crate::wasm::FilterResult::LocalResponse(mut resp) => {
                                     // ローカルレスポンスを返送。F-271: 本文を読み切れたら接続を続ける
                                     // （以前は毎回閉じていた）
                                     let start_instant = Instant::now();
@@ -867,18 +867,18 @@ pub(super) async fn handle_requests(
                                         && chunked_end.is_none()
                                         && initial_body.is_empty()
                                         && check_expect_continue(&headers_for_proxy);
-                                    // B-499: 閉じると分かっているなら応答に `Connection: close` を付ける
-                                    let response = wasm_local_response_h1(
-                                        &resp,
+                                    // B-499: 閉じると分かっているなら応答に `Connection: close` を付ける。
+                                    // F-322: パイプラインで次の要求が届いていれば溜める
+                                    let (resp_size, written) = write_wasm_local_response_h1(
+                                        &mut tls_stream,
+                                        &mut resp,
                                         method_bytes.as_ref() == b"HEAD",
                                         client_wants_close || is_websocket || expect_waiting,
-                                    );
-                                    let resp_size = response.len() as u64;
-                                    // F-322: パイプラインで次の要求が届いていれば溜める
-                                    let write_result =
-                                        timeout(WRITE_TIMEOUT, tls_stream.write_or_hold(response))
-                                            .await;
-                                    if !matches!(write_result, Ok((Ok(_), _))) {
+                                        true,
+                                        WRITE_TIMEOUT,
+                                    )
+                                    .await;
+                                    if !written {
                                         return;
                                     }
                                     log_access(
@@ -1026,19 +1026,21 @@ pub(super) async fn handle_requests(
                                     (b.to_vec(), b.len(), false, headers)
                                 }
                                 crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
-                                    resp,
+                                    mut resp,
                                 ) => {
                                     let start_instant = Instant::now();
-                                    let response = wasm_local_response_h1(
-                                        &resp,
+                                    // F-330: ヘッダの段のローカル応答と同じく、パイプラインで次の要求が届いていれば
+                                    // 溜める（F-322）
+                                    let (resp_size, written) = write_wasm_local_response_h1(
+                                        &mut tls_stream,
+                                        &mut resp,
                                         method_bytes.as_ref() == b"HEAD",
                                         client_wants_close,
-                                    );
-                                    let resp_size = response.len() as u64;
-                                    let write_result =
-                                        timeout(WRITE_TIMEOUT, tls_stream.write_all(response))
-                                            .await;
-                                    if !matches!(write_result, Ok((Ok(_), _))) {
+                                        true,
+                                        WRITE_TIMEOUT,
+                                    )
+                                    .await;
+                                    if !written {
                                         return;
                                     }
                                     log_access(
@@ -1056,6 +1058,8 @@ pub(super) async fn handle_requests(
                                     crate::wasm::on_request_complete_async(&modules_to_apply).await;
                                     accumulated.clear();
                                     if client_wants_close {
+                                        // F-322: 溜めた応答を送ってから閉じる
+                                        flush_held_before_close(&mut tls_stream).await;
                                         return;
                                     }
                                     if !pipelined.is_empty() {
@@ -2420,64 +2424,124 @@ async fn pump_api_chunked_body(
     }
 }
 
-/// Wasm のローカル応答（`send_local_response`）を HTTP/1.1 の応答にする（Content-Length が無ければ補う。F-62）。
+/// Wasm のローカル応答（`send_local_response`）を HTTP/1.1 の応答として書き、応答の大きさと書けたかを返す。
 ///
 /// B-188: HEAD の要求への応答と、本文を持たないステータス（1xx・204・304）では本文を書かない（接続を続けるので、
 /// 書くとクライアントは残りを次の応答の先頭として読む）。HEAD は Content-Length を本文の長さのまま付ける
-/// （GET と同じヘッダ）。1xx・204・304 は補わない。
-#[cfg(feature = "wasm")]
+/// （GET と同じヘッダ）。1xx・204・304 は補わない。Content-Length が無ければ補う（F-62）。
 ///
 /// `close` は応答の後にクライアントの接続を閉じるとき（`Connection: close` を付け、モジュールの `Connection`・
 /// `Keep-Alive` は付けない。B-499: 付けないとクライアントは閉じられる接続で次の要求を送って失う。B-360 と同じ）。
+///
+/// F-330: ステータス行とヘッダは要求バッファのプールのバッファに書き（`write_fmt` を使わない）、小さな本文は同じバッファへ
+/// 続けて 1 回で送る（`hold` なら、パイプラインで次の要求が届いているとき溜める。F-322）。大きな本文は写さずにヘッダと 1 回の
+/// scatter-gather で送る（ハンドラの応答と同じ。F-202・F-301。本文は `resp` から移す）。kTLS の `write_all_vectored` は
+/// ヘッダと本文を別に送る（送信が 2 回になる）ので、kTLS は今までどおり 1 つのバッファにまとめる。
+#[cfg(feature = "wasm")]
+pub(super) async fn write_wasm_local_response_h1(
+    stream: &mut ServerTls,
+    resp: &mut crate::wasm::LocalResponse,
+    head: bool,
+    close: bool,
+    hold: bool,
+    write_timeout: Duration,
+) -> (u64, bool) {
+    let body_len = if head || is_bodyless_status(resp.status_code) {
+        0
+    } else {
+        resp.body.len()
+    };
+    let one_buffer = body_len <= API_INLINE_BODY_MAX || stream.is_ktls_enabled();
+    let mut out = if body_len <= API_INLINE_BODY_MAX || !one_buffer {
+        crate::pool::request_buf_get(API_HEAD_ESTIMATE + if one_buffer { body_len } else { 0 })
+    } else {
+        Vec::with_capacity(API_HEAD_ESTIMATE + body_len)
+    };
+    write_wasm_local_head_h1(&mut out, resp, close);
+    let size = (out.len() + body_len) as u64;
+    if one_buffer {
+        out.extend_from_slice(&resp.body[..body_len]);
+        let written = if hold {
+            timeout(write_timeout, stream.write_or_hold(out)).await
+        } else {
+            timeout(write_timeout, stream.write_all(out)).await
+        };
+        return match written {
+            Ok((Ok(_), buf)) => {
+                crate::pool::request_buf_put(buf);
+                (size, true)
+            }
+            _ => (size, false),
+        };
+    }
+    let body = std::mem::take(&mut resp.body);
+    match timeout(write_timeout, stream.write_all_vectored(out, body)).await {
+        Ok((Ok(()), buf, _)) => {
+            crate::pool::request_buf_put(buf);
+            (size, true)
+        }
+        _ => (size, false),
+    }
+}
+
+/// Wasm のローカル応答の HTTP/1.1 のバイト列（ヘッダと本文を 1 つのバッファに。[`write_wasm_local_response_h1`] が送る
+/// ものと同じ）。応答ヘッダの段のローカル応答（B-300）のように、まれな経路でストリームの型を問わずに書くとき
+#[cfg(feature = "wasm")]
 pub(super) fn wasm_local_response_h1(
     resp: &crate::wasm::LocalResponse,
     head: bool,
     close: bool,
 ) -> Vec<u8> {
-    let no_body_status = matches!(resp.status_code, 100..=199 | 204 | 304);
-    let write_body = !head && !no_body_status;
-    let mut response = Vec::with_capacity(
-        64 + if write_body { resp.body.len() } else { 0 } + resp.headers.len() * 32,
-    );
-    let _ = std::io::Write::write_fmt(
-        &mut response,
-        format_args!(
-            "HTTP/1.1 {} {}\r\n",
-            resp.status_code,
-            crate::http_utils::status_reason_phrase(resp.status_code)
-        ),
-    );
+    let body_len = if head || is_bodyless_status(resp.status_code) {
+        0
+    } else {
+        resp.body.len()
+    };
+    let mut out = Vec::with_capacity(API_HEAD_ESTIMATE + body_len);
+    write_wasm_local_head_h1(&mut out, resp, close);
+    out.extend_from_slice(&resp.body[..body_len]);
+    out
+}
+
+/// 本文を持たないステータス（1xx・204・304。B-188）
+#[cfg(feature = "wasm")]
+#[inline]
+fn is_bodyless_status(status: u16) -> bool {
+    matches!(status, 100..=199 | 204 | 304)
+}
+
+/// Wasm のローカル応答のステータス行とヘッダ（本文の前の空行まで）を `out` に書く（[`write_wasm_local_response_h1`]）
+#[cfg(feature = "wasm")]
+fn write_wasm_local_head_h1(out: &mut Vec<u8>, resp: &crate::wasm::LocalResponse, close: bool) {
+    let mut num = itoa::Buffer::new();
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(num.format(resp.status_code).as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(crate::http_utils::status_reason_phrase(resp.status_code).as_bytes());
+    out.extend_from_slice(b"\r\n");
+    let mut has_length = false;
     for (k, v) in &resp.headers {
         if close && (k.eq_ignore_ascii_case(b"connection") || k.eq_ignore_ascii_case(b"keep-alive"))
         {
             continue;
         }
-        response.extend_from_slice(k);
-        response.extend_from_slice(b": ");
-        response.extend_from_slice(v);
-        response.extend_from_slice(b"\r\n");
+        has_length |= k.eq_ignore_ascii_case(b"content-length");
+        out.extend_from_slice(k);
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v);
+        out.extend_from_slice(b"\r\n");
     }
     if close {
-        response.extend_from_slice(b"Connection: close\r\n");
+        out.extend_from_slice(b"Connection: close\r\n");
     }
     // F-62: モジュールが Content-Length を設定していない場合は補完する（欠落するとクライアントは接続
     // クローズまでボディを待ち続け、TLS では close_notify 無しの EOF エラーになる）
-    if !no_body_status
-        && !resp
-            .headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case(b"content-length"))
-    {
-        let _ = std::io::Write::write_fmt(
-            &mut response,
-            format_args!("Content-Length: {}\r\n", resp.body.len()),
-        );
+    if !has_length && !is_bodyless_status(resp.status_code) {
+        out.extend_from_slice(b"Content-Length: ");
+        out.extend_from_slice(num.format(resp.body.len()).as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
-    response.extend_from_slice(b"\r\n");
-    if write_body {
-        response.extend_from_slice(&resp.body);
-    }
-    response
+    out.extend_from_slice(b"\r\n");
 }
 
 /// 最初の読み取りに全量が入っている要求の本文（F-329。Wasm の要求ヘッダと本文の段を一度に呼ぶ）。Content-Length は
@@ -2539,12 +2603,12 @@ pub(super) fn no_wasm_modules() -> crate::wasm_plugin_config::WasmModules {
     EMPTY.with(Clone::clone)
 }
 
-/// HTTP/1.1 のハンドラ応答で、ヘッダと同じバッファに続けて 1 回で書く本文の上限（F-202）。
+/// HTTP/1.1 のハンドラ応答と Wasm のローカル応答（F-330）で、ヘッダと同じバッファに続けて 1 回で書く本文の上限（F-202）。
 /// 要求バッファのプールの大きい方（既定 4KB）に収まる大きさ。超えるものはヘッダと別に書く（複製しない）。
-#[cfg(feature = "handler")]
+#[cfg(any(feature = "handler", feature = "wasm"))]
 pub(super) const API_INLINE_BODY_MAX: usize = 3 * 1024;
 /// ステータス行と既定のヘッダの見積もり（プールのバッファの選択に使う）。
-#[cfg(feature = "handler")]
+#[cfg(any(feature = "handler", feature = "wasm"))]
 pub(super) const API_HEAD_ESTIMATE: usize = 256;
 
 /// ハンドラのストリーミング応答を HTTP/1.1 の chunked で書く（F-197）。トレーラは最後のチャンクの後に
@@ -2896,6 +2960,95 @@ mod b186_overflow_tests {
         assert_eq!(b, b"5\r\nhello\r\n0\r\n\r\nGET");
     }
 
+    /// クライアントの側に今までに届いたバイト
+    #[cfg(feature = "wasm")]
+    fn received(mut c: &UnixStream) -> Vec<u8> {
+        c.set_nonblocking(true).unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match std::io::Read::read(&mut c, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        c.set_nonblocking(false).unwrap();
+        out
+    }
+
+    /// F-330: Wasm のローカル応答は、どの書き方（小さな本文はヘッダと同じバッファ・大きな本文は写さずに scatter-gather・
+    /// HEAD・本文の無いステータス・パイプラインの溜め）でも同じバイト列を送る
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn wasm_local_response_sends_the_same_bytes_on_every_path() {
+        if !runtime_available() {
+            return;
+        }
+        let local = |status: u16, len: usize| crate::wasm::LocalResponse {
+            status_code: status,
+            headers: vec![(b"content-type".to_vec(), b"text/plain".to_vec())],
+            body: (0..len).map(|i| b'a' + (i % 26) as u8).collect(),
+        };
+        let expected = wasm_local_response_h1;
+        let limit = Duration::from_secs(5);
+        crate::runtime::block_on(async move {
+            for (status, len, head, close) in [
+                (200, 2, false, false),
+                (200, API_INLINE_BODY_MAX, false, false),
+                (200, API_INLINE_BODY_MAX + 1, false, false),
+                (200, 40 * 1024, false, true),
+                (200, 40 * 1024, true, false),
+                (204, 10, false, false),
+                (404, 0, false, false),
+            ] {
+                let (s, c) = pair();
+                let mut tls = server(s).await;
+                let mut r = local(status, len);
+                let want = expected(&r, head, close);
+                let (size, ok) =
+                    write_wasm_local_response_h1(&mut tls, &mut r, head, close, true, limit).await;
+                assert!(ok);
+                assert_eq!(size as usize, want.len(), "{status} {len} {head} {close}");
+                assert_eq!(received(&c), want, "{status} {len} {head} {close}");
+            }
+            // パイプラインで次の要求が届いていれば溜め、次の応答の前に送る（大きな本文の応答は溜めた分を先に送る。F-322）
+            let (s, c) = pair();
+            let mut tls = server(s).await;
+            tls.set_hold_next(true);
+            let mut first = local(200, 5);
+            let want_first = expected(&first, false, false);
+            assert!(
+                write_wasm_local_response_h1(&mut tls, &mut first, false, false, true, limit)
+                    .await
+                    .1
+            );
+            assert!(received(&c).is_empty());
+            tls.set_hold_next(false);
+            let mut second = local(200, 10 * 1024);
+            let want_second = expected(&second, false, false);
+            assert!(
+                write_wasm_local_response_h1(&mut tls, &mut second, false, false, true, limit)
+                    .await
+                    .1
+            );
+            assert_eq!(received(&c), [want_first, want_second].concat());
+            // 溜めない書き方（`hold = false`）は次の要求が届いていても送る
+            let (s, c) = pair();
+            let mut tls = server(s).await;
+            tls.set_hold_next(true);
+            let mut r = local(200, 5);
+            let want = expected(&r, false, false);
+            assert!(
+                write_wasm_local_response_h1(&mut tls, &mut r, false, false, false, limit)
+                    .await
+                    .1
+            );
+            assert_eq!(received(&c), want);
+        });
+    }
+
     #[test]
     fn drain_request_body_returns_pipelined_bytes() {
         if !runtime_available() {
@@ -3125,6 +3278,23 @@ mod b188_wasm_local_response_tests {
             headers: vec![(b"x-a".to_vec(), b"1".to_vec())],
             body: b"hello".to_vec(),
         }
+    }
+
+    #[test]
+    fn status_line_and_supplied_length() {
+        let out = String::from_utf8(wasm_local_response_h1(&resp(404), false, false)).unwrap();
+        assert_eq!(
+            out,
+            "HTTP/1.1 404 Not Found\r\nx-a: 1\r\nContent-Length: 5\r\n\r\nhello"
+        );
+        // モジュールの Content-Length はそのまま（補わない）
+        let mut r = resp(200);
+        r.headers.push((b"content-length".to_vec(), b"5".to_vec()));
+        let out = String::from_utf8(wasm_local_response_h1(&r, false, false)).unwrap();
+        assert_eq!(
+            out,
+            "HTTP/1.1 200 OK\r\nx-a: 1\r\ncontent-length: 5\r\n\r\nhello"
+        );
     }
 
     #[test]

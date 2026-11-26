@@ -279,13 +279,14 @@ where
                             super::compress::set_h1_content_length(&mut headers_data, body.len());
                             body_result = BufferedBodyResult::Memory(body);
                         }
-                        Err(local) => {
-                            let response =
-                                super::h1::wasm_local_response_h1(&local, is_head, close);
-                            let len = response.len() as u64;
-                            let _ = timeout(
+                        Err(mut local) => {
+                            let (len, _) = super::h1::write_wasm_local_response_h1(
+                                client_stream,
+                                &mut local,
+                                is_head,
+                                close,
+                                false,
                                 Duration::from_secs(buffering_config.client_write_timeout_secs),
-                                client_stream.write_all(response),
                             )
                             .await;
                             return Some((local.status_code, len, backend_wants_keep_alive, false));
