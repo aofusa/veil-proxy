@@ -1010,17 +1010,35 @@ impl H3BufferedTask {
                     let path_arc: std::sync::Arc<str> = std::sync::Arc::from(path_str);
                     let method_arc: std::sync::Arc<str> = std::sync::Arc::from(method_str);
                     let ip_arc: std::sync::Arc<str> = std::sync::Arc::from(self.client_ip.as_str());
-                    // 呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
-                    let wasm_result = Box::pin(wasm_engine.on_request_headers_with_modules(
-                        &modules_to_apply,
-                        &path_arc,
-                        &method_arc,
-                        headers_vec,
-                        &ip_arc,
-                        request_body.is_empty(),
-                        modules_to_apply.sessions(),
-                    ))
-                    .await;
+                    // F-329: 本文は全量がある（バッファの経路）。本文を受けるモジュールがあり、要求のトレーラが無ければ
+                    // （トレーラの段は本文の段の後）、ヘッダと本文の段を一度に呼ぶ（1 モジュールのルートは 1 回の
+                    // ファイバーの出入り）。呼び出し元の future に本体（数 KB）を埋め込まない（B-240）
+                    let wasm_result = if !request_body.is_empty()
+                        && self.req_trailers.is_empty()
+                        && wasm_engine.wants_request_body(&modules_to_apply)
+                    {
+                        Box::pin(wasm_engine.on_request_with_body(
+                            &modules_to_apply,
+                            &path_arc,
+                            &method_arc,
+                            headers_vec,
+                            &ip_arc,
+                            request_body.clone(),
+                            modules_to_apply.sessions(),
+                        ))
+                        .await
+                    } else {
+                        Box::pin(wasm_engine.on_request_headers_with_modules(
+                            &modules_to_apply,
+                            &path_arc,
+                            &method_arc,
+                            headers_vec,
+                            &ip_arc,
+                            request_body.is_empty(),
+                            modules_to_apply.sessions(),
+                        ))
+                        .await
+                    };
 
                     match wasm_result {
                         crate::wasm::FilterResult::LocalResponse(resp) => {
@@ -1057,7 +1075,8 @@ impl H3BufferedTask {
                             return Ok(());
                         }
                         crate::wasm::FilterResult::Continue {
-                            headers: modified, ..
+                            headers: modified,
+                            body: body_done,
                         } => {
                             // B-38: 変更後ヘッダを上流リクエストへ反映
                             let modified = wasm_request_headers.insert(modified);
@@ -1065,7 +1084,10 @@ impl H3BufferedTask {
                             // F-132: リクエストボディフィルタ（HTTP/3 は WASM 適用時に
                             // 必ず Decision::Buffer に落ちるためボディ全体がメモリ上にある。
                             // end_of_stream=true の 1 回呼びで実装できる）。
-                            if !request_body.is_empty() {
+                            if let Some(b) = body_done {
+                                // F-329: 本文の段はヘッダの段と一緒に呼んだ
+                                wasm_request_body_override = Some(b);
+                            } else if !request_body.is_empty() {
                                 // F-271: 本文の段からも要求のパス・ヘッダが見える
                                 let meta = crate::wasm::RequestMeta {
                                     method: &method_arc,

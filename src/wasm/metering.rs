@@ -39,7 +39,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use wasmtime::{AsContextMut, Engine, Store, UpdateDeadline};
+use wasmtime::{AsContext, AsContextMut, Engine, Store, UpdateDeadline};
 
 use super::context::HostState;
 use super::types::{Metering, WasmConfig};
@@ -202,6 +202,8 @@ pub(crate) struct Meter {
     budget: Duration,
     /// 実時間の上限
     wall: Duration,
+    /// エポックを進める専用スレッド（[`install`] が置く。上限を入れるたびに眠っていれば起こす）
+    ticker: Option<Arc<Ticker>>,
 }
 
 impl Meter {
@@ -240,6 +242,7 @@ impl Default for Meter {
             run: Duration::ZERO,
             budget: Duration::ZERO,
             wall: Window::Callback.wall(),
+            ticker: None,
         }
     }
 }
@@ -296,9 +299,13 @@ pub(crate) fn arm(
             ctx.set_epoch_deadline(window.fuel_ticks());
         }
         Metering::Clock => {
-            ctx.data_mut()
-                .meter
-                .arm(crate::runtime::time::coarse_now(), window, limits);
+            let meter = &mut ctx.data_mut().meter;
+            meter.arm(crate::runtime::time::coarse_now(), window, limits);
+            // 専用スレッドが眠っていたら起こす（エポックが進まないと締切を検査できない。段を続けて呼ぶ `call_chain` が
+            // 段の間に入れ直すときも。F-329）。動いている間は読み取り 1 回
+            if let Some(t) = &meter.ticker {
+                t.wake();
+            }
             RESUMED.with(|c| c.set(None));
             ctx.set_epoch_deadline(1);
         }
@@ -317,9 +324,11 @@ pub(crate) fn rearm_wall(
     match limits.metering {
         Metering::Fuel => ctx.set_epoch_deadline(window.fuel_ticks()),
         Metering::Clock => {
-            ctx.data_mut()
-                .meter
-                .rearm_wall(crate::runtime::time::coarse_now(), window);
+            let meter = &mut ctx.data_mut().meter;
+            meter.rearm_wall(crate::runtime::time::coarse_now(), window);
+            if let Some(t) = &meter.ticker {
+                t.wake();
+            }
             RESUMED.with(|c| c.set(None));
             ctx.set_epoch_deadline(1);
         }
@@ -332,6 +341,7 @@ pub(crate) fn install(store: &mut Store<HostState>, limits: &Limits, ticker: &Ar
         return;
     }
     let limits = *limits;
+    store.data_mut().meter.ticker = Some(Arc::clone(ticker));
     let ticker = Arc::clone(ticker);
     store.epoch_deadline_callback(move |mut ctx| {
         let meter = &mut ctx.data_mut().meter;
@@ -345,11 +355,18 @@ pub(crate) fn install(store: &mut Store<HostState>, limits: &Limits, ticker: &Ar
 }
 
 /// `fuel` で、直前のコールバックが使った燃料（`clock` は数えないので `None`）
-pub(crate) fn fuel_consumed(store: &Store<HostState>, limits: &Limits) -> Option<u64> {
+pub(crate) fn fuel_consumed(
+    store: impl AsContext<Data = HostState>,
+    limits: &Limits,
+) -> Option<u64> {
     if !limits.uses_fuel() {
         return None;
     }
-    Some(limits.fuel.saturating_sub(store.get_fuel().unwrap_or(0)))
+    Some(
+        limits
+            .fuel
+            .saturating_sub(store.as_context().get_fuel().unwrap_or(0)),
+    )
 }
 
 /// エポックの締切に届いたゲストの扱いを決める（`clock`）
@@ -451,6 +468,7 @@ impl Future for Resume {
 
 /// エポックを進める専用スレッドを起こすための状態（エンジンごと）。2 つの印は専用スレッドが [`ACTIVE_WINDOW`] ごとに
 /// 下ろし、窓の間に立った印で次の窓の間隔を決める（[`Limits::pace`]）
+#[derive(Debug)]
 pub(crate) struct Ticker {
     /// 呼び出しが来ている（`slow_tick` ごとに進める）。呼び出しを始めたワーカーが立てる
     active: AtomicBool,
@@ -866,6 +884,35 @@ mod tests {
             "the guest must yield about every millisecond: {yields}"
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    // F-329: 上限を入れるたびに、眠っている専用スレッドを起こす（段を続けて呼ぶ `call_chain` が段の間に入れ直すとき、
+    // 前の段の間に専用スレッドが眠っていても、次の段の締切を `slow_tick` ごとに検査できる）
+    #[test]
+    fn arming_wakes_the_ticker() {
+        use crate::wasm::capabilities::ModuleCapabilities;
+        use crate::wasm::context::HttpContext;
+
+        let mut cfg = wasmtime::Config::new();
+        cfg.async_support(true);
+        cfg.epoch_interruption(true);
+        let engine = Engine::new(&cfg).unwrap();
+        let limits = limits(20, 1_000);
+        let ticker = Arc::new(Ticker {
+            active: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
+            thread: OnceLock::new(),
+        });
+        let mut store = Store::new(
+            &engine,
+            HostState::new(HttpContext::new(1, ModuleCapabilities::default())),
+        );
+        install(&mut store, &limits, &ticker);
+        arm(&mut store, &limits, Window::Callback).unwrap();
+        assert!(ticker.active.load(Ordering::Relaxed));
+        ticker.active.store(false, Ordering::Relaxed);
+        rearm_wall(&mut store, &limits, Window::Callback);
+        assert!(ticker.active.load(Ordering::Relaxed));
     }
 
     #[test]

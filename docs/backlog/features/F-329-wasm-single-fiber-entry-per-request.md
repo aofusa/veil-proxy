@@ -1,7 +1,7 @@
 # F-329: ローカル応答の要求を 1 回のファイバーの出入りで終える（GET 2 → 1 回、POST 3 → 1 回）
 
-**状態: 未着手（[F-327](F-327-proxy-wasm-path-cost.md) の子。2 段階に分ける。段階 1〈ゲストから見える意味は変わらない〉は確認不要。
-段階 2〈`proxy_on_log` の時機が変わる〉は入れる前に利用者の確認を得る）**
+**状態: 実装済み（feat/proxy-wasm-perf。段階 1・段階 2 とも、HTTP/1.1・HTTP/2・HTTP/3 のすべてで。2026-11-26 利用者の決定）。
+計測は下の「実装」の A/B**
 
 ## 現状
 
@@ -118,6 +118,44 @@
   上限を超える chunked の 413、`Expect: 100-continue`、ヘッダの段の間に本文が見えないこと、`max_execution_time_ms` が段ごとに効くこと、
   長時間の負荷でゲストの線形メモリが増え続けないこと（SDK の文脈の表）。
 - 複数のモジュールのルートの段の順の試験（既存の E2E が通る）。io_uring と epoll の両方。
+
+## 実装（2026-11-26）
+
+- `src/wasm/exports.rs`: `Step::RequestBody(context_id, body_size)`（`end_of_stream` は常に 1）と `Step::LogLocal(context_id)` を足し、
+  `MAX_STEPS = 5`。条件つきの段は `enter_step` が決める: 保留の外部呼び出しがある・ゲストが `request.path`・`request.method` を書き換えた
+  （`HttpContext::request_line_overridden`。今の経路は段ごとに元の値へ戻すので、続けて呼ぶと見え方が変わる）なら止める。本文の段は
+  ローカル応答があれば飛ばし（続くログの段がその応答を記録する）、エクスポートが無ければ context を作り直さずに終えたことにする。
+  ログの段は決まったローカル応答を `Chain::local` へ取り出してから呼び、エクスポートが無ければ呼ばない。本文・ログの段の context は
+  `HttpContext::enter_request_body`・`enter_log`（段の間の `recycle` + `set_request_attrs` と同じ状態）。段ごとに燃料を記録し
+  （本文の段はトラップでも。今の経路と同じ）、本文・ログ・削除（エクスポートがあるとき）の前に `metering::arm` で入れ直す。
+- `src/wasm/metering.rs`: `arm`・`rearm_wall` が `clock` のとき専用スレッドを起こす（`Meter::ticker`。`install` が置く）。続けて呼ぶ段の
+  間で入れ直すとき、前の段の間に専用スレッドが眠っていても次の段の締切を `slow_tick` ごとに検査できる（ans-06 の 1-1）。エンジンの
+  `arm_store_until`・外部呼び出しの後の `rearm_wall` の前の `ticker.wake()` はこれに置き換えた。
+- `src/wasm/engine.rs`: `on_request_headers_with_modules` と新しい `on_request_with_body`（`_async` 版も）は `on_request_phases` を通る。
+  効く並びが 1 モジュールで `instance_reuse`、要求の並びがあるときだけ `single_module_request` → `execute_on_request_chained`
+  （`[ContextCreate?, RequestHeaders, RequestBody?, LogLocal, Delete?]`）。それ以外（2 つ以上のモジュール・使い回さない・要求の並びが無い
+  〈メッシュ・試験〉）は今の段ごとの経路。結果は `RequestStep`（ヘッダの段まで・本文の段まで・ログ済み）で、ヘッダ・本文の段の結果の扱いは
+  今の経路と同じ関数（`request_headers_outcome`・`request_body_outcome`）。ログの段に入ったら `RequestSessions::set_logged`。
+  `FilterResult::Continue::body` は `Option<Bytes>`（本文の段まで呼んだときの本文）。
+- `RequestSessions::logged` が立っていれば、応答の後の `on_request_complete_async`・`on_log_with_modules` は何もしない。
+- プロトコル: HTTP/1.1 は `body_in_hand`（Content-Length は最初の読み取りに全量があり上限以下なら写さずに移す。chunked は終端まで
+  読み取り済みで上限つきの復号が終わるとき。それ以外は今の 2 段の経路）、`Expect: 100-continue`・WebSocket は今の経路。Continue なら
+  `set_body_framing_headers` で Content-Length にし、後の本文の段を飛ばす。ローカル応答はヘッダの段のローカル応答と同じ経路で書く
+  （本文を読み終えているので読み捨てない）。HTTP/2 は `ctx.body`、HTTP/3 は `request_body` に全量があり、トレーラが無いとき。
+- ログの段から見える値は今の経路と同じにした（要求の疑似ヘッダとプロパティだけ。`response.code` は 0、応答ヘッダは空）。上の
+  「段階」・「設計」・「意味の変化と危険」はローカル応答のステータスとヘッダを見せる案だったが、1 モジュールの経路だけで見え方が変わると、モジュールの
+  数や `instance_reuse` でフィルタの挙動が変わる（最適化は意味を変えない。ans-06 の 5-0・5-1）。全経路で見せるのは
+  [F-336](F-336-wasm-on-log-response-values.md) へ分けた。
+- ガイド（`docs/guide/wasm.md`・`ja/wasm.md` の `instance_reuse` の節）に、続けて呼ぶ条件・ログの段の時機・書き込みに失敗しても
+  `on_log` が呼ばれること・ログの段から見える値を書いた。
+- レビュー（Gemini）: `docs/artifacts/proxy-wasm-perf/gemini/ans-06-design-F-329.md`。must-fix 無し。should-fix の 1-1（専用スレッドを
+  起こす）・2-1（エクスポートの無い段の無駄）・5-1（見え方の食い違い）・6-1（試験）と、nit の 1-2（本文の段のトラップの燃料）・1-3
+  （書き換えた要求の行）・4-1（アクセスログの本文の大きさのコメント）・4-2（HTTP/2 の変えなかった本文の比較）を直した。4-1 は「応答の前に
+  本文を読み終えていた要求は本文の大きさ」に揃えた（応答の後に読み捨てる要求は今までどおり 0）。
+- 試験: `exports.rs`（本文の段の見え方・飛ばす・止める・エクスポートの無い段・書き換えた要求の行・ログの段のトラップ・本文の段の前の
+  燃料の入れ直し）、`tests.rs` の `f329_chained_request_tests`（段の回数・ローカル応答のログが 1 回・本文の段の Pause とトラップの
+  `failure_policy`・B-299・ログの段のトラップ・本文の書き換えと本文の段のヘッダ・続けて呼ばない経路）、`metering.rs`（上限を入れると
+  専用スレッドを起こす）、`h1.rs`（`body_in_hand` の境界）。
 
 ## 関連
 

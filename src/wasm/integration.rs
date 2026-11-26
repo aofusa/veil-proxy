@@ -39,7 +39,12 @@ pub fn empty_wasm_modules() -> crate::wasm_plugin_config::WasmModules {
 /// 要求の終わり（`on_log`）。`instance_reuse` のモジュールはここで要求の http context を消す（B-177）。
 /// エンジンは要求の並びが持つもの（要求の入口で置いた。B-501）
 pub async fn on_request_complete_async(modules: &crate::wasm_plugin_config::WasmModules) {
-    if modules.is_empty() {
+    // F-329: ローカル応答の要求は、要求の段の続きで `proxy_on_log`・`proxy_on_delete` を呼び終えている
+    if modules.is_empty()
+        || modules
+            .sessions()
+            .is_some_and(super::RequestSessions::logged)
+    {
         return;
     }
     if let Some(engine) = modules.engine() {

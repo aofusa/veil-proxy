@@ -2618,3 +2618,361 @@ mod f318_recycle_tests {
         assert!(Arc::ptr_eq(&ctx.shared_data, &shared));
     }
 }
+
+// F-329: 1 モジュールの `instance_reuse` のルートは、要求ヘッダ・本文（全量が手元にあるとき）・ローカル応答のログと
+// 削除の段を 1 回のファイバーの出入りで続けて呼ぶ。別に呼んでいたときと同じ結果になることをインラインの WAT で確かめる
+mod f329_chained_request_tests {
+    use crate::wasm::{
+        FailurePolicy, FilterEngine, FilterResult, ModuleCapabilities, ModuleConfig,
+        RequestSessions, WasmConfig,
+    };
+    use crate::wasm_plugin_config::ModuleRef;
+    use std::sync::Arc;
+
+    /// 段ごとの呼ばれた回数を数え、ローカル応答の本文に回数（context の作成・要求ヘッダ・要求本文・ログ・削除の各 1 桁）を
+    /// 書くモジュール。要求ヘッダの段はヘッダの数で、要求本文の段は本文の長さで振る舞いを変える:
+    ///
+    /// - ヘッダ 1 つ: 403 を返す。3 つ: トラップ。4 つ: 403 を返し、続くログの段でトラップする。5 つ: 403 を返して
+    ///   からトラップする（B-299）。それ以外: 続ける
+    /// - 本文 1 バイト: 413 を返す。2 バイト: Pause。3 バイト: トラップ。6 バイト: 要求ヘッダ `x-b` を足し、本文を `new`
+    ///   にする。それ以外: 続ける
+    const MODULE: &str = r#"(module
+  (import "env" "proxy_send_local_response"
+    (func $slr (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_add_header_map_value"
+    (func $add (param i32 i32 i32 i32 i32) (result i32)))
+  (import "env" "proxy_set_buffer_bytes"
+    (func $setbuf (param i32 i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 64) "x-b")
+  (data (i32.const 72) "1")
+  (data (i32.const 80) "new")
+  (global $create (mut i32) (i32.const 0))
+  (global $hdrs (mut i32) (i32.const 0))
+  (global $body (mut i32) (i32.const 0))
+  (global $log (mut i32) (i32.const 0))
+  (global $del (mut i32) (i32.const 0))
+  (global $trap_log (mut i32) (i32.const 0))
+  (func $report (param $status i32)
+    (i32.store8 (i32.const 0) (i32.add (i32.const 48) (global.get $create)))
+    (i32.store8 (i32.const 1) (i32.add (i32.const 48) (global.get $hdrs)))
+    (i32.store8 (i32.const 2) (i32.add (i32.const 48) (global.get $body)))
+    (i32.store8 (i32.const 3) (i32.add (i32.const 48) (global.get $log)))
+    (i32.store8 (i32.const 4) (i32.add (i32.const 48) (global.get $del)))
+    (drop (call $slr (local.get $status) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 5)
+      (i32.const 0) (i32.const 0) (i32.const 0))))
+  (func (export "proxy_on_context_create") (param i32 i32)
+    (global.set $create (i32.add (global.get $create) (i32.const 1))))
+  (func (export "proxy_on_vm_start") (param i32 i32) (result i32) (i32.const 1))
+  (func (export "proxy_on_configure") (param i32 i32) (result i32) (i32.const 1))
+  (func (export "proxy_on_request_headers") (param $c i32) (param $n i32) (param $eos i32) (result i32)
+    (global.set $hdrs (i32.add (global.get $hdrs) (i32.const 1)))
+    (if (i32.eq (local.get $n) (i32.const 3)) (then unreachable))
+    (if (i32.eq (local.get $n) (i32.const 4)) (then (global.set $trap_log (i32.const 1))))
+    (if (i32.or (i32.eq (local.get $n) (i32.const 1))
+          (i32.or (i32.eq (local.get $n) (i32.const 4)) (i32.eq (local.get $n) (i32.const 5))))
+      (then (call $report (i32.const 403))))
+    (if (i32.eq (local.get $n) (i32.const 5)) (then unreachable))
+    (i32.const 0))
+  (func (export "proxy_on_request_body") (param $c i32) (param $size i32) (param $eos i32) (result i32)
+    (global.set $body (i32.add (global.get $body) (i32.const 1)))
+    (if (i32.eq (local.get $size) (i32.const 3)) (then unreachable))
+    (if (i32.eq (local.get $size) (i32.const 1)) (then (call $report (i32.const 413))))
+    (if (i32.eq (local.get $size) (i32.const 6))
+      (then
+        (drop (call $add (i32.const 0) (i32.const 64) (i32.const 3) (i32.const 72) (i32.const 1)))
+        (drop (call $setbuf (i32.const 0) (i32.const 0) (local.get $size) (i32.const 80) (i32.const 3)))))
+    (i32.eq (local.get $size) (i32.const 2)))
+  (func (export "proxy_on_log") (param i32)
+    (global.set $log (i32.add (global.get $log) (i32.const 1)))
+    (if (global.get $trap_log) (then (global.set $trap_log (i32.const 0)) unreachable)))
+  (func (export "proxy_on_delete") (param i32)
+    (global.set $del (i32.add (global.get $del) (i32.const 1))))
+)"#;
+
+    struct Fixture {
+        engine: FilterEngine,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// `names` の数だけ同じモジュールを並べたエンジン
+    fn build(names: &[&str], reuse: bool, policy: Option<FailurePolicy>) -> Fixture {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "veil-f329-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.wat");
+        // 理由付き allow: テストのフィクスチャ作成（ホットパス外）。
+        #[allow(clippy::disallowed_methods)]
+        std::fs::write(&path, MODULE).unwrap();
+        let modules = names
+            .iter()
+            .map(|n| ModuleConfig {
+                name: n.to_string(),
+                path: path.to_string_lossy().into_owned(),
+                capabilities: ModuleCapabilities {
+                    allow_send_local_response: true,
+                    allow_request_headers_write: true,
+                    allow_request_body_read: true,
+                    allow_request_body_write: true,
+                    ..Default::default()
+                },
+                instance_reuse: reuse,
+                failure_policy: policy,
+                ..Default::default()
+            })
+            .collect();
+        let config = WasmConfig {
+            enabled: true,
+            defaults: Default::default(),
+            modules,
+            interpreter: false,
+            grpc_connect_timeout_ms: crate::wasm::DEFAULT_GRPC_CONNECT_TIMEOUT_MS,
+            http_call_max_timeout_ms: crate::wasm::DEFAULT_HTTP_CALL_MAX_TIMEOUT_MS,
+            shared_data_max_keys: crate::wasm::DEFAULT_SHARED_DATA_MAX_KEYS,
+            metering: Default::default(),
+        };
+        let engine = FilterEngine::new(&config).unwrap();
+        engine.validate().unwrap();
+        Fixture { engine, dir }
+    }
+
+    fn refs(names: &[&str]) -> Vec<ModuleRef> {
+        names.iter().map(|n| ModuleRef::from_name(n)).collect()
+    }
+
+    fn headers(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        (0..n)
+            .map(|i| (format!("x-{i}").into_bytes(), b"v".to_vec()))
+            .collect()
+    }
+
+    /// 本文の全量を持つ要求（ヘッダ `n_headers` 個）
+    fn with_body(
+        f: &Fixture,
+        names: &[&str],
+        n_headers: usize,
+        body: &'static [u8],
+        sessions: Option<&RequestSessions>,
+    ) -> FilterResult {
+        futures::executor::block_on(f.engine.on_request_with_body(
+            &refs(names),
+            &Arc::from("/p"),
+            &Arc::from("POST"),
+            headers(n_headers),
+            &Arc::from("127.0.0.1"),
+            bytes::Bytes::from_static(body),
+            sessions,
+        ))
+    }
+
+    /// 応答の後の `on_log`（要求の並びが「ログ済み」なら何もしない）
+    fn log(f: &Fixture, names: &[&str], sessions: &RequestSessions) {
+        futures::executor::block_on(f.engine.on_log_with_modules(&refs(names), Some(sessions)));
+    }
+
+    /// 403 を返す要求で、その時点の回数（作成・ヘッダ・本文・ログ・削除）を読む。この要求のログと削除も済ませる
+    fn counts(f: &Fixture) -> [u8; 5] {
+        let s = RequestSessions::default();
+        let r = with_body(f, &["m"], 1, b"xxxx", Some(&s));
+        assert!(s.logged());
+        log(f, &["m"], &s);
+        match r {
+            FilterResult::LocalResponse(resp) => {
+                assert_eq!(resp.status_code, 403);
+                let b: [u8; 5] = resp.body[..].try_into().unwrap();
+                b.map(|c| c - b'0')
+            }
+            FilterResult::Continue { .. } => panic!("expected the 403 with the counts"),
+        }
+    }
+
+    fn status(r: &FilterResult) -> Option<u16> {
+        match r {
+            FilterResult::LocalResponse(resp) => Some(resp.status_code),
+            FilterResult::Continue { .. } => None,
+        }
+    }
+
+    // 続く要求: ヘッダと本文の段を 1 回ずつ呼び、ヘッダと本文を返す。ログと削除は応答の後（今までと同じ）
+    #[test]
+    fn continued_request_runs_headers_and_body_once() {
+        let f = build(&["m"], true, None);
+        let base = counts(&f);
+        let s = RequestSessions::default();
+        match with_body(&f, &["m"], 2, b"hello", Some(&s)) {
+            FilterResult::Continue { headers: h, body } => {
+                assert_eq!(h, headers(2));
+                assert_eq!(body.as_deref(), Some(&b"hello"[..]));
+            }
+            FilterResult::LocalResponse(r) => panic!("unexpected {}", r.status_code),
+        }
+        assert!(!s.logged());
+        log(&f, &["m"], &s);
+        let now = counts(&f);
+        // 作成 +1（この要求）+1（`counts` の要求）、ヘッダ +2、本文 +1、ログ・削除 +1（この要求。`counts` の要求の分は
+        // 次の `counts` で数える）
+        assert_eq!(now[1] - base[1], 2);
+        assert_eq!(now[2] - base[2], 1);
+        assert_eq!(now[3] - base[3], 2, "{base:?} {now:?}");
+        assert_eq!(now[4] - base[4], 2, "{base:?} {now:?}");
+        assert_eq!(f.engine.pooled_instances("m"), 1);
+    }
+
+    // ローカル応答: ログと削除の段も続けて 1 回だけ呼ぶ（応答の後の `on_log` は何もしない）。本文の段は飛ばす
+    #[test]
+    fn local_response_is_logged_once_in_the_same_entry() {
+        let f = build(&["m"], true, None);
+        let base = counts(&f);
+        let s = RequestSessions::default();
+        let r = with_body(&f, &["m"], 1, b"hello", Some(&s));
+        assert_eq!(status(&r), Some(403));
+        assert!(s.logged());
+        log(&f, &["m"], &s);
+        log(&f, &["m"], &s);
+        let now = counts(&f);
+        assert_eq!(now[2], base[2], "the body phase is skipped");
+        // この要求と前の `counts` の要求の 2 回（どちらも 1 回ずつ）
+        assert_eq!(now[3] - base[3], 2, "{base:?} {now:?}");
+        assert_eq!(now[4] - base[4], 2, "{base:?} {now:?}");
+
+        // 本文の段のローカル応答も同じ
+        let s = RequestSessions::default();
+        let r = with_body(&f, &["m"], 2, b"x", Some(&s));
+        assert_eq!(status(&r), Some(413));
+        assert!(s.logged());
+        log(&f, &["m"], &s);
+        let after = counts(&f);
+        assert_eq!(after[2] - now[2], 1);
+        assert_eq!(after[3] - now[3], 2);
+        assert_eq!(after[4] - now[4], 2);
+    }
+
+    // 本文の段の Pause（待つものが無い）とトラップは今までどおり `failure_policy` に従う。拒否の応答はモジュールが決めた
+    // ものではないので、ログの段は応答の後に呼ぶ
+    #[test]
+    fn body_phase_failures_follow_the_policy() {
+        // Pause・トラップする本文
+        const BODIES: [&[u8]; 2] = [b"xx", b"xxx"];
+        let closed = build(&["m"], true, None);
+        for body in BODIES {
+            let s = RequestSessions::default();
+            let r = with_body(&closed, &["m"], 2, body, Some(&s));
+            assert_eq!(status(&r), Some(503), "{body:?}");
+            assert!(!s.logged());
+            log(&closed, &["m"], &s);
+        }
+        let open = build(&["m"], true, Some(FailurePolicy::FailOpen));
+        for body in BODIES {
+            let s = RequestSessions::default();
+            match with_body(&open, &["m"], 2, body, Some(&s)) {
+                // 失敗したモジュールを飛ばし、元の本文で続く
+                FilterResult::Continue { body: b, .. } => assert_eq!(b.as_deref(), Some(body)),
+                FilterResult::LocalResponse(r) => panic!("fail_open: {}", r.status_code),
+            }
+            assert!(!s.logged());
+            log(&open, &["m"], &s);
+        }
+        // ヘッダの段のトラップ
+        let s = RequestSessions::default();
+        assert_eq!(
+            status(&with_body(&closed, &["m"], 3, b"xxxx", Some(&s))),
+            Some(503)
+        );
+        assert!(!s.logged());
+    }
+
+    // 本文の段で変えた本文は上流へ届き、本文の段で足したヘッダは今までどおり届かない（本文の段に見せるヘッダは写し）。
+    // 段を別に呼ぶ経路（要求の並びが無い）と同じ
+    #[test]
+    fn body_phase_rewrites_the_body_but_not_the_upstream_headers() {
+        let f = build(&["m"], true, None);
+        let s = RequestSessions::default();
+        for sessions in [Some(&s), None] {
+            match with_body(&f, &["m"], 2, b"modify", sessions) {
+                FilterResult::Continue { headers: h, body } => {
+                    assert_eq!(h, headers(2));
+                    assert_eq!(body.as_deref(), Some(&b"new"[..]));
+                }
+                FilterResult::LocalResponse(r) => panic!("unexpected {}", r.status_code),
+            }
+        }
+        assert!(!s.logged());
+        log(&f, &["m"], &s);
+    }
+
+    // B-299: ヘッダの段がローカル応答を決めてからトラップしたら、応答は返すがログの段は続けて呼ばない（インスタンスは
+    // 捨て、ログの段は応答の後に新しいインスタンスで呼ぶ。今までと同じ）
+    #[test]
+    fn local_response_before_a_trap_is_logged_after_the_response() {
+        let f = build(&["m"], true, None);
+        let _ = counts(&f);
+        let s = RequestSessions::default();
+        assert_eq!(
+            status(&with_body(&f, &["m"], 5, b"xxxx", Some(&s))),
+            Some(403)
+        );
+        assert!(!s.logged());
+        assert_eq!(f.engine.pooled_instances("m"), 0);
+        log(&f, &["m"], &s);
+    }
+
+    // ログの段のトラップ: 決まった応答は返し、インスタンスは捨てる（`on_failure` は呼ばない）
+    #[test]
+    fn log_trap_still_sends_the_local_response_and_discards_the_instance() {
+        let f = build(&["m"], true, None);
+        let _ = counts(&f);
+        assert_eq!(f.engine.pooled_instances("m"), 1);
+        let s = RequestSessions::default();
+        let r = with_body(&f, &["m"], 4, b"xxxx", Some(&s));
+        assert_eq!(status(&r), Some(403));
+        assert!(s.logged());
+        assert_eq!(f.engine.pooled_instances("m"), 0);
+        // 次の要求は新しいインスタンス（回数は 0 から）
+        let now = counts(&f);
+        assert_eq!((now[1], now[2], now[3]), (1, 0, 0), "{now:?}");
+    }
+
+    // 続けて呼ばない経路（2 つ以上のモジュール・使い回さないモジュール・要求の並びが無い）は今までどおり段ごとに呼ぶ。
+    // ローカル応答のログは応答の後
+    #[test]
+    fn other_routes_keep_separate_calls() {
+        let two = build(&["m", "n"], true, None);
+        let s = RequestSessions::default();
+        match with_body(&two, &["m", "n"], 2, b"hello", Some(&s)) {
+            FilterResult::Continue { body, .. } => assert_eq!(body.as_deref(), Some(&b"hello"[..])),
+            FilterResult::LocalResponse(r) => panic!("unexpected {}", r.status_code),
+        }
+        let s = RequestSessions::default();
+        assert_eq!(
+            status(&with_body(&two, &["m", "n"], 1, b"hello", Some(&s))),
+            Some(403)
+        );
+        assert!(!s.logged());
+        log(&two, &["m", "n"], &s);
+
+        let fresh = build(&["m"], false, None);
+        let s = RequestSessions::default();
+        assert_eq!(
+            status(&with_body(&fresh, &["m"], 2, b"x", Some(&s))),
+            Some(413)
+        );
+        assert!(!s.logged());
+
+        let reuse = build(&["m"], true, None);
+        assert_eq!(status(&with_body(&reuse, &["m"], 2, b"x", None)), Some(413));
+        match with_body(&reuse, &["m"], 2, b"hello", None) {
+            FilterResult::Continue { body, .. } => assert_eq!(body.as_deref(), Some(&b"hello"[..])),
+            FilterResult::LocalResponse(r) => panic!("unexpected {}", r.status_code),
+        }
+    }
+}

@@ -216,6 +216,24 @@ run in a new HTTP context (the filter still runs, but state kept in the old cont
 configured instances per module (and per route `module_configuration`), up to half of the pooling allocator's
 `total_memories` divided among the workers and the modules with `instance_reuse`.
 
+On a route with one module and `instance_reuse = true`, veil runs the callbacks of a request in as few entries into the
+module as it can (each entry has a fixed cost that matters for small requests):
+
+- When the whole request body is already in hand with the request headers (an HTTP/1.1 body with `Content-Length`, or a
+  chunked body, that arrived together with the headers and without `Expect: 100-continue`; an HTTP/2 or HTTP/3 request
+  without trailers), `on_http_request_headers` and `on_http_request_body` run back to back. The filter sees the same
+  values as when they run separately: the body phase sees the request headers as they were after the headers phase, and
+  header changes made in the body phase are not forwarded upstream.
+- When the request phases answer with a local response, `on_log` and `proxy_on_delete` run right after them, before veil
+  writes the response (on HTTP/3, before the response is handed to the connection). `on_log` therefore runs even when
+  writing the response fails, as Envoy logs every stream.
+- A request that waits for an `http_call` or a gRPC call, or whose filter changes `request.path` or `request.method` with
+  `set_property`, continues phase by phase. Routes with several modules always do, so that a phase runs for every module
+  before the next phase starts.
+
+The order and the arguments of the callbacks are the same either way. On every route, `on_log` sees the request's
+pseudo-headers and properties but not its other headers, its body or the client address, and `response.code` is `0`.
+
 ### Answering Requests from a Filter (`Respond` + modules)
 
 A `type = "Respond"` route can carry `modules`. If a filter answers with `send_local_response`, veil returns

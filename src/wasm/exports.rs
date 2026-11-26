@@ -13,6 +13,7 @@ use wasmtime::{Caller, Func, Instance, Memory, Store, TypedFunc, ValRaw, WasmPar
 
 use super::context::HostState;
 use super::metering::{Limits, Window};
+use super::types::LocalResponse;
 
 /// 1 つのエクスポートの状態
 #[derive(Default)]
@@ -47,15 +48,29 @@ pub(crate) struct GuestExports {
     memory: Option<Memory>,
     /// 段を続けて呼ぶホスト関数（ストアごとに 1 つ。初めて使うときに作る。[`call_chain`]）
     chain: Export<(), ()>,
-    /// [`call_chain`] とホスト関数が受け渡す段・入れ直す上限（`metering::arm`）・結果
-    chain_steps: [Option<Step>; MAX_STEPS],
-    chain_arm: Option<(Limits, Window)>,
-    chain_done: usize,
-    chain_values: [Option<i32>; MAX_STEPS],
+    /// [`call_chain`] とホスト関数が受け渡すもの
+    chain_io: ChainIo,
 }
 
-/// 1 回のファイバーの出入りで続けて呼べる段の数
-pub(crate) const MAX_STEPS: usize = 3;
+/// [`call_chain`] とホスト関数（[`run_chain`]）が受け渡す段・入れ直す上限（`metering::arm`）・結果
+#[derive(Default)]
+struct ChainIo {
+    steps: [Option<Step>; MAX_STEPS],
+    arm: Option<(Limits, Window)>,
+    done: usize,
+    values: [Option<i32>; MAX_STEPS],
+    fuel: [Option<u64>; MAX_STEPS],
+    skipped: u8,
+    /// `RequestBody` の段で context に置く本文
+    body: Option<bytes::Bytes>,
+    /// `RequestBody` の段の前の要求ヘッダ（上流へ送るもの）
+    upstream_headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    /// `LogLocal` の段の前に context から取り出したローカル応答
+    local: Option<LocalResponse>,
+}
+
+/// 1 回のファイバーの出入りで続けて呼べる段の数（作成・ヘッダ・本文・ログ・削除）
+pub(crate) const MAX_STEPS: usize = 5;
 
 /// 1 回のファイバーの出入りで続けて呼ぶコールバック（[`call_chain`]）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,19 +79,63 @@ pub(crate) enum Step {
     ContextCreate(i32, i32),
     /// `proxy_on_request_headers(context_id, num_headers, end_of_stream)`
     RequestHeaders(i32, i32, i32),
+    /// `proxy_on_request_body(context_id, body_size, 1)`（本文の全量。F-329）。要求がまだ続く（ローカル応答が決まって
+    /// おらず、保留の外部呼び出しが無い）ときだけ呼ぶ。呼ぶ前に、燃料と締切を入れ直し、上流へ送る要求ヘッダを
+    /// [`Chain::upstream_headers`] へ移してその写しを context に置き（本文の段のヘッダの書き換えは上流へ届かない）、
+    /// [`call_chain`] に預けた本文を置く（ヘッダの段からは本文が見えない）。別の呼び出しで呼んでいたときと同じ
+    RequestBody(i32, i32),
     /// `proxy_on_log(context_id)`
     Log(i32),
+    /// ローカル応答の要求の `proxy_on_log(context_id)`（F-329）。ローカル応答が決まっていて、保留の外部呼び出しが無い
+    /// ときだけ呼ぶ。呼ぶ前に、燃料と締切を入れ直し、ローカル応答を [`Chain::local`] へ取り出し（ログの段で
+    /// `proxy_send_local_response` を呼ばれても決まった応答は変わらない）、context を応答の後のログの段と同じ見え方に
+    /// する（[`super::context::HttpContext::enter_log`]）
+    LogLocal(i32),
     /// `proxy_on_delete(context_id)`。前に段があれば燃料と締切を入れ直してから呼ぶ（別に呼んでいたときと同じ）
     Delete(i32),
 }
 
 /// [`call_chain`] の結果
 pub(crate) struct Chain {
-    /// 終わった段の数。`error` があれば、この番号の段（段に入る前の失敗も含む）で止まった
+    /// 終わった（飛ばしたものを含む）段の数。`error` があれば、この番号の段（段に入る前の失敗も含む）で止まった。
+    /// `error` が無く段の数より小さければ、この番号の段（`RequestBody`・`LogLocal`）の条件を満たさずにそこで止めた
+    /// （以後の段は呼んでいない）
     pub(crate) done: usize,
-    /// 段の戻り値（`proxy_on_request_headers` の action。戻り値の無い段・エクスポートの無い段は `None`）
+    /// 条件を満たさずに飛ばした段（ビット `i` が段 `i`。`RequestBody` はローカル応答が決まっていれば飛ばして次の段へ進む）
+    pub(crate) skipped: u8,
+    /// 段の戻り値（`proxy_on_request_headers`・`proxy_on_request_body` の action。戻り値の無い段・エクスポートの無い段は `None`）
     pub(crate) values: [Option<i32>; MAX_STEPS],
+    /// 段を終えた時点で、最後に上限を入れてから使った燃料（`fuel` のときだけ。段の燃料のメトリクス）
+    pub(crate) fuel: [Option<u64>; MAX_STEPS],
     pub(crate) error: Option<anyhow::Error>,
+    /// `RequestBody` の段に入ったときの、上流へ送る要求ヘッダ（ヘッダの段の後のもの）
+    pub(crate) upstream_headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    /// `LogLocal` の段に入ったときの、決まっていたローカル応答
+    pub(crate) local: Option<LocalResponse>,
+}
+
+impl Chain {
+    fn failed(e: anyhow::Error) -> Self {
+        Chain {
+            done: 0,
+            skipped: 0,
+            values: [None; MAX_STEPS],
+            fuel: [None; MAX_STEPS],
+            error: Some(e),
+            upstream_headers: None,
+            local: None,
+        }
+    }
+
+    /// 段 `i` を呼んだ（終えたか、そこで失敗した）か
+    pub(crate) fn entered(&self, i: usize) -> bool {
+        (self.done > i || (self.done == i && self.error.is_some())) && self.skipped & (1 << i) == 0
+    }
+
+    /// 段 `i` を呼んで終えたか
+    pub(crate) fn completed(&self, i: usize) -> bool {
+        self.done > i && self.skipped & (1 << i) == 0
+    }
 }
 
 /// [`GuestExports`] のどのエクスポートか
@@ -212,12 +271,16 @@ where
 ///   （続けて呼ぶと wasmtime の後始末の再開〈1 回で終わる前提〉の後にまた止まる）。
 /// - ゲストに入るたびにスタックの上限を測り直すので、段と確保関数の入れ子は今と同じ 2 段に収まる
 ///   （`registry::ASYNC_STACK_SIZE`）。
-/// - `Delete` の前に燃料と締切を `arm`（fuel, エポックの締切）で入れ直す（別に呼んでいたときと同じ上限）。
+/// - `RequestBody`・`LogLocal`・`Delete`（最初の段でなければ）の前に燃料と締切を `arm`（fuel, エポックの締切）で入れ直す
+///   （別に呼んでいたときと同じ上限）。
+/// - `RequestBody`・`LogLocal` は条件つきの段（[`Step`]）。満たさなければそこで止める（エラーではない）。
+/// - `body` は `RequestBody` の段で context に置く本文。
 pub(crate) async fn call_chain(
     store: &mut Store<HostState>,
     instance: Instance,
     steps: &[Step],
     arm: (Limits, Window),
+    body: Option<bytes::Bytes>,
 ) -> Chain {
     // ホスト関数の中では呼び出し元のインスタンスを引けないので、段のエクスポートを先に引いておく
     for step in steps {
@@ -234,7 +297,15 @@ pub(crate) async fn call_chain(
                 |e| &mut e.on_request_headers,
                 "proxy_on_request_headers",
             ),
-            Step::Log(_) => resolve(store, instance, |e| &mut e.on_log, "proxy_on_log"),
+            Step::RequestBody(..) => resolve(
+                store,
+                instance,
+                |e| &mut e.on_request_body,
+                "proxy_on_request_body",
+            ),
+            Step::Log(_) | Step::LogLocal(_) => {
+                resolve(store, instance, |e| &mut e.on_log, "proxy_on_log")
+            }
             Step::Delete(_) => resolve(store, instance, |e| &mut e.on_delete, "proxy_on_delete"),
         }
     }
@@ -242,55 +313,144 @@ pub(crate) async fn call_chain(
         Export::Present(f) => f,
         _ => match Func::wrap(&mut *store, run_chain).typed::<(), ()>(&*store) {
             Ok(f) => f,
-            Err(e) => {
-                return Chain {
-                    done: 0,
-                    values: [None; MAX_STEPS],
-                    error: Some(e),
-                }
-            }
+            Err(e) => return Chain::failed(e),
         },
     };
     {
-        let e = &mut store.data_mut().exports;
-        e.chain_steps = [None; MAX_STEPS];
-        for (slot, step) in e.chain_steps.iter_mut().zip(steps) {
+        let io = &mut store.data_mut().exports.chain_io;
+        *io = ChainIo::default();
+        for (slot, step) in io.steps.iter_mut().zip(steps) {
             *slot = Some(*step);
         }
-        e.chain_arm = Some(arm);
-        e.chain_done = 0;
-        e.chain_values = [None; MAX_STEPS];
+        io.arm = Some(arm);
+        io.body = body;
     }
     let r = chain.call_async(&mut *store, ()).await;
     let e = &mut store.data_mut().exports;
     e.chain = Export::Present(chain);
-    e.chain_steps = [None; MAX_STEPS];
+    let io = std::mem::take(&mut e.chain_io);
     Chain {
-        done: e.chain_done,
-        values: e.chain_values,
+        done: io.done,
+        skipped: io.skipped,
+        values: io.values,
+        fuel: io.fuel,
         error: r.err(),
+        upstream_headers: io.upstream_headers,
+        local: io.local,
     }
 }
 
 /// [`call_chain`] のホスト関数（ファイバーの上で段を続けて呼ぶ）
 fn run_chain(mut caller: Caller<'_, HostState>) -> anyhow::Result<()> {
-    let steps = caller.data().exports.chain_steps;
-    let arm = caller.data().exports.chain_arm;
+    let steps = caller.data().exports.chain_io.steps;
+    let arm = caller.data().exports.chain_io.arm;
     for (i, step) in steps.into_iter().enumerate() {
         let Some(step) = step else {
             break;
         };
-        if i > 0 && matches!(step, Step::Delete(_)) {
+        let rearm = match step {
+            Step::RequestBody(..) | Step::LogLocal(_) => match enter_step(&mut caller, step) {
+                Enter::Run => true,
+                Enter::Pass => {
+                    // 呼ばずに終えた（燃料のメトリクスは別に呼んでいたときと同じく 0）
+                    let io = &mut caller.data_mut().exports.chain_io;
+                    io.fuel[i] = arm.and_then(|(limits, _)| limits.uses_fuel().then_some(0));
+                    io.done = i + 1;
+                    continue;
+                }
+                Enter::Skip => {
+                    let io = &mut caller.data_mut().exports.chain_io;
+                    io.skipped |= 1 << i;
+                    io.done = i + 1;
+                    continue;
+                }
+                Enter::Stop => break,
+            },
+            // エクスポートが無ければ呼ばないので入れ直さない
+            Step::Delete(_) => i > 0 && present(&caller.data().exports.on_delete).is_some(),
+            _ => false,
+        };
+        if rearm {
             if let Some((limits, window)) = arm {
                 super::metering::arm(&mut caller, &limits, window)?;
             }
         }
-        let value = run_step(&mut caller, step)?;
-        let e = &mut caller.data_mut().exports;
-        e.chain_values[i] = value;
-        e.chain_done = i + 1;
+        let r = run_step(&mut caller, step);
+        // 段が失敗しても燃料は記録する（本文の段を別に呼んでいたときはトラップでも記録した）
+        let fuel = arm.and_then(|(limits, _)| super::metering::fuel_consumed(&caller, &limits));
+        let io = &mut caller.data_mut().exports.chain_io;
+        io.fuel[i] = fuel;
+        io.values[i] = r?;
+        io.done = i + 1;
     }
     Ok(())
+}
+
+/// 条件つきの段をどうするか（[`enter_step`]）
+enum Enter {
+    /// 呼ぶ（context は段の前の状態にした）
+    Run,
+    /// 段を終えたことにして次の段へ進む（エクスポートが無い。別に呼んでいたときも何もせずに続けた）
+    Pass,
+    /// 呼ばずに次の段へ進む（段を終えたことにはしない）
+    Skip,
+    /// ここで止める（以後の段も呼ばない）
+    Stop,
+}
+
+/// 条件つきの段（[`Step::RequestBody`]・[`Step::LogLocal`]）の条件を見て、呼ぶなら context を段の前の状態にする
+/// （止める・飛ばすなら何も変えない）。
+///
+/// - 保留の外部呼び出しがあれば止める（呼び出し元が今の経路で解決して続ける）。ゲストが要求のパス・メソッドを書き換えて
+///   いても止める（別に呼んでいたときは段ごとに元の値へ戻っていた。今の経路で続けて同じ見え方にする）。
+/// - 本文の段は、ローカル応答が決まっていれば飛ばす（続くログの段がその応答を記録する）。
+/// - エクスポートの無い段は、context を作り直さず（ヘッダを写さず）に終えたことにする。
+fn enter_step(caller: &mut Caller<'_, HostState>, step: Step) -> Enter {
+    let state = caller.data_mut();
+    let ctx = &mut state.http_ctx;
+    if ctx.has_pending_calls() || ctx.request_line_overridden {
+        return Enter::Stop;
+    }
+    let exports = &mut state.exports;
+    match step {
+        Step::RequestBody(..) => {
+            if ctx.local_response.is_some() {
+                return Enter::Skip;
+            }
+            if exports.chain_io.body.is_none() {
+                return Enter::Stop;
+            }
+            // 上流へ送るのはヘッダの段の後のヘッダ
+            let headers = std::mem::take(&mut ctx.request_headers);
+            if present(&exports.on_request_body).is_none() {
+                // ヘッダの段で本文のバッファに書いていても、本文は変えていない
+                ctx.request_body_modified = false;
+                exports.chain_io.body = None;
+                exports.chain_io.upstream_headers = Some(headers);
+                return Enter::Pass;
+            }
+            let body = exports.chain_io.body.take().unwrap_or_default();
+            // 本文の段には写しを見せる（別に呼んでいたときの `to_vec()` と同じ。本文の段でのヘッダの書き換えは上流へ
+            // 届かない）
+            ctx.enter_request_body(headers.clone(), body);
+            exports.chain_io.upstream_headers = Some(headers);
+            Enter::Run
+        }
+        Step::LogLocal(_) => {
+            // 決まった応答は取り出しておく（ログの段の `proxy_send_local_response` は応答を変えない。別に呼んでいたときも
+            // 応答を書いた後で、捨てられていた）
+            let Some(local) = ctx.local_response.take() else {
+                return Enter::Stop;
+            };
+            exports.chain_io.local = Some(local);
+            if present(&exports.on_log).is_none() {
+                return Enter::Pass;
+            }
+            ctx.enter_log();
+            Enter::Run
+        }
+        _ => Enter::Run,
+    }
 }
 
 /// 1 つの段を今のファイバーの上で呼ぶ（エクスポートが無ければ呼ばずに `None`）
@@ -299,7 +459,8 @@ fn run_step(caller: &mut Caller<'_, HostState>, step: Step) -> anyhow::Result<Op
     let (func, args, params, result) = match step {
         Step::ContextCreate(c, p) => (present(&e.on_context_create), [c, p, 0], 2, false),
         Step::RequestHeaders(c, n, eos) => (present(&e.on_request_headers), [c, n, eos], 3, true),
-        Step::Log(c) => (present(&e.on_log), [c, 0, 0], 1, false),
+        Step::RequestBody(c, n) => (present(&e.on_request_body), [c, n, 1], 3, true),
+        Step::Log(c) | Step::LogLocal(c) => (present(&e.on_log), [c, 0, 0], 1, false),
         Step::Delete(c) => (present(&e.on_delete), [c, 0, 0], 1, false),
     };
     let Some(func) = func else {
@@ -308,7 +469,8 @@ fn run_step(caller: &mut Caller<'_, HostState>, step: Step) -> anyhow::Result<Op
     let mut vals = args.map(ValRaw::i32);
     let vals: &mut [ValRaw] = &mut vals[..params];
     // SAFETY: `func` はこのストアのインスタンスのエクスポートで、段の型（`ContextCreate` は `(i32, i32) -> ()`、
-    // `RequestHeaders` は `(i32, i32, i32) -> i32`、`Log`・`Delete` は `(i32) -> ()`）であることを `typed` で確かめてある
+    // `RequestHeaders`・`RequestBody` は `(i32, i32, i32) -> i32`、`Log`・`LogLocal`・`Delete` は `(i32) -> ()`）であることを
+    // `typed` で確かめてある
     // （`resolve`。型が合わなければ `Absent` で呼ばない）。`vals` の長さは引数の数で、戻り値（0〜1 個）より短くない。
     unsafe { func.call_unchecked(&mut *caller, vals) }?;
     Ok(result.then(|| vals[0].get_i32()))
@@ -624,8 +786,9 @@ mod tests {
         assert!(!store.data().exports.allocating);
     }
 
-    /// 呼ばれた順を `trace` に 10 進で積むモジュール（context_create=1・request_headers=2・log=3・delete=4）。
-    /// `proxy_on_request_headers` は context の ID を action として返し、`proxy_on_log` は context 9 でトラップする。
+    /// 呼ばれた順を `trace` に 10 進で積むモジュール（context_create=1・request_headers=2・log=3・delete=4・request_body=5）。
+    /// `proxy_on_request_headers` は context の ID を、`proxy_on_request_body` は `本文の長さ * 10 + end_of_stream` を action
+    /// として返し、`proxy_on_log` は context 9 でトラップする。
     /// `$spin` は fuel を使う（fuel の区切りを試す）
     const CHAIN_MODULE: &str = r#"(module
       (memory (export "memory") 1)
@@ -643,6 +806,9 @@ mod tests {
         (call $spin) (call $push (i32.const 1)))
       (func (export "proxy_on_request_headers") (param $c i32) (param i32 i32) (result i32)
         (call $spin) (call $push (i32.const 2)) (local.get $c))
+      (func (export "proxy_on_request_body") (param $c i32) (param $n i32) (param $eos i32) (result i32)
+        (call $spin) (call $push (i32.const 5))
+        (i32.add (i32.mul (local.get $n) (i32.const 10)) (local.get $eos)))
       (func (export "proxy_on_log") (param $c i32)
         (if (i32.eq (local.get $c) (i32.const 9)) (then unreachable))
         (call $spin) (call $push (i32.const 3)))
@@ -693,7 +859,7 @@ mod tests {
     fn chain_runs_the_steps_in_order_and_resumes_after_yields() {
         let (mut store, instance) = chain_instance(100);
         let steps = [Step::ContextCreate(5, 1), Step::RequestHeaders(5, 3, 1)];
-        let (chain, pending) = poll_to_end(call_chain(&mut store, instance, &steps, arm()));
+        let (chain, pending) = poll_to_end(call_chain(&mut store, instance, &steps, arm(), None));
         assert!(chain.error.is_none(), "{:?}", chain.error);
         assert_eq!(chain.done, 2);
         assert_eq!(chain.values[..2], [None, Some(5)]);
@@ -702,7 +868,7 @@ mod tests {
         assert!(matches!(store.data().exports.chain, Export::Present(_)));
 
         let steps = [Step::Log(5), Step::Delete(5)];
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm()));
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm(), None));
         assert!(chain.error.is_none());
         assert_eq!(chain.done, 2);
         assert_eq!(trace(&mut store, instance), 1234);
@@ -713,7 +879,7 @@ mod tests {
     fn chain_stops_at_the_first_error() {
         let (mut store, instance) = chain_instance(1_000_000);
         let steps = [Step::ContextCreate(9, 1), Step::Log(9), Step::Delete(9)];
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm()));
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm(), None));
         let e = chain.error.expect("proxy_on_log traps");
         assert!(
             matches!(
@@ -732,7 +898,7 @@ mod tests {
         let (mut store, instance) = chain_instance(1_000_000);
         store.data_mut().exports.on_log = Export::Absent;
         let steps = [Step::Log(5), Step::Delete(5)];
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm()));
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm(), None));
         assert!(chain.error.is_none());
         assert_eq!(chain.done, 2);
         assert_eq!(chain.values[..2], [None, None]);
@@ -744,7 +910,13 @@ mod tests {
     fn chain_rearms_fuel_before_delete() {
         let (mut store, instance) = chain_instance(1_000_000);
         // 1 段が使う燃料を測り、その 1.5 倍だけ入れる: 1 段は走れるが、続けて 2 段は走れない
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &[Step::Log(5)], arm()));
+        let (chain, _) = poll_to_end(call_chain(
+            &mut store,
+            instance,
+            &[Step::Log(5)],
+            arm(),
+            None,
+        ));
         assert!(chain.error.is_none());
         let fuel = (1_000_000_000 - store.get_fuel().unwrap()) * 3 / 2;
         let reset = instance
@@ -759,6 +931,7 @@ mod tests {
             instance,
             &steps,
             fuel_arm(fuel, 1_000_000),
+            None,
         ));
         assert!(chain.error.is_none(), "{:?}", chain.error);
         assert_eq!(trace(&mut store, instance), 34);
@@ -773,6 +946,7 @@ mod tests {
             instance,
             &steps,
             fuel_arm(fuel, 1_000_000),
+            None,
         ));
         assert!(matches!(
             chain
@@ -790,7 +964,7 @@ mod tests {
         let (mut store, instance) = chain_instance(100);
         {
             let steps = [Step::ContextCreate(5, 1), Step::RequestHeaders(5, 3, 1)];
-            let mut f = Box::pin(call_chain(&mut store, instance, &steps, arm()));
+            let mut f = Box::pin(call_chain(&mut store, instance, &steps, arm(), None));
             let waker = futures::task::noop_waker();
             let mut cx = std::task::Context::from_waker(&waker);
             assert!(std::future::Future::poll(f.as_mut(), &mut cx).is_pending());
@@ -798,7 +972,7 @@ mod tests {
         // 取り出していたホスト関数は戻らない（次に作り直す）
         assert!(!matches!(store.data().exports.chain, Export::Present(_)));
         let steps = [Step::Log(5)];
-        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm()));
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm(), None));
         assert!(chain.error.is_none(), "{:?}", chain.error);
         assert_eq!(chain.done, 1);
     }
@@ -819,5 +993,258 @@ mod tests {
         // ストアは続けて使える
         let (r, _) = poll_to_end(run.call_async(&mut store, 8));
         assert!(r.unwrap() >= 1024);
+    }
+
+    fn local(status: u16) -> crate::wasm::types::LocalResponse {
+        crate::wasm::types::LocalResponse {
+            status_code: status,
+            headers: vec![(b"x".to_vec(), b"y".to_vec())],
+            body: b"denied".to_vec(),
+        }
+    }
+
+    // F-329: 本文の段は預けた本文を全量（end_of_stream = 1）で見る。context はヘッダの段で置いた値を消して本文の段を別に
+    // 呼んでいたときと同じ見え方にし（ヘッダは写し）、上流へ送るヘッダ（ヘッダの段の後）は別に返す
+    #[test]
+    fn chain_body_step_sees_the_body_like_a_separate_call() {
+        let (mut store, instance) = chain_instance(100);
+        {
+            let ctx = &mut store.data_mut().http_ctx;
+            ctx.request_headers = vec![(b"a".to_vec(), b"1".to_vec())];
+            ctx.request_headers_modified = true;
+            ctx.client_ip = std::sync::Arc::from("192.0.2.1");
+            ctx.custom_properties.insert("k".into(), b"v".to_vec());
+        }
+        let steps = [Step::RequestHeaders(5, 1, 0), Step::RequestBody(5, 3)];
+        let body = bytes::Bytes::from_static(b"abc");
+        let (chain, pending) =
+            poll_to_end(call_chain(&mut store, instance, &steps, arm(), Some(body)));
+        assert!(chain.error.is_none(), "{:?}", chain.error);
+        assert!(pending > 0);
+        assert_eq!(chain.done, 2);
+        assert_eq!(chain.values[..2], [Some(5), Some(31)]);
+        assert!(chain.completed(0) && chain.completed(1) && chain.entered(1));
+        assert!(chain.fuel[0].is_some_and(|f| f > 0) && chain.fuel[1].is_some_and(|f| f > 0));
+        assert_eq!(
+            chain.upstream_headers,
+            Some(vec![(b"a".to_vec(), b"1".to_vec())])
+        );
+        assert!(chain.local.is_none());
+        assert_eq!(trace(&mut store, instance), 25);
+        let ctx = &store.data().http_ctx;
+        assert_eq!(ctx.request_body.as_slice(), b"abc");
+        assert!(ctx.request_body_complete);
+        assert_eq!(ctx.request_headers, vec![(b"a".to_vec(), b"1".to_vec())]);
+        assert!(!ctx.request_headers_modified && ctx.custom_properties.is_empty());
+        assert_eq!(&*ctx.client_ip, "192.0.2.1");
+        assert_eq!(ctx.context_id, 1);
+    }
+
+    // ローカル応答が決まっていれば本文の段は飛ばし、ログの段は応答を取り出してから呼ぶ（context は要求の属性だけ）。
+    // 削除の段も続けて呼ぶ
+    #[test]
+    fn chain_skips_the_body_after_a_local_response_and_logs_it() {
+        let (mut store, instance) = chain_instance(1_000_000);
+        {
+            let ctx = &mut store.data_mut().http_ctx;
+            ctx.local_response = Some(local(401));
+            ctx.request_headers = vec![(b"a".to_vec(), b"1".to_vec())];
+            ctx.client_ip = std::sync::Arc::from("192.0.2.1");
+            ctx.set_request_line(std::sync::Arc::from("POST"), std::sync::Arc::from("/p?q=1"));
+        }
+        let steps = [Step::RequestBody(5, 3), Step::LogLocal(5), Step::Delete(5)];
+        let (chain, _) = poll_to_end(call_chain(
+            &mut store,
+            instance,
+            &steps,
+            arm(),
+            Some(bytes::Bytes::from_static(b"abc")),
+        ));
+        assert!(chain.error.is_none(), "{:?}", chain.error);
+        assert_eq!(chain.done, 3);
+        assert!(!chain.entered(0) && !chain.completed(0));
+        assert!(chain.completed(1) && chain.completed(2));
+        assert!(chain.upstream_headers.is_none());
+        let l = chain.local.expect("the local response is taken out");
+        assert_eq!((l.status_code, &l.body[..]), (401, &b"denied"[..]));
+        assert_eq!(trace(&mut store, instance), 34);
+        let ctx = &store.data().http_ctx;
+        assert!(ctx.local_response.is_none() && ctx.request_headers.is_empty());
+        assert!(ctx.client_ip.is_empty() && ctx.request_body.is_empty());
+        assert_eq!(
+            (&*ctx.request_method, &*ctx.request_path),
+            ("POST", "/p?q=1")
+        );
+        assert_eq!(ctx.response_status, 0);
+    }
+
+    // 保留の外部呼び出しがあれば条件つきの段の前で止める（呼び出し元が今の経路で解決して続ける）。本文も context も変えない
+    #[test]
+    fn chain_stops_before_conditional_steps_while_calls_are_pending() {
+        let (mut store, instance) = chain_instance(1_000_000);
+        store.data_mut().http_ctx.pending_http_calls.insert(
+            7,
+            crate::wasm::types::PendingHttpCall {
+                token: 7,
+                upstream: "up".into(),
+                timeout_ms: 1000,
+                headers: Vec::new(),
+                body: Vec::new(),
+                trailers: Vec::new(),
+            },
+        );
+        store.data_mut().http_ctx.local_response = Some(local(403));
+        let steps = [
+            Step::RequestHeaders(5, 1, 0),
+            Step::RequestBody(5, 3),
+            Step::LogLocal(5),
+            Step::Delete(5),
+        ];
+        let (chain, _) = poll_to_end(call_chain(
+            &mut store,
+            instance,
+            &steps,
+            arm(),
+            Some(bytes::Bytes::from_static(b"abc")),
+        ));
+        assert!(chain.error.is_none(), "{:?}", chain.error);
+        assert_eq!(chain.done, 1);
+        assert!(!chain.entered(1) && !chain.entered(2));
+        assert!(chain.local.is_none() && chain.upstream_headers.is_none());
+        assert_eq!(trace(&mut store, instance), 2);
+        let ctx = &store.data().http_ctx;
+        assert!(ctx.local_response.is_some() && ctx.request_body.is_empty());
+    }
+
+    // ローカル応答が無ければログの段で止める（後の削除の段も呼ばない）。本文が無ければ本文の段で止める
+    #[test]
+    fn chain_stops_at_conditional_steps_without_their_input() {
+        let (mut store, instance) = chain_instance(1_000_000);
+        let steps = [
+            Step::RequestHeaders(5, 1, 0),
+            Step::LogLocal(5),
+            Step::Delete(5),
+        ];
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm(), None));
+        assert!(chain.error.is_none());
+        assert_eq!(chain.done, 1);
+        assert!(chain.local.is_none());
+        assert_eq!(trace(&mut store, instance), 2);
+
+        let steps = [Step::RequestBody(5, 3), Step::Delete(5)];
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm(), None));
+        assert!(chain.error.is_none());
+        assert_eq!(chain.done, 0);
+        assert!(!chain.entered(0));
+        assert_eq!(trace(&mut store, instance), 2);
+    }
+
+    // ログの段のトラップ: 応答は取り出してあり、`done` はログの段（削除の段は呼ばない）
+    #[test]
+    fn chain_log_local_trap_keeps_the_local_response() {
+        let (mut store, instance) = chain_instance(1_000_000);
+        store.data_mut().http_ctx.local_response = Some(local(429));
+        let steps = [
+            Step::RequestHeaders(9, 1, 1),
+            Step::LogLocal(9),
+            Step::Delete(9),
+        ];
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm(), None));
+        assert!(chain.error.is_some());
+        assert_eq!(chain.done, 1);
+        assert!(chain.entered(1) && !chain.completed(1));
+        assert_eq!(chain.local.map(|l| l.status_code), Some(429));
+        assert_eq!(trace(&mut store, instance), 2);
+    }
+
+    // エクスポートの無い段は呼ばずに終えたことにする: 本文の段は context を作り直さずに上流のヘッダを返し、ログの段は
+    // 応答を取り出すだけ（どちらも context を作り直さない）
+    #[test]
+    fn chain_passes_steps_without_exports() {
+        let (mut store, instance) = chain_instance(1_000_000);
+        store.data_mut().exports.on_request_body = Export::Absent;
+        store.data_mut().exports.on_log = Export::Absent;
+        {
+            let ctx = &mut store.data_mut().http_ctx;
+            ctx.request_headers = vec![(b"a".to_vec(), b"1".to_vec())];
+            ctx.client_ip = std::sync::Arc::from("192.0.2.1");
+            // ヘッダの段で本文のバッファに書いていても本文は変えていない
+            ctx.request_body_modified = true;
+        }
+        let steps = [Step::RequestHeaders(5, 1, 0), Step::RequestBody(5, 3)];
+        let (chain, _) = poll_to_end(call_chain(
+            &mut store,
+            instance,
+            &steps,
+            arm(),
+            Some(bytes::Bytes::from_static(b"abc")),
+        ));
+        assert!(chain.error.is_none(), "{:?}", chain.error);
+        assert_eq!(chain.done, 2);
+        assert!(chain.completed(1));
+        assert_eq!(chain.values[..2], [Some(5), None]);
+        assert_eq!(chain.fuel[1], Some(0));
+        assert_eq!(
+            chain.upstream_headers,
+            Some(vec![(b"a".to_vec(), b"1".to_vec())])
+        );
+        assert_eq!(trace(&mut store, instance), 2);
+        let ctx = &store.data().http_ctx;
+        assert!(!ctx.request_body_modified && ctx.request_body.is_empty());
+        assert_eq!(&*ctx.client_ip, "192.0.2.1");
+
+        store.data_mut().http_ctx.local_response = Some(local(401));
+        let steps = [Step::LogLocal(5), Step::Delete(5)];
+        let (chain, _) = poll_to_end(call_chain(&mut store, instance, &steps, arm(), None));
+        assert!(chain.error.is_none());
+        assert_eq!(chain.done, 2);
+        assert_eq!(chain.local.map(|l| l.status_code), Some(401));
+        assert_eq!(trace(&mut store, instance), 24);
+        assert_eq!(&*store.data().http_ctx.client_ip, "192.0.2.1");
+    }
+
+    // ゲストが要求のパス・メソッドを書き換えたら条件つきの段の前で止める（呼び出し元の今の経路が段ごとに元の値へ戻す）
+    #[test]
+    fn chain_stops_after_the_request_line_is_overridden() {
+        let (mut store, instance) = chain_instance(1_000_000);
+        store.data_mut().http_ctx.request_line_overridden = true;
+        let steps = [Step::RequestHeaders(5, 1, 0), Step::RequestBody(5, 3)];
+        let (chain, _) = poll_to_end(call_chain(
+            &mut store,
+            instance,
+            &steps,
+            arm(),
+            Some(bytes::Bytes::from_static(b"abc")),
+        ));
+        assert!(chain.error.is_none());
+        assert_eq!(chain.done, 1);
+        assert!(chain.upstream_headers.is_none());
+        assert_eq!(trace(&mut store, instance), 2);
+    }
+
+    // 本文の段の前にも燃料を入れ直す（ヘッダの段で使い切っても本文の段は別に呼んだときと同じ上限で走る）
+    #[test]
+    fn chain_rearms_fuel_before_the_body_step() {
+        let (mut store, instance) = chain_instance(1_000_000);
+        let (chain, _) = poll_to_end(call_chain(
+            &mut store,
+            instance,
+            &[Step::RequestHeaders(5, 1, 0)],
+            arm(),
+            None,
+        ));
+        assert!(chain.error.is_none());
+        let fuel = (1_000_000_000 - store.get_fuel().unwrap()) * 3 / 2;
+        store.set_fuel(fuel).unwrap();
+        let steps = [Step::RequestHeaders(5, 1, 0), Step::RequestBody(5, 3)];
+        let (chain, _) = poll_to_end(call_chain(
+            &mut store,
+            instance,
+            &steps,
+            fuel_arm(fuel, 1_000_000),
+            Some(bytes::Bytes::from_static(b"abc")),
+        ));
+        assert!(chain.error.is_none(), "{:?}", chain.error);
+        assert_eq!(chain.done, 2);
     }
 }

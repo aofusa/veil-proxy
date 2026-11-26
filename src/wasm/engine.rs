@@ -168,67 +168,286 @@ impl FilterEngine {
         end_of_stream: bool,
         sessions: Option<&RequestSessions>,
     ) -> FilterResult {
-        let mut resolved = resolve_effective_modules(&self.registry, modules).peekable();
+        let req = RequestLine {
+            path,
+            method,
+            client_ip,
+        };
+        self.on_request_phases(modules, &req, headers, end_of_stream, None, sessions)
+            .await
+    }
 
-        if resolved.peek().is_none() {
+    /// 本文の全量が手元にある要求の、要求ヘッダの段と要求本文の段（F-329）。`end_of_stream = false` でヘッダの段を、
+    /// 続けて本文の全量で本文の段（`end_of_stream = true`）を呼ぶ。プロトコルの経路は、本文の段を受けるモジュールが
+    /// ある（[`Self::wants_request_body`]）ときだけ呼ぶ。結果は `FilterResult::Continue { headers, body: Some(本文の段の後の本文) }`
+    /// かローカル応答。
+    ///
+    /// 効く並びが `instance_reuse` のモジュール 1 つで要求の並びがあれば、作成・ヘッダ・本文（・ローカル応答のログ・削除）の
+    /// 段を 1 回のファイバーの出入りで呼ぶ。それ以外は今までと同じく全モジュールのヘッダの段の後に全モジュールの本文の段
+    /// （モジュールをまたぐ順を変えない）。
+    pub async fn on_request_with_body(
+        &self,
+        modules: &[ModuleRef],
+        path: &Arc<str>,
+        method: &Arc<str>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        client_ip: &Arc<str>,
+        body: bytes::Bytes,
+        sessions: Option<&RequestSessions>,
+    ) -> FilterResult {
+        let req = RequestLine {
+            path,
+            method,
+            client_ip,
+        };
+        self.on_request_phases(modules, &req, headers, false, Some(body), sessions)
+            .await
+    }
+
+    /// [`Self::on_request_with_body`] を要求の並びで呼ぶ（呼び出し元の future に本体を埋め込まない。B-240）
+    pub async fn on_request_with_body_async(
+        &self,
+        modules: &crate::wasm_plugin_config::WasmModules,
+        path: Arc<str>,
+        method: Arc<str>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        client_ip: Arc<str>,
+        body: bytes::Bytes,
+    ) -> FilterResult {
+        Box::pin(self.on_request_with_body(
+            modules,
+            &path,
+            &method,
+            headers,
+            &client_ip,
+            body,
+            modules.sessions(),
+        ))
+        .await
+    }
+
+    /// 要求ヘッダの段（`body` があれば続けて本文の段）。[`Self::on_request_headers_with_modules`]・
+    /// [`Self::on_request_with_body`] の本体
+    async fn on_request_phases(
+        &self,
+        modules: &[ModuleRef],
+        req: &RequestLine<'_>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        end_of_stream: bool,
+        body: Option<bytes::Bytes>,
+        sessions: Option<&RequestSessions>,
+    ) -> FilterResult {
+        let mut resolved = resolve_effective_modules(&self.registry, modules);
+        let Some((first, first_config)) = resolved.next() else {
+            return FilterResult::Continue { headers, body };
+        };
+        // B-408: 後の段（応答・`on_log`）の context にも要求のメソッドとパスを見せる
+        if let Some(s) = sessions {
+            s.set_request_line(req.method, req.path);
+        }
+        // F-329: `instance_reuse` のモジュール 1 つで要求の並びがあれば（要求の間同じ context を使う）、段を続けて呼ぶ。
+        // 2 つ以上のモジュールはモジュールをまたぐ段の順（全モジュールのヘッダの段の後に本文の段、`on_log` はフィルタの順）を
+        // 保つために今までどおり。要求の並びの無い呼び出し（メッシュ・試験）は `on_log` を呼ばないことがあるので続けない
+        if let (true, None, Some(s)) = (first.instance_reuse, resolved.next(), sessions) {
+            return self
+                .single_module_request(first, first_config, req, headers, end_of_stream, body, s)
+                .await;
+        }
+
+        let headers = match self
+            .request_headers_each(modules, req, headers, end_of_stream, sessions)
+            .await
+        {
+            FilterResult::Continue { headers, .. } => headers,
+            local => return local,
+        };
+        let Some(body) = body else {
             return FilterResult::Continue {
                 headers,
                 body: None,
             };
+        };
+        let meta = RequestMeta {
+            method: req.method,
+            path: req.path,
+            headers: &headers,
+            client_ip: req.client_ip,
+        };
+        match self
+            .on_request_body_with_modules(modules, body, true, Some(&meta), sessions)
+            .await
+        {
+            BodyFilterResult::Continue { body } => FilterResult::Continue {
+                headers,
+                body: Some(body),
+            },
+            BodyFilterResult::LocalResponse(r) => FilterResult::LocalResponse(r),
         }
-        // B-408: 後の段（応答・`on_log`）の context にも要求のメソッドとパスを見せる
-        if let Some(s) = sessions {
-            s.set_request_line(method, path);
-        }
+    }
 
+    /// 全モジュールの要求ヘッダの段を順に呼ぶ（モジュールごとに 1 回のファイバーの出入り）
+    async fn request_headers_each(
+        &self,
+        modules: &[ModuleRef],
+        req: &RequestLine<'_>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        end_of_stream: bool,
+        sessions: Option<&RequestSessions>,
+    ) -> FilterResult {
         let mut current_headers = headers;
 
-        for (module, config) in resolved {
+        for (module, config) in resolve_effective_modules(&self.registry, modules) {
             let (returned, result) = self
                 .execute_on_request_headers(
                     module,
                     config,
-                    path,
-                    method,
+                    req,
                     current_headers,
-                    client_ip,
                     end_of_stream,
                     sessions,
                 )
                 .await;
             // ヘッダは変更有無に関わらず回収済み（ムーブスルー）。
             current_headers = returned;
-
-            match result {
-                Ok(ModuleAction::Continue) => {}
-                Ok(ModuleAction::Pause { grpc }) => {
-                    // 本文を待つ Pause（Envoy の StopIteration）は本文の段で続きを決めるので守れる。
-                    // gRPC の呼び出しの結果・本文の無い要求の Pause は待てない（B-300）
-                    if grpc || end_of_stream || !module.capabilities.allow_request_body_read {
-                        if let Some(resp) = self.record_failure(
-                            module,
-                            "request_headers",
-                            "unsupported_pause",
-                            None,
-                        ) {
-                            return FilterResult::LocalResponse(resp);
-                        }
-                    }
-                }
-                Ok(ModuleAction::LocalResponse(resp)) => {
-                    return FilterResult::LocalResponse(resp);
-                }
-                Err(e) => {
-                    if let Some(resp) = self.on_failure(module, "request_headers", &e) {
-                        return FilterResult::LocalResponse(resp);
-                    }
-                }
+            if let Some(resp) = self.request_headers_outcome(module, result, end_of_stream) {
+                return FilterResult::LocalResponse(resp);
             }
         }
 
         FilterResult::Continue {
             headers: current_headers,
             body: None,
+        }
+    }
+
+    /// 1 つのモジュールの要求ヘッダの段の結果の扱い。要求を断るならその応答
+    fn request_headers_outcome(
+        &self,
+        module: &LoadedModule,
+        result: anyhow::Result<ModuleAction>,
+        end_of_stream: bool,
+    ) -> Option<LocalResponse> {
+        match result {
+            Ok(ModuleAction::Continue) => None,
+            Ok(ModuleAction::Pause { grpc }) => {
+                // 本文を待つ Pause（Envoy の StopIteration）は本文の段で続きを決めるので守れる。
+                // gRPC の呼び出しの結果・本文の無い要求の Pause は待てない（B-300）
+                if grpc || end_of_stream || !module.capabilities.allow_request_body_read {
+                    self.record_failure(module, "request_headers", "unsupported_pause", None)
+                } else {
+                    None
+                }
+            }
+            Ok(ModuleAction::LocalResponse(resp)) => Some(resp),
+            Err(e) => self.on_failure(module, "request_headers", &e),
+        }
+    }
+
+    /// 1 つのモジュールの要求本文の段の結果の扱い（本文を全量で 1 回呼ぶ。B-300）。続けるなら `Ok(本文)`、断るなら
+    /// `Err(応答)`。`body` は段に渡した本文（変えられていなければそのまま続ける）
+    fn request_body_outcome(
+        &self,
+        module: &LoadedModule,
+        result: anyhow::Result<BodyModuleResult>,
+        body: bytes::Bytes,
+    ) -> Result<bytes::Bytes, LocalResponse> {
+        let rejected = match result {
+            Ok(BodyModuleResult::Continue { modified_body }) => {
+                return Ok(modified_body.unwrap_or(body))
+            }
+            // 本文の段は本文全体で 1 回呼ぶので、Pause は待つものが無い（B-300）
+            Ok(BodyModuleResult::Pause) => {
+                self.record_failure(module, "request_body", "unsupported_pause", None)
+            }
+            Ok(BodyModuleResult::LocalResponse(resp)) => Some(resp),
+            Err(e) => self.on_failure(module, "request_body", &e),
+        };
+        rejected.map_or(Ok(body), Err)
+    }
+
+    /// `instance_reuse` のモジュール 1 つのルートの要求の段（F-329）。作成・ヘッダ・（全量の本文があれば）本文の段と、
+    /// ローカル応答ならそのログ・削除の段を 1 回のファイバーの出入りで呼ぶ。続けられないところ（保留の外部呼び出し・
+    /// 段の失敗）からは今までの経路（`settle` での解決・本文の段の別の呼び出し・応答の後の `on_log`）で続ける
+    #[allow(clippy::too_many_arguments)]
+    async fn single_module_request(
+        &self,
+        module: &LoadedModule,
+        configuration: &Arc<[u8]>,
+        req: &RequestLine<'_>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        end_of_stream: bool,
+        body: Option<bytes::Bytes>,
+        sessions: &RequestSessions,
+    ) -> FilterResult {
+        // 本文の段を受けないモジュールには本文の段を呼ばない（今までと同じ）
+        let chain_body = body
+            .as_ref()
+            .filter(|_| module.capabilities.allow_request_body_read)
+            .cloned();
+        let (headers, step) = self
+            .execute_on_request_chained(
+                module,
+                configuration,
+                req,
+                headers,
+                end_of_stream,
+                chain_body,
+                sessions,
+            )
+            .await;
+        let result = match step {
+            RequestStep::Logged(local) => return FilterResult::LocalResponse(local),
+            RequestStep::Body(result) => {
+                // 本文の段まで呼んだ（ヘッダの段は本文を待って続いた）
+                let body = body.unwrap_or_default();
+                return match self.request_body_outcome(module, result, body) {
+                    Ok(body) => FilterResult::Continue {
+                        headers,
+                        body: Some(body),
+                    },
+                    Err(resp) => FilterResult::LocalResponse(resp),
+                };
+            }
+            RequestStep::Headers(result) => result,
+        };
+        if let Some(resp) = self.request_headers_outcome(module, result, end_of_stream) {
+            return FilterResult::LocalResponse(resp);
+        }
+        let Some(body) = body else {
+            return FilterResult::Continue {
+                headers,
+                body: None,
+            };
+        };
+        if !module.capabilities.allow_request_body_read {
+            return FilterResult::Continue {
+                headers,
+                body: Some(body),
+            };
+        }
+        // ヘッダの段で止めた（保留の外部呼び出しを解決した・失敗を `fail_open` で続けた）: 本文の段は別に呼ぶ（今までと同じ）
+        let meta = RequestMeta {
+            method: req.method,
+            path: req.path,
+            headers: &headers,
+            client_ip: req.client_ip,
+        };
+        let result = self
+            .execute_on_request_body(
+                module,
+                configuration,
+                body.clone(),
+                true,
+                Some(&meta),
+                Some(sessions),
+            )
+            .await;
+        match self.request_body_outcome(module, result, body) {
+            Ok(body) => FilterResult::Continue {
+                headers,
+                body: Some(body),
+            },
+            Err(resp) => FilterResult::LocalResponse(resp),
         }
     }
 
@@ -306,10 +525,8 @@ impl FilterEngine {
         self.arm_store_until(store, Window::Lifecycle)
     }
 
+    /// （`clock` は専用スレッドが眠っていれば `metering::arm` が起こす）
     fn arm_store_until(&self, store: &mut Store<HostState>, window: Window) -> anyhow::Result<()> {
-        if !self.limits.uses_fuel() {
-            self.ticker.wake();
-        }
         super::metering::arm(store, &self.limits, window)
     }
 
@@ -857,6 +1074,7 @@ impl FilterEngine {
                         exports::Step::RequestHeaders(sess.context_id, num_headers, eos),
                     ],
                     (self.limits, Window::Callback),
+                    None,
                 )
                 .await;
                 if let Some(e) = chain.error {
@@ -950,10 +1168,8 @@ impl FilterEngine {
 
                 // B-56: 外部 I/O を待っていた間にエポックが進んで（B-173 以降は時間で）締切が過ぎていると、
                 // resume 直後にトラップする。再開直前に猶予を与え直す。
-                // （外部 I/O の待ち時間はゲストの CPU 時間ではないため、これは制限の回避ではない）
-                if !self.limits.uses_fuel() {
-                    self.ticker.wake();
-                }
+                // （外部 I/O の待ち時間はゲストの CPU 時間ではないため、これは制限の回避ではない。専用スレッドが
+                // 眠っていれば `rearm_wall` が起こす）
                 super::metering::rearm_wall(&mut *store, &self.limits, Window::Callback);
 
                 // 応答をコンテキストへ格納して proxy_on_http_call_response を呼ぶ
@@ -1049,10 +1265,8 @@ impl FilterEngine {
         &self,
         module: &LoadedModule,
         configuration: &Arc<[u8]>,
-        path: &Arc<str>,
-        method: &Arc<str>,
+        req: &RequestLine<'_>,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
-        client_ip: &Arc<str>,
         end_of_stream: bool,
         sessions: Option<&RequestSessions>,
     ) -> (Vec<(Vec<u8>, Vec<u8>)>, anyhow::Result<ModuleAction>) {
@@ -1067,10 +1281,10 @@ impl FilterEngine {
         };
         // 文字列は Arc 共有、ヘッダはムーブ
         sess.store.data_mut().http_ctx.set_request(
-            method.clone(),
-            path.clone(),
+            req.method.clone(),
+            req.path.clone(),
             headers,
-            client_ip.clone(),
+            req.client_ip.clone(),
         );
 
         let run = self
@@ -1095,6 +1309,150 @@ impl FilterEngine {
         let headers = std::mem::take(&mut sess.store.data_mut().http_ctx.request_headers);
         self.close_session(module, sess, ok, sessions, false).await;
         (headers, result)
+    }
+
+    /// `instance_reuse` のモジュールの要求の段を 1 回のファイバーの出入りで続けて呼ぶ（F-329。
+    /// [`Self::single_module_request`]）。段は `[ContextCreate?, RequestHeaders, RequestBody?, LogLocal, Delete?]`
+    /// （[`exports::Step`]。本文の段は `body` があるときだけ、削除の段は context の ID が残っているときだけ）。
+    ///
+    /// - 本文の段は、ヘッダの段がローカル応答を決めず、保留の外部呼び出しが無いときだけ呼ばれる（本文を待つ Pause・
+    ///   Continue のどちらでも。別に呼んでいたときもどちらでも本文の段へ進んだ）。
+    /// - ログ・削除の段は、ローカル応答が決まっていて保留の外部呼び出しが無いときだけ呼ばれる。終えたら（失敗しても）
+    ///   要求の並びを「ログ済み」にする（応答の後の `on_log` は呼ばない）。失敗したインスタンスは捨てる（`log_pooled` と同じ）。
+    /// - それ以外で止まったら、最後に呼んだ段の結果を今までと同じく `settle`（保留の外部呼び出しの解決・B-299 のローカル
+    ///   応答）で決める。
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_on_request_chained(
+        &self,
+        module: &LoadedModule,
+        configuration: &Arc<[u8]>,
+        req: &RequestLine<'_>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        end_of_stream: bool,
+        body: Option<bytes::Bytes>,
+        sessions: &RequestSessions,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, RequestStep) {
+        let num_headers = headers.len() as i32;
+        let mut sess = match self
+            .open_session_deferred(module, configuration, Some(sessions))
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => return (headers, RequestStep::Headers(Err(e))),
+        };
+        // 文字列は Arc 共有、ヘッダはムーブ
+        sess.store.data_mut().http_ctx.set_request(
+            req.method.clone(),
+            req.path.clone(),
+            headers,
+            req.client_ip.clone(),
+        );
+
+        let mut steps = [exports::Step::Log(sess.context_id); exports::MAX_STEPS];
+        let mut n = 0;
+        if let Some((context_id, parent)) = sess.create_pending.take() {
+            steps[n] = exports::Step::ContextCreate(context_id, parent);
+            n += 1;
+        }
+        let headers_at = n;
+        steps[n] =
+            exports::Step::RequestHeaders(sess.context_id, num_headers, i32::from(end_of_stream));
+        n += 1;
+        let mut body_at = None;
+        if let Some(b) = &body {
+            body_at = Some(n);
+            steps[n] = exports::Step::RequestBody(sess.context_id, b.len() as i32);
+            n += 1;
+        }
+        let log_at = n;
+        steps[n] = exports::Step::LogLocal(sess.context_id);
+        n += 1;
+        // `close_session` と同じ: context の ID を使い切ったインスタンスは消さずに捨てる
+        let delete = sess.next_context_id < i32::MAX - 1;
+        if delete {
+            steps[n] = exports::Step::Delete(sess.context_id);
+            n += 1;
+        }
+        let mut chain = exports::call_chain(
+            &mut sess.store,
+            sess.instance,
+            &steps[..n],
+            (self.limits, Window::Callback),
+            body,
+        )
+        .await;
+
+        // F-48: 燃料のメトリクス（`fuel` のときだけ。今までと同じ段の名前で、別に呼んでいたときと同じく、ヘッダの段は
+        // 終えたときだけ、本文の段はトラップしても）
+        if let (true, Some(consumed)) = (chain.completed(headers_at), chain.fuel[headers_at]) {
+            crate::metrics::observe_wasm_fuel_consumed(&module.name, "request_headers", consumed);
+        }
+        if let Some(i) = body_at {
+            if let (true, Some(consumed)) = (chain.entered(i), chain.fuel[i]) {
+                crate::metrics::observe_wasm_fuel_consumed(&module.name, "request_body", consumed);
+            }
+        }
+
+        // ローカル応答のログの段に入った（失敗の扱いは `log_pooled` と同じ: インスタンスを捨て、`on_failure` は呼ばない）
+        if let Some(local) = chain.local.take() {
+            let ok = match &chain.error {
+                None => {
+                    ftlog::debug!(
+                        "[wasm:{}] proxy_on_log({}) OK",
+                        module.name,
+                        sess.context_id
+                    );
+                    delete
+                }
+                Some(e) => {
+                    if chain.done == log_at {
+                        ftlog::debug!("[wasm:{}] proxy_on_log error: {}", module.name, e);
+                    }
+                    false
+                }
+            };
+            Self::release_session(module, sess, ok, Some(sessions), true);
+            sessions.set_logged();
+            return (Vec::new(), RequestStep::Logged(local));
+        }
+
+        let body_step = body_at.filter(|&i| chain.entered(i));
+        let run = match chain.error.take() {
+            Some(e) => Err(e),
+            None => Ok(chain.values[body_step.unwrap_or(headers_at)].unwrap_or(0)),
+        };
+        let (ok, settled) = self.settle(module, &mut sess, run).await;
+        let (headers, step) = if body_step.is_some() {
+            let result = match settled {
+                Settled::Local(r) => Ok(BodyModuleResult::LocalResponse(r)),
+                Settled::Failed(e) => Err(e),
+                Settled::Pause { .. } => Ok(BodyModuleResult::Pause),
+                Settled::Continue => {
+                    // F-61: 変更時は store からムーブで取り出す
+                    let ctx = &mut sess.store.data_mut().http_ctx;
+                    let modified_body = ctx
+                        .request_body_modified
+                        .then(|| std::mem::take(&mut ctx.request_body).into_bytes());
+                    Ok(BodyModuleResult::Continue { modified_body })
+                }
+            };
+            // 上流へ送るのは本文の段の前のヘッダ（本文の段に見せた写しは捨てる）
+            let headers = chain.upstream_headers.take().unwrap_or_default();
+            (headers, RequestStep::Body(result))
+        } else {
+            let result = match settled {
+                Settled::Continue => Ok(ModuleAction::Continue),
+                Settled::Pause { grpc } => Ok(ModuleAction::Pause { grpc }),
+                Settled::Local(r) => Ok(ModuleAction::LocalResponse(r)),
+                Settled::Failed(e) => Err(e),
+            };
+            // ヘッダをコンテキストから回収（ゼロコピー・ムーブ。resume 中の変更も反映される）
+            let headers = std::mem::take(&mut sess.store.data_mut().http_ctx.request_headers);
+            (headers, RequestStep::Headers(result))
+        };
+        self.close_session(module, sess, ok, Some(sessions), false)
+            .await;
+        (headers, step)
     }
 
     /// Execute on_response_headers callback for all modules (reverse order)
@@ -1279,8 +1637,10 @@ impl FilterEngine {
     ///
     /// 無いルートは応答本文を溜めない（ストリーミング・splice のまま）。
     pub fn wants_response_body(&self, modules: &crate::wasm_plugin_config::WasmModules) -> bool {
+        // 借りるだけ（`get_module` は全ワーカー共有の `Arc` を複製して捨てる。F-329）
         modules.modules().iter().any(|m| {
-            self.get_module(&m.name)
+            self.registry
+                .loaded_module(&m.name)
                 .is_some_and(|lm| lm.capabilities.allow_response_body_read)
         })
     }
@@ -1536,9 +1896,10 @@ impl FilterEngine {
     /// 要求本文のコールバックを呼ぶモジュール（`allow_request_body_read`）が含まれるか（F-271。HTTP/1.1・HTTP/2 は
     /// これが真の要求だけ本文を読み切ってから上流へ送る）
     pub fn wants_request_body(&self, modules: &[ModuleRef]) -> bool {
+        // 借りるだけ（`get_module` は全ワーカー共有の `Arc` を複製して捨てる。F-329）
         modules.iter().any(|r| {
             self.registry
-                .get_module(&r.name)
+                .loaded_module(&r.name)
                 .is_some_and(|m| m.capabilities.allow_request_body_read)
         })
     }
@@ -1765,6 +2126,10 @@ impl FilterEngine {
         modules: &[ModuleRef],
         sessions: Option<&RequestSessions>,
     ) {
+        // F-329: ローカル応答の要求は要求の段の続きで `proxy_on_log`・`proxy_on_delete` を呼んだ
+        if sessions.is_some_and(RequestSessions::logged) {
+            return;
+        }
         let resolved = resolve_effective_modules(&self.registry, modules);
 
         for (module, config) in resolved {
@@ -1863,6 +2228,7 @@ impl FilterEngine {
             sess.instance,
             &steps[..n],
             (self.limits, Window::Callback),
+            None,
         )
         .await;
         match chain.error {
@@ -3008,6 +3374,23 @@ impl Session {
     }
 }
 
+/// 要求の行とクライアント（要求の段の入口の引数。F-329）
+struct RequestLine<'a> {
+    path: &'a Arc<str>,
+    method: &'a Arc<str>,
+    client_ip: &'a Arc<str>,
+}
+
+/// [`FilterEngine::execute_on_request_chained`] がどこまで呼んだか（F-329）
+enum RequestStep {
+    /// 要求ヘッダの段まで（`settle` した結果）
+    Headers(anyhow::Result<ModuleAction>),
+    /// 要求本文の段まで（本文の段を `settle` した結果。ヘッダの段は本文を待って続いた）
+    Body(anyhow::Result<BodyModuleResult>),
+    /// ローカル応答のログ・削除の段まで（要求の並びは「ログ済み」）
+    Logged(LocalResponse),
+}
+
 enum ModuleAction {
     Continue,
     /// 解決できない呼び出しの無い Pause（`grpc` は gRPC の呼び出しを待っている）
@@ -3022,7 +3405,8 @@ pub enum FilterResult {
     /// Continue with potentially modified headers/body
     Continue {
         headers: Vec<(Vec<u8>, Vec<u8>)>,
-        body: Option<Vec<u8>>,
+        /// 要求本文の段まで呼んだときの本文（[`FilterEngine::on_request_with_body`]。それ以外は `None`）
+        body: Option<bytes::Bytes>,
     },
     /// Send a local response instead of proxying
     LocalResponse(LocalResponse),

@@ -180,6 +180,9 @@ pub struct HttpContext {
     pub request_headers_modified: bool,
     /// Request body modified
     pub request_body_modified: bool,
+    /// ゲストが要求のパス・メソッドを書き換えた（`proxy_set_property` の `request.path`・`request.method`。F-329: 要求の段を
+    /// 続けて呼ばない）
+    pub request_line_overridden: bool,
     /// Response headers modified
     pub response_headers_modified: bool,
     /// Response body modified
@@ -358,6 +361,7 @@ impl HttpContext {
             plugin_data: empty_plugin_data(),
             request_headers_modified: false,
             request_body_modified: false,
+            request_line_overridden: false,
             response_headers_modified: false,
             response_body_modified: false,
             local_response: None,
@@ -421,6 +425,7 @@ impl HttpContext {
             plugin_data: _,
             request_headers_modified,
             request_body_modified,
+            request_line_overridden,
             response_headers_modified,
             response_body_modified,
             local_response,
@@ -470,6 +475,7 @@ impl HttpContext {
         *client_ip = local_empty_str();
         *request_headers_modified = false;
         *request_body_modified = false;
+        *request_line_overridden = false;
         *response_headers_modified = false;
         *response_body_modified = false;
         *local_response = None;
@@ -606,6 +612,50 @@ impl HttpContext {
     /// Check if local response should be sent
     pub fn should_send_local_response(&self) -> bool {
         self.local_response.is_some()
+    }
+
+    /// まだ解決していない外部呼び出し（`proxy_http_call`・gRPC の呼び出しとストリーム）があるか（F-329。続けて呼ぶ段の条件）
+    pub(crate) fn has_pending_calls(&self) -> bool {
+        #[cfg(feature = "grpc")]
+        if !self.pending_grpc_calls.is_empty() || !self.pending_grpc_streams.is_empty() {
+            return true;
+        }
+        !self.pending_http_calls.is_empty()
+    }
+
+    /// 要求の段の値（ヘッダ・本文・トレーラ・クライアントの IP・ゲストが置いたプロパティ・メトリクス・ローカル応答等）を
+    /// 消し、context の ID・要求の属性・メソッドとパス（[`HttpContext::set_request_line`]）だけを残す（F-329）。段を別に
+    /// 呼んでいたときの、段の間の `recycle` とセッションが入れ直す要求の属性（`set_request_attrs`）の後と同じ状態
+    fn keep_request_line_only(&mut self) {
+        let info = self.request_info.take();
+        let path = std::mem::replace(&mut self.request_path, local_empty_str());
+        let method = std::mem::replace(&mut self.request_method, local_empty_str());
+        let query = std::mem::take(&mut self.request_query);
+        let (context_id, root_context_id) = (self.context_id, self.root_context_id);
+        self.recycle();
+        self.context_id = context_id;
+        self.root_context_id = root_context_id;
+        self.request_info = info;
+        self.request_path = path;
+        self.request_method = method;
+        self.request_query = query;
+    }
+
+    /// 要求ヘッダの段に続けて呼ぶ要求本文の段の context にする（F-329）。本文の段を別に呼んでいたときと同じ見え方:
+    /// ヘッダの段で置いた値は消し、要求の属性・メソッド・パス・クライアントの IP を残して、`headers`（ヘッダの段の後の
+    /// ヘッダ）と全量の本文を置く
+    pub(crate) fn enter_request_body(&mut self, headers: Vec<(Vec<u8>, Vec<u8>)>, body: Bytes) {
+        let client_ip = std::mem::replace(&mut self.client_ip, local_empty_str());
+        self.keep_request_line_only();
+        self.client_ip = client_ip;
+        self.request_headers = headers;
+        self.set_request_body(body, true);
+    }
+
+    /// ローカル応答の要求の `proxy_on_log` の前に、context を応答の後に別に呼んでいたログの段と同じ見え方にする（F-329）。
+    /// 見えるのは要求の属性とメソッド・パスだけ（応答のステータスも別に呼んでいたときと同じく 0）
+    pub(crate) fn enter_log(&mut self) {
+        self.keep_request_line_only();
     }
 
     /// Get next gRPC call ID

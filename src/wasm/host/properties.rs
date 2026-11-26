@@ -391,6 +391,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 "request.path" => {
                     if let Ok(s) = String::from_utf8(value) {
                         state.http_ctx.request_path = std::sync::Arc::from(s);
+                        state.http_ctx.request_line_overridden = true;
                         return PROXY_RESULT_OK;
                     }
                     PROXY_RESULT_PARSE_FAILURE
@@ -398,6 +399,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 "request.method" => {
                     if let Ok(s) = String::from_utf8(value) {
                         state.http_ctx.request_method = std::sync::Arc::from(s);
+                        state.http_ctx.request_line_overridden = true;
                         return PROXY_RESULT_OK;
                     }
                     PROXY_RESULT_PARSE_FAILURE

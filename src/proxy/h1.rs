@@ -738,6 +738,10 @@ pub(super) async fn handle_requests(
                 // F-322: 後ろに次の要求のヘッダが丸ごと届いていれば、この要求の応答は溜めてよい（次の要求の応答と
                 // まとめて 1 回で送る）。応答の後に閉じる要求は溜めない
                 tls_stream.set_hold_next(!client_wants_close && has_request_head(&pipelined));
+                // F-329: Wasm の要求ヘッダと本文の段を一度に呼ぶときは、Content-Length の本文をここから移す
+                #[cfg(feature = "wasm")]
+                let mut initial_body: Vec<u8> = accumulated.to_vec();
+                #[cfg(not(feature = "wasm"))]
                 let initial_body: Vec<u8> = accumulated.to_vec();
 
                 // WASMモジュールの適用
@@ -757,6 +761,9 @@ pub(super) async fn handle_requests(
                         _ => crate::wasm::empty_wasm_modules(),
                     };
 
+                // F-329: 要求ヘッダの段と一緒に要求本文の段も呼んだときの、本文の段の後の本文
+                #[cfg(feature = "wasm")]
+                let mut wasm_request_body: Option<Bytes> = None;
                 #[cfg(feature = "wasm")]
                 let headers_for_proxy = if modules_to_apply.is_empty() {
                     headers_for_proxy
@@ -783,24 +790,64 @@ pub(super) async fn handle_requests(
                                 .map(|(k, v)| (k.to_vec(), v.to_vec()))
                                 .collect();
 
-                            let wasm_result = wasm_engine
-                                .on_request_headers_with_modules_async(
-                                    &modules_to_apply,
-                                    Arc::from(path_str),
-                                    Arc::from(method_str),
-                                    headers_vec,
-                                    Arc::from(client_ip),
-                                    // end_of_stream。B-320: WebSocket は本文の段を走らせないので、本文を待つ
-                                    // Pause を決めずに通さないよう、本文が無いものとして渡す（F57）
-                                    (content_length == 0 && !is_chunked) || is_websocket,
+                            // F-329: 本文の全量が最初の読み取りにあり、本文の段を受けるモジュールがあれば、ヘッダと本文の
+                            // 段を一度に呼ぶ（1 モジュールのルートは 1 回のファイバーの出入り）。`Expect: 100-continue` の
+                            // 要求は今までの経路（本文を読む前の 100 Continue。B-189）
+                            let full_body = if !is_websocket
+                                && (is_chunked || content_length > 0)
+                                && wasm_engine.wants_request_body(&modules_to_apply)
+                                && !check_expect_continue(&headers_for_proxy)
+                            {
+                                body_in_hand(
+                                    &mut initial_body,
+                                    content_length,
+                                    is_chunked,
+                                    chunked_end.is_some(),
+                                    if is_chunked {
+                                        security.max_chunked_body_size
+                                    } else {
+                                        security.max_request_body_size
+                                    },
                                 )
-                                .await;
+                            } else {
+                                None
+                            };
+                            let body_read = full_body.is_some();
+                            let wasm_result = match full_body {
+                                Some(body) => {
+                                    wasm_engine
+                                        .on_request_with_body_async(
+                                            &modules_to_apply,
+                                            Arc::from(path_str),
+                                            Arc::from(method_str),
+                                            headers_vec,
+                                            Arc::from(client_ip),
+                                            body,
+                                        )
+                                        .await
+                                }
+                                None => {
+                                    wasm_engine
+                                        .on_request_headers_with_modules_async(
+                                            &modules_to_apply,
+                                            Arc::from(path_str),
+                                            Arc::from(method_str),
+                                            headers_vec,
+                                            Arc::from(client_ip),
+                                            // end_of_stream。B-320: WebSocket は本文の段を走らせないので、本文を待つ
+                                            // Pause を決めずに通さないよう、本文が無いものとして渡す（F57）
+                                            (content_length == 0 && !is_chunked) || is_websocket,
+                                        )
+                                        .await
+                                }
+                            };
 
                             match wasm_result {
                                 crate::wasm::FilterResult::Continue {
                                     headers: modified_headers,
-                                    ..
+                                    body,
                                 } => {
+                                    wasm_request_body = body;
                                     // 修正されたヘッダーを使用
                                     // F-43/F-168: 所有権ムーブで変換（deep copy しない）。
                                     // `Bytes::from(Vec<u8>)` はバッファの所有権を引き継ぐだけで
@@ -839,7 +886,9 @@ pub(super) async fn handle_requests(
                                         &host_bytes,
                                         &path_bytes,
                                         &user_agent,
-                                        0,
+                                        // 応答の前に本文を読み終えていた要求は本文の大きさ（本文の段のローカル応答と
+                                        // 同じ。応答の後に読み捨てる要求は 0）
+                                        if body_read { content_length as u64 } else { 0 },
                                         resp.status_code,
                                         resp_size,
                                         start_instant,
@@ -849,17 +898,19 @@ pub(super) async fn handle_requests(
                                     // WASMライフサイクルコールバック: リクエスト完了
                                     crate::wasm::on_request_complete_async(&modules_to_apply).await;
                                     accumulated.clear();
+                                    // 本文の段まで呼んだ要求は本文を読み終えている（読み捨てるものが無い）
                                     if client_wants_close
                                         || is_websocket
                                         || expect_waiting
-                                        || !drain_request_body(
-                                            &mut tls_stream,
-                                            content_length,
-                                            is_chunked && chunked_end.is_none(),
-                                            &initial_body,
-                                            &mut pipelined,
-                                        )
-                                        .await
+                                        || (!body_read
+                                            && !drain_request_body(
+                                                &mut tls_stream,
+                                                content_length,
+                                                is_chunked && chunked_end.is_none(),
+                                                &initial_body,
+                                                &mut pipelined,
+                                            )
+                                            .await)
                                     {
                                         // F-322: 溜めた応答を送ってから閉じる
                                         flush_held_before_close(&mut tls_stream).await;
@@ -885,137 +936,140 @@ pub(super) async fn handle_requests(
                 // 要求だけ）。本文を上限付きで読み切って `on_request_body` を呼び、結果の本文を Content-Length 付きで
                 // バックエンドへ渡す（chunked は外す）。Wasm の無いルートは `is_empty` の分岐だけ
                 #[cfg(feature = "wasm")]
-                let (initial_body, content_length, is_chunked, headers_for_proxy) =
-                    if modules_to_apply.is_empty()
-                        || is_websocket
-                        || !(is_chunked || content_length > 0)
-                    {
-                        (initial_body, content_length, is_chunked, headers_for_proxy)
-                    } else {
-                        match modules_to_apply.engine() {
-                            Some(wasm_engine)
-                                if wasm_engine.wants_request_body(&modules_to_apply) =>
-                            {
-                                let limit = if is_chunked {
-                                    security.max_chunked_body_size
-                                } else {
-                                    security.max_request_body_size
-                                };
-                                // B-189: 本文を読む前に 100 Continue を返す（Content-Length の要求は上で返して
-                                // いる。chunked は上流の 100 Continue に任せているが、この段は上流へつなぐ前に
-                                // 本文を読むので、送らないとクライアントは本文を送らずに待ち続ける）
-                                if is_chunked && check_expect_continue(&headers_for_proxy) {
-                                    let write_result = timeout(
-                                        WRITE_TIMEOUT,
-                                        tls_stream.write_all(HTTP_100_CONTINUE.to_vec()),
-                                    )
-                                    .await;
-                                    if let Err(_) | Ok((Err(_), _)) = write_result {
-                                        return;
-                                    }
-                                }
-                                let body = match read_full_request_body(
-                                    &mut tls_stream,
-                                    content_length,
-                                    is_chunked,
-                                    &initial_body,
-                                    limit,
-                                    &mut pipelined,
+                let (initial_body, content_length, is_chunked, headers_for_proxy) = if let Some(b) =
+                    wasm_request_body
+                {
+                    // F-329: 本文の段はヘッダの段と一緒に呼んだ。本文の段の後と同じく Content-Length で送る（本文は
+                    // 他に参照が無ければ写さずに `Vec` へ戻る）
+                    let mut headers = headers_for_proxy;
+                    let len = b.len();
+                    set_body_framing_headers(&mut headers, len);
+                    (Vec::from(b), len, false, headers)
+                } else if modules_to_apply.is_empty()
+                    || is_websocket
+                    || !(is_chunked || content_length > 0)
+                {
+                    (initial_body, content_length, is_chunked, headers_for_proxy)
+                } else {
+                    match modules_to_apply.engine() {
+                        Some(wasm_engine) if wasm_engine.wants_request_body(&modules_to_apply) => {
+                            let limit = if is_chunked {
+                                security.max_chunked_body_size
+                            } else {
+                                security.max_request_body_size
+                            };
+                            // B-189: 本文を読む前に 100 Continue を返す（Content-Length の要求は上で返して
+                            // いる。chunked は上流の 100 Continue に任せているが、この段は上流へつなぐ前に
+                            // 本文を読むので、送らないとクライアントは本文を送らずに待ち続ける）
+                            if is_chunked && check_expect_continue(&headers_for_proxy) {
+                                let write_result = timeout(
+                                    WRITE_TIMEOUT,
+                                    tls_stream.write_all(HTTP_100_CONTINUE.to_vec()),
                                 )
-                                .await
-                                {
-                                    Ok(b) => b,
-                                    Err(status) => {
-                                        let err: &[u8] = if status == 413 {
-                                            ERR_MSG_REQUEST_TOO_LARGE
-                                        } else {
-                                            ERR_MSG_BAD_REQUEST
-                                        };
-                                        let _ = timeout(
-                                            WRITE_TIMEOUT,
-                                            tls_stream.write_all(err.to_vec()),
-                                        )
-                                        .await;
-                                        // 未読の本文を残して閉じると RST で応答が届かないことがある（B-102）
-                                        lingering_drain_before_close(&mut tls_stream).await;
-                                        return;
-                                    }
-                                };
-                                let method_arc: Arc<str> =
-                                    Arc::from(std::str::from_utf8(&method_bytes).unwrap_or("GET"));
-                                let path_arc: Arc<str> =
-                                    Arc::from(std::str::from_utf8(&path_bytes).unwrap_or("/"));
-                                let ip_arc: Arc<str> = Arc::from(client_ip);
-                                let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers_for_proxy
-                                    .iter()
-                                    .map(|(k, v)| (k.to_vec(), v.to_vec()))
-                                    .collect();
-                                let meta = crate::wasm::RequestMeta {
-                                    method: &method_arc,
-                                    path: &path_arc,
-                                    headers: &headers_vec,
-                                    client_ip: &ip_arc,
-                                };
-                                match crate::wasm::http_executor::apply_wasm_request_body(
-                                    wasm_engine,
-                                    &modules_to_apply,
-                                    body,
-                                    true,
-                                    Some(&meta),
-                                )
-                                .await
-                                {
-                                    crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => {
-                                        let mut headers = headers_for_proxy;
-                                        set_body_framing_headers(&mut headers, b.len());
-                                        (b.to_vec(), b.len(), false, headers)
-                                    }
-                                    crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
-                                        resp,
-                                    ) => {
-                                        let start_instant = Instant::now();
-                                        let response = wasm_local_response_h1(
-                                            &resp,
-                                            method_bytes.as_ref() == b"HEAD",
-                                            client_wants_close,
-                                        );
-                                        let resp_size = response.len() as u64;
-                                        let write_result =
-                                            timeout(WRITE_TIMEOUT, tls_stream.write_all(response))
-                                                .await;
-                                        if !matches!(write_result, Ok((Ok(_), _))) {
-                                            return;
-                                        }
-                                        log_access(
-                                            &method_bytes,
-                                            &host_bytes,
-                                            &path_bytes,
-                                            &user_agent,
-                                            content_length as u64,
-                                            resp.status_code,
-                                            resp_size,
-                                            start_instant,
-                                            client_ip,
-                                            "",
-                                        );
-                                        crate::wasm::on_request_complete_async(&modules_to_apply)
-                                            .await;
-                                        accumulated.clear();
-                                        if client_wants_close {
-                                            return;
-                                        }
-                                        if !pipelined.is_empty() {
-                                            accumulated.extend_from_slice(&pipelined);
-                                            pipelined_ready =
-                                                accumulated.windows(4).any(|w| w == b"\r\n\r\n");
-                                        }
-                                        continue;
-                                    }
+                                .await;
+                                if let Err(_) | Ok((Err(_), _)) = write_result {
+                                    return;
                                 }
                             }
-                            _ => (initial_body, content_length, is_chunked, headers_for_proxy),
+                            let body = match read_full_request_body(
+                                &mut tls_stream,
+                                content_length,
+                                is_chunked,
+                                &initial_body,
+                                limit,
+                                &mut pipelined,
+                            )
+                            .await
+                            {
+                                Ok(b) => b,
+                                Err(status) => {
+                                    let err: &[u8] = if status == 413 {
+                                        ERR_MSG_REQUEST_TOO_LARGE
+                                    } else {
+                                        ERR_MSG_BAD_REQUEST
+                                    };
+                                    let _ =
+                                        timeout(WRITE_TIMEOUT, tls_stream.write_all(err.to_vec()))
+                                            .await;
+                                    // 未読の本文を残して閉じると RST で応答が届かないことがある（B-102）
+                                    lingering_drain_before_close(&mut tls_stream).await;
+                                    return;
+                                }
+                            };
+                            let method_arc: Arc<str> =
+                                Arc::from(std::str::from_utf8(&method_bytes).unwrap_or("GET"));
+                            let path_arc: Arc<str> =
+                                Arc::from(std::str::from_utf8(&path_bytes).unwrap_or("/"));
+                            let ip_arc: Arc<str> = Arc::from(client_ip);
+                            let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers_for_proxy
+                                .iter()
+                                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                                .collect();
+                            let meta = crate::wasm::RequestMeta {
+                                method: &method_arc,
+                                path: &path_arc,
+                                headers: &headers_vec,
+                                client_ip: &ip_arc,
+                            };
+                            match crate::wasm::http_executor::apply_wasm_request_body(
+                                wasm_engine,
+                                &modules_to_apply,
+                                body,
+                                true,
+                                Some(&meta),
+                            )
+                            .await
+                            {
+                                crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => {
+                                    let mut headers = headers_for_proxy;
+                                    set_body_framing_headers(&mut headers, b.len());
+                                    (b.to_vec(), b.len(), false, headers)
+                                }
+                                crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
+                                    resp,
+                                ) => {
+                                    let start_instant = Instant::now();
+                                    let response = wasm_local_response_h1(
+                                        &resp,
+                                        method_bytes.as_ref() == b"HEAD",
+                                        client_wants_close,
+                                    );
+                                    let resp_size = response.len() as u64;
+                                    let write_result =
+                                        timeout(WRITE_TIMEOUT, tls_stream.write_all(response))
+                                            .await;
+                                    if !matches!(write_result, Ok((Ok(_), _))) {
+                                        return;
+                                    }
+                                    log_access(
+                                        &method_bytes,
+                                        &host_bytes,
+                                        &path_bytes,
+                                        &user_agent,
+                                        content_length as u64,
+                                        resp.status_code,
+                                        resp_size,
+                                        start_instant,
+                                        client_ip,
+                                        "",
+                                    );
+                                    crate::wasm::on_request_complete_async(&modules_to_apply).await;
+                                    accumulated.clear();
+                                    if client_wants_close {
+                                        return;
+                                    }
+                                    if !pipelined.is_empty() {
+                                        accumulated.extend_from_slice(&pipelined);
+                                        pipelined_ready =
+                                            accumulated.windows(4).any(|w| w == b"\r\n\r\n");
+                                    }
+                                    continue;
+                                }
+                            }
                         }
-                    };
+                        _ => (initial_body, content_length, is_chunked, headers_for_proxy),
+                    }
+                };
 
                 // 処理時間計測開始（アクセスログ・メトリクスが無効なら時刻を読まない）
                 let start_instant = crate::logging::request_start_instant();
@@ -2426,6 +2480,38 @@ pub(super) fn wasm_local_response_h1(
     response
 }
 
+/// 最初の読み取りに全量が入っている要求の本文（F-329。Wasm の要求ヘッダと本文の段を一度に呼ぶ）。Content-Length は
+/// 全部あって上限以下（`initial_body` から写さずに移す）、chunked は終端まで読み取り済み（`chunked_complete`）で上限つきの
+/// 復号が終わるときだけ（復号は [`read_full_request_body`] と同じ）。それ以外（足りない・上限超過・不正）は `None` で
+/// `initial_body` は変えない: 今までの経路で、ヘッダの段の後に読む（上限超過・不正は 413・400）
+#[cfg(feature = "wasm")]
+fn body_in_hand(
+    initial_body: &mut Vec<u8>,
+    content_length: usize,
+    is_chunked: bool,
+    chunked_complete: bool,
+    limit: usize,
+) -> Option<Bytes> {
+    if is_chunked {
+        if !chunked_complete {
+            return None;
+        }
+        let mut decoder = ChunkedDecoder::new_request(limit as u64);
+        let mut body = Vec::new();
+        // 終端の後ろは呼び出し元が次の要求として切り出してある
+        let mut after = BytesMut::new();
+        match decode_chunked_into(&mut decoder, initial_body, &mut body, &mut after) {
+            ChunkedFeedResult::Complete if after.is_empty() => Some(Bytes::from(body)),
+            _ => None,
+        }
+    } else if content_length > 0 && content_length <= limit && initial_body.len() == content_length
+    {
+        Some(Bytes::from(std::mem::take(initial_body)))
+    } else {
+        None
+    }
+}
+
 /// 本文を差し替えた要求のヘッダ（Transfer-Encoding・Content-Length を外して新しい Content-Length を付ける。F-271）。
 /// 本文は読み終えているので `Expect` も外す（上流が 100 Continue を返すと、クライアントへ重ねて届く。B-189）
 #[cfg(feature = "wasm")]
@@ -2764,6 +2850,43 @@ mod b186_overflow_tests {
         let mut buf = rest.to_vec();
         buf.extend_from_slice(NEXT);
         c.write_all(&buf).unwrap();
+    }
+
+    // F-329: 最初の読み取りに全量がある本文だけを取る（足りない・上限超過・不正は今までの経路で読む）
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn body_in_hand_takes_only_complete_bodies() {
+        // Content-Length: 全部ある（写さずに移す）・足りない・上限超過
+        let mut b = b"hello".to_vec();
+        assert_eq!(
+            body_in_hand(&mut b, 5, false, false, 100).as_deref(),
+            Some(&b"hello"[..])
+        );
+        assert!(b.is_empty());
+        let mut b = b"hel".to_vec();
+        assert!(body_in_hand(&mut b, 5, false, false, 100).is_none());
+        assert_eq!(b, b"hel");
+        let mut b = b"hello".to_vec();
+        assert!(body_in_hand(&mut b, 5, false, false, 4).is_none());
+        assert_eq!(b, b"hello");
+        // chunked: 終端まである（拡張・トレーラ付きも）・空・終端がまだ無い・上限超過・不正
+        let mut b = b"5;ext=1\r\nhello\r\n3\r\n!!!\r\n0\r\nx-t: 1\r\n\r\n".to_vec();
+        assert_eq!(
+            body_in_hand(&mut b, 0, true, true, 100).as_deref(),
+            Some(&b"hello!!!"[..])
+        );
+        assert!(!b.is_empty());
+        let mut b = b"0\r\n\r\n".to_vec();
+        assert_eq!(
+            body_in_hand(&mut b, 0, true, true, 100).as_deref(),
+            Some(&b""[..])
+        );
+        let mut b = b"5\r\nhello\r\n".to_vec();
+        assert!(body_in_hand(&mut b, 0, true, false, 100).is_none());
+        let mut b = b"5\r\nhello\r\n0\r\n\r\n".to_vec();
+        assert!(body_in_hand(&mut b, 0, true, true, 4).is_none());
+        let mut b = b"zz\r\nhello\r\n0\r\n\r\n".to_vec();
+        assert!(body_in_hand(&mut b, 0, true, true, 100).is_none());
     }
 
     #[test]

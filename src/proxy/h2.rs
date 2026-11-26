@@ -1559,6 +1559,13 @@ pub(super) async fn h2_send(
     r
 }
 
+/// Wasm の本文の段の後の本文が元の本文と同じか（変えなかった本文は同じ `Bytes` のまま戻るので、まず位置と長さで
+/// 見る。`Bytes` の比較は全バイトを比べる。F-329）
+#[cfg(feature = "wasm")]
+fn same_body(a: &Bytes, b: &Bytes) -> bool {
+    (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
+}
+
 /// サーバー/Alt-Svc 等の共通レスポンスヘッダを所有ベクタで構築する。
 ///
 /// F-166: 名前は静的定数（`Bytes::from_static`）、値は Guard から参照カウント
@@ -2008,6 +2015,9 @@ pub(super) async fn h2_dispatch(
     // `wasm_request_headers` として反映済み。HTTP/1.1 経路も反映済み）。
     #[cfg(feature = "wasm")]
     let mut wasm_request_headers_override: Option<Vec<crate::http2::hpack::HeaderField>> = None;
+    // F-329: 要求ヘッダの段と一緒に要求本文の段も呼んだか（`Some` は本文の段の後の本文）
+    #[cfg(feature = "wasm")]
+    let mut wasm_request_body_done: Option<Bytes> = None;
     #[cfg(feature = "wasm")]
     let wasm_modules_to_apply: crate::wasm_plugin_config::WasmModules = 'modules: {
         // フィルタの無いルート・エンジンの無い設定（入口で決めた。B-501）
@@ -2038,16 +2048,34 @@ pub(super) async fn h2_dispatch(
                     .filter(|h| !h.name.starts_with(b":"))
                     .map(|h| (h.name.to_vec(), h.value.to_vec()))
                     .collect();
-                let wasm_result = wasm_engine
-                    .on_request_headers_with_modules_async(
-                        &modules_to_apply,
-                        Arc::from(path_str),
-                        Arc::from(method_str),
-                        headers_vec,
-                        Arc::from(client_ip),
-                        ctx.body.is_empty(),
-                    )
-                    .await;
+                // F-329: Wasm のルートは本文を溜める経路（`ctx.body` に全量）。本文を受けるモジュールがあり、要求のトレーラが
+                // 無ければ（トレーラの段は本文の段の後）、ヘッダと本文の段を一度に呼ぶ（1 モジュールのルートは 1 回のファイバーの出入り）
+                let wasm_result = if !ctx.body.is_empty()
+                    && ctx.trailers.is_empty()
+                    && wasm_engine.wants_request_body(&modules_to_apply)
+                {
+                    wasm_engine
+                        .on_request_with_body_async(
+                            &modules_to_apply,
+                            Arc::from(path_str),
+                            Arc::from(method_str),
+                            headers_vec,
+                            Arc::from(client_ip),
+                            ctx.body.clone(),
+                        )
+                        .await
+                } else {
+                    wasm_engine
+                        .on_request_headers_with_modules_async(
+                            &modules_to_apply,
+                            Arc::from(path_str),
+                            Arc::from(method_str),
+                            headers_vec,
+                            Arc::from(client_ip),
+                            ctx.body.is_empty(),
+                        )
+                        .await
+                };
                 match wasm_result {
                     crate::wasm::FilterResult::LocalResponse(resp) => {
                         // resp.headers を所有権ムーブで変換（`.clone()` 不要、F-166）。
@@ -2070,7 +2098,8 @@ pub(super) async fn h2_dispatch(
                         crate::wasm::on_request_complete_async(&modules_to_apply).await;
                         return (st, sz);
                     }
-                    crate::wasm::FilterResult::Continue { headers, .. } => {
+                    crate::wasm::FilterResult::Continue { headers, body } => {
+                        wasm_request_body_done = body;
                         // F-133: 変更後ヘッダを上流リクエストへ反映する（下の ctx 差し替え）。
                         wasm_request_headers_override = Some(
                             headers
@@ -2093,7 +2122,12 @@ pub(super) async fn h2_dispatch(
     #[cfg(feature = "wasm")]
     let mut wasm_request_body_override: Option<Bytes> = None;
     #[cfg(feature = "wasm")]
-    if !ctx.body.is_empty() && !wasm_modules_to_apply.is_empty() {
+    if let Some(b) = wasm_request_body_done {
+        // F-329: 本文の段はヘッダの段と一緒に呼んだ
+        if !same_body(&b, &ctx.body) {
+            wasm_request_body_override = Some(b);
+        }
+    } else if !ctx.body.is_empty() && !wasm_modules_to_apply.is_empty() {
         if let Some(wasm_engine) = wasm_modules_to_apply.engine() {
             if wasm_engine.wants_request_body(&wasm_modules_to_apply) {
                 let method_arc: Arc<str> = Arc::from(std::str::from_utf8(method).unwrap_or("GET"));
@@ -2122,7 +2156,7 @@ pub(super) async fn h2_dispatch(
                 .await
                 {
                     crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => {
-                        if b != ctx.body {
+                        if !same_body(&b, &ctx.body) {
                             wasm_request_body_override = Some(b);
                         }
                     }
