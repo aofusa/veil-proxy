@@ -1,6 +1,6 @@
 # F-327: Proxy-Wasm の経路の 1 要求の費用を下げ、HttpArena の Proxy-Wasm の版で h2o を超える（親）
 
-**状態: 未着手（2026-11-26、feat/proxy-wasm-perf。調査と設計まで。実装は利用者の確認の後。HttpArena への提出は人の確認の後）**
+**状態: 完了（2026-11-26、feat/proxy-wasm-perf。同日の利用者の指示で実装。試算は SDK を使わないフィルタで約 4,315 点・Rust の SDK のフィルタで約 4,210 点で、h2o〈3,874〉と目安の 4,000 点を超えた〈下の「結果」〉。HttpArena への提出は人の確認の後）**
 
 ## 背景
 
@@ -10,7 +10,7 @@
 - Proxy-Wasm の版の内訳: Wasm を通る 5 プロファイル（baseline 482・limited-conn 550・json-tls 407・baseline-h2 159・baseline-h3 214、
   計 1,812）と、通らない 4 プロファイル（pipelined 127〈`/pipeline` は設定の固定応答〉・static-tls 782・static-h2 593・static-h3 268）。
   h2o を超えるには Wasm を通る 5 プロファイルが約 16% 上がればよい。h2o を超えることを目標にし、4,000 点（約 +23%）を目安にする
-  （2026-11-26 に F-332・F-333・F-335 を見送ったので、4,000 点は届かない見通し。下の「子チケット」）。
+  （2026-11-26 に F-332・F-333・F-335 を見送ったので、4,000 点は届かない見通しだった。下の「子チケット」。結果は超えた。下の「結果」）。
 - HttpArena の baseline・limited-conn は gcannon が GET・POST（Content-Length）・POST（chunked）の 3 種を回すので、要求の 3 分の 2 が POST。
   POST はヘッダの段・本文の段・後始末の段で 3 回ゲストへ入り、1 要求のユーザー時間の上乗せは GET の約 1.5 倍（下の表）。
 
@@ -75,7 +75,7 @@
   試算は 3,830〜3,880 点（h2o 3,874 と並ぶ）。システム時間はユーザー時間が減ると一緒に縮む（ループバック）ので上振れし得る（〜3,930 点）。
   SDK を使わないフィルタ（F-334 の 2）を使えば +40〜50 点。F-329 の段階 2 を入れない場合は約 −70〜80 点で、h2o には届かない見込み。
   h2o を超えるのは、段階 2 と SDK を使わないフィルタを入れた場合で、余裕は小さい。
-- 4,000 点は、wasmtime の側（F-333・F-335）と `gc`（F-332）を見送ったので届かない見通し。段ごとに測った値で試算を更新する。
+- 4,000 点は、wasmtime の側（F-333・F-335）と `gc`（F-332）を見送ったので届かない見通しだった（結果は超えた。下の「結果」）。
 - 全部を入れても h1 GET でネイティブより約 1.6 µs/要求 多い見込み（veil の層 0.25・出入り 0.4・ゲスト 0.35・ホスト関数 0.3・付随 0.3）。
 - HttpArena のサーバは CPU `0-31,64-95`（32 コア × SMT の 64 スレッド。`scripts/lib/profiles.sh`）。aofish の 8 ワーカー（4 コア × SMT）と同じく
   SMT を分け合い、aofish では SMT の兄弟と分け合うと Proxy-Wasm の版の方が大きく遅くなった（×1.33 とネイティブ ×1.09。
@@ -85,6 +85,108 @@
   `available_parallelism()` で割るので、`total_memories` が 4096 なら 1 スレッド 32 個）。F-329 の段階 2（出入りの回数を減らす）は前者を半分にし、
   ローカル応答で context をすぐ消すので後者の圧力も下げる。F-335 を見送ったので、前者は 1 要求 1 回分残る。
 - limited-conn は張り直しの費用が大きく、Wasm の削減の効きが baseline より薄い（試算は F-328 の実測で直す）。
+
+## 結果（2026-11-26）
+
+### 試算（F-325 の 3 と同じ方法。`docs/artifacts/benchmark/httparena-perf/scripts/scen2.py`）
+
+HttpArena の veil-api の値（v0.10.1、2026-11-24）に、aofish で測った「その版 / 同じ木の veil-api の設定」の比をプロファイルごとに掛けた。
+前 = e2（main 86297922。3d8148a0 との `src/` の差は B-503 の `proxy/detect.rs` だけ）+ F-320 のフィルタ。後 = f331c（ab4c0ead。以後の
+本体の変更は試験・文書と、エラーの経路〈B-504・`proxy_get_property` の確かめる順〉と警告だけ）+ F-334 のフィルタ（ABI = SDK を使わない版・
+SDK = Rust の SDK のまま最適化した版。どちらも bulk-memory 無しのビルド）。aofish の f327t（io_uring、3 巡を交互、エラーの出た巡は除く）。
+
+| プロファイル | 前 | 後・ABI | 後・SDK |
+|---|---|---|---|
+| baseline | 474 | 552 | 514 |
+| pipelined | 127 | 127 | 126 |
+| limited-conn | 540 | 630 | 586 |
+| json-tls | 397 | 883 | 883 |
+| static-tls | 872 | 801 | 814 |
+| baseline-h2 | 157 | 212 | 190 |
+| static-h2 | 599 | 598 | 598 |
+| baseline-h3 | 209 | 250 | 236 |
+| static-h3 | 262 | 261 | 263 |
+| 計（9 エントリ中の順位） | 約 3,640（6 位） | **約 4,315（5 位）** | **約 4,210（5 位）** |
+
+- h2o（3,874）と目安の 4,000 点を、どちらのフィルタでも超えた（上は fit 4,521・nginx 4,779）。前の 3,640 は F-320 の時の 3,580 と同じ
+  方法の同じ版で、回の違いの揺れ（static-tls）を含む。
+- 分母を前と同じ e2-api にすると、後は ABI 約 4,380・SDK 約 4,270 点（同じ木の分母より、static-tls が高く json-tls が低い）。
+- Wasm を通る 5 プロファイルの計は 前 1,777 → 後 2,527（ABI、+42%）・2,409（SDK、+36%）。h2o を超えるのに要った +16% を大きく上回り、
+  見込み（「子チケット」の 3,830〜3,880 点）も超えた。同じ回の 1 要求のサーバの CPU（user + sys µs）と rps（中央値）:
+
+  | 負荷（aofish の代わりの負荷） | 前 | 後・ABI | 後・SDK |
+  |---|---|---|---|
+  | h1 GET（`h1-wasm`。baseline・limited-conn） | 16.87（446k） | 13.68（549k） | 14.67（512k） |
+  | json-tls | 36.97（205k） | 18.67（390k） | 19.23（390k） |
+  | h2（`h2-wasm`。baseline-h2） | 7.22（1,071k） | 5.40（1,431k） | 6.02（1,280k） |
+  | h3（`h3-wasm`。baseline-h3） | 7.80（124k） | 6.61（147k） | 7.02（138k） |
+
+  json-tls は「今の状態」の内訳のゲストの `memory.copy`（2.9 µs）とゲストのコード（3.1 µs）が F-334 のビルドとフィルタで、ヘッダ・本文・
+  ローカル応答の写しと TLS の記録が F-330 で減り、ユーザー時間が減った分システム時間（ループバックで相手を起こす費用）も縮んだ。段ごとの
+  効きは各子チケットの交互 A/B。
+- 同じ木の分母（veil-api）の json-tls は、f327t の回で e2-api の 23.10 µs（326k rps）に対し 27.00 µs（279k、−14.4%）で、その分だけ後の
+  json-tls の点が高く出る（e2 を分母にすると 756 点。json-tls だけ e2 を分母にした計は ABI 約 4,190・
+  SDK 約 4,080 点で、これでも h2o と 4,000 点を超える）。別に二分した回（`apibis`、3 巡）では `422c4721`（TLS の記録の結合）のビルドから
+  1 要求の CPU が +1.9 µs（rps −6〜−9%）で、命令数は −600/要求・サイクル数は +4,750/要求（`istat-api`）。同じバイナリの中で
+  記録の積み方を切り替えると、記録 1 つは veil-api の json-tls でだけ 0.62 µs 重く、static-tls（両方の版で 2 µs 以上）と Proxy-Wasm の版の
+  json-tls（0.50 µs）では軽い。差の大半はビルドごとのコードの配置（B-339）なので、記録 1 つのままにした
+  （[F-330](F-330-wasm-request-response-copies.md) の「同じバイナリの A/B」）。
+
+### Wasm を通らない経路（受け入れ条件の ±2%）
+
+`p0`（47a6e284。veil のコードは main 3d8148a0 と同じ）→ `f331c`（ab4c0ead）。f327n（rps・1 要求の CPU、3 巡）と istat327（同じ 2 つの版の
+1 要求のユーザー空間の命令数・サイクル数。`perf stat -e instructions:u,cycles:u`。WSL の `perf_event_paranoid` が 2 なのでカーネルの
+イベントは数えられない）。どちらもエラーの出た巡は除く（istat327 の epoll の static-tls の後の版はエラーの無い巡が 1/3 巡。他の回・
+io_uring も同じ向き）。
+
+| 負荷 | io_uring 命令 | io_uring サイクル | io_uring rps | epoll 命令 | epoll サイクル | epoll rps |
+|---|---|---|---|---|---|---|
+| h1-plain | −0.3% | −1.7% | +0.0% | +1.0% | +0.6% | −0.7% |
+| pipe-plain | +0.2% | +0.8% | −0.2% | +0.7% | −1.2% | −0.3% |
+| h2c-plain | +0.0% | −0.7% | +0.6% | +0.4% | +0.9% | −0.6% |
+| h2-plain（TLS） | +0.0% | +1.3% | −0.8% | +0.3% | +1.4% | −0.9% |
+| h3-plain | +0.4% | +1.6% | −1.5% | −0.2% | +3.1% | −1.9% |
+| static-tls | −3.6% | −5.2% | +8.0% | −3.7% | −5.1% | +10.5% |
+| static-h2 | +0.2% | −0.8% | −0.4% | +0.1% | +0.8% | −4.1% |
+
+- 命令数は −0.3〜+1.0%（static-tls は TLS の記録の結合〈422c4721〉で −3.6%）。サイクル数は ±1.7% の中で、epoll の h3-plain の +3.1% は
+  命令数 −0.2% のままなのでコードの配置の差（B-339）。f327n で ±2% を外れた rps（io_uring の h2-plain −5.6%・h2c-plain −2.5%、epoll の
+  h3-plain −3.8%）は istat327 の回では再現しない（−0.8%・+0.6%・−1.9%）。istat327 の epoll の static-h2 −4.1% も命令数 +0.1%・サイクル数
+  +0.8% で、f327n では −0.7%。Wasm を通らない経路に退行は無い。
+- veil-api（ネイティブのハンドラ。この表の外）の json-tls の 1 要求の CPU +1.9 µs は、上の「試算」の注のとおりビルドの配置の差が大半で、
+  同じバイナリの中では記録 1 つ（今）の方が static-tls を含めて軽い。
+
+### 受け入れ条件の確かめ
+
+- 試算: 上の表。h2o を超えた。
+- 拡張性: 今読めるモジュール・フィルタが今できることは減らしていない。Proxy-Wasm の ABI の意味を変えたのは F-329 の段階 2（ローカル応答の
+  要求のログ・削除の段を要求の段に続けて呼ぶ時機。呼ぶ順・回数・見える値は変えない。2026-11-26 利用者の決定）だけで、ガイド（英日）に書いた。
+  Proxy-Wasm の適合の試験（`tests/proxy_wasm_conformance.rs`）・Proxy-Wasm の E2E（全段・全プロトコル、io_uring と epoll）が通り、試験の
+  モジュールは全部読める。wasmtime の cargo の機能・`third_party/wasmtime`・エンジンの設定（`wasmtime::Config`）は変えていない（足した
+  `Config::new()` は `metering.rs` の単体の試験の中だけ）。
+- `max_execution_time_ms`: 終わらない段は続けて呼ぶ段の中でも打ち切られ、同じスレッドの他の要求を止めない（F-329 の単体の試験）。既存の
+  E2E（`test_wasm_timeout`）も通る。
+- 試験（最後の版で、手元の 1 回のビルドずつ）: `cargo fmt --check`・`cargo clippy --all-targets -D warnings`（full・full,epoll）、単体 + 統合（full 1,534 + 63 件・
+  full,epoll 1,492 + 63 件）、proptest・Proxy-Wasm の適合（20 件）・F-148・取り消しの試験、自己完結型 E2E（full・full,epoll、81 件ずつ）、
+  E2E（io_uring・epoll・kTLS、597 件ずつ）、`--no-default-features` と既定のビルド、`wasm`・`wasm,http2`・`wasm,http3`・`wasm,epoll` の
+  `cargo check`、`cargo doc`（`-D warnings`）と doc の試験、`check-docs.sh`・`check-messages.py`・`render-defaults.sh --check`・
+  `check-guide-configs.py`・`gen_dashboard.py --check`、ライブラリの E2E の `nonregression`。すべて通った。
+- 文書: ガイド（英日）の Proxy-Wasm の章に、フィルタを書く人向けの性能の注意（F-334）・ログの段の時機（F-329）・ログの段を呼ぶ範囲（B-504）を
+  書いた。設定のキーは足していない（`examples/config.toml` は変えない）。
+- 見つけたバグ: [B-504](../bugs/B-504-h1-body-error-skips-wasm-on-log.md)（ログの段が抜ける経路。main から。このブランチで直した）。
+
+### レビュー（Gemini）
+
+計画（req-04）、F-334（req-05）、F-329 の設計と差分（req-06・req-07）、F-330（req-08）、TLS と F-331 の 1（req-09）、F-331 の 2 と F-330 の 3
+（req-10）、試験と B-504（req-11）、B-504 の修正（req-12）、その指摘の対応と TLS の記録の判断（req-13）。指摘と扱いは `docs/artifacts/proxy-wasm-perf/gemini/` の各回答と各子チケットの
+「実装」に書いた。
+
+### 残したもの
+
+- `proxy_on_log` から応答のステータスとヘッダを見せる（[F-336](F-336-wasm-on-log-response-values.md)）。
+- 範囲外の気づき（下）は [F-337](F-337-per-request-security-and-h2-header-vectors.md)・[F-338](F-338-wasm-envoy-local-reply-and-request-time.md) に起票した。
+- 要求の future ごと捨てたときは今までどおり次の利用で `proxy_on_delete` だけ（B-177）。
+- HttpArena への提出（Proxy-Wasm の版で出すか・いつ出すか）は人の確認の後。フィルタは手元（`docs/artifacts`）にある。
 
 ## 分担（Claude Code と Gemini）
 
@@ -116,7 +218,7 @@
   （`--no-default-features`・`wasm` 単体等）。`max_execution_time_ms` で無限ループのフィルタが打ち切られ、他の要求が止まらないこと。
 - 挙動・設定を変えたものは同じ変更で `docs/guide/`（英日）と `examples/config.toml` を更新する。
 
-## 範囲外の気づき（Wasm に限らない。別のチケットで扱う）
+## 範囲外の気づき（Wasm に限らない。F-337・F-338 に起票した）
 
 - `l7::check_security` が要求ごとに `SecurityConfig::ip_filter()` で `IpFilter` を作り直している（空の一覧なら確保は無い。設定のロードの時に
   解決できる）。
